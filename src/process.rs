@@ -8,20 +8,31 @@ use std::io::{self, BufReader, BufWriter, Write};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(not(unix))]
 use std::sync::OnceLock;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use sha2::{Digest, Sha256};
+
+use crate::backend::state::{
+    ensure_evaluator_snapshot_bound, sandbox_policy_sha256, BackendCheckpointV1,
+    BackendRestoreReceiptV1, BackendStateCapabilitiesV1, BackendStateTierV1, BackendWireCommandV2,
+    BackendWireResponseV2, EvaluatorActorCheckpointV1, EvaluatorStateSnapshotV1,
+};
 use crate::capability::BackendSandboxPolicy;
-use crate::value::{OValue, OWireCommand, OWireResponse};
+use crate::value::OValue;
 use crate::wire;
 
 static LIFECYCLE_TRACE_LOCK: Mutex<()> = Mutex::new(());
+static BACKEND_SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
 const DEFAULT_BACKEND_OPERATION_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_BACKEND_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const BACKEND_FALLBACK_REAP_TIMEOUT: Duration = Duration::from_millis(250);
+const DEFAULT_MAX_OPEN_BACKEND_SESSIONS: usize = 128;
+const DEFAULT_MAX_OPEN_BACKEND_SESSIONS_PER_BACKEND: usize = 32;
 
 /// Marker carried through `anyhow` so the worker pool can distinguish a
 /// physical execution failure from a language-level backend error.
@@ -52,6 +63,27 @@ impl fmt::Display for BackendSemanticError {
 }
 
 impl StdError for BackendSemanticError {}
+
+/// A checkpoint was refused without damaging the live session. Callers may
+/// continue on the same actor, but must not claim restart or migration.
+#[derive(Debug)]
+pub(crate) struct BackendStatePinned {
+    pub(crate) backend: String,
+    pub(crate) path: String,
+    pub(crate) message: String,
+}
+
+impl fmt::Display for BackendStatePinned {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "state.pin-required: backend={} path={} message={}",
+            self.backend, self.path, self.message
+        )
+    }
+}
+
+impl StdError for BackendStatePinned {}
 
 /// A one-shot compatibility backend completed its semantic operation but
 /// could not participate in the explicit shutdown handshake.  This marker is
@@ -228,9 +260,10 @@ struct BackendProcess {
     language: String,
     child: Child,
     stdin: Option<BufWriter<ChildStdin>>,
-    responses: mpsc::Receiver<std::result::Result<OWireResponse, String>>,
+    responses: mpsc::Receiver<std::result::Result<BackendWireResponseV2, String>>,
     reader: Option<JoinHandle<()>>,
     terminal: bool,
+    exec_pending: bool,
 }
 
 pub(crate) fn backend_operation_timeout() -> Duration {
@@ -652,10 +685,36 @@ impl BackendProcess {
         sandbox: &BackendSandboxPolicy,
         executable_leases: Option<&crate::runtime_exec::ExecutableLeaseSet>,
     ) -> Result<Self> {
-        #[cfg(test)]
-        let _ = executable_leases;
+        let ordinal = BACKEND_SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let session_id = hex::encode(Sha256::digest(format!(
+            "ostadix-ephemeral-session-v1\0{}\0{}\0{}",
+            std::process::id(),
+            ordinal,
+            lang
+        )));
+        Self::new_with_session(lang, shim_path, sandbox, executable_leases, &session_id)
+    }
+
+    fn new_with_session(
+        lang: &str,
+        shim_path: &Path,
+        sandbox: &BackendSandboxPolicy,
+        executable_leases: Option<&crate::runtime_exec::ExecutableLeaseSet>,
+        session_id: &str,
+    ) -> Result<Self> {
+        if session_id.len() != 64 || !session_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            bail!("backend session identity must be a 64-character SHA-256 digest");
+        }
         #[cfg(test)]
         let mut command = legacy_backend_command(shim_path, sandbox)?;
+        #[cfg(test)]
+        if let Some(executable_leases) = executable_leases {
+            executable_leases.verify_backend(lang)?;
+            command.env(
+                crate::runtime_exec::ADMITTED_EXECUTABLE_MANIFEST_ENV,
+                executable_leases.backend_manifest_json(lang)?,
+            );
+        }
 
         #[cfg(not(test))]
         let mut command = rust_backend_command(
@@ -666,6 +725,8 @@ impl BackendProcess {
                 anyhow!("backend `{lang}` has no admitted executable lease authority")
             })?,
         )?;
+
+        command.env("O_BACKEND_SESSION_ID", session_id);
 
         #[cfg(unix)]
         command.process_group(0);
@@ -719,7 +780,7 @@ impl BackendProcess {
         let reader = match thread::Builder::new().name(reader_name).spawn(move || {
             let mut stdout = BufReader::new(stdout);
             loop {
-                match wire::read_frame::<_, OWireResponse>(&mut stdout) {
+                match wire::read_frame::<_, BackendWireResponseV2>(&mut stdout) {
                     Ok(Some(response)) => {
                         if responses_tx.send(Ok(response)).is_err() {
                             return;
@@ -755,10 +816,11 @@ impl BackendProcess {
             responses,
             reader: Some(reader),
             terminal: false,
+            exec_pending: false,
         })
     }
 
-    fn send_command(&mut self, command: &OWireCommand) -> Result<()> {
+    fn send_command(&mut self, command: &BackendWireCommandV2) -> Result<()> {
         let stdin = self
             .stdin
             .as_mut()
@@ -767,18 +829,30 @@ impl BackendProcess {
     }
 
     fn recv_step(&mut self) -> Result<ExecStep> {
-        let response = self
-            .responses
+        let step = Self::response_step(self.recv_response()?);
+        if !matches!(&step, Ok(ExecStep::EvalRequest { .. })) {
+            self.exec_pending = false;
+        }
+        step
+    }
+
+    fn recv_response(&mut self) -> Result<BackendWireResponseV2> {
+        self.responses
             .recv()
             .map_err(|_| anyhow!("backend process closed stdout unexpectedly"))?
-            .map_err(anyhow::Error::msg)?;
-
-        Self::response_step(response)
+            .map_err(anyhow::Error::msg)
     }
 
     fn recv_step_timeout(&mut self, timeout: Duration) -> Result<ExecStep> {
-        let response = self
-            .responses
+        let step = Self::response_step(self.recv_response_timeout(timeout)?);
+        if !matches!(&step, Ok(ExecStep::EvalRequest { .. })) {
+            self.exec_pending = false;
+        }
+        step
+    }
+
+    fn recv_response_timeout(&mut self, timeout: Duration) -> Result<BackendWireResponseV2> {
+        self.responses
             .recv_timeout(timeout)
             .map_err(|error| match error {
                 mpsc::RecvTimeoutError::Timeout => anyhow!(
@@ -790,30 +864,49 @@ impl BackendProcess {
                     anyhow!("backend process closed stdout unexpectedly")
                 }
             })?
-            .map_err(anyhow::Error::msg)?;
-
-        Self::response_step(response)
+            .map_err(anyhow::Error::msg)
     }
 
-    fn response_step(response: OWireResponse) -> Result<ExecStep> {
+    fn response_step(response: BackendWireResponseV2) -> Result<ExecStep> {
         match response {
-            OWireResponse::Ok { value } => Ok(ExecStep::Done(value)),
-            OWireResponse::Err { message } => {
+            BackendWireResponseV2::Ok { value } => Ok(ExecStep::Done(value)),
+            BackendWireResponseV2::Err { message } => {
                 Err(anyhow::Error::new(BackendSemanticError(message)))
             }
-            OWireResponse::EvalRequest { src, scope } => Ok(ExecStep::EvalRequest { src, scope }),
+            BackendWireResponseV2::EvalRequest { src, scope } => {
+                Ok(ExecStep::EvalRequest { src, scope })
+            }
+            BackendWireResponseV2::StateCapabilitiesV1 { .. }
+            | BackendWireResponseV2::CheckpointV1 { .. }
+            | BackendWireResponseV2::RestoreV1 { .. }
+            | BackendWireResponseV2::StatePinRequiredV1 { .. }
+            | BackendWireResponseV2::StateErrorV1 { .. } => {
+                bail!("backend returned a state-protocol response during execution")
+            }
         }
     }
 
     fn send_eval_result(&mut self, value: OValue) -> Result<()> {
-        self.send_command(&OWireCommand::EvalResult { value })
+        if !self.exec_pending {
+            bail!("backend has no pending execution awaiting eval_result");
+        }
+        self.send_command(&BackendWireCommandV2::EvalResult { value })
     }
 
-    fn exec(&mut self, code: &str, bindings: HashMap<String, OValue>) -> Result<OValue> {
-        self.send_command(&OWireCommand::Exec {
+    fn begin_exec(&mut self, code: &str, bindings: HashMap<String, OValue>) -> Result<()> {
+        if self.exec_pending {
+            bail!("backend already has a pending execution");
+        }
+        self.send_command(&BackendWireCommandV2::Exec {
             code: code.to_string(),
             bindings,
         })?;
+        self.exec_pending = true;
+        Ok(())
+    }
+
+    fn exec(&mut self, code: &str, bindings: HashMap<String, OValue>) -> Result<OValue> {
+        self.begin_exec(code, bindings)?;
         match self.recv_step()? {
             ExecStep::Done(v) => Ok(v),
             ExecStep::EvalRequest { src, .. } => Err(anyhow!(
@@ -825,9 +918,87 @@ impl BackendProcess {
         }
     }
 
+    fn state_capabilities(&mut self) -> Result<BackendStateCapabilitiesV1> {
+        self.ensure_state_boundary()?;
+        self.send_command(&BackendWireCommandV2::StateCapabilitiesV1)?;
+        match self.recv_response_timeout(backend_operation_timeout())? {
+            BackendWireResponseV2::StateCapabilitiesV1 { capabilities } => {
+                capabilities.validate()?;
+                Ok(capabilities)
+            }
+            response => Err(unexpected_state_response("state_capabilities_v1", response)),
+        }
+    }
+
+    fn checkpoint(&mut self, max_bytes: u64) -> Result<BackendCheckpointV1> {
+        self.ensure_state_boundary()?;
+        self.send_command(&BackendWireCommandV2::CheckpointV1 { max_bytes })?;
+        match self.recv_response_timeout(backend_operation_timeout())? {
+            BackendWireResponseV2::CheckpointV1 { checkpoint } => {
+                checkpoint.validate()?;
+                crate::backend::state::ensure_checkpoint_bound(&checkpoint, max_bytes)?;
+                Ok(checkpoint)
+            }
+            BackendWireResponseV2::StatePinRequiredV1 { reason } => {
+                Err(anyhow::Error::new(BackendStatePinned {
+                    backend: reason.backend,
+                    path: reason.path,
+                    message: reason.message,
+                }))
+            }
+            BackendWireResponseV2::StateErrorV1 { error } => bail!(
+                "{}: backend={} message={}",
+                error.code,
+                error.backend,
+                error.message
+            ),
+            response => Err(unexpected_state_response("checkpoint_v1", response)),
+        }
+    }
+
+    fn restore(&mut self, checkpoint: BackendCheckpointV1) -> Result<BackendRestoreReceiptV1> {
+        self.ensure_state_boundary()?;
+        checkpoint.validate()?;
+        self.send_command(&BackendWireCommandV2::RestoreV1 {
+            checkpoint: checkpoint.clone(),
+        })?;
+        match self.recv_response_timeout(backend_operation_timeout())? {
+            BackendWireResponseV2::RestoreV1 { receipt } => {
+                if !receipt.restored
+                    || receipt.backend != checkpoint.backend
+                    || receipt.checkpoint_sha256 != checkpoint.checkpoint_sha256()?
+                {
+                    bail!("backend returned an invalid restore receipt");
+                }
+                Ok(receipt)
+            }
+            BackendWireResponseV2::StatePinRequiredV1 { reason } => {
+                Err(anyhow::Error::new(BackendStatePinned {
+                    backend: reason.backend,
+                    path: reason.path,
+                    message: reason.message,
+                }))
+            }
+            BackendWireResponseV2::StateErrorV1 { error } => bail!(
+                "{}: backend={} message={}",
+                error.code,
+                error.backend,
+                error.message
+            ),
+            response => Err(unexpected_state_response("restore_v1", response)),
+        }
+    }
+
+    fn ensure_state_boundary(&self) -> Result<()> {
+        if self.exec_pending {
+            bail!("state.not-settled: backend execution is still pending");
+        }
+        Ok(())
+    }
+
     fn shutdown(&mut self, timeout: Duration) -> Result<()> {
         let deadline = bounded_deadline(timeout, "backend shutdown")?;
-        if let Err(error) = self.send_command(&OWireCommand::Shutdown) {
+        if let Err(error) = self.send_command(&BackendWireCommandV2::Shutdown) {
             let termination = self.force_terminate(BACKEND_FALLBACK_REAP_TIMEOUT);
             return match termination {
                 Ok(()) => Err(anyhow::Error::new(BackendShutdownUnacknowledged(
@@ -1145,6 +1316,20 @@ impl BackendProcess {
     }
 }
 
+fn unexpected_state_response(operation: &str, response: BackendWireResponseV2) -> anyhow::Error {
+    let kind = match response {
+        BackendWireResponseV2::Ok { .. } => "ok",
+        BackendWireResponseV2::Err { .. } => "err",
+        BackendWireResponseV2::EvalRequest { .. } => "eval_request",
+        BackendWireResponseV2::StateCapabilitiesV1 { .. } => "state_capabilities_v1",
+        BackendWireResponseV2::CheckpointV1 { .. } => "checkpoint_v1",
+        BackendWireResponseV2::RestoreV1 { .. } => "restore_v1",
+        BackendWireResponseV2::StatePinRequiredV1 { .. } => "state_pin_required_v1",
+        BackendWireResponseV2::StateErrorV1 { .. } => "state_error_v1",
+    };
+    anyhow!("backend returned `{kind}` while answering `{operation}`")
+}
+
 impl Drop for BackendProcess {
     fn drop(&mut self) {
         if self.terminal {
@@ -1191,10 +1376,7 @@ where
 
     let execution = (|| {
         process
-            .send_command(&OWireCommand::Exec {
-                code: code.to_string(),
-                bindings,
-            })
+            .begin_exec(code, bindings)
             .map_err(infrastructure_error)?;
         lifecycle_trace(
             "worker.exec_sent",
@@ -1255,8 +1437,39 @@ where
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BackendSessionLimits {
+    pub(crate) total: usize,
+    pub(crate) per_backend: usize,
+}
+
+impl BackendSessionLimits {
+    fn from_env() -> Self {
+        let total = positive_usize_from_env(
+            "O_BACKEND_MAX_OPEN_SESSIONS",
+            DEFAULT_MAX_OPEN_BACKEND_SESSIONS,
+        );
+        let per_backend = positive_usize_from_env(
+            "O_BACKEND_MAX_OPEN_SESSIONS_PER_BACKEND",
+            DEFAULT_MAX_OPEN_BACKEND_SESSIONS_PER_BACKEND,
+        )
+        .min(total);
+        Self { total, per_backend }
+    }
+}
+
+fn positive_usize_from_env(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
 pub struct ProcessRegistry {
     registry: HashMap<(String, u32, BackendSandboxPolicy, String), BackendProcess>,
+    session_limits: BackendSessionLimits,
+    registry_identity_sha256: String,
 }
 
 /// Admission-scoped physical launch authority shared by persistent and
@@ -1282,6 +1495,18 @@ impl ProcessRegistry {
     pub fn new() -> Self {
         Self {
             registry: HashMap::new(),
+            session_limits: BackendSessionLimits::from_env(),
+            registry_identity_sha256: fresh_registry_identity(),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_session_limits(total: usize, per_backend: usize) -> Self {
+        assert!(total > 0 && per_backend > 0 && per_backend <= total);
+        Self {
+            registry: HashMap::new(),
+            session_limits: BackendSessionLimits { total, per_backend },
+            registry_identity_sha256: fresh_registry_identity(),
         }
     }
 
@@ -1297,7 +1522,7 @@ impl ProcessRegistry {
         launch: BackendLaunchContext<'_>,
     ) -> Result<()> {
         let launch_generation_sha256 = actor_launch_generation(&launch, lang)?;
-        self.retire_stale_actor(lang, env_id, launch.sandbox, &launch_generation_sha256)?;
+        self.reject_generation_conflict(lang, env_id, launch.sandbox, &launch_generation_sha256)?;
         let key = (
             lang.to_string(),
             env_id,
@@ -1305,11 +1530,19 @@ impl ProcessRegistry {
             launch_generation_sha256,
         );
         if !self.registry.contains_key(&key) {
-            let process = BackendProcess::new(
+            self.ensure_session_capacity(lang)?;
+            let session_id = actor_session_identity(
+                &self.registry_identity_sha256,
+                lang,
+                env_id,
+                launch.sandbox,
+            );
+            let process = BackendProcess::new_with_session(
                 lang,
                 launch.shim_path,
                 launch.sandbox,
                 launch.executable_leases.map(AsRef::as_ref),
+                &session_id,
             )
             .with_context(|| format!("failed to start backend for language `{lang}`"))?;
             self.registry.insert(key.clone(), process);
@@ -1317,10 +1550,7 @@ impl ProcessRegistry {
         self.registry
             .get_mut(&key)
             .expect("backend was just inserted but is missing")
-            .send_command(&OWireCommand::Exec {
-                code: code.to_string(),
-                bindings,
-            })
+            .begin_exec(code, bindings)
             .with_context(|| format!("failed to send Exec to backend `{lang}`"))?;
         lifecycle_trace(
             "worker.exec_sent",
@@ -1343,7 +1573,10 @@ impl ProcessRegistry {
             .ok_or_else(|| anyhow!("no live backend process for `{lang}[{env_id}]`"))?
             .recv_step();
 
-        if step.is_err() {
+        if step
+            .as_ref()
+            .is_err_and(|error| !error.is::<BackendSemanticError>())
+        {
             self.registry.remove(&key);
         }
         let step = step.with_context(|| format!("backend `{lang}[{env_id}]` recv_step failed"))?;
@@ -1375,6 +1608,11 @@ impl ProcessRegistry {
             .recv_step_timeout(timeout);
         let step = match step {
             Ok(step) => step,
+            Err(error) if error.is::<BackendSemanticError>() => {
+                return Err(error).with_context(|| {
+                    format!("backend `{lang}[{env_id}]` returned an execution error")
+                });
+            }
             Err(error) => {
                 let mut process = self
                     .registry
@@ -1418,6 +1656,23 @@ impl ProcessRegistry {
             .with_context(|| format!("failed to send eval_result to backend `{lang}`"))
     }
 
+    /// Whether an exact logical actor/sandbox still has a published physical
+    /// process, independent of its launch generation. Used only to classify a
+    /// failed split-protocol settlement as a semantic refusal (actor retained)
+    /// or ambiguous infrastructure loss (actor no longer usable).
+    pub(crate) fn has_live_env(
+        &self,
+        lang: &str,
+        env_id: u32,
+        sandbox: &BackendSandboxPolicy,
+    ) -> bool {
+        self.registry
+            .keys()
+            .any(|(candidate_lang, candidate_env, candidate_sandbox, _)| {
+                candidate_lang == lang && *candidate_env == env_id && candidate_sandbox == sandbox
+            })
+    }
+
     pub(crate) fn exec(
         &mut self,
         lang: &str,
@@ -1427,7 +1682,7 @@ impl ProcessRegistry {
         launch: BackendLaunchContext<'_>,
     ) -> Result<OValue> {
         let launch_generation_sha256 = actor_launch_generation(&launch, lang)?;
-        self.retire_stale_actor(lang, env_id, launch.sandbox, &launch_generation_sha256)?;
+        self.reject_generation_conflict(lang, env_id, launch.sandbox, &launch_generation_sha256)?;
         let key = (
             lang.to_string(),
             env_id,
@@ -1436,11 +1691,19 @@ impl ProcessRegistry {
         );
 
         if !self.registry.contains_key(&key) {
-            let process = BackendProcess::new(
+            self.ensure_session_capacity(lang)?;
+            let session_id = actor_session_identity(
+                &self.registry_identity_sha256,
+                lang,
+                env_id,
+                launch.sandbox,
+            );
+            let process = BackendProcess::new_with_session(
                 lang,
                 launch.shim_path,
                 launch.sandbox,
                 launch.executable_leases.map(AsRef::as_ref),
+                &session_id,
             )
             .with_context(|| format!("failed to start backend for language `{lang}`"))?;
             self.registry.insert(key.clone(), process);
@@ -1452,7 +1715,10 @@ impl ProcessRegistry {
             .expect("backend was just inserted but is missing")
             .exec(code, bindings);
 
-        if result.is_err() {
+        if result
+            .as_ref()
+            .is_err_and(|error| !error.is::<BackendSemanticError>())
+        {
             self.registry.remove(&key);
         }
 
@@ -1468,6 +1734,211 @@ impl ProcessRegistry {
                 lang, env_label
             )
         })
+    }
+
+    pub(crate) fn state_capabilities(
+        &mut self,
+        lang: &str,
+        env_id: u32,
+        sandbox: &BackendSandboxPolicy,
+    ) -> Result<BackendStateCapabilitiesV1> {
+        let key = self.process_key(lang, env_id, sandbox)?;
+        self.registry
+            .get_mut(&key)
+            .expect("resolved backend process is missing")
+            .state_capabilities()
+            .with_context(|| {
+                format!("failed to query backend state capabilities for `{lang}[{env_id}]`")
+            })
+    }
+
+    pub(crate) fn checkpoint_env(
+        &mut self,
+        lang: &str,
+        env_id: u32,
+        sandbox: &BackendSandboxPolicy,
+        max_bytes: u64,
+    ) -> Result<BackendCheckpointV1> {
+        let key = self.process_key(lang, env_id, sandbox)?;
+        self.registry
+            .get_mut(&key)
+            .expect("resolved backend process is missing")
+            .checkpoint(max_bytes)
+            .with_context(|| format!("failed to checkpoint backend `{lang}[{env_id}]`"))
+    }
+
+    /// Capture every settled persistent actor without removing, replacing, or
+    /// shutting down any registry entry. A refusal or protocol error aborts
+    /// the whole aggregate, while actors already queried remain live.
+    pub(crate) fn checkpoint_persistent_actors(
+        &mut self,
+        max_total_bytes: u64,
+    ) -> Result<EvaluatorStateSnapshotV1> {
+        if max_total_bytes == 0 {
+            bail!("evaluator snapshot byte limit must be non-zero");
+        }
+        let mut ordered = self
+            .registry
+            .keys()
+            .filter(|(_, env_id, _, _)| *env_id <= crate::environment::MAX_PERSISTENT_ENV_ID)
+            .map(|key| {
+                sandbox_policy_sha256(key.2.permissions()).map(|digest| (key.clone(), digest))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        ordered.sort_by(|(left, left_sandbox), (right, right_sandbox)| {
+            (&left.0, left.1, left_sandbox, &left.3).cmp(&(
+                &right.0,
+                right.1,
+                right_sandbox,
+                &right.3,
+            ))
+        });
+
+        let mut actors = Vec::with_capacity(ordered.len());
+        let empty = EvaluatorStateSnapshotV1::new(Vec::new())?;
+        ensure_evaluator_snapshot_bound(&empty, max_total_bytes)?;
+        for ((lang, env_id, sandbox, launch_generation_sha256), _) in ordered {
+            let partial = EvaluatorStateSnapshotV1::new(actors.clone())?;
+            let used = u64::try_from(partial.encoded_len()?)
+                .context("partial evaluator snapshot length exceeds u64")?;
+            let remaining = max_total_bytes.checked_sub(used).ok_or_else(|| {
+                anyhow!("evaluator snapshot metadata exhausted its aggregate byte limit")
+            })?;
+            if remaining == 0 {
+                bail!("evaluator snapshot metadata exhausted its aggregate byte limit");
+            }
+
+            let capabilities = self.state_capabilities(&lang, env_id, &sandbox)?;
+            if capabilities.backend != lang {
+                bail!(
+                    "backend `{lang}[{env_id}]` reported state identity `{}`",
+                    capabilities.backend
+                );
+            }
+            if capabilities.tier == BackendStateTierV1::ExternalPinned
+                || !capabilities.restore_supported
+            {
+                return Err(anyhow::Error::new(BackendStatePinned {
+                    backend: lang,
+                    path: "$actor".to_string(),
+                    message:
+                        "backend state is pinned to external resources and has no portable restore"
+                            .to_string(),
+                }));
+            }
+            let checkpoint = self.checkpoint_env(&lang, env_id, &sandbox, remaining)?;
+            if checkpoint.tier != capabilities.tier || checkpoint.codec != capabilities.codec {
+                bail!(
+                    "backend `{lang}[{env_id}]` checkpoint disagrees with its advertised state capabilities"
+                );
+            }
+            actors.push(EvaluatorActorCheckpointV1::new(
+                lang,
+                env_id,
+                sandbox.permissions().to_vec(),
+                launch_generation_sha256,
+                checkpoint,
+            )?);
+            let partial = EvaluatorStateSnapshotV1::new(actors.clone())?;
+            ensure_evaluator_snapshot_bound(&partial, max_total_bytes)?;
+        }
+
+        let snapshot = EvaluatorStateSnapshotV1::new(actors)?;
+        ensure_evaluator_snapshot_bound(&snapshot, max_total_bytes)?;
+        Ok(snapshot)
+    }
+
+    /// Validate a staged restore set against the live registry without
+    /// mutating either side. This makes multi-actor staging all-or-nothing.
+    pub(crate) fn ensure_restore_targets_vacant(
+        &self,
+        actors: &[EvaluatorActorCheckpointV1],
+    ) -> Result<()> {
+        for actor in actors {
+            let sandbox = BackendSandboxPolicy::new(actor.sandbox_permissions.iter().copied());
+            if self
+                .registry
+                .keys()
+                .any(|(candidate_lang, candidate_env, candidate_sandbox, _)| {
+                    candidate_lang == &actor.canonical_backend
+                        && *candidate_env == actor.environment_id
+                        && candidate_sandbox == &sandbox
+                })
+            {
+                bail!(
+                    "state.restore-conflict: backend `{}[{}]` already owns an open session for sandbox {}",
+                    actor.canonical_backend,
+                    actor.environment_id,
+                    actor.sandbox_policy_sha256
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Restore a checkpoint into a new physical actor and publish it only
+    /// after the backend returns a matching receipt. An already-open logical
+    /// session is never evicted or overwritten.
+    pub(crate) fn restore_env(
+        &mut self,
+        lang: &str,
+        env_id: u32,
+        checkpoint: BackendCheckpointV1,
+        launch: BackendLaunchContext<'_>,
+    ) -> Result<BackendRestoreReceiptV1> {
+        checkpoint.validate()?;
+        if checkpoint.backend != lang {
+            bail!(
+                "state.restore-incompatible: checkpoint backend `{}` cannot restore as `{lang}`",
+                checkpoint.backend
+            );
+        }
+        if self
+            .registry
+            .keys()
+            .any(|(candidate_lang, candidate_env, candidate_sandbox, _)| {
+                candidate_lang == lang
+                    && *candidate_env == env_id
+                    && candidate_sandbox == launch.sandbox
+            })
+        {
+            bail!(
+                "state.restore-conflict: backend `{lang}[{env_id}]` already owns an open session"
+            );
+        }
+        self.ensure_session_capacity(lang)?;
+        let launch_generation_sha256 = actor_launch_generation(&launch, lang)?;
+        let key = (
+            lang.to_string(),
+            env_id,
+            launch.sandbox.clone(),
+            launch_generation_sha256,
+        );
+        let session_id =
+            actor_session_identity(&self.registry_identity_sha256, lang, env_id, launch.sandbox);
+        let mut process = BackendProcess::new_with_session(
+            lang,
+            launch.shim_path,
+            launch.sandbox,
+            launch.executable_leases.map(AsRef::as_ref),
+            &session_id,
+        )
+        .with_context(|| format!("failed to start restore target for `{lang}[{env_id}]`"))?;
+        match process.restore(checkpoint) {
+            Ok(receipt) => {
+                self.registry.insert(key, process);
+                Ok(receipt)
+            }
+            Err(error) => {
+                let termination = process.force_terminate(BACKEND_FALLBACK_REAP_TIMEOUT);
+                match termination {
+                    Ok(()) => Err(error),
+                    Err(termination) => Err(anyhow!(
+                        "{error:#}; failed restore target termination also failed: {termination:#}"
+                    )),
+                }
+            }
+        }
     }
 
     pub fn cleanup_env(&mut self, lang: &str, env_id: u32) -> Result<()> {
@@ -1531,17 +2002,38 @@ impl ProcessRegistry {
         Ok(key)
     }
 
-    fn retire_stale_actor(
-        &mut self,
+    fn ensure_session_capacity(&self, lang: &str) -> Result<()> {
+        if self.registry.len() >= self.session_limits.total {
+            bail!(
+                "session.capacity-exhausted: open backend sessions reached configured total quota {}",
+                self.session_limits.total
+            );
+        }
+        let backend_count = self
+            .registry
+            .keys()
+            .filter(|(candidate_lang, _, _, _)| candidate_lang == lang)
+            .count();
+        if backend_count >= self.session_limits.per_backend {
+            bail!(
+                "session.capacity-exhausted: backend `{lang}` reached configured per-backend quota {}",
+                self.session_limits.per_backend
+            );
+        }
+        Ok(())
+    }
+
+    fn reject_generation_conflict(
+        &self,
         lang: &str,
         env_id: u32,
         sandbox: &BackendSandboxPolicy,
         launch_generation_sha256: &str,
     ) -> Result<()> {
-        let stale_keys = self
+        let conflicting_generation = self
             .registry
             .keys()
-            .filter(
+            .find(
                 |(candidate_lang, candidate_env, candidate_sandbox, candidate_digest)| {
                     candidate_lang == lang
                         && *candidate_env == env_id
@@ -1549,16 +2041,11 @@ impl ProcessRegistry {
                         && candidate_digest != launch_generation_sha256
                 },
             )
-            .cloned()
-            .collect::<Vec<_>>();
-        for stale_key in stale_keys {
-            if let Some(mut process) = self.registry.remove(&stale_key) {
-                process.shutdown(backend_shutdown_timeout()).with_context(|| {
-                    format!(
-                        "failed to restart persistent backend `{lang}[{env_id}]` after its admitted launch generation changed"
-                    )
-                })?;
-            }
+            .map(|(_, _, _, digest)| digest);
+        if let Some(conflicting_generation) = conflicting_generation {
+            bail!(
+                "session.generation-conflict: backend `{lang}[{env_id}]` remains pinned to launch generation `{conflicting_generation}`; explicitly checkpoint/cleanup/restore before using `{launch_generation_sha256}`"
+            );
         }
         Ok(())
     }
@@ -1586,6 +2073,40 @@ fn actor_launch_generation(launch: &BackendLaunchContext<'_>, lang: &str) -> Res
     {
         bail!("backend `{lang}` has no admitted executable lease authority")
     }
+}
+
+fn fresh_registry_identity() -> String {
+    let mut random = [0_u8; 32];
+    if getrandom::fill(&mut random).is_ok() {
+        return hex::encode(random);
+    }
+    let ordinal = BACKEND_SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
+    hex::encode(Sha256::digest(format!(
+        "ostadix-registry-fallback/v1\0{}\0{}\0{}",
+        std::process::id(),
+        monotonic_nanos(),
+        ordinal
+    )))
+}
+
+fn actor_session_identity(
+    registry_identity_sha256: &str,
+    lang: &str,
+    env_id: u32,
+    sandbox: &BackendSandboxPolicy,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"ostadix-backend-session/v1\0");
+    digest.update(registry_identity_sha256.as_bytes());
+    digest.update([0]);
+    digest.update(lang.as_bytes());
+    digest.update([0]);
+    digest.update(env_id.to_be_bytes());
+    for authority in sandbox.names() {
+        digest.update([0]);
+        digest.update(authority.as_bytes());
+    }
+    hex::encode(digest.finalize())
 }
 
 impl Drop for ProcessRegistry {
@@ -1617,6 +2138,19 @@ mod tests {
 
     fn python_shim_path() -> std::path::PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("backends/python_shim.py")
+    }
+
+    fn test_launch_context<'a>(
+        shim_path: &'a Path,
+        sandbox: &'a BackendSandboxPolicy,
+        launch_generation_sha256: &'a str,
+    ) -> BackendLaunchContext<'a> {
+        BackendLaunchContext {
+            shim_path,
+            sandbox,
+            executable_leases: None,
+            launch_generation_sha256: Some(launch_generation_sha256),
+        }
     }
 
     fn spawn_python_shim() -> Result<BackendProcess> {
@@ -1652,7 +2186,7 @@ mod tests {
     fn ping_round_trip_returns_null() -> Result<()> {
         let mut process = spawn_python_shim()?;
 
-        process.send_command(&OWireCommand::Ping)?;
+        process.send_command(&BackendWireCommandV2::Ping)?;
         let value = expect_done(process.recv_step()?);
 
         assert_eq!(value, OValue::Null);
@@ -1785,10 +2319,51 @@ mod tests {
     fn cleanup_command_returns_ok_null() -> Result<()> {
         let mut process = spawn_python_shim()?;
 
-        process.send_command(&OWireCommand::Cleanup)?;
+        process.send_command(&BackendWireCommandV2::Cleanup)?;
         let value = expect_done(process.recv_step()?);
 
         assert_eq!(value, OValue::Null);
+        process.shutdown(backend_shutdown_timeout())?;
+        Ok(())
+    }
+
+    #[test]
+    fn python_checkpoint_restore_preserves_mutable_alias_cycle() -> Result<()> {
+        let mut source = spawn_python_shim()?;
+        source.exec(
+            "x = []\nx.append(x)\ny = x\n__oval_result__ = 'ready'",
+            HashMap::new(),
+        )?;
+        let checkpoint = source.checkpoint(1024 * 1024)?;
+        source.shutdown(backend_shutdown_timeout())?;
+
+        let mut target = spawn_python_shim()?;
+        let receipt = target.restore(checkpoint.clone())?;
+        assert!(receipt.restored);
+        assert_eq!(receipt.checkpoint_sha256, checkpoint.checkpoint_sha256()?);
+        assert_eq!(
+            target.exec("__oval_result__ = x is y and x[0] is x", HashMap::new())?,
+            OValue::bool_(true)
+        );
+        target.shutdown(backend_shutdown_timeout())?;
+        Ok(())
+    }
+
+    #[test]
+    fn unsupported_python_checkpoint_pins_and_keeps_actor_live() -> Result<()> {
+        let mut process = spawn_python_shim()?;
+        process.exec("f = lambda: 42\n__oval_result__ = 'ready'", HashMap::new())?;
+        let error = process
+            .checkpoint(1024 * 1024)
+            .expect_err("functions are outside the constrained graph codec");
+        let pin = error
+            .downcast_ref::<BackendStatePinned>()
+            .expect("checkpoint refusal must retain a typed pin reason");
+        assert_eq!(pin.path, "$globals['f']");
+        assert_eq!(
+            process.exec("__oval_result__ = f()", HashMap::new())?,
+            OValue::int(42)
+        );
         process.shutdown(backend_shutdown_timeout())?;
         Ok(())
     }
@@ -1813,26 +2388,29 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let shim = temp.path().join("delayed_shutdown.py");
         let common = Path::new(env!("CARGO_MANIFEST_DIR")).join("backends/o_shim_common.py");
-        std::fs::copy(&common, temp.path().join("o_shim_common.py"))?;
+        std::fs::copy(python_shim_path(), &shim)?;
 
-        let source = std::fs::read_to_string(python_shim_path())?;
+        let source = std::fs::read_to_string(&common)?;
         let original = concat!(
-            "        elif tag == \"shutdown\":\n",
-            "            send_ok(None)\n",
-            "            break\n",
+            "            elif tag == \"shutdown\":\n",
+            "                send_ok({\"t\": \"null\"})\n",
+            "                break\n",
         );
         let delayed = concat!(
-            "        elif tag == \"shutdown\":\n",
-            "            __import__(\"time\").sleep(0.2)\n",
-            "            send_ok(None)\n",
-            "            __import__(\"time\").sleep(0.4)\n",
-            "            break\n",
+            "            elif tag == \"shutdown\":\n",
+            "                __import__(\"time\").sleep(0.2)\n",
+            "                send_ok({\"t\": \"null\"})\n",
+            "                __import__(\"time\").sleep(0.4)\n",
+            "                break\n",
         );
         assert!(
             source.contains(original),
-            "Python shim shutdown branch changed; update the deadline fixture"
+            "shared shim shutdown branch changed; update the deadline fixture"
         );
-        std::fs::write(&shim, source.replacen(original, delayed, 1))?;
+        std::fs::write(
+            temp.path().join("o_shim_common.py"),
+            source.replacen(original, delayed, 1),
+        )?;
 
         let mut process =
             BackendProcess::new("python", &shim, &BackendSandboxPolicy::none(), None)?;
@@ -1927,7 +2505,83 @@ mod tests {
     }
 
     #[test]
-    fn persistent_actor_restarts_when_admitted_launch_generation_changes() -> Result<()> {
+    fn session_quota_refuses_new_actor_without_evicting_open_session() -> Result<()> {
+        let mut registry = ProcessRegistry::with_session_limits(1, 1);
+        let sandbox = BackendSandboxPolicy::none();
+        let shim = python_shim_path();
+        registry.exec(
+            "python",
+            1,
+            "retained = 42\n'created'",
+            HashMap::new(),
+            test_launch_context(&shim, &sandbox, "quota-test-generation"),
+        )?;
+
+        let error = registry
+            .exec(
+                "python",
+                2,
+                "'must-not-run'",
+                HashMap::new(),
+                test_launch_context(&shim, &sandbox, "quota-test-generation"),
+            )
+            .expect_err("a second actor must exceed the configured quota");
+        assert!(
+            format!("{error:#}").contains("session.capacity-exhausted"),
+            "{error:#}"
+        );
+
+        assert_eq!(
+            registry.exec(
+                "python",
+                1,
+                "retained",
+                HashMap::new(),
+                test_launch_context(&shim, &sandbox, "quota-test-generation"),
+            )?,
+            OValue::int(42)
+        );
+        registry.shutdown_all(Duration::from_secs(2))?;
+        Ok(())
+    }
+
+    #[test]
+    fn semantic_error_does_not_retire_session_owned_actor() -> Result<()> {
+        let mut registry = ProcessRegistry::new();
+        let sandbox = BackendSandboxPolicy::none();
+        let shim = python_shim_path();
+        registry.exec(
+            "python",
+            3,
+            "retained = 42\n'created'",
+            HashMap::new(),
+            test_launch_context(&shim, &sandbox, "semantic-error-generation"),
+        )?;
+        registry
+            .exec(
+                "python",
+                3,
+                "raise RuntimeError('expected')",
+                HashMap::new(),
+                test_launch_context(&shim, &sandbox, "semantic-error-generation"),
+            )
+            .expect_err("the language-level error must surface");
+        assert_eq!(
+            registry.exec(
+                "python",
+                3,
+                "retained",
+                HashMap::new(),
+                test_launch_context(&shim, &sandbox, "semantic-error-generation"),
+            )?,
+            OValue::int(42)
+        );
+        registry.shutdown_all(Duration::from_secs(2))?;
+        Ok(())
+    }
+
+    #[test]
+    fn persistent_actor_refuses_implicit_launch_generation_replacement() -> Result<()> {
         let mut registry = ProcessRegistry::new();
         let sandbox = BackendSandboxPolicy::none();
         let shim = python_shim_path();
@@ -1966,29 +2620,38 @@ mod tests {
         )?;
         assert_eq!(same_generation, OValue::str_("present"));
 
-        let restarted = registry.exec(
+        let error = registry
+            .exec(
+                "python",
+                7,
+                "__oval_result__ = 'must-not-run'",
+                HashMap::new(),
+                BackendLaunchContext {
+                    shim_path: &shim,
+                    sandbox: &sandbox,
+                    executable_leases: None,
+                    launch_generation_sha256: Some(second_generation),
+                },
+            )
+            .expect_err("an open session must not be implicitly retired");
+        assert!(
+            format!("{error:#}").contains("session.generation-conflict"),
+            "{error:#}"
+        );
+
+        let retained = registry.exec(
             "python",
             7,
-            concat!(
-                "import os\n",
-                "__oval_result__ = str(os.getpid()) + ':' + globals().get(\n",
-                "    'retained_across_commands', 'missing'\n",
-                ")",
-            ),
+            "import os\n__oval_result__ = str(os.getpid()) + ':' + retained_across_commands",
             HashMap::new(),
             BackendLaunchContext {
                 shim_path: &shim,
                 sandbox: &sandbox,
                 executable_leases: None,
-                launch_generation_sha256: Some(second_generation),
+                launch_generation_sha256: Some(first_generation),
             },
         )?;
-        let restarted = restarted.as_str()?;
-        assert!(restarted.ends_with(":missing"), "{restarted}");
-        assert!(
-            !restarted.starts_with(&format!("{first_pid}:")),
-            "{restarted}"
-        );
+        assert_eq!(retained.as_str()?, format!("{first_pid}:present"));
 
         registry.shutdown_all(Duration::from_secs(2))?;
         Ok(())
