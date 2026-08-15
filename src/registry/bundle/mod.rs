@@ -12,9 +12,18 @@ use num_bigint::BigInt;
 use sha2::{Digest, Sha256};
 
 use crate::placement::protocol::{
-    BackendStateSupportV2, CurrentBackendCatalogV1, SemanticDigestV1, SnapshotCompatibilityV2,
+    BackendImplementationIdV1, BackendStateSupportV2, CurrentBackendCatalogV1,
+    PlacementValidationError, SemanticDigestV1, SnapshotCompatibilityV2,
 };
 use crate::value::BackendAuthority;
+use crate::world::ArtifactId;
+
+/// Wire ABI spoken by the current local evaluator/backend process boundary.
+pub const LOCAL_BACKEND_PROTOCOL_ABI_V1: &str = "o-backend-cbor-v1";
+/// Canonical JSON material schema retained for local realization identities.
+pub const LOCAL_REALIZATION_SCHEMA_V1: &str = "ostadix.local-realization/v1";
+/// Domain separating a realization-pipeline digest from every other digest.
+pub const LOCAL_REALIZATION_DIGEST_DOMAIN_V1: &str = "ostadix/registry/local-realization/v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionMode {
@@ -705,6 +714,80 @@ impl BackendRegistry {
         Some(finish_catalog_hash(hash))
     }
 
+    /// Build the exact implementation identity shared by local publication
+    /// and evaluator placement preflight.
+    ///
+    /// `backend` may be a canonical name or a declared alias; both resolve
+    /// through the current catalog and therefore produce identical identities.
+    /// When an admitted caller already carries a backend-specification digest,
+    /// it supplies that value through `expected_backend_specification`; a
+    /// stale or foreign catalog coordinate then fails closed before an
+    /// implementation identity can be minted. `None` is reserved for callers
+    /// such as local discovery that intentionally derive the coordinate from
+    /// the process's current catalog.
+    ///
+    /// This function is pure: artifact and executable-set discovery remains
+    /// with the caller, while this method owns the canonical realization
+    /// formula and its catalog/adapter interpretation.
+    pub fn backend_implementation_id_v1(
+        &self,
+        backend: &str,
+        expected_backend_specification: Option<&SemanticDigestV1>,
+        adapter_artifact: ArtifactId,
+        executable_set: SemanticDigestV1,
+        protocol_abi: impl Into<String>,
+    ) -> Result<BackendImplementationIdV1, PlacementValidationError> {
+        let spec = self
+            .get(backend)
+            .ok_or_else(|| PlacementValidationError::InvalidToken {
+                field: "backend implementation canonical backend",
+                value: backend.to_owned(),
+            })?;
+        let backend_specification =
+            SemanticDigestV1::from_sha256(self.specification_sha256(spec.name).ok_or_else(
+                || PlacementValidationError::InvalidToken {
+                    field: "backend implementation canonical backend",
+                    value: backend.to_owned(),
+                },
+            )?)?;
+        if let Some(expected) = expected_backend_specification {
+            if expected != &backend_specification {
+                if !self.contains_specification_sha256(expected.as_sha256()) {
+                    return Err(PlacementValidationError::NonCurrentBackendCatalog {
+                        specification: expected.as_sha256().to_owned(),
+                        current_schema: BACKEND_CATALOG_CURRENT_SCHEMA.to_owned(),
+                    });
+                }
+                return Err(PlacementValidationError::ScopeMismatch {
+                    field: "backend implementation specification",
+                    expected: backend_specification.as_sha256().to_owned(),
+                    got: expected.as_sha256().to_owned(),
+                });
+            }
+        }
+
+        let protocol_abi = protocol_abi.into();
+        let realization_material = serde_json::json!({
+            "schema": LOCAL_REALIZATION_SCHEMA_V1,
+            "backend_specification": backend_specification.as_sha256(),
+            "adapter_kind": spec.adapter.name(),
+            "adapter_artifact": adapter_artifact.as_sha256(),
+            "executable_set": executable_set.as_sha256(),
+            "protocol": protocol_abi.as_str(),
+        });
+        let realization_bytes = serde_json::to_vec(&realization_material)
+            .map_err(|error| PlacementValidationError::CanonicalSerialization(error.to_string()))?;
+        let realization_pipeline =
+            SemanticDigestV1::hash_bytes(LOCAL_REALIZATION_DIGEST_DOMAIN_V1, &realization_bytes);
+        BackendImplementationIdV1::new(
+            backend_specification,
+            adapter_artifact,
+            executable_set,
+            protocol_abi,
+            realization_pipeline,
+        )
+    }
+
     /// Whether `digest` is the specification identity of a canonical backend
     /// under the current catalog schema and hash domain.
     ///
@@ -815,5 +898,144 @@ impl CurrentBackendCatalogV1 for BackendRegistry {
                 .is_some_and(|current| current == digest.as_sha256())
                 .then_some(&spec.state_support)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn artifact(byte: u8) -> ArtifactId {
+        ArtifactId::from_sha256(format!("{byte:02x}").repeat(32)).unwrap()
+    }
+
+    fn digest(byte: u8) -> SemanticDigestV1 {
+        SemanticDigestV1::from_sha256(format!("{byte:02x}").repeat(32)).unwrap()
+    }
+
+    #[test]
+    fn implementation_identity_aliases_resolve_to_one_canonical_backend() {
+        let registry = BackendRegistry::global();
+        let canonical = registry
+            .backend_implementation_id_v1(
+                "markdown",
+                None,
+                artifact(0x11),
+                digest(0x22),
+                LOCAL_BACKEND_PROTOCOL_ABI_V1,
+            )
+            .unwrap();
+        let alias = registry
+            .backend_implementation_id_v1(
+                "md",
+                None,
+                artifact(0x11),
+                digest(0x22),
+                LOCAL_BACKEND_PROTOCOL_ABI_V1,
+            )
+            .unwrap();
+
+        assert_eq!(canonical, alias);
+        assert_eq!(
+            canonical.backend_specification().as_sha256(),
+            registry.specification_sha256("markdown").unwrap()
+        );
+        assert_eq!(
+            canonical.realization_pipeline().as_sha256(),
+            "c98daed592288c5e4e80bd10be1c8f26786303d07d001d4250171616e4e41c90"
+        );
+
+        // Compatibility oracle for the formula formerly owned by
+        // `o-registry::discover_backend_implementations`.
+        let legacy_material = serde_json::json!({
+            "schema": "ostadix.local-realization/v1",
+            "backend_specification": registry.specification_sha256("markdown").unwrap(),
+            "adapter_kind": "inline",
+            "adapter_artifact": "11".repeat(32),
+            "executable_set": "22".repeat(32),
+            "protocol": "o-backend-cbor-v1",
+        });
+        let legacy_pipeline = SemanticDigestV1::hash_bytes(
+            "ostadix/registry/local-realization/v1",
+            &serde_json::to_vec(&legacy_material).unwrap(),
+        );
+        assert_eq!(canonical.realization_pipeline(), &legacy_pipeline);
+    }
+
+    #[test]
+    fn implementation_identity_rejects_unknown_and_stale_catalog_coordinates() {
+        let registry = BackendRegistry::global();
+        let unknown = registry
+            .backend_implementation_id_v1(
+                "not-a-current-backend",
+                None,
+                artifact(0x11),
+                digest(0x22),
+                LOCAL_BACKEND_PROTOCOL_ABI_V1,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            unknown,
+            PlacementValidationError::InvalidToken {
+                field: "backend implementation canonical backend",
+                ..
+            }
+        ));
+
+        let stale = digest(0x33);
+        let mismatch = registry
+            .backend_implementation_id_v1(
+                "markdown",
+                Some(&stale),
+                artifact(0x11),
+                digest(0x22),
+                LOCAL_BACKEND_PROTOCOL_ABI_V1,
+            )
+            .unwrap_err();
+        assert_eq!(
+            mismatch,
+            PlacementValidationError::NonCurrentBackendCatalog {
+                specification: stale.as_sha256().to_owned(),
+                current_schema: BACKEND_CATALOG_CURRENT_SCHEMA.to_owned(),
+            }
+        );
+
+        let wrong_current =
+            SemanticDigestV1::from_sha256(registry.specification_sha256("html").unwrap()).unwrap();
+        let mismatch = registry
+            .backend_implementation_id_v1(
+                "markdown",
+                Some(&wrong_current),
+                artifact(0x11),
+                digest(0x22),
+                LOCAL_BACKEND_PROTOCOL_ABI_V1,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            mismatch,
+            PlacementValidationError::ScopeMismatch {
+                field: "backend implementation specification",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn implementation_identity_accepts_the_exact_current_catalog_coordinate() {
+        let registry = BackendRegistry::global();
+        let expected =
+            SemanticDigestV1::from_sha256(registry.specification_sha256("markdown").unwrap())
+                .unwrap();
+        let implementation = registry
+            .backend_implementation_id_v1(
+                "md",
+                Some(&expected),
+                artifact(0x11),
+                digest(0x22),
+                LOCAL_BACKEND_PROTOCOL_ABI_V1,
+            )
+            .unwrap();
+
+        assert_eq!(implementation.backend_specification(), &expected);
     }
 }
