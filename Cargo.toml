@@ -2,6 +2,7 @@
 name        = "o-lang"
 version     = "0.2.0"
 edition     = "2021"
+rust-version = "1.93.1"
 description = "Ostadix-lang (O-lang): recursive evaluator composition for whole-program polyglot execution"
 repository  = "https://github.com/lostadi/Ostadix-lang"
 authors     = ["Lee Daghlar Ostadi"]
