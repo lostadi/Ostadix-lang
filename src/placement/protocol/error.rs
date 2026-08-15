@@ -47,6 +47,13 @@ pub enum PlacementValidationError {
         specification: String,
         current_schema: String,
     },
+    #[error(
+        "backend realization `{realization_pipeline}` is not authorized by current catalog `{current_schema}`"
+    )]
+    NonCurrentBackendImplementation {
+        realization_pipeline: String,
+        current_schema: String,
+    },
     #[error("node capacity cannot satisfy the requested reservation")]
     InsufficientCapacity,
     #[error("invalid state quota relationship: {0}")]
