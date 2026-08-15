@@ -4,16 +4,41 @@
 Executes code inside a persistent Ubuntu VM via Multipass.
 """
 import sys
+import base64
+import hashlib
 import os
 import subprocess
 import traceback
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from o_shim_common import admitted_tool_path, command_loop, write_wire_message
+from o_shim_common import (
+    StatePinRequired,
+    admitted_tool_path,
+    command_loop,
+    make_checkpoint,
+    state_capabilities,
+    validate_checkpoint,
+    write_wire_message,
+)
 from o_shim_common import stdout_result
 
-VM_NAME = "ostadix-vm"
+UBUNTU_RESOURCE_CODEC_V1 = "ostadix.multipass-resource/v1"
+
+
+def _session_identity():
+    identity = os.environ.get("O_BACKEND_SESSION_ID", "")
+    if len(identity) == 64 and all(character in "0123456789abcdefABCDEF" for character in identity):
+        return identity.lower()
+    # Direct/manual shim launches do not have the registry identity. Keep even
+    # those isolated instead of silently sharing the historical global VM.
+    return hashlib.sha256(
+        f"ostadix-manual-ubuntu-session/v1\0{os.getpid()}".encode("utf-8")
+    ).hexdigest()
+
+
+SESSION_ID = _session_identity()
+VM_NAME = "ostadix-" + base64.b32encode(bytes.fromhex(SESSION_ID)).decode("ascii").lower().rstrip("=")
 
 def multipass_command():
     return admitted_tool_path("multipass")
@@ -76,4 +101,49 @@ def handle_exec(cmd):
     except Exception:
         send_err(traceback.format_exc())
 
-command_loop(handle_exec)
+
+def handle_state_capabilities():
+    return state_capabilities(
+        "ubuntu_vm", "external_pinned", UBUNTU_RESOURCE_CODEC_V1, False
+    )
+
+
+def handle_checkpoint(max_bytes):
+    return make_checkpoint(
+        "ubuntu_vm",
+        "external_pinned",
+        UBUNTU_RESOURCE_CODEC_V1,
+        {
+            "profile": "multipass-resource-manifest-only",
+            "session_id": SESSION_ID,
+            "vm_name": VM_NAME,
+            "provider": "multipass-local",
+        },
+        external_resources=[{
+            "kind": "multipass-instance",
+            "identity": f"multipass-local:{VM_NAME}",
+            "recovery": "same-live-provider-resource-required",
+            "metadata": {
+                "provider": "multipass-local",
+                "session_id": SESSION_ID,
+                "vm_name": VM_NAME,
+            },
+        }],
+    )
+
+
+def handle_restore(checkpoint):
+    validate_checkpoint(checkpoint)
+    raise StatePinRequired(
+        "$external_resources[0]",
+        "Ubuntu VM state remains in the named live Multipass instance; portable restore is unsupported",
+    )
+
+
+command_loop(
+    handle_exec,
+    handle_state_capabilities=handle_state_capabilities,
+    handle_checkpoint=handle_checkpoint,
+    handle_restore=handle_restore,
+    state_backend="ubuntu_vm",
+)
