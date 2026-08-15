@@ -1,0 +1,19 @@
+schema = "ostadix.ci-test-suites/v1"
+
+[suites.rust]
+required_executables = ["bash", "clang", "openssl", "python3", "sqlite3"]
+
+[suites.python]
+required_executables = ["python3"]
+
+[suites.c17]
+required_executables = ["cc", "cmake", "make", "python3"]
+
+[suites.mcp]
+required_executables = ["python3"]
+
+[suites.release-claims]
+required_executables = ["bash", "python3"]
+
+[suites.ocore-qemu]
+required_executables = ["clang", "grub-mkstandalone", "mcopy", "qemu-system-aarch64", "qemu-system-x86_64"]
