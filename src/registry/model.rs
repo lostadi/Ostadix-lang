@@ -210,6 +210,9 @@ impl ProfilePublicationV1 {
     }
 }
 
+// This enum is the stable V1 registry-event vocabulary. Keep its direct
+// construction shape aligned with the frozen record model.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "record", rename_all = "kebab-case")]
 pub enum RegistryEventBodyV1 {

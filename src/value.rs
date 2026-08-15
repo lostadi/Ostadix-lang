@@ -199,6 +199,10 @@ impl FidelityLossSet {
         self.0.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
     pub fn contains(&self, kind: &AnnotationKind) -> bool {
         self.0.contains(kind)
     }
@@ -209,6 +213,233 @@ impl FidelityLossSet {
 
     fn into_set(self) -> BTreeSet<AnnotationKind> {
         self.0
+    }
+}
+
+/// Why a definite/possible fidelity bound could not be constructed.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum FidelityBoundsError {
+    #[error("definite fidelity losses must be a subset of possible losses")]
+    DefiniteOutsidePossible,
+}
+
+/// A V2 fidelity judgment separates losses established for every represented
+/// value from losses that remain possible for at least one represented value.
+///
+/// The legacy [`Fidelity`] type remains the canonical V1/V5 wire vocabulary.
+/// This additive type is used by the stratified solver and new evidence so an
+/// abstract `I64` crossing to JavaScript can say “precision loss is possible”
+/// without claiming that every concrete `I64` loses precision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FidelityAssessmentV2 {
+    Lossless,
+    Structural {
+        definite: Option<FidelityLossSet>,
+        possible: FidelityLossSet,
+    },
+    NativeCapsule,
+    Unsupported,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum FidelityAssessmentSerializeV2<'a> {
+    Lossless,
+    Structural {
+        definite: Option<&'a BTreeSet<AnnotationKind>>,
+        possible: &'a BTreeSet<AnnotationKind>,
+    },
+    NativeCapsule,
+    Unsupported,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum FidelityAssessmentDeserializeV2 {
+    Lossless,
+    Structural {
+        #[serde(default)]
+        definite: BTreeSet<AnnotationKind>,
+        possible: BTreeSet<AnnotationKind>,
+    },
+    NativeCapsule,
+    Unsupported,
+}
+
+impl FidelityAssessmentV2 {
+    pub fn structural(
+        definite: impl IntoIterator<Item = AnnotationKind>,
+        possible: impl IntoIterator<Item = AnnotationKind>,
+    ) -> Result<Self, FidelityBoundsError> {
+        let definite = definite.into_iter().collect::<BTreeSet<_>>();
+        let possible = possible.into_iter().collect::<BTreeSet<_>>();
+        if !definite.is_subset(&possible) {
+            return Err(FidelityBoundsError::DefiniteOutsidePossible);
+        }
+        let Some(possible) = FidelityLossSet::new(possible) else {
+            return Ok(Self::Lossless);
+        };
+        Ok(Self::Structural {
+            definite: FidelityLossSet::new(definite),
+            possible,
+        })
+    }
+
+    pub fn from_concrete(fidelity: Fidelity) -> Self {
+        match fidelity {
+            Fidelity::Lossless => Self::Lossless,
+            Fidelity::Structural { lost } => Self::Structural {
+                definite: Some(lost.clone()),
+                possible: lost,
+            },
+            Fidelity::NativeCapsule => Self::NativeCapsule,
+            Fidelity::Unsupported => Self::Unsupported,
+        }
+    }
+
+    pub fn definite_losses(&self) -> Option<&FidelityLossSet> {
+        match self {
+            Self::Structural { definite, .. } => definite.as_ref(),
+            _ => None,
+        }
+    }
+
+    pub fn possible_losses(&self) -> Option<&FidelityLossSet> {
+        match self {
+            Self::Structural { possible, .. } => Some(possible),
+            _ => None,
+        }
+    }
+
+    /// Compose two crossings on one execution path. A loss established or
+    /// possible at either crossing remains established or possible after the
+    /// complete path.
+    pub fn then(self, next: Self) -> Self {
+        use FidelityAssessmentV2::*;
+        match (self, next) {
+            (Unsupported, _) | (_, Unsupported) => Unsupported,
+            (NativeCapsule, _) | (_, NativeCapsule) => NativeCapsule,
+            (Lossless, other) | (other, Lossless) => other,
+            (
+                Structural { definite, possible },
+                Structural {
+                    definite: more_definite,
+                    possible: more_possible,
+                },
+            ) => {
+                let mut definite = definite.map(FidelityLossSet::into_set).unwrap_or_default();
+                definite.extend(
+                    more_definite
+                        .map(FidelityLossSet::into_set)
+                        .unwrap_or_default(),
+                );
+                let mut possible = possible.into_set();
+                possible.extend(more_possible.into_set());
+                Self::structural(definite, possible)
+                    .expect("union preserves the definite-subset-possible invariant")
+            }
+        }
+    }
+
+    /// Merge mutually exclusive abstract alternatives. Only losses common to
+    /// every alternative remain definite; a loss possible on either side
+    /// remains possible for the merged abstraction.
+    pub fn join_paths(self, other: Self) -> Self {
+        use FidelityAssessmentV2::*;
+        match (self, other) {
+            (Unsupported, _) | (_, Unsupported) => Unsupported,
+            (NativeCapsule, _) | (_, NativeCapsule) => NativeCapsule,
+            (left, right) => {
+                let (left_definite, mut left_possible) = left.loss_bounds();
+                let (right_definite, right_possible) = right.loss_bounds();
+                let definite = left_definite
+                    .intersection(&right_definite)
+                    .cloned()
+                    .collect::<BTreeSet<_>>();
+                left_possible.extend(right_possible);
+                Self::structural(definite, left_possible)
+                    .expect("path merge preserves the definite-subset-possible invariant")
+            }
+        }
+    }
+
+    /// Conservative V1 projection used only by compatibility evidence. It
+    /// reports every possible loss so old consumers never receive an
+    /// optimistic answer.
+    pub fn possible_fidelity(&self) -> Fidelity {
+        match self {
+            Self::Lossless => Fidelity::Lossless,
+            Self::Structural { possible, .. } => {
+                Fidelity::structural(possible.as_set().iter().cloned())
+            }
+            Self::NativeCapsule => Fidelity::NativeCapsule,
+            Self::Unsupported => Fidelity::Unsupported,
+        }
+    }
+
+    /// Return a concrete V1 judgment only when uncertainty has collapsed.
+    pub fn concrete_fidelity(&self) -> Option<Fidelity> {
+        match self {
+            Self::Structural {
+                definite: Some(definite),
+                possible,
+            } if definite == possible => {
+                Some(Fidelity::structural(possible.as_set().iter().cloned()))
+            }
+            Self::Structural { .. } => None,
+            other => Some(other.possible_fidelity()),
+        }
+    }
+
+    fn loss_bounds(&self) -> (BTreeSet<AnnotationKind>, BTreeSet<AnnotationKind>) {
+        match self {
+            Self::Lossless => (BTreeSet::new(), BTreeSet::new()),
+            Self::Structural { definite, possible } => (
+                definite
+                    .as_ref()
+                    .map(|losses| losses.as_set().clone())
+                    .unwrap_or_default(),
+                possible.as_set().clone(),
+            ),
+            Self::NativeCapsule | Self::Unsupported => {
+                unreachable!("non-structural fidelity has no loss bounds")
+            }
+        }
+    }
+}
+
+impl Serialize for FidelityAssessmentV2 {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Lossless => FidelityAssessmentSerializeV2::Lossless,
+            Self::Structural { definite, possible } => FidelityAssessmentSerializeV2::Structural {
+                definite: definite.as_ref().map(FidelityLossSet::as_set),
+                possible: possible.as_set(),
+            },
+            Self::NativeCapsule => FidelityAssessmentSerializeV2::NativeCapsule,
+            Self::Unsupported => FidelityAssessmentSerializeV2::Unsupported,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for FidelityAssessmentV2 {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = FidelityAssessmentDeserializeV2::deserialize(deserializer)?;
+        match wire {
+            FidelityAssessmentDeserializeV2::Lossless => Ok(Self::Lossless),
+            FidelityAssessmentDeserializeV2::Structural { definite, possible } => {
+                Self::structural(definite, possible).map_err(serde::de::Error::custom)
+            }
+            FidelityAssessmentDeserializeV2::NativeCapsule => Ok(Self::NativeCapsule),
+            FidelityAssessmentDeserializeV2::Unsupported => Ok(Self::Unsupported),
+        }
     }
 }
 
@@ -3551,6 +3782,103 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn fidelity_v2_distinguishes_definite_from_possible_losses() {
+        let assessment = FidelityAssessmentV2::structural(
+            [AnnotationKind::TypeTag],
+            [AnnotationKind::TypeTag, AnnotationKind::NumericPrecision],
+        )
+        .unwrap();
+
+        assert!(assessment
+            .definite_losses()
+            .unwrap()
+            .contains(&AnnotationKind::TypeTag));
+        assert!(!assessment
+            .definite_losses()
+            .unwrap()
+            .contains(&AnnotationKind::NumericPrecision));
+        assert!(assessment
+            .possible_losses()
+            .unwrap()
+            .contains(&AnnotationKind::NumericPrecision));
+        assert_eq!(
+            assessment.possible_fidelity(),
+            Fidelity::structural([AnnotationKind::TypeTag, AnnotationKind::NumericPrecision,])
+        );
+        assert_eq!(assessment.concrete_fidelity(), None);
+    }
+
+    #[test]
+    fn fidelity_v2_rejects_definite_losses_outside_possible_losses() {
+        assert_eq!(
+            FidelityAssessmentV2::structural(
+                [AnnotationKind::NumericPrecision],
+                [AnnotationKind::TypeTag],
+            ),
+            Err(FidelityBoundsError::DefiniteOutsidePossible)
+        );
+
+        let invalid = r#"{"kind":"structural","definite":[{"kind":"numeric_precision"}],"possible":[{"kind":"type_tag"}]}"#;
+        let error = serde_json::from_str::<FidelityAssessmentV2>(invalid).unwrap_err();
+        assert!(error.to_string().contains("subset"), "{error}");
+    }
+
+    #[test]
+    fn fidelity_v2_sequential_composition_unions_both_bounds() {
+        let first = FidelityAssessmentV2::structural(
+            [AnnotationKind::TypeTag],
+            [AnnotationKind::TypeTag, AnnotationKind::NumericPrecision],
+        )
+        .unwrap();
+        let second = FidelityAssessmentV2::structural(
+            [AnnotationKind::Encoding],
+            [AnnotationKind::Encoding],
+        )
+        .unwrap();
+        let composed = first.then(second);
+
+        let definite = composed.definite_losses().unwrap();
+        assert!(definite.contains(&AnnotationKind::TypeTag));
+        assert!(definite.contains(&AnnotationKind::Encoding));
+        assert!(!definite.contains(&AnnotationKind::NumericPrecision));
+        let possible = composed.possible_losses().unwrap();
+        assert!(possible.contains(&AnnotationKind::TypeTag));
+        assert!(possible.contains(&AnnotationKind::Encoding));
+        assert!(possible.contains(&AnnotationKind::NumericPrecision));
+    }
+
+    #[test]
+    fn fidelity_v2_path_join_intersects_definite_and_unions_possible() {
+        let lossy = FidelityAssessmentV2::from_concrete(Fidelity::structural([
+            AnnotationKind::NumericPrecision,
+        ]));
+        let merged = lossy.join_paths(FidelityAssessmentV2::Lossless);
+
+        assert!(merged.definite_losses().is_none());
+        assert!(merged
+            .possible_losses()
+            .unwrap()
+            .contains(&AnnotationKind::NumericPrecision));
+        assert_eq!(merged.concrete_fidelity(), None);
+    }
+
+    #[test]
+    fn fidelity_v2_concrete_round_trip_is_canonical() {
+        let assessment = FidelityAssessmentV2::from_concrete(Fidelity::structural([
+            AnnotationKind::NumericExactness,
+            AnnotationKind::TypeTag,
+        ]));
+        let wire = serde_json::to_string(&assessment).unwrap();
+        let decoded: FidelityAssessmentV2 = serde_json::from_str(&wire).unwrap();
+
+        assert_eq!(decoded, assessment);
+        assert_eq!(
+            decoded.concrete_fidelity(),
+            Some(assessment.possible_fidelity())
+        );
     }
 
     #[test]

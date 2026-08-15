@@ -313,20 +313,27 @@ fn serve_connection(
 ) -> Result<()> {
     let mut stream =
         accept_mutual_tls(tcp, tls_config, DEFAULT_CONNECT_TIMEOUT, DEFAULT_IO_TIMEOUT)?;
-    let request = match read_hosted_frame::<_, HostedRequestV1>(&mut stream) {
+    serve_v1_stream(&mut stream, runtime)
+}
+
+pub(crate) fn serve_v1_stream(
+    stream: &mut super::tls::HostedServerStream,
+    runtime: &HostedNodeRuntime,
+) -> Result<()> {
+    let request = match read_hosted_frame::<_, HostedRequestV1>(&mut *stream) {
         Ok(Some(request)) => request,
         Ok(None) => bail!("authenticated client closed before sending a request"),
         Err(error) => {
             let response = HostedResponseV1::Error {
                 error: HostedProtocolErrorV1::new("invalid-frame", format!("{error:#}")),
             };
-            write_hosted_frame(&mut stream, &response)
+            write_hosted_frame(&mut *stream, &response)
                 .context("failed to return invalid-frame response")?;
             return Ok(());
         }
     };
     let response = runtime.handle_request(request);
-    write_hosted_frame(&mut stream, &response).context("failed to write hosted response")?;
+    write_hosted_frame(&mut *stream, &response).context("failed to write hosted response")?;
     Ok(())
 }
 

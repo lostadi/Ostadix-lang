@@ -852,7 +852,7 @@ install_ubuntu_vm_tools() {
 build_rust() {
   echo ">>> Building Rust edition (--release)..."
   clean_rust_release_binaries
-  local cargo_args=(build --release)
+  local cargo_args=(build --release --locked)
   if $FULL; then
     cargo_args+=(--features notebook)
   fi
@@ -1460,6 +1460,8 @@ verify_runnable() {
   local ok=0 fail=0
   local missing_shims="/tmp/o-no-such-backends-setup-$$"
   local verify_bin="/tmp/verify-o-rust-$$"
+  local hosted_verify_dir
+  hosted_verify_dir="$(mktemp -d "${TMPDIR:-/tmp}/ostadix-hosted-verify.XXXXXX")"
   rm -rf "$missing_shims"
   rm -f "$verify_bin"
 
@@ -1468,6 +1470,34 @@ verify_runnable() {
 
   echo -n "Installed O on PATH: "
   if has_cmd O && "$(command -v O)" examples/bindings.O 2>/dev/null | grep -q "43"; then echo "OK"; ((ok+=1)); else echo "FAIL"; ((fail+=1)); fi
+
+  echo -n "Installed hosted node/client CLIs: "
+  if [[ -x "$CARGO_BIN_DIR/o-node" && -x "$CARGO_BIN_DIR/octl" ]] \
+      && "$CARGO_BIN_DIR/o-node" serve --help >/dev/null 2>&1 \
+      && "$CARGO_BIN_DIR/octl" node session --help >/dev/null 2>&1; then
+    echo "OK"; ((ok+=1))
+  else
+    echo "FAIL"; ((fail+=1))
+  fi
+
+  echo -n "Hosted V2 identity and development-mTLS preflight: "
+  if (
+      trap 'rm -rf -- "$hosted_verify_dir"' EXIT HUP INT TERM
+      "$CARGO_BIN_DIR/o-node" pki init \
+        --directory "$hosted_verify_dir/pki" >/dev/null 2>&1 \
+      && "$CARGO_BIN_DIR/o-node" identity init \
+        --state-dir "$hosted_verify_dir/state" >/dev/null 2>&1 \
+      && "$CARGO_BIN_DIR/octl" node session principal \
+        --cert "$hosted_verify_dir/pki/client-cert.pem" \
+        >"$hosted_verify_dir/principal.sha256" 2>/dev/null \
+      && grep -Eq '^[0-9a-f]{64}$' "$hosted_verify_dir/principal.sha256" \
+      && [[ -s "$hosted_verify_dir/state/node-signing-key.v2" \
+         && -s "$hosted_verify_dir/state/node-signing-public.v2" ]]
+    ); then
+    echo "OK"; ((ok+=1))
+  else
+    echo "FAIL"; ((fail+=1))
+  fi
 
   echo -n "Standalone O binary: "
   local standalone_bin

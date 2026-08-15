@@ -10,7 +10,8 @@
 // `[["dotnet"], ["mcs", "mono"]]` means dotnet OR (mcs AND mono).
 
 backend_catalog_metadata! {
-    schema: "ostadix.backend-catalog/v3",
+    current_schema: "ostadix.backend-catalog/v4",
+    legacy_schema_v3: "ostadix.backend-catalog/v3",
 }
 
 runtime_requirement_catalog! {
@@ -166,6 +167,7 @@ backend_catalog! {
         runtime: "builtin",
         integer_exactness: Arbitrary,
         rich_numbers: Preserved,
+        state_support: Stateless,
     },
     {
         name: "quote",
@@ -178,6 +180,7 @@ backend_catalog! {
         runtime: "builtin",
         integer_exactness: Unknown,
         rich_numbers: Unknown,
+        state_support: Stateless,
     },
     {
         name: "nix",
@@ -190,6 +193,7 @@ backend_catalog! {
         runtime: "nix",
         integer_exactness: TwosComplementBits(63),
         rich_numbers: Collapsed,
+        state_support: Stateless,
     },
     {
         name: "nix_expr",
@@ -204,6 +208,7 @@ backend_catalog! {
         runtime: "builtin",
         integer_exactness: TwosComplementBits(63),
         rich_numbers: Collapsed,
+        state_support: Stateless,
     },
     {
         name: "nix_store",
@@ -216,6 +221,7 @@ backend_catalog! {
         runtime: "nix",
         integer_exactness: TwosComplementBits(63),
         rich_numbers: Collapsed,
+        state_support: Stateless,
     },
     {
         name: "nixos_test",
@@ -228,6 +234,7 @@ backend_catalog! {
         runtime: "nixos_test",
         integer_exactness: Unknown,
         rich_numbers: Unknown,
+        state_support: Stateless,
     },
     {
         name: "html",
@@ -240,6 +247,7 @@ backend_catalog! {
         runtime: "builtin",
         integer_exactness: Arbitrary,
         rich_numbers: Collapsed,
+        state_support: Stateless,
     },
     {
         name: "markdown",
@@ -252,6 +260,7 @@ backend_catalog! {
         runtime: "builtin",
         integer_exactness: Arbitrary,
         rich_numbers: Collapsed,
+        state_support: Stateless,
     },
     {
         name: "latex",
@@ -264,6 +273,7 @@ backend_catalog! {
         runtime: "builtin",
         integer_exactness: Arbitrary,
         rich_numbers: Collapsed,
+        state_support: Stateless,
     },
     {
         name: "text",
@@ -276,6 +286,7 @@ backend_catalog! {
         runtime: "builtin",
         integer_exactness: Arbitrary,
         rich_numbers: Collapsed,
+        state_support: Stateless,
     },
     {
         name: "sql",
@@ -288,6 +299,10 @@ backend_catalog! {
         runtime: "sql",
         integer_exactness: TwosComplementBits(63),
         rich_numbers: Collapsed,
+        state_support: SemanticSnapshot {
+            codec: "ostadix.sqlite-cli-main/v1",
+            compatibility: ExactImplementation,
+        },
     },
     {
         name: "haskell",
@@ -300,6 +315,7 @@ backend_catalog! {
         runtime: "haskell",
         integer_exactness: Arbitrary,
         rich_numbers: Preserved,
+        state_support: Stateless,
     },
     {
         name: "ocaml",
@@ -312,6 +328,7 @@ backend_catalog! {
         runtime: "ocaml",
         integer_exactness: Unknown,
         rich_numbers: Unknown,
+        state_support: Stateless,
     },
     {
         name: "webassembly",
@@ -324,6 +341,7 @@ backend_catalog! {
         runtime: "webassembly",
         integer_exactness: TwosComplementBits(63),
         rich_numbers: Collapsed,
+        state_support: Stateless,
     },
     {
         name: "python",
@@ -336,6 +354,10 @@ backend_catalog! {
         runtime: "python",
         integer_exactness: Arbitrary,
         rich_numbers: Preserved,
+        state_support: SemanticSnapshot {
+            codec: "ostadix.python-graph/v1",
+            compatibility: ExactImplementation,
+        },
     },
     {
         name: "ubuntu_vm",
@@ -348,6 +370,9 @@ backend_catalog! {
         runtime: "ubuntu_vm",
         integer_exactness: Unknown,
         rich_numbers: Unknown,
+        state_support: ExternalPinned {
+            manifest_schema: "ostadix.multipass-resource/v1",
+        },
     },
     {
         name: "bash",
@@ -360,6 +385,7 @@ backend_catalog! {
         runtime: "bash",
         integer_exactness: Unknown,
         rich_numbers: Unknown,
+        state_support: Stateless,
     },
     {
         name: "shell",
@@ -372,6 +398,7 @@ backend_catalog! {
         runtime: "shell",
         integer_exactness: Unknown,
         rich_numbers: Unknown,
+        state_support: Stateless,
     },
     {
         name: "rust",
@@ -384,6 +411,7 @@ backend_catalog! {
         runtime: "rust",
         integer_exactness: TwosComplementBits(63),
         rich_numbers: Collapsed,
+        state_support: Stateless,
     },
     {
         name: "racket",
@@ -396,6 +424,7 @@ backend_catalog! {
         runtime: "racket",
         integer_exactness: Arbitrary,
         rich_numbers: Preserved,
+        state_support: Stateless,
     },
     {
         name: "csharp",
@@ -408,6 +437,7 @@ backend_catalog! {
         runtime: "csharp",
         integer_exactness: TwosComplementBits(63),
         rich_numbers: Collapsed,
+        state_support: Stateless,
     },
     {
         name: "c",
@@ -420,6 +450,7 @@ backend_catalog! {
         runtime: "c",
         integer_exactness: TwosComplementBits(63),
         rich_numbers: Collapsed,
+        state_support: Stateless,
     },
     {
         name: "cpp",
@@ -432,6 +463,7 @@ backend_catalog! {
         runtime: "cpp",
         integer_exactness: TwosComplementBits(63),
         rich_numbers: Collapsed,
+        state_support: Stateless,
     },
     {
         name: "lisp",
@@ -444,6 +476,7 @@ backend_catalog! {
         runtime: "common_lisp",
         integer_exactness: Arbitrary,
         rich_numbers: Collapsed,
+        state_support: Stateless,
     },
     {
         name: "common_lisp",
@@ -456,6 +489,7 @@ backend_catalog! {
         runtime: "common_lisp",
         integer_exactness: Arbitrary,
         rich_numbers: Collapsed,
+        state_support: Stateless,
     },
     {
         name: "ruby",
@@ -468,6 +502,7 @@ backend_catalog! {
         runtime: "ruby",
         integer_exactness: Arbitrary,
         rich_numbers: Collapsed,
+        state_support: Stateless,
     },
     {
         name: "matlab",
@@ -480,6 +515,7 @@ backend_catalog! {
         runtime: "matlab",
         integer_exactness: ExactMagnitudeBits(53),
         rich_numbers: Collapsed,
+        state_support: Stateless,
     },
     {
         name: "mathematica",
@@ -492,6 +528,7 @@ backend_catalog! {
         runtime: "mathematica",
         integer_exactness: Arbitrary,
         rich_numbers: Preserved,
+        state_support: Stateless,
     },
     {
         name: "java",
@@ -504,6 +541,7 @@ backend_catalog! {
         runtime: "java",
         integer_exactness: TwosComplementBits(63),
         rich_numbers: Collapsed,
+        state_support: Stateless,
     },
     {
         name: "javascript",
@@ -516,5 +554,6 @@ backend_catalog! {
         runtime: "javascript",
         integer_exactness: ExactMagnitudeBits(53),
         rich_numbers: Collapsed,
+        state_support: Stateless,
     },
 }

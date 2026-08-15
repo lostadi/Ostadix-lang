@@ -32,7 +32,7 @@ mod tests {
             BackendRegistry, BackendValueCapabilities, IntegerExactness, InvokeMode, OIr,
             OIrProgram, RichNumberPreservation,
         },
-        value::{AnnotationKind, Fidelity, GroupMode, ONumber, OValue},
+        value::{AnnotationKind, Fidelity, FidelityAssessmentV2, GroupMode, ONumber, OValue},
     };
 
     use super::*;
@@ -977,6 +977,93 @@ mod tests {
             solve::fidelity_for(&node, "O", "unregistered-backend"),
             Fidelity::Unsupported
         );
+    }
+
+    #[test]
+    fn abstract_integer_precision_is_possible_until_materialization() {
+        let abstract_i64 = HNode {
+            domain: DomainFlags::INTEGER,
+            rep: RepFlags::I64,
+            ..HNode::fresh()
+        };
+        let assessment = solve::fidelity_assessment_for(&abstract_i64, "O", "javascript");
+        let FidelityAssessmentV2::Structural { definite, possible } = assessment else {
+            panic!("abstract I64 should carry bounded structural loss")
+        };
+        assert!(definite.as_ref().is_some_and(|losses| {
+            losses.contains(&AnnotationKind::NumericExactness)
+                && losses.contains(&AnnotationKind::TypeTag)
+                && !losses.contains(&AnnotationKind::NumericPrecision)
+        }));
+        assert!(possible.contains(&AnnotationKind::NumericPrecision));
+
+        let exact = HNode {
+            value: Some(OValue::big_int(BigInt::from(1_u64) << 53)),
+            domain: DomainFlags::INTEGER,
+            rep: RepFlags::I64,
+            ..HNode::fresh()
+        };
+        let exact = solve::fidelity_assessment_for(&exact, "O", "javascript");
+        assert!(!exact
+            .possible_losses()
+            .expect("JavaScript collapses O numeric kinds")
+            .contains(&AnnotationKind::NumericPrecision));
+
+        let inexact = HNode {
+            value: Some(OValue::big_int((BigInt::from(1_u64) << 53) + 1_u8)),
+            domain: DomainFlags::INTEGER,
+            rep: RepFlags::I64,
+            ..HNode::fresh()
+        };
+        let inexact = solve::fidelity_assessment_for(&inexact, "O", "javascript");
+        assert!(inexact
+            .definite_losses()
+            .expect("concrete loss must be definite")
+            .contains(&AnnotationKind::NumericPrecision));
+        assert_eq!(
+            inexact.concrete_fidelity(),
+            Some(inexact.possible_fidelity())
+        );
+    }
+
+    #[test]
+    fn solved_graph_keeps_v1_possible_projection_and_v2_bounds() {
+        let mut graph = HGraph::default();
+        let input = graph.add_node(HNode {
+            domain: DomainFlags::INTEGER,
+            rep: RepFlags::I64,
+            ..HNode::fresh()
+        });
+        let output = graph.add_node(HNode::fresh());
+        graph.add_edge(HEdge::constraint(
+            OpKind::BackendCrossing {
+                from_lang: "O".into(),
+                to_lang: "javascript".into(),
+            },
+            vec![
+                Port {
+                    node: input,
+                    role: PortRole::Input,
+                },
+                Port {
+                    node: output,
+                    role: PortRole::Output,
+                },
+            ],
+        ));
+
+        solve::solve_types(&mut graph).unwrap();
+        let output = graph.node(output).unwrap();
+        assert!(output
+            .fidelity
+            .as_ref()
+            .and_then(Fidelity::losses)
+            .is_some_and(|losses| losses.contains(&AnnotationKind::NumericPrecision)));
+        assert!(output
+            .fidelity_assessment
+            .as_ref()
+            .and_then(FidelityAssessmentV2::definite_losses)
+            .is_some_and(|losses| !losses.contains(&AnnotationKind::NumericPrecision)));
     }
 
     #[test]

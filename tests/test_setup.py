@@ -353,6 +353,7 @@ class SetupScriptTests(unittest.TestCase):
 
             output = self.combined_output(result)
             self.assertEqual(result.returncode, 0, output)
+            self.assertIn("cargo build --release --locked", output)
             for binary in (
                 "O",
                 "olangc",
@@ -379,6 +380,17 @@ class SetupScriptTests(unittest.TestCase):
                 f"replace {local_alias} from {PROJECT_ROOT / 'target' / 'release' / 'O'}",
                 output,
             )
+
+    def test_verify_preflights_installed_hosted_v2_command_surfaces_in_temp_state(self) -> None:
+        setup = SETUP.read_text(encoding="utf-8")
+
+        self.assertIn('"$CARGO_BIN_DIR/o-node" serve --help', setup)
+        self.assertIn('"$CARGO_BIN_DIR/octl" node session --help', setup)
+        self.assertIn("ostadix-hosted-verify.XXXXXX", setup)
+        self.assertIn('"$CARGO_BIN_DIR/o-node" pki init', setup)
+        self.assertIn('"$CARGO_BIN_DIR/o-node" identity init', setup)
+        self.assertIn('"$CARGO_BIN_DIR/octl" node session principal', setup)
+        self.assertIn("trap 'rm -rf -- \"$hosted_verify_dir\"' EXIT HUP INT TERM", setup)
 
     def test_python_setup_is_repository_local_and_never_runs_pip(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
