@@ -11,7 +11,7 @@ use thiserror::Error;
 use crate::ir::{
     BackendRegistry, BackendValueCapabilities, IntegerExactness, RichNumberPreservation,
 };
-use crate::value::{AnnotationKind, Fidelity, ONumber, OValue};
+use crate::value::{AnnotationKind, Fidelity, FidelityAssessmentV2, ONumber, OValue};
 
 use super::{
     graph::{EdgeId, HEdge, HGraph, HNode, HNodeKind, NodeId, PortRole},
@@ -136,6 +136,7 @@ fn solve_types_with_limits(
     applied_pass_limit: usize,
 ) -> Result<(), SolveError> {
     validate_dataflow_constraints(graph)?;
+    hydrate_fidelity_assessments(graph);
     let mut trace = SolveTrace::default();
     let mut completed_passes = 0;
     for phase in [SolvePhase::TypeAndValue, SolvePhase::Fidelity] {
@@ -164,6 +165,17 @@ fn solve_types_with_limits(
         }
     }
     Ok(())
+}
+
+fn hydrate_fidelity_assessments(graph: &mut HGraph) {
+    for node in graph.nodes.values_mut().filter(|node| node.is_value()) {
+        if node.fidelity_assessment.is_none() {
+            node.fidelity_assessment = node
+                .fidelity
+                .clone()
+                .map(FidelityAssessmentV2::from_concrete);
+        }
+    }
 }
 
 fn budget_exhausted(
@@ -263,16 +275,21 @@ fn validate_dataflow_constraints(graph: &HGraph) -> Result<(), SolveError> {
 }
 
 fn derived_iteration_budget(graph: &HGraph) -> usize {
-    let existing_fidelity_kinds = graph
-        .nodes
-        .values()
-        .filter_map(|node| match &node.fidelity {
-            Some(Fidelity::Structural { lost }) => Some(lost.iter()),
-            _ => None,
-        })
-        .flatten()
-        .collect::<BTreeSet<_>>()
-        .len();
+    let mut fidelity_kinds = BTreeSet::new();
+    for node in graph.nodes.values() {
+        if let Some(Fidelity::Structural { lost }) = &node.fidelity {
+            fidelity_kinds.extend(lost.iter());
+        }
+        if let Some(FidelityAssessmentV2::Structural { definite, possible }) =
+            &node.fidelity_assessment
+        {
+            fidelity_kinds.extend(possible.iter());
+            if let Some(definite) = definite {
+                fidelity_kinds.extend(definite.iter());
+            }
+        }
+    }
+    let existing_fidelity_kinds = fidelity_kinds.len();
     // These public bitflags retain unknown bits, so count the full underlying
     // storage width rather than only today's named ANY masks.
     let domain_height = u16::BITS as usize;
@@ -284,7 +301,7 @@ fn derived_iteration_budget(graph: &HGraph) -> usize {
         .saturating_add(3);
     let per_node_height = domain_height
         .saturating_add(rep_height)
-        .saturating_add(fidelity_height)
+        .saturating_add(fidelity_height.saturating_mul(2))
         .saturating_add(1); // value: None -> Some
 
     graph
@@ -315,6 +332,11 @@ enum SlotSnapshot {
     Domain(u16),
     Representation(u16),
     Fidelity(FidelitySnapshot),
+    FidelityAssessment {
+        definite_count: usize,
+        possible_count: usize,
+        possible_fingerprint: u64,
+    },
     ValueMaterialized(bool),
 }
 
@@ -326,6 +348,14 @@ impl SlotSnapshot {
                 format!("representation bits {bits:#06x}").into_boxed_str()
             }
             Self::Fidelity(fidelity) => fidelity.describe(),
+            Self::FidelityAssessment {
+                definite_count,
+                possible_count,
+                possible_fingerprint,
+            } => format!(
+                "fidelity bounds with {definite_count} definite and {possible_count} possible loss kind(s), possible fingerprint {possible_fingerprint:016x}"
+            )
+            .into_boxed_str(),
             Self::ValueMaterialized(materialized) => {
                 if materialized {
                     "materialized".into()
@@ -491,6 +521,41 @@ impl SolverSlot for Option<Fidelity> {
     }
 }
 
+impl SolverSlot for Option<FidelityAssessmentV2> {
+    const DIRECTION: SlotDirection = SlotDirection::AscendingJoin;
+    const SLOT_NAME: &'static str = "fidelity-assessment-v2";
+
+    fn merge(&self, incoming: Self) -> Self {
+        match (self.clone(), incoming) {
+            (Some(existing), Some(incoming)) => Some(existing.then(incoming)),
+            (None, incoming) => incoming,
+            (existing, None) => existing,
+        }
+    }
+
+    fn permits(&self, next: &Self) -> bool {
+        self.merge(next.clone()) == *next
+    }
+
+    fn snapshot(&self) -> SlotSnapshot {
+        let (definite_count, possible_count, possible_fingerprint) = match self {
+            None | Some(FidelityAssessmentV2::Lossless) => (0, 0, 0),
+            Some(FidelityAssessmentV2::Structural { definite, possible }) => (
+                definite.as_ref().map_or(0, |losses| losses.len()),
+                possible.len(),
+                fidelity_loss_fingerprint(possible.as_set()),
+            ),
+            Some(FidelityAssessmentV2::NativeCapsule) => (0, usize::MAX - 1, 0),
+            Some(FidelityAssessmentV2::Unsupported) => (0, usize::MAX, 0),
+        };
+        SlotSnapshot::FidelityAssessment {
+            definite_count,
+            possible_count,
+            possible_fingerprint,
+        }
+    }
+}
+
 impl SolverSlot for Option<OValue> {
     const DIRECTION: SlotDirection = SlotDirection::WriteOnce;
     const SLOT_NAME: &'static str = "value";
@@ -558,8 +623,8 @@ fn propagate(
             OpKind::BackendCrossing { from_lang, to_lang } => {
                 let fidelity = input_value_nodes(graph, &edge)
                     .next()
-                    .map(|node| fidelity_for(node, from_lang, to_lang))
-                    .unwrap_or(Fidelity::Unsupported);
+                    .map(|node| fidelity_assessment_for(node, from_lang, to_lang))
+                    .unwrap_or(FidelityAssessmentV2::Unsupported);
                 Ok(apply_fidelity_to_outputs(graph, &edge, fidelity, trace))
             }
             OpKind::DataFlow => Ok(propagate_dataflow_fidelity(graph, &edge, trace)),
@@ -669,10 +734,14 @@ fn propagate_dataflow_type_value(
 }
 
 fn propagate_dataflow_fidelity(graph: &mut HGraph, edge: &HEdge, trace: &mut SolveTrace) -> bool {
-    let Some(incoming) = input_value_nodes(graph, edge)
-        .next()
-        .and_then(|input| input.fidelity.clone())
-    else {
+    let Some(incoming) = input_value_nodes(graph, edge).next().and_then(|input| {
+        input.fidelity_assessment.clone().or_else(|| {
+            input
+                .fidelity
+                .clone()
+                .map(FidelityAssessmentV2::from_concrete)
+        })
+    }) else {
         return false;
     };
     let mut changed = false;
@@ -684,7 +753,7 @@ fn propagate_dataflow_fidelity(graph: &mut HGraph, edge: &HEdge, trace: &mut Sol
         .collect::<Vec<_>>()
     {
         if let Some(output) = value_node_mut(graph, nid) {
-            changed |= update_slot(&mut output.fidelity, Some(incoming.clone()), trace, nid);
+            changed |= apply_fidelity_to_node(output, incoming.clone(), trace, nid);
         }
     }
     changed
@@ -761,6 +830,37 @@ pub fn fidelity_for(node: &HNode, from_lang: &str, to_lang: &str) -> Fidelity {
         return fidelity_for_value_with_capabilities(value, &to_spec.value_capabilities);
     }
     fidelity_for_abstract(node, &to_spec.value_capabilities)
+}
+
+pub fn fidelity_assessment_for(
+    node: &HNode,
+    from_lang: &str,
+    to_lang: &str,
+) -> FidelityAssessmentV2 {
+    if !node.is_value() {
+        return FidelityAssessmentV2::Unsupported;
+    }
+    if matches!(node.value, Some(OValue::Native { .. })) {
+        return FidelityAssessmentV2::NativeCapsule;
+    }
+
+    let registry = BackendRegistry::global();
+    let Some(to_spec) = registry.get(to_lang) else {
+        return FidelityAssessmentV2::Unsupported;
+    };
+    let same_backend = registry
+        .get(from_lang)
+        .is_some_and(|from_spec| from_spec.name == to_spec.name);
+    if same_backend {
+        return FidelityAssessmentV2::Lossless;
+    }
+    if let Some(value) = &node.value {
+        return FidelityAssessmentV2::from_concrete(fidelity_for_value_with_capabilities(
+            value,
+            &to_spec.value_capabilities,
+        ));
+    }
+    fidelity_assessment_for_abstract(node, &to_spec.value_capabilities)
 }
 
 pub fn fidelity_for_value(value: &OValue, to_lang: &str) -> Fidelity {
@@ -898,6 +998,30 @@ pub(super) fn fidelity_for_abstract(
     Fidelity::Unsupported
 }
 
+pub(super) fn fidelity_assessment_for_abstract(
+    node: &HNode,
+    capabilities: &BackendValueCapabilities,
+) -> FidelityAssessmentV2 {
+    match fidelity_for_abstract(node, capabilities) {
+        Fidelity::Structural { lost } => {
+            let possible = lost.as_set().iter().cloned().collect::<BTreeSet<_>>();
+            // An abstract integer representation generally includes both
+            // exactly representable and out-of-range values. Precision is
+            // therefore a may-loss until a concrete value or a narrower range
+            // proves otherwise. Rich-number kind collapse applies to every
+            // numeric value and remains definite.
+            let definite = possible
+                .iter()
+                .filter(|kind| **kind != AnnotationKind::NumericPrecision)
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            FidelityAssessmentV2::structural(definite, possible)
+                .expect("abstract fidelity transfer preserves subset bounds")
+        }
+        other => FidelityAssessmentV2::from_concrete(other),
+    }
+}
+
 fn abstract_integer_exceeds_capability(
     reps: RepFlags,
     exactness: &IntegerExactness,
@@ -1022,7 +1146,7 @@ fn apply_rep_to_outputs(
 fn apply_fidelity_to_outputs(
     graph: &mut HGraph,
     edge: &HEdge,
-    fidelity: Fidelity,
+    fidelity: FidelityAssessmentV2,
     trace: &mut SolveTrace,
 ) -> bool {
     let mut changed = false;
@@ -1034,9 +1158,29 @@ fn apply_fidelity_to_outputs(
         .collect::<Vec<_>>()
     {
         if let Some(node) = value_node_mut(graph, nid) {
-            changed |= update_slot(&mut node.fidelity, Some(fidelity.clone()), trace, nid);
+            changed |= apply_fidelity_to_node(node, fidelity.clone(), trace, nid);
         }
     }
+    changed
+}
+
+fn apply_fidelity_to_node(
+    node: &mut HNode,
+    incoming: FidelityAssessmentV2,
+    trace: &mut SolveTrace,
+    node_id: NodeId,
+) -> bool {
+    let mut changed = update_slot(
+        &mut node.fidelity_assessment,
+        Some(incoming),
+        trace,
+        node_id,
+    );
+    let projected = node
+        .fidelity_assessment
+        .as_ref()
+        .map(FidelityAssessmentV2::possible_fidelity);
+    changed |= update_slot(&mut node.fidelity, projected, trace, node_id);
     changed
 }
 
