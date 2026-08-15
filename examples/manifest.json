@@ -546,6 +546,19 @@
       }
     },
     {
+      "path": "semantic_custody.O",
+      "editions": ["rust"],
+      "classification": "integration",
+      "requirements": {
+        "backends": ["python", "text"],
+        "programs": ["python3"],
+        "authorities": ["process"]
+      },
+      "expected": {
+        "rust": {"patterns": ["semantic-custody answer=42"]}
+      }
+    },
+    {
       "path": "shell_hello.O",
       "editions": ["rust"],
       "classification": "integration",

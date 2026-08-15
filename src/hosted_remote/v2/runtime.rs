@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{mpsc, Arc, Mutex, MutexGuard, Weak};
+use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard, RwLock, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -30,7 +30,7 @@ use super::auth::{
 };
 use super::crypto::{constant_time_eq, decode_fixed_hex, salted_bearer_hash};
 use super::protocol::*;
-use super::store::{DurableSessionStoreV2, DurableStoreReopenRequiredV2};
+use super::store::{DurableSessionStoreV2, DurableStoreReopenRequiredV2, JournalReadV2};
 
 const TERMINAL_RECORD_OVERHEAD_RESERVATION: u64 = 64 * 1024;
 const SESSION_CLOSE_HEADROOM_RESERVATION: u64 = 64 * 1024;
@@ -53,6 +53,27 @@ pub struct HostedV2Runtime {
     inner: Arc<RuntimeInnerV2>,
 }
 
+/// Stable direct-call error returned once explicit runtime shutdown begins.
+/// Hosted wire callers receive the matching non-retryable `runtime-closed`
+/// protocol error instead.
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+#[error("hosted V2 runtime is closed")]
+pub struct HostedV2RuntimeClosedV2;
+
+/// Explicit shutdown completed and released the durable store, but at least
+/// one owned actor thread panicked while being drained.
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+#[error("hosted V2 runtime shutdown completed with worker failures: {message}")]
+pub struct HostedV2RuntimeShutdownErrorV2 {
+    message: String,
+}
+
+impl HostedV2RuntimeShutdownErrorV2 {
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
 impl std::fmt::Debug for HostedV2Runtime {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -65,9 +86,12 @@ impl std::fmt::Debug for HostedV2Runtime {
 
 struct RuntimeInnerV2 {
     config: HostedV2RuntimeConfig,
-    store: DurableSessionStoreV2,
+    store: RuntimeStoreV2,
     authorizer: SharedPlacementAuthorizerV2,
     state: Mutex<RuntimeStateV2>,
+    lifecycle: Mutex<RuntimeLifecycleV2>,
+    lifecycle_changed: Condvar,
+    worker_lifecycles: Mutex<Vec<Arc<ActorWorkerLifecycleV2>>>,
     #[cfg(debug_assertions)]
     current_view_prelock_barrier_for_test:
         Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
@@ -76,7 +100,7 @@ struct RuntimeInnerV2 {
 #[derive(Default)]
 struct RuntimeStateV2 {
     sessions: HashMap<String, SessionRecordV2>,
-    workers: HashMap<String, mpsc::Sender<ActorCommandV2>>,
+    workers: HashMap<String, Arc<ActorWorkerV2>>,
     retired_session_ids: HashSet<String>,
     used_lease_nonces: HashSet<String>,
     durable_bytes: u64,
@@ -93,6 +117,237 @@ struct RuntimeStateV2 {
     #[cfg(debug_assertions)]
     checkpoint_failure_terminal_barrier_for_test:
         HashMap<String, (Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuntimePhaseV2 {
+    Running,
+    ShuttingDown,
+    Closed,
+}
+
+struct RuntimeLifecycleV2 {
+    phase: RuntimePhaseV2,
+    active_calls: usize,
+    shutdown_error: Option<HostedV2RuntimeShutdownErrorV2>,
+}
+
+impl Default for RuntimeLifecycleV2 {
+    fn default() -> Self {
+        Self {
+            phase: RuntimePhaseV2::Running,
+            active_calls: 0,
+            shutdown_error: None,
+        }
+    }
+}
+
+struct RuntimeCallGuardV2<'a> {
+    inner: &'a RuntimeInnerV2,
+}
+
+impl Drop for RuntimeCallGuardV2<'_> {
+    fn drop(&mut self) {
+        let mut lifecycle = self
+            .inner
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        lifecycle.active_calls = lifecycle.active_calls.saturating_sub(1);
+        if lifecycle.active_calls == 0 {
+            self.inner.lifecycle_changed.notify_all();
+        }
+    }
+}
+
+struct RuntimeStoreV2 {
+    store: RwLock<Option<DurableSessionStoreV2>>,
+}
+
+impl std::fmt::Debug for RuntimeStoreV2 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let store = self
+            .store
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        formatter
+            .debug_struct("RuntimeStoreV2")
+            .field("open", &store.is_some())
+            .field("store", &store.as_ref())
+            .finish()
+    }
+}
+
+impl RuntimeStoreV2 {
+    fn new(store: DurableSessionStoreV2) -> Self {
+        Self {
+            store: RwLock::new(Some(store)),
+        }
+    }
+
+    fn with_store<T>(
+        &self,
+        operation: impl FnOnce(&DurableSessionStoreV2) -> Result<T>,
+    ) -> Result<T> {
+        let store = self
+            .store
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let store = store
+            .as_ref()
+            .ok_or_else(|| anyhow::Error::new(HostedV2RuntimeClosedV2))?;
+        operation(store)
+    }
+
+    fn take(&self) -> Option<DurableSessionStoreV2> {
+        self.store
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    fn is_reopen_required(&self) -> Result<bool> {
+        self.with_store(|store| Ok(store.is_reopen_required()))
+    }
+
+    fn issue_journal_entry(&self, entry: JournalEntryV2) -> Result<SignedJournalEntryV2> {
+        self.with_store(|store| store.signer().issue_journal_entry(entry))
+    }
+
+    fn encoded_frame_bytes<T: serde::Serialize>(&self, value: &T) -> Result<u64> {
+        self.with_store(|store| store.encoded_frame_bytes(value))
+    }
+
+    fn install_session(&self, session_id: &str, entry: &SignedJournalEntryV2) -> Result<u64> {
+        self.with_store(|store| store.install_session(session_id, entry))
+    }
+
+    fn append_entry(&self, session_id: &str, entry: &SignedJournalEntryV2) -> Result<u64> {
+        self.with_store(|store| store.append_entry(session_id, entry))
+    }
+
+    fn append_authority_entry(&self, entry: &SignedJournalEntryV2) -> Result<u64> {
+        self.with_store(|store| store.append_authority_entry(entry))
+    }
+
+    fn operation_new_bytes(
+        &self,
+        session_id: &str,
+        operation: &PreparedOperationV2,
+    ) -> Result<u64> {
+        self.with_store(|store| store.operation_new_bytes(session_id, operation))
+    }
+
+    fn write_operation(&self, session_id: &str, operation: &PreparedOperationV2) -> Result<u64> {
+        self.with_store(|store| store.write_operation(session_id, operation))
+    }
+
+    fn read_operation(&self, session_id: &str, operation_id: &str) -> Result<PreparedOperationV2> {
+        self.with_store(|store| store.read_operation(session_id, operation_id))
+    }
+
+    fn checkpoint_new_bytes(
+        &self,
+        session_id: &str,
+        actor_generation_sha256: &str,
+        snapshot: &EvaluatorStateSnapshotV1,
+        max_snapshot_payload_bytes: u64,
+    ) -> Result<u64> {
+        self.with_store(|store| {
+            store.checkpoint_new_bytes(
+                session_id,
+                actor_generation_sha256,
+                snapshot,
+                max_snapshot_payload_bytes,
+            )
+        })
+    }
+
+    fn write_checkpoint(
+        &self,
+        session_id: &str,
+        actor_generation_sha256: &str,
+        snapshot: &EvaluatorStateSnapshotV1,
+        max_snapshot_payload_bytes: u64,
+    ) -> Result<u64> {
+        self.with_store(|store| {
+            store.write_checkpoint(
+                session_id,
+                actor_generation_sha256,
+                snapshot,
+                max_snapshot_payload_bytes,
+            )
+        })
+    }
+
+    fn read_checkpoint(
+        &self,
+        session_id: &str,
+        actor_generation_sha256: &str,
+        expected_snapshot_payload_bytes: u64,
+    ) -> Result<EvaluatorStateSnapshotV1> {
+        self.with_store(|store| {
+            store.read_checkpoint(
+                session_id,
+                actor_generation_sha256,
+                expected_snapshot_payload_bytes,
+            )
+        })
+    }
+
+    fn read_authority_journal(&self) -> Result<JournalReadV2> {
+        self.with_store(DurableSessionStoreV2::read_authority_journal)
+    }
+
+    fn list_session_ids(&self) -> Result<Vec<String>> {
+        self.with_store(DurableSessionStoreV2::list_session_ids)
+    }
+
+    fn read_closed_session_gc_archive(&self, event: &JournalEventV2) -> Result<JournalReadV2> {
+        self.with_store(|store| store.read_closed_session_gc_archive(event))
+    }
+
+    fn read_journal(&self, session_id: &str) -> Result<JournalReadV2> {
+        self.with_store(|store| store.read_journal(session_id))
+    }
+
+    fn session_durable_bytes(&self, session_id: &str) -> Result<u64> {
+        self.with_store(|store| store.session_durable_bytes(session_id))
+    }
+}
+
+struct ActorWorkerV2 {
+    sender: mpsc::Sender<ActorCommandV2>,
+    lifecycle: Arc<ActorWorkerLifecycleV2>,
+}
+
+struct ActorWorkerLifecycleV2 {
+    session_id: String,
+    join: Mutex<Option<thread::JoinHandle<()>>>,
+}
+
+impl ActorWorkerV2 {
+    fn send(&self, command: ActorCommandV2) -> std::result::Result<(), ()> {
+        self.sender.send(command).map_err(|_| ())
+    }
+
+    fn request_close(&self) {
+        let _ = self.sender.send(ActorCommandV2::Close);
+    }
+
+    fn join(&self) -> Option<thread::Result<()>> {
+        self.lifecycle.join()
+    }
+}
+
+impl ActorWorkerLifecycleV2 {
+    fn join(&self) -> Option<thread::Result<()>> {
+        self.join
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .map(thread::JoinHandle::join)
+    }
 }
 
 struct SessionRecordV2 {
@@ -222,7 +477,7 @@ enum ActorCommandV2 {
         reply: mpsc::Sender<std::result::Result<(), String>>,
     },
     #[cfg(debug_assertions)]
-    CloseAndAcknowledgeForTest(mpsc::Sender<()>),
+    PanicForTest,
     Close,
 }
 
@@ -259,6 +514,74 @@ fn bounded_durable_text(message: &str) -> String {
     truncate_hosted_error_message(message.to_owned())
 }
 
+fn runtime_closed_error() -> anyhow::Error {
+    HostedV2RuntimeClosedV2.into()
+}
+
+impl RuntimeInnerV2 {
+    fn begin_call(&self) -> Result<RuntimeCallGuardV2<'_>> {
+        let mut lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if lifecycle.phase != RuntimePhaseV2::Running {
+            return Err(runtime_closed_error());
+        }
+        lifecycle.active_calls = lifecycle
+            .active_calls
+            .checked_add(1)
+            .context("hosted V2 active-call accounting overflow")?;
+        Ok(RuntimeCallGuardV2 { inner: self })
+    }
+
+    fn require_running(&self) -> Result<()> {
+        let lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if lifecycle.phase == RuntimePhaseV2::Running {
+            Ok(())
+        } else {
+            Err(runtime_closed_error())
+        }
+    }
+
+    fn completed_shutdown_result(&self) -> Result<()> {
+        let lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match &lifecycle.shutdown_error {
+            Some(error) => Err(error.clone().into()),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for RuntimeInnerV2 {
+    fn drop(&mut self) {
+        // Explicit shutdown is the only deterministic lifecycle barrier. Drop
+        // merely makes a best effort to wake actor threads; joining here could
+        // deadlock if the last transient Arc is released by an actor itself.
+        let lifecycle = self
+            .lifecycle
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if lifecycle.phase == RuntimePhaseV2::Running {
+            lifecycle.phase = RuntimePhaseV2::ShuttingDown;
+        }
+        let workers = self
+            .state
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .workers
+            .values();
+        for worker in workers {
+            worker.request_close();
+        }
+    }
+}
+
 impl HostedV2Runtime {
     pub fn open(
         config: HostedV2RuntimeConfig,
@@ -278,13 +601,16 @@ impl HostedV2Runtime {
         let authority_control_headroom_bytes = store.remaining_authority_control_headroom_bytes();
         let inner = Arc::new(RuntimeInnerV2 {
             config,
-            store,
+            store: RuntimeStoreV2::new(store),
             authorizer,
             state: Mutex::new(RuntimeStateV2 {
                 durable_bytes,
                 authority_control_headroom_bytes,
                 ..RuntimeStateV2::default()
             }),
+            lifecycle: Mutex::new(RuntimeLifecycleV2::default()),
+            lifecycle_changed: Condvar::new(),
+            worker_lifecycles: Mutex::new(Vec::new()),
             #[cfg(debug_assertions)]
             current_view_prelock_barrier_for_test: Mutex::new(None),
         });
@@ -293,12 +619,119 @@ impl HostedV2Runtime {
         Ok(runtime)
     }
 
-    pub fn node_id(&self) -> &str {
-        &self.inner.config.node_id
+    pub fn node_id(&self) -> Result<&str> {
+        self.inner.require_running()?;
+        Ok(&self.inner.config.node_id)
     }
 
-    pub fn state_quotas(&self) -> &StateQuotaLimitsV2 {
-        &self.inner.config.state_quotas
+    pub fn state_quotas(&self) -> Result<&StateQuotaLimitsV2> {
+        self.inner.require_running()?;
+        Ok(&self.inner.config.state_quotas)
+    }
+
+    /// Stop admission, drain every already-admitted actor mailbox, join every
+    /// actor thread ever spawned by this runtime, and release this runtime's
+    /// durable-store/root-lock ownership before returning. Concurrent callers
+    /// share one idempotent outcome.
+    pub fn shutdown(&self) -> Result<()> {
+        let mut lifecycle = self
+            .inner
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            match lifecycle.phase {
+                RuntimePhaseV2::Running => {
+                    lifecycle.phase = RuntimePhaseV2::ShuttingDown;
+                    while lifecycle.active_calls != 0 {
+                        lifecycle = self
+                            .inner
+                            .lifecycle_changed
+                            .wait(lifecycle)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    }
+                    break;
+                }
+                RuntimePhaseV2::ShuttingDown => {
+                    lifecycle = self
+                        .inner
+                        .lifecycle_changed
+                        .wait(lifecycle)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
+                RuntimePhaseV2::Closed => {
+                    drop(lifecycle);
+                    return self.inner.completed_shutdown_result();
+                }
+            }
+        }
+        drop(lifecycle);
+
+        let current_workers = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .workers
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for worker in &current_workers {
+            worker.request_close();
+        }
+        let lifecycles = self
+            .inner
+            .worker_lifecycles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let mut failures = Vec::new();
+        for lifecycle in &lifecycles {
+            if let Some(Err(payload)) = lifecycle.join() {
+                let detail = payload
+                    .downcast_ref::<&str>()
+                    .map(|message| (*message).to_owned())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "non-string panic payload".to_owned());
+                failures.push(format!("{}: {detail}", lifecycle.session_id));
+            }
+        }
+        failures.sort();
+        failures.dedup();
+
+        self.inner
+            .worker_lifecycles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .workers
+            .clear();
+
+        // The write-side store barrier proves no store operation is still in
+        // progress. Workers have already joined and public calls were drained,
+        // so dropping this Option releases the runtime-owned root lock now.
+        drop(self.inner.store.take());
+
+        let shutdown_error = (!failures.is_empty()).then(|| HostedV2RuntimeShutdownErrorV2 {
+            message: failures.join("; "),
+        });
+        let mut lifecycle = self
+            .inner
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        lifecycle.phase = RuntimePhaseV2::Closed;
+        lifecycle.shutdown_error = shutdown_error.clone();
+        self.inner.lifecycle_changed.notify_all();
+        drop(lifecycle);
+        match shutdown_error {
+            Some(error) => Err(error.into()),
+            None => Ok(()),
+        }
     }
 
     /// Return live durable-byte accounting for fault-injection regressions.
@@ -306,6 +739,7 @@ impl HostedV2Runtime {
     #[cfg(debug_assertions)]
     #[doc(hidden)]
     pub fn durable_accounting_for_test(&self, session_id: &str) -> Result<(u64, u64, u64)> {
+        let _call = self.inner.begin_call()?;
         let state = self.lock_state()?;
         let session = state
             .sessions
@@ -324,6 +758,7 @@ impl HostedV2Runtime {
     #[cfg(debug_assertions)]
     #[doc(hidden)]
     pub fn inject_actor_close_before_execute_for_test(&self, session_id: &str) -> Result<()> {
+        let _call = self.inner.begin_call()?;
         let mut state = self.lock_state()?;
         if !state.sessions.contains_key(session_id) {
             bail!("test actor-close injection names an unknown hosted session");
@@ -348,6 +783,7 @@ impl HostedV2Runtime {
         entered: Arc<std::sync::Barrier>,
         release: Arc<std::sync::Barrier>,
     ) -> Result<()> {
+        let _call = self.inner.begin_call()?;
         let mut state = self.lock_state()?;
         if !state.sessions.contains_key(session_id) {
             bail!("test checkpoint-failure injection names an unknown hosted session");
@@ -371,7 +807,25 @@ impl HostedV2Runtime {
     #[cfg(debug_assertions)]
     #[doc(hidden)]
     pub fn has_worker_for_test(&self, session_id: &str) -> Result<bool> {
+        let _call = self.inner.begin_call()?;
         Ok(self.lock_state()?.workers.contains_key(session_id))
+    }
+
+    /// Make one actor panic at its next mailbox turn. Shutdown must still join
+    /// it, release the durable root lock, and publish a stable typed failure.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn inject_worker_panic_for_test(&self, session_id: &str) -> Result<()> {
+        let _call = self.inner.begin_call()?;
+        let worker = self
+            .lock_state()?
+            .workers
+            .get(session_id)
+            .cloned()
+            .context("test worker-panic injection names an unknown hosted session")?;
+        worker
+            .send(ActorCommandV2::PanicForTest)
+            .map_err(|_| reject("actor-unavailable", "session actor is unavailable", true))
     }
 
     /// Pause the next Status/Actors request after its optimistic store-current
@@ -385,6 +839,7 @@ impl HostedV2Runtime {
         entered: Arc<std::sync::Barrier>,
         release: Arc<std::sync::Barrier>,
     ) -> Result<()> {
+        let _call = self.inner.begin_call()?;
         let mut hook = self
             .inner
             .current_view_prelock_barrier_for_test
@@ -412,11 +867,12 @@ impl HostedV2Runtime {
     }
 
     pub fn unreadable_sessions(&self) -> Result<Vec<String>> {
+        let _call = self.inner.begin_call()?;
         Ok(self.lock_state()?.unreadable_sessions.clone())
     }
 
     fn require_store_current(&self) -> Result<()> {
-        if self.inner.store.is_reopen_required() {
+        if self.inner.store.is_reopen_required()? {
             return Err(reject(
                 "store-reopen-required",
                 "durable store state is indeterminate; reopen the node before serving mutations or current-head views",
@@ -431,6 +887,9 @@ impl HostedV2Runtime {
         principal_sha256: &str,
         request: HostedRequestV2,
     ) -> HostedResponseV2 {
+        if let Err(error) = self.inner.require_running() {
+            return error_response(error);
+        }
         if let Err(error) = request.validate() {
             return HostedResponseV2::Error {
                 error: HostedProtocolErrorV2::new("invalid-request", format!("{error:#}"), false),
@@ -463,6 +922,7 @@ impl HostedV2Runtime {
         principal_sha256: &str,
         request: OpenSessionRequestV2,
     ) -> Result<HostedResponseV2> {
+        let _call = self.inner.begin_call()?;
         self.require_store_current()?;
         validate_sha256_v2("principal_sha256", principal_sha256)?;
         request.validate()?;
@@ -638,8 +1098,7 @@ impl HostedV2Runtime {
         // Acquire the fallible process resource before creating durable
         // session identity or returning its sole bearer. The idle actor owns
         // no session state until a later accepted Execute command.
-        let sender = match spawn_actor(Arc::downgrade(&self.inner), &session_id, request.state_tier)
-        {
+        let sender = match spawn_actor(&self.inner, &session_id, request.state_tier) {
             Ok(sender) => sender,
             Err(error) => {
                 let mut state = self.lock_state()?;
@@ -840,6 +1299,7 @@ impl HostedV2Runtime {
         principal_sha256: &str,
         request: SubmitOperationRequestV2,
     ) -> Result<HostedResponseV2> {
+        let _call = self.inner.begin_call()?;
         self.require_store_current()?;
         request.credentials.validate()?;
         request.operation.validate()?;
@@ -959,9 +1419,8 @@ impl HostedV2Runtime {
                             !had_state,
                         ));
                     }
-                    let sender =
-                        spawn_actor(Arc::downgrade(&self.inner), &session_id, session.state_tier)
-                            .map_err(|error| {
+                    let sender = spawn_actor(&self.inner, &session_id, session.state_tier)
+                        .map_err(|error| {
                             reject(
                                 "actor-unavailable",
                                 format!("session actor could not be started: {error:#}"),
@@ -1383,14 +1842,15 @@ impl HostedV2Runtime {
                 .close_actor_before_execute_for_test
                 .remove(&session_id);
             if close_before_execute {
-                let (closed_sender, closed_receiver) = mpsc::channel();
-                if sender
-                    .send(ActorCommandV2::CloseAndAcknowledgeForTest(closed_sender))
-                    .is_ok()
-                {
-                    closed_receiver
-                        .recv_timeout(Duration::from_secs(5))
-                        .context("test actor did not acknowledge deterministic close")?;
+                self.inner
+                    .state
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("hosted V2 state lock is poisoned"))?
+                    .workers
+                    .remove(&session_id);
+                sender.request_close();
+                if let Some(result) = sender.join() {
+                    result.map_err(|_| anyhow::anyhow!("test actor panicked during close"))?;
                 }
             }
         }
@@ -1419,6 +1879,7 @@ impl HostedV2Runtime {
         principal_sha256: &str,
         query: SessionQueryV2,
     ) -> Result<HostedResponseV2> {
+        let _call = self.inner.begin_call()?;
         self.require_store_current()?;
         #[cfg(debug_assertions)]
         self.wait_current_view_prelock_barrier_for_test()?;
@@ -1451,6 +1912,7 @@ impl HostedV2Runtime {
         principal_sha256: &str,
         query: SessionQueryV2,
     ) -> Result<HostedResponseV2> {
+        let _call = self.inner.begin_call()?;
         self.require_store_current()?;
         #[cfg(debug_assertions)]
         self.wait_current_view_prelock_barrier_for_test()?;
@@ -1473,6 +1935,7 @@ impl HostedV2Runtime {
         principal_sha256: &str,
         request: SessionMutationRequestV2,
     ) -> Result<HostedResponseV2> {
+        let _call = self.inner.begin_call()?;
         self.require_store_current()?;
         let request_sha256 = canonical_hosted_sha256(&request)?;
         let now = unix_time_ms()?;
@@ -1586,6 +2049,7 @@ impl HostedV2Runtime {
         principal_sha256: &str,
         request: RecoverSessionRequestV2,
     ) -> Result<HostedResponseV2> {
+        let _call = self.inner.begin_call()?;
         self.require_store_current()?;
         request.warrant.validate()?;
         let warrant_sha256 = request.warrant.sha256()?;
@@ -2108,7 +2572,7 @@ impl HostedV2Runtime {
                 let _ = sender.send(ActorCommandV2::Close);
             }
             let replacement = match spawn_actor(
-                Arc::downgrade(&self.inner),
+                &self.inner,
                 &session_id,
                 SessionStateTierV2::CheckpointRestore,
             ) {
@@ -2630,6 +3094,7 @@ impl HostedV2Runtime {
         principal_sha256: &str,
         request: SessionMutationRequestV2,
     ) -> Result<HostedResponseV2> {
+        let _call = self.inner.begin_call()?;
         self.require_store_current()?;
         let request_sha256 = canonical_hosted_sha256(&request)?;
         let now = unix_time_ms()?;
@@ -2716,17 +3181,14 @@ impl HostedV2Runtime {
         now: u64,
         event: JournalEventV2,
     ) -> Result<SignedJournalEntryV2> {
-        self.inner
-            .store
-            .signer()
-            .issue_journal_entry(JournalEntryV2 {
-                schema: HOSTED_JOURNAL_ENTRY_SCHEMA_V2.to_owned(),
-                session_id: session_id.to_owned(),
-                sequence,
-                previous_entry_sha256: previous,
-                recorded_unix_ms: now,
-                event,
-            })
+        self.inner.store.issue_journal_entry(JournalEntryV2 {
+            schema: HOSTED_JOURNAL_ENTRY_SCHEMA_V2.to_owned(),
+            session_id: session_id.to_owned(),
+            sequence,
+            previous_entry_sha256: previous,
+            recorded_unix_ms: now,
+            event,
+        })
     }
 
     fn issue_next_entry(
@@ -3309,20 +3771,35 @@ fn quarantine_recovery_attempt_locked(
 }
 
 fn spawn_actor(
-    runtime: Weak<RuntimeInnerV2>,
+    runtime: &Arc<RuntimeInnerV2>,
     session_id: &str,
     tier: SessionStateTierV2,
-) -> Result<mpsc::Sender<ActorCommandV2>> {
+) -> Result<Arc<ActorWorkerV2>> {
     let (sender, receiver) = mpsc::channel();
     let session_id = session_id.to_owned();
-    thread::Builder::new()
+    let runtime_weak = Arc::downgrade(runtime);
+    let worker_session_id = session_id.clone();
+    let join = thread::Builder::new()
         .name(format!(
             "ostadix-v2-{}",
             &session_id[..session_id.len().min(24)]
         ))
-        .spawn(move || actor_loop(runtime, session_id, tier, receiver))
+        .spawn(move || actor_loop(runtime_weak, worker_session_id, tier, receiver))
         .context("failed to spawn hosted V2 session actor")?;
-    Ok(sender)
+    let lifecycle = Arc::new(ActorWorkerLifecycleV2 {
+        session_id,
+        join: Mutex::new(Some(join)),
+    });
+    let worker = Arc::new(ActorWorkerV2 {
+        sender,
+        lifecycle: Arc::clone(&lifecycle),
+    });
+    runtime
+        .worker_lifecycles
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(lifecycle);
+    Ok(worker)
 }
 
 fn actor_loop(
@@ -3523,19 +4000,7 @@ fn actor_loop(
                 scope.clear();
             }
             #[cfg(debug_assertions)]
-            ActorCommandV2::CloseAndAcknowledgeForTest(reply) => {
-                // The acknowledgement is a bounded test shutdown barrier, not
-                // merely confirmation that Close reached the actor mailbox.
-                // Release every actor-loop resource that can retain backend or
-                // runtime state before waking the caller, so an immediate
-                // durable-store reopen cannot race thread-stack destruction.
-                drop(receiver);
-                drop(scope);
-                drop(evaluator);
-                drop(runtime);
-                let _ = reply.send(());
-                return;
-            }
+            ActorCommandV2::PanicForTest => panic!("injected hosted V2 actor panic"),
             ActorCommandV2::Close => break,
         }
     }
@@ -3548,7 +4013,7 @@ fn new_evaluator(inner: &RuntimeInnerV2) -> Evaluator {
 }
 
 fn checkpoint_for_session(
-    store: &DurableSessionStoreV2,
+    store: &RuntimeStoreV2,
     session: &SessionRecordV2,
 ) -> Result<Option<EvaluatorStateSnapshotV1>> {
     if session.state_tier != SessionStateTierV2::CheckpointRestore {
@@ -3956,7 +4421,7 @@ fn operation_started(
     if operation_record.view.status != OperationStatusV2::Accepted {
         bail!("operation is no longer accepted");
     }
-    let receipt = inner.store.signer().issue_journal_entry(JournalEntryV2 {
+    let receipt = inner.store.issue_journal_entry(JournalEntryV2 {
         schema: HOSTED_JOURNAL_ENTRY_SCHEMA_V2.to_owned(),
         session_id: session_id.to_owned(),
         sequence: session.journal_sequence + 1,
@@ -4076,7 +4541,7 @@ fn persist_actor_checkpoint(
         bail!("actor generation changed before checkpoint persistence");
     }
     validate_checkpoint_state_contract(&snapshot, session)?;
-    let receipt = inner.store.signer().issue_journal_entry(JournalEntryV2 {
+    let receipt = inner.store.issue_journal_entry(JournalEntryV2 {
         schema: HOSTED_JOURNAL_ENTRY_SCHEMA_V2.to_owned(),
         session_id: session_id.to_owned(),
         sequence: session.journal_sequence + 1,
@@ -4169,7 +4634,7 @@ fn record_checkpoint_failure(
         .get(&operation.operation_id)
         .context("checkpoint failure operation disappeared")?
         .reserved_bytes;
-    let receipt = inner.store.signer().issue_journal_entry(JournalEntryV2 {
+    let receipt = inner.store.issue_journal_entry(JournalEntryV2 {
         schema: HOSTED_JOURNAL_ENTRY_SCHEMA_V2.to_owned(),
         session_id: session_id.to_owned(),
         sequence: session.journal_sequence + 1,
@@ -4258,7 +4723,7 @@ fn record_ambiguous_actor_loss(
             .checked_add(1)
             .context("actor generation overflow after infrastructure failure")?,
     )?;
-    let lost = inner.store.signer().issue_journal_entry(JournalEntryV2 {
+    let lost = inner.store.issue_journal_entry(JournalEntryV2 {
         schema: HOSTED_JOURNAL_ENTRY_SCHEMA_V2.to_owned(),
         session_id: session_id.to_owned(),
         sequence: session.journal_sequence + 1,
@@ -4270,7 +4735,7 @@ fn record_ambiguous_actor_loss(
             reason: bounded_durable_text(reason),
         },
     })?;
-    let interrupted = inner.store.signer().issue_journal_entry(JournalEntryV2 {
+    let interrupted = inner.store.issue_journal_entry(JournalEntryV2 {
         schema: HOSTED_JOURNAL_ENTRY_SCHEMA_V2.to_owned(),
         session_id: session_id.to_owned(),
         sequence: lost.entry.sequence + 1,
@@ -4387,7 +4852,7 @@ fn operation_finished(
     }
     let digest = operation_record.view.operation_sha256.clone();
     let reserved = operation_record.reserved_bytes;
-    let receipt = inner.store.signer().issue_journal_entry(JournalEntryV2 {
+    let receipt = inner.store.issue_journal_entry(JournalEntryV2 {
         schema: HOSTED_JOURNAL_ENTRY_SCHEMA_V2.to_owned(),
         session_id: session_id.to_owned(),
         sequence: session.journal_sequence + 1,
@@ -4483,7 +4948,7 @@ fn fence_missing_worker_locked(
             reason: bounded_durable_text(reason),
         }
     };
-    let receipt = inner.store.signer().issue_journal_entry(JournalEntryV2 {
+    let receipt = inner.store.issue_journal_entry(JournalEntryV2 {
         schema: HOSTED_JOURNAL_ENTRY_SCHEMA_V2.to_owned(),
         session_id: session_id.to_owned(),
         sequence: session
@@ -4551,7 +5016,7 @@ fn interrupt_before_start(
     let operation_id = operation.view.operation_id.clone();
     let digest = operation.view.operation_sha256.clone();
     let reserved = operation.reserved_bytes;
-    let interrupted = inner.store.signer().issue_journal_entry(JournalEntryV2 {
+    let interrupted = inner.store.issue_journal_entry(JournalEntryV2 {
         schema: HOSTED_JOURNAL_ENTRY_SCHEMA_V2.to_owned(),
         session_id: session_id.to_owned(),
         sequence: session.journal_sequence + 1,
@@ -4589,7 +5054,7 @@ fn interrupt_before_start(
                 reason: bounded_durable_text(reason),
             }
         };
-        Some(inner.store.signer().issue_journal_entry(JournalEntryV2 {
+        Some(inner.store.issue_journal_entry(JournalEntryV2 {
             schema: HOSTED_JOURNAL_ENTRY_SCHEMA_V2.to_owned(),
             session_id: session_id.to_owned(),
             sequence: interrupted.entry.sequence + 1,
@@ -4797,7 +5262,7 @@ fn mark_quarantined(inner: &Arc<RuntimeInnerV2>, session_id: &str, reason: &str)
 
 fn reconstruct_session(
     node_id: &str,
-    store: &DurableSessionStoreV2,
+    store: &RuntimeStoreV2,
     entries: &[SignedJournalEntryV2],
 ) -> Result<SessionRecordV2> {
     let first = entries.first().context("session journal is empty")?;
@@ -5944,6 +6409,11 @@ fn quota_rejection(name: &str) -> anyhow::Error {
 }
 
 fn error_response(error: anyhow::Error) -> HostedResponseV2 {
+    if error.downcast_ref::<HostedV2RuntimeClosedV2>().is_some() {
+        return HostedResponseV2::Error {
+            error: HostedProtocolErrorV2::new("runtime-closed", format!("{error:#}"), false),
+        };
+    }
     if let Some(rejection) = error.downcast_ref::<HostedV2Rejection>() {
         return HostedResponseV2::Error {
             error: HostedProtocolErrorV2::new(
