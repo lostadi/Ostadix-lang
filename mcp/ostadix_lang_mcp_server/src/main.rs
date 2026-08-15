@@ -633,11 +633,19 @@ struct CatalogBackendRuntime {
     integer_exactness_min: Option<&'static str>,
     integer_exactness_max: Option<&'static str>,
     rich_numbers: &'static str,
+    state_support: &'static str,
+    state_codec: Option<&'static str>,
+    state_compatibility: Option<&'static str>,
+    state_manifest_schema: Option<&'static str>,
 }
 
 macro_rules! backend_catalog_metadata {
-    (schema: $schema:literal $(,)?) => {
-        const CATALOG_SCHEMA: &str = $schema;
+    (
+        current_schema: $current_schema:literal,
+        legacy_schema_v3: $legacy_schema_v3:literal $(,)?
+    ) => {
+        const CATALOG_SCHEMA: &str = $current_schema;
+        const CATALOG_LEGACY_SCHEMA_V3: &str = $legacy_schema_v3;
     };
 }
 
@@ -691,6 +699,46 @@ macro_rules! catalog_rich_numbers {
     };
 }
 
+macro_rules! catalog_state_support {
+    (Stateless) => {
+        (
+            "stateless",
+            None::<&'static str>,
+            None::<&'static str>,
+            None::<&'static str>,
+        )
+    };
+    (SemanticSnapshot { codec: $codec:literal, compatibility: ExactImplementation }) => {
+        (
+            "semantic-snapshot",
+            Some($codec),
+            Some("exact-implementation"),
+            None::<&'static str>,
+        )
+    };
+    (
+        SemanticSnapshot {
+            codec: $codec:literal,
+            compatibility: CompatibilityClass($class:literal)
+        }
+    ) => {
+        (
+            "semantic-snapshot",
+            Some($codec),
+            Some($class),
+            None::<&'static str>,
+        )
+    };
+    (ExternalPinned { manifest_schema: $manifest_schema:literal }) => {
+        (
+            "external-pinned",
+            None::<&'static str>,
+            None::<&'static str>,
+            Some($manifest_schema),
+        )
+    };
+}
+
 macro_rules! runtime_requirement_precision_name {
     (Exact) => {
         "exact"
@@ -740,6 +788,10 @@ macro_rules! backend_catalog {
                     $(($($integer_arguments:literal),* $(,)?))?
                     $({ min: $integer_min:literal, max: $integer_max:literal })?,
                 rich_numbers: $rich_numbers:ident,
+                state_support: $state_support:ident
+                    $({
+                        $($state_key:ident: $state_value:tt),* $(,)?
+                    })?,
             }
         ),* $(,)?
     ) => {
@@ -769,6 +821,22 @@ macro_rules! backend_catalog {
                         $({ min: $integer_min, max: $integer_max })?
                     ).3,
                     rich_numbers: catalog_rich_numbers!($rich_numbers),
+                    state_support: catalog_state_support!(
+                        $state_support
+                        $({ $($state_key: $state_value),* })?
+                    ).0,
+                    state_codec: catalog_state_support!(
+                        $state_support
+                        $({ $($state_key: $state_value),* })?
+                    ).1,
+                    state_compatibility: catalog_state_support!(
+                        $state_support
+                        $({ $($state_key: $state_value),* })?
+                    ).2,
+                    state_manifest_schema: catalog_state_support!(
+                        $state_support
+                        $({ $($state_key: $state_value),* })?
+                    ).3,
                 },
             )*
         ];
@@ -812,7 +880,7 @@ impl RuntimeDiscovery {
 
     fn to_text(&self) -> String {
         let mut out = format!(
-            "runtime-catalog-schema={CATALOG_SCHEMA}\nruntime-catalog-projection=compiled-mcp-snapshot\nruntime-search-mode={}\nruntime-search-path={}\n{}\n",
+            "runtime-catalog-schema={CATALOG_SCHEMA}\nruntime-catalog-legacy-schema-v3={CATALOG_LEGACY_SCHEMA_V3}\nruntime-catalog-projection=compiled-mcp-snapshot\nruntime-search-mode={}\nruntime-search-path={}\n{}\n",
             self.search.mode.name(),
             self.search.encoded.to_string_lossy(),
             self.summary()
@@ -928,9 +996,27 @@ fn discover_runtimes(search: &RuntimeSearchPath, root: &Path) -> RuntimeDiscover
             (None, None, None) => backend.integer_exactness.to_string(),
             _ => unreachable!("catalog exactness projection has inconsistent parameters"),
         };
+        let state_detail = match (
+            backend.state_codec,
+            backend.state_compatibility,
+            backend.state_manifest_schema,
+        ) {
+            (Some(codec), Some(compatibility), None) => {
+                format!(" codec={codec} compatibility={compatibility}")
+            }
+            (None, None, Some(manifest_schema)) => {
+                format!(" manifest-schema={manifest_schema}")
+            }
+            (None, None, None) => String::new(),
+            _ => unreachable!("catalog state projection has inconsistent parameters"),
+        };
         lines.push(format!(
-            "runtime-capability backend={} integer-exactness={} rich-numbers={} provenance=catalog",
-            backend.name, integer_exactness, backend.rich_numbers
+            "runtime-capability backend={} integer-exactness={} rich-numbers={} state-support={}{} provenance=catalog",
+            backend.name,
+            integer_exactness,
+            backend.rich_numbers,
+            backend.state_support,
+            state_detail,
         ));
     }
 
@@ -1745,8 +1831,8 @@ mod tests {
         resolve_directory, resolve_file, resolve_run_target, run_cmd,
         runtime_search_path_with_mode, runtime_search_path_with_mode_and_manager_environment,
         validate_intent_target, EmptyArgs, IntentLease, IntentReservation, IntentStore, OstadixMcp,
-        RuntimePathMode, CATALOG_BACKEND_RUNTIMES, CATALOG_RUNTIME_REQUIREMENTS, CATALOG_SCHEMA,
-        INTENT_SCHEMA_V1, MAX_LIVE_INTENTS,
+        RuntimePathMode, CATALOG_BACKEND_RUNTIMES, CATALOG_LEGACY_SCHEMA_V3,
+        CATALOG_RUNTIME_REQUIREMENTS, CATALOG_SCHEMA, INTENT_SCHEMA_V1, MAX_LIVE_INTENTS,
     };
     use std::collections::BTreeSet;
     use std::ffi::OsStr;
@@ -1844,7 +1930,8 @@ mod tests {
 
     #[test]
     fn runtime_inventory_is_a_complete_catalog_projection() {
-        assert_eq!(CATALOG_SCHEMA, "ostadix.backend-catalog/v3");
+        assert_eq!(CATALOG_SCHEMA, "ostadix.backend-catalog/v4");
+        assert_eq!(CATALOG_LEGACY_SCHEMA_V3, "ostadix.backend-catalog/v3");
         let requirement_keys = CATALOG_RUNTIME_REQUIREMENTS
             .iter()
             .map(|requirement| requirement.key)
@@ -1880,6 +1967,24 @@ mod tests {
                 requirement.key
             );
         }
+
+        let stateless = CATALOG_BACKEND_RUNTIMES
+            .iter()
+            .filter(|backend| backend.state_support == "stateless")
+            .count();
+        let semantic = CATALOG_BACKEND_RUNTIMES
+            .iter()
+            .filter(|backend| backend.state_support == "semantic-snapshot")
+            .map(|backend| backend.name)
+            .collect::<Vec<_>>();
+        let external = CATALOG_BACKEND_RUNTIMES
+            .iter()
+            .filter(|backend| backend.state_support == "external-pinned")
+            .map(|backend| backend.name)
+            .collect::<Vec<_>>();
+        assert_eq!(stateless, 27);
+        assert_eq!(semantic, ["sql", "python"]);
+        assert_eq!(external, ["ubuntu_vm"]);
     }
 
     #[test]
@@ -1893,6 +1998,18 @@ mod tests {
         assert_eq!(python.integer_exactness_min, None);
         assert_eq!(python.integer_exactness_max, None);
         assert_eq!(python.rich_numbers, "preserved");
+        assert_eq!(python.state_support, "semantic-snapshot");
+        assert_eq!(python.state_codec, Some("ostadix.python-graph/v1"));
+        assert_eq!(python.state_compatibility, Some("exact-implementation"));
+        assert_eq!(python.state_manifest_schema, None);
+
+        let sql = CATALOG_BACKEND_RUNTIMES
+            .iter()
+            .find(|backend| backend.name == "sql")
+            .expect("sql catalog entry");
+        assert_eq!(sql.state_support, "semantic-snapshot");
+        assert_eq!(sql.state_codec, Some("ostadix.sqlite-cli-main/v1"));
+        assert_eq!(sql.state_compatibility, Some("exact-implementation"));
 
         let javascript = CATALOG_BACKEND_RUNTIMES
             .iter()
@@ -1912,6 +2029,19 @@ mod tests {
         assert_eq!(java.integer_exactness_bits, Some(63));
         assert_eq!(java.integer_exactness_min, None);
         assert_eq!(java.integer_exactness_max, None);
+        assert_eq!(java.state_support, "stateless");
+
+        let ubuntu_vm = CATALOG_BACKEND_RUNTIMES
+            .iter()
+            .find(|backend| backend.name == "ubuntu_vm")
+            .expect("ubuntu_vm catalog entry");
+        assert_eq!(ubuntu_vm.state_support, "external-pinned");
+        assert_eq!(ubuntu_vm.state_codec, None);
+        assert_eq!(ubuntu_vm.state_compatibility, None);
+        assert_eq!(
+            ubuntu_vm.state_manifest_schema,
+            Some("ostadix.multipass-resource/v1")
+        );
 
         let range = catalog_integer_exactness!(ExactRange {
             min: "-10",

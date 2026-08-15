@@ -212,7 +212,7 @@ impl WarrantAssertionV1 {
     }
 }
 
-/// One authenticated fact in a placement proof.  Signature bytes and key
+/// One authenticated fact in a placement proof. Signature bytes and key
 /// resolution remain outside this transport-neutral payload.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -324,6 +324,10 @@ impl PlacementWarrantV1 {
 
     pub fn issuer_key(&self) -> &SemanticDigestV1 {
         &self.issuer_key
+    }
+
+    pub fn expires_at(&self) -> Option<UnixMillisV1> {
+        self.expires_at
     }
 
     pub fn id(&self) -> Result<SemanticDigestV1, PlacementValidationError> {

@@ -2,16 +2,16 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::ir::{BackendRegistry, BACKEND_CATALOG_SCHEMA_V3};
 use crate::world::ArtifactId;
 
 use super::digest::{validate_label, validate_token};
 use super::{
-    CanonicalPlacementRecordV1, CapabilityAtomV1, CapabilityKeyV1, EndiannessV1,
-    PlacementValidationError, RequirementAtomV1, RequirementFootprintV1, SemanticDigestV1,
+    CanonicalPlacementRecordV1, CapabilityAtomV1, CapabilityKeyV1, CurrentBackendCatalogV1,
+    EndiannessV1, PlacementValidationError, RequirementAtomV1, RequirementFootprintV1,
+    SemanticDigestV1,
 };
 
-/// V1 deliberately accepts only capability ideals.  Non-downward-closed
+/// Placement V1 deliberately accepts only capability ideals. Non-downward-closed
 /// accelerator capability relations require a different solver.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -43,7 +43,7 @@ impl PlatformDescriptorV1 {
         validate_token("target operating system", &operating_system)?;
         validate_token("target architecture", &architecture)?;
         validate_token("target ABI", &abi)?;
-        if pointer_width == 0 || pointer_width > 128 || pointer_width % 8 != 0 {
+        if pointer_width == 0 || pointer_width > 128 || !pointer_width.is_multiple_of(8) {
             return Err(PlacementValidationError::InvalidToken {
                 field: "target pointer width",
                 value: pointer_width.to_string(),
@@ -224,6 +224,22 @@ impl ActorGenerationIdV1 {
         &self.logical_environment
     }
 
+    pub fn backend_implementation(&self) -> &SemanticDigestV1 {
+        &self.backend_implementation
+    }
+
+    pub fn target_descriptor(&self) -> &SemanticDigestV1 {
+        &self.target_descriptor
+    }
+
+    pub fn sandbox_policy(&self) -> &SemanticDigestV1 {
+        &self.sandbox_policy
+    }
+
+    pub fn launch_context(&self) -> &SemanticDigestV1 {
+        &self.launch_context
+    }
+
     pub fn generation(&self) -> super::GenerationV1 {
         self.generation
     }
@@ -318,22 +334,35 @@ impl TargetDescriptorV1 {
         &self.backend_implementations
     }
 
-    /// Reject backend identities minted under an older catalog hash domain.
+    /// Reject backend identities minted under an older catalog or realization
+    /// hash domain.
     ///
     /// The records themselves remain decodable and their detached signatures
     /// remain independently inspectable.  They cannot, however, authorize a
     /// placement against this process unless every advertised backend
-    /// specification belongs to the current compiled catalog.  Because the
-    /// catalog schema is part of every specification digest, the V2 -> V3
-    /// rollover fails closed without rewriting the signed record schema.
-    pub fn validate_current_backend_catalog(&self) -> Result<(), PlacementValidationError> {
-        let registry = BackendRegistry::global();
+    /// specification and complete realization belong to the current compiled
+    /// catalog. Because the catalog schema and realization formula are both
+    /// checked, either rollover fails closed without rewriting the signed
+    /// target-record schema.
+    pub fn validate_current_backend_catalog_with(
+        &self,
+        catalog: &impl CurrentBackendCatalogV1,
+    ) -> Result<(), PlacementValidationError> {
         for implementation in &self.backend_implementations {
-            let specification = implementation.backend_specification().as_sha256();
-            if !registry.contains_specification_sha256(specification) {
+            let specification = implementation.backend_specification();
+            if !catalog.contains_current_specification(specification) {
                 return Err(PlacementValidationError::NonCurrentBackendCatalog {
-                    specification: specification.to_owned(),
-                    current_schema: BACKEND_CATALOG_SCHEMA_V3.to_owned(),
+                    specification: specification.as_sha256().to_owned(),
+                    current_schema: catalog.current_schema().to_owned(),
+                });
+            }
+            if !catalog.contains_current_implementation(implementation) {
+                return Err(PlacementValidationError::NonCurrentBackendImplementation {
+                    realization_pipeline: implementation
+                        .realization_pipeline()
+                        .as_sha256()
+                        .to_owned(),
+                    current_schema: catalog.current_schema().to_owned(),
                 });
             }
         }
