@@ -506,7 +506,7 @@ pub struct PlacementFragmentBindingsV1 {
     operation_oir: crate::world::ArtifactId,
     requirement_footprint: crate::placement::RequirementFootprintV1,
     requirement_footprint_sha256: crate::placement::SemanticDigestV1,
-    admission: crate::placement::SemanticDigestV1,
+    placement_admission: crate::placement::SemanticDigestV1,
     task_attempt: crate::placement::TaskAttemptIdV1,
     backend_implementation: crate::placement::BackendImplementationIdV1,
     backend_implementation_sha256: crate::placement::SemanticDigestV1,
@@ -541,8 +541,16 @@ impl PlacementFragmentBindingsV1 {
         &self.requirement_footprint_sha256
     }
 
+    /// Process-portable admission over the exact semantic OIR/plan/HGraph,
+    /// current catalog projection, analyzer, schema, and base policy.
+    pub fn placement_admission(&self) -> &crate::placement::SemanticDigestV1 {
+        &self.placement_admission
+    }
+
+    /// Compatibility spelling for the placement-lease admission coordinate.
+    /// This is intentionally not the full process-local `admission_sha256`.
     pub fn admission(&self) -> &crate::placement::SemanticDigestV1 {
-        &self.admission
+        self.placement_admission()
     }
 
     pub fn task_attempt(&self) -> &crate::placement::TaskAttemptIdV1 {
@@ -2299,9 +2307,7 @@ impl Evaluator {
         let operation_oir = crate::world::ArtifactId::from_sha256(
             admitted.admission().bindings().oir_sha256.clone(),
         )?;
-        let admission = crate::placement::SemanticDigestV1::from_sha256(
-            admitted.admission().admission_sha256().to_string(),
-        )?;
+        let placement_admission = admitted.admission().placement_admission().clone();
         let hgraph_schedule = crate::hgraph::schedule::try_schedule(admitted.graph())
             .map_err(anyhow::Error::msg)
             .context("failed to schedule admitted placement fragment")?;
@@ -2317,7 +2323,7 @@ impl Evaluator {
             operation_oir,
             requirement_footprint: footprint,
             requirement_footprint_sha256,
-            admission,
+            placement_admission,
             task_attempt,
             backend_implementation,
             backend_implementation_sha256,
@@ -3452,13 +3458,27 @@ fn validate_placement_fragment_shape(
     program: &OIrProgram,
     plan: &ExecutionPlan,
 ) -> Result<PlanNodeId> {
-    if plan.roots.len() != 1 {
+    let flat = program.flatten_for_plan();
+    let mut semantic_roots = Vec::new();
+    for root in &plan.roots {
+        match flat.get(root.0) {
+            Some(OIr::Text(text)) if text.trim().is_empty() => {}
+            Some(OIr::Text(_)) => {
+                bail!(
+                    "placement fragment contains a non-whitespace top-level text root (text-only or mixed-document input is not executable placement authority)"
+                )
+            }
+            Some(_) => semantic_roots.push(*root),
+            None => bail!("placement fragment root P{} has no OIR node", root.0),
+        }
+    }
+    if semantic_roots.len() != 1 {
         bail!(
-            "placement fragment requires exactly one root, found {}",
-            plan.roots.len()
+            "placement fragment requires exactly one non-whitespace semantic root, found {}",
+            semantic_roots.len()
         );
     }
-    let root = plan.roots[0];
+    let root = semantic_roots[0];
     let mut exec = None;
     for node in &plan.nodes {
         match &node.kind {
@@ -5402,6 +5422,82 @@ mod tests {
     }
 
     #[test]
+    fn prepared_placement_fragment_exposes_portable_admission_separately() -> Result<()> {
+        let shim_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("backends");
+        let source = "python^(__oval_result__ = 6 * 7)_python";
+        let source_with_shebang = format!("#!/usr/bin/env O\n{source}");
+        let mut evaluator = placement_evaluator(shim_dir);
+
+        let plain = evaluator.prepare_placement_fragment(source, placement_attempt())?;
+        let alternate_attempt = crate::placement::TaskAttemptIdV1::new(
+            crate::placement::SemanticDigestV1::from_sha256("ba".repeat(32))?,
+            crate::placement::GenerationV1::new(2)?,
+        );
+        let shebang =
+            evaluator.prepare_placement_fragment(&source_with_shebang, alternate_attempt)?;
+
+        assert_ne!(
+            plain.bindings().source_sha256(),
+            shebang.bindings().source_sha256(),
+            "original source bytes remain a separate binding"
+        );
+        assert_ne!(
+            plain.bindings().task_attempt(),
+            shebang.bindings().task_attempt(),
+            "task identity remains a separate binding"
+        );
+        assert_eq!(
+            plain.bindings().operation_oir(),
+            shebang.bindings().operation_oir(),
+            "the prepared executable syntax is identical after shebang stripping"
+        );
+        assert_eq!(
+            plain.bindings().placement_admission(),
+            shebang.bindings().placement_admission(),
+            "source bytes and task identity must not contaminate portable admission"
+        );
+        assert_eq!(
+            plain.bindings().admission(),
+            plain.bindings().placement_admission(),
+            "the placement-lease compatibility getter uses the portable coordinate"
+        );
+        assert_eq!(plain.bindings().placement_admission().as_sha256().len(), 64);
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_placement_fragment_permits_only_trailing_whitespace_roots() -> Result<()> {
+        let shim_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("backends");
+        for suffix in ["\n", "\r\n \t"] {
+            let source = format!("python^(__oval_result__ = 6 * 7)_python{suffix}");
+            let mut evaluator = placement_evaluator(shim_dir.clone());
+            let prepared = evaluator.prepare_placement_fragment(&source, placement_attempt())?;
+            assert_eq!(
+                prepared.bindings().source_sha256(),
+                crate::evidence::source_sha256(source.as_bytes())
+            );
+            assert_eq!(
+                evaluator.execute_prepared_placement_fragment(prepared, &mut HashMap::new())?,
+                OValue::int(42)
+            );
+        }
+
+        let mut evaluator = placement_evaluator(shim_dir);
+        let error = match evaluator.prepare_placement_fragment(
+            "python^(__oval_result__ = 42)_python\nnot whitespace",
+            placement_attempt(),
+        ) {
+            Ok(_) => panic!("non-whitespace sibling text must remain outside placement authority"),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:#}").contains("non-whitespace top-level text root"),
+            "{error:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn prepared_placement_fragment_binds_persistent_session_requirement() -> Result<()> {
         let shim_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("backends");
         let mut evaluator = placement_evaluator(shim_dir);
@@ -5432,7 +5528,10 @@ mod tests {
     fn prepared_placement_fragment_rejects_non_fragment_shapes() {
         let shim_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("backends");
         let cases = [
-            ("python^(1)_python\npython^(2)_python", "exactly one root"),
+            (
+                "python^(1)_python\npython^(2)_python",
+                "exactly one non-whitespace semantic root",
+            ),
             ("now(python^(1)_python)", "cannot contain"),
             ("ordinary text only", "text-only"),
             ("python^($later)_python", "cannot contain Load"),
