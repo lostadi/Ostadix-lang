@@ -123,7 +123,17 @@ registry: `init`, `profile-local`, `publish-profile`, `verify`, `list`,
 `export`, and `import`. Its canonical snapshots support pinned roots and
 prefix-scoped delegation for offline federation, but there is no registry
 network daemon and neither `octl` nor the scheduler discovers or dispatches
-through this store. Normal setup also exposes it as `o registry ...`.
+through this store. Normal setup also exposes it as `o registry ...` and
+installs the native `ostadix-evaluator` alias used for exact runtime
+fingerprinting without treating the case-insensitive `O`/`o` dispatcher as the
+evaluator artifact. `o-node doctor` and `serve` use that same native alias as
+the admitted `O --o-backend` proxy (or a sibling native `O` development build);
+`--runtime-binary` selects an explicit native image, and shell dispatchers are
+rejected. The default/sibling O path is covered by the hosted execution gate;
+an arbitrary explicit image receives a format preflight and proves protocol
+compatibility only when an admitted hosted block launches. Registry `profile-local`
+records default to 45 seconds and accept `--valid-for-seconds` from 1 through
+the placement-core maximum of 60.
 
 This hosted profile is not a World, Governor, G1/G10, physical-machine,
 exactly-once, project-migration, or mid-operation-migration claim. Its complete
@@ -2341,6 +2351,8 @@ o-link src/ --literal -o sequential.O
 Each literal wrapper uses `LANG[*]^(...)_LANG[*]`, so files remain evaluator-
 isolated without synthesizing a persistent numeric identity. Existing numeric
 indices inside authored `.O` input remain persistent and are never renumbered.
+Sequential `LANG[*]` parsing and per-occurrence fresh-evaluator semantics are
+supported by the Rust runtime, the Python reference, and the C17 edition.
 
 The default sequence remains ordered. `--parallel` emits each consecutive run
 of eligible independent wrappers under `autonomous(batch(...))`; that run
@@ -2354,12 +2366,24 @@ o-link --parallel --parallel-required calc.py report.py
 o-link --parallel --explain-parallel calc.py report.py
 ```
 
+The generated `autonomous(batch(...))` call expression is currently executable
+only by the authoritative Rust edition. The C17 edition supports `LANG[*]` but
+schedules it serially; the Python reference supports sequential `LANG[*]` but
+does not implement the call-expression grammar used by the autonomous wrapper.
+Thus the generated sequential `LANG[*]` wrappers are portable across the three
+hosted editions, while `o-link --parallel` output currently requires the Rust
+runtime.
+
 Plain `--parallel` is explicit consent to unordered hidden effects in eligible
 one-shot hosted operations; work already started is not rolled back. The
 `verified` mode admits only catalog-verified pure inline renderers,
 `--parallel-required` fails if a selected section cannot enter the requested
 lane, and `--explain-parallel` reports every decision on stderr. Parallel
 linking does not itself authorize remote placement.
+
+Detected import/include dependencies remain execution barriers: the linker
+emits topological waves and batches only same-wave antichains. Cycles keep
+stable source order and are serialized rather than being guessed apart.
 
 Use explicit `--project` whenever the directory must be captured without
 executing arbitrary files:
@@ -2794,8 +2818,9 @@ scripts/demo_o_link_schedule_why.sh --workers 4
 It links four ordinary `.O` stages into a reviewed `1 -> 4 -> 3 -> 1` hosted
 pipeline, checks its full admission, selects a layer-3 operation for focused
 `why`, and compares serial/graph returned-value semantics. It also links two
-ordinary `.py` files as a negative control: their generated `python[0]` and
-`python[1]` environments remain coordinator-owned. Evidence is retained under
+ordinary `.py` files as a conservative control: each receives a generated
+fresh-isolated `python[*]` environment, while the absence of explicit
+autonomous consent keeps both coordinator-owned. Evidence is retained under
 `target/tmp/o_link_schedule_why_demo/`; timings are descriptive wait-overlap
 measurements, not a CPU-parallelism claim.
 
@@ -3429,8 +3454,10 @@ python3 scripts/release_evidence.py validate
 - Ephemeral bare blocks and explicit persistent backend environments.
 - Linker-isolated `[*]` environments that preserve per-file isolation without
   creating a persistent numeric actor identity.
-- Explicit `o-link --parallel` autonomous batching with input-ordered results,
-  verified-only admission, required-mode failure, and per-section explanation.
+- Rust-edition `o-link --parallel` autonomous batching with input-ordered
+  results, verified-only admission, required-mode failure, and per-section
+  explanation; C17 remains serial and the Python reference has no call grammar
+  for the generated wrapper.
 - O-level `let` bindings and `$var` splicing.
 - The complete current OValue sum type, canonical CBOR backend wire protocol,
   content identity, runtime-boundary classification, and persistence checks.
