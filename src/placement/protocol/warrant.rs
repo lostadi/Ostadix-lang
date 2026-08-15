@@ -326,6 +326,10 @@ impl PlacementWarrantV1 {
         &self.issuer_key
     }
 
+    pub fn expires_at(&self) -> Option<UnixMillisV1> {
+        self.expires_at
+    }
+
     pub fn id(&self) -> Result<SemanticDigestV1, PlacementValidationError> {
         self.semantic_digest()
     }
