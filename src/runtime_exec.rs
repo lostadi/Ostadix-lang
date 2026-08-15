@@ -35,6 +35,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::ir::{BackendAdapterKind, BackendRegistry, ExecutionMode, ExecutionPlan, PlanNodeKind};
+use crate::placement::SemanticDigestV1;
+use crate::registry::bundle::{
+    backend_executable_set_v2 as project_backend_executable_set_v2, BackendExecutableSelectionV2,
+    BackendExecutableSetRowV2,
+};
+use crate::world::ArtifactId;
 
 pub const EXECUTABLE_MANIFEST_SCHEMA_V1: &str = "oexec.direct-executable-manifest/v1";
 pub const ADMITTED_EXECUTABLE_MANIFEST_ENV: &str = "O_ADMITTED_EXECUTABLE_MANIFEST";
@@ -166,6 +172,50 @@ impl ExecutableSelectionV1 {
             Self::AdapterDirectLauncherRefinement => "adapter-direct-launcher-refinement",
             Self::NotSelected => "not-selected",
         }
+    }
+
+    /// Project an execution-manifest selection into the path-independent
+    /// implementation-identity vocabulary. Inspection rows deliberately have
+    /// no such projection.
+    pub const fn implementation_selection_v2(self) -> Option<BackendExecutableSelectionV2> {
+        match self {
+            Self::CompleteCatalogAlternative => {
+                Some(BackendExecutableSelectionV2::CompleteCatalogAlternative)
+            }
+            Self::AdapterDirectLauncherRefinement => {
+                Some(BackendExecutableSelectionV2::AdapterDirectLauncherRefinement)
+            }
+            Self::NotSelected => None,
+        }
+    }
+}
+
+/// One resolved direct-launch alternative shared by runtime admission and
+/// local registry discovery. This describes filesystem resolution; the V2
+/// semantic projector later removes paths while retaining exact content.
+#[derive(Clone, Debug)]
+pub struct ResolvedBackendLaunchSelectionV1 {
+    requirement_key: String,
+    selected_alternative: usize,
+    selection: ExecutableSelectionV1,
+    direct_commands: Vec<(String, PathBuf)>,
+}
+
+impl ResolvedBackendLaunchSelectionV1 {
+    pub fn requirement_key(&self) -> &str {
+        &self.requirement_key
+    }
+
+    pub const fn selected_alternative(&self) -> usize {
+        self.selected_alternative
+    }
+
+    pub const fn selection(&self) -> ExecutableSelectionV1 {
+        self.selection
+    }
+
+    pub fn direct_commands(&self) -> &[(String, PathBuf)] {
+        &self.direct_commands
     }
 }
 
@@ -462,6 +512,12 @@ impl ExecutableLeaseSet {
             .with_context(|| format!("no admitted executable-set digest for backend `{backend}`"))
     }
 
+    /// Path-independent V2 executable-set identity projected from the exact
+    /// launch-bound rows retained by this admission.
+    pub fn backend_executable_set_v2(&self, backend: &str) -> Result<SemanticDigestV1> {
+        backend_executable_set_v2_from_manifest(&self.manifest, backend)
+    }
+
     fn artifact(&self, backend: &str, logical: &str) -> Option<&ExecutableArtifactV1> {
         self.manifest.artifacts.iter().find(|artifact| {
             artifact.canonical_backend == backend && artifact.logical_command == logical
@@ -620,6 +676,57 @@ impl ExecutableLeaseSet {
     }
 }
 
+/// Project one backend's launch-bound manifest rows into the shared semantic
+/// executable-set identity used by registry publication and placement
+/// preflight. Unprobed, unhashed, malformed, or duplicate rows fail before a
+/// digest is returned.
+pub fn backend_executable_set_v2_from_manifest(
+    manifest: &ExecutableManifestV1,
+    backend: &str,
+) -> Result<SemanticDigestV1> {
+    validate_decoded_manifest(manifest, None)
+        .context("cannot project an invalid execution manifest")?;
+    let artifacts = manifest
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.canonical_backend == backend)
+        .collect::<Vec<_>>();
+    if artifacts.is_empty() {
+        bail!("execution manifest contains no launch rows for backend `{backend}`");
+    }
+
+    let rows = artifacts
+        .into_iter()
+        .map(|artifact| {
+            let selected_alternative = artifact
+                .selected_alternative
+                .context("launch-bound executable has no selected alternative")?;
+            let selected_alternative = u32::try_from(selected_alternative)
+                .context("selected executable alternative exceeds the V2 coordinate range")?;
+            let selection = artifact
+                .selection
+                .implementation_selection_v2()
+                .context("unprobed executable selection cannot enter implementation identity")?;
+            let sha256 = artifact
+                .sha256
+                .as_deref()
+                .context("launch-bound executable has no content SHA-256")?;
+            let artifact_id = ArtifactId::from_sha256(sha256)
+                .context("launch-bound executable has an invalid content SHA-256")?;
+            BackendExecutableSetRowV2::new(
+                artifact.requirement_key.clone(),
+                selected_alternative,
+                selection,
+                artifact.logical_command.clone(),
+                artifact.role.clone(),
+                artifact_id,
+            )
+            .map_err(anyhow::Error::from)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    project_backend_executable_set_v2(rows).map_err(Into::into)
+}
+
 /// Child-process projection used by `src/backend.rs`.  It independently
 /// revalidates the admitted rows immediately before every direct launch.
 #[derive(Debug)]
@@ -695,6 +802,63 @@ impl BackendToolchain {
     }
 }
 
+/// Resolve one exact direct-launch alternative using the same catalog and
+/// host refinement rules consumed by runtime admission.
+pub fn resolve_backend_launch_selection(backend: &str) -> Result<ResolvedBackendLaunchSelectionV1> {
+    let registry = BackendRegistry::global();
+    let spec = registry
+        .get(backend)
+        .with_context(|| format!("unknown backend `{backend}`"))?;
+    if spec.execution != ExecutionMode::Shim {
+        bail!(
+            "backend `{}` is not a shim-backed execution target",
+            spec.name
+        );
+    }
+    let requirement = registry.runtime_requirements_for(spec.name);
+    let (selected_alternative, selection, direct_commands) = match spec.adapter {
+        BackendAdapterKind::LegacyPythonShim
+            if spec.name == "nixos_test" && !nixos_test_uses_nix_on_this_host() =>
+        {
+            (
+                0,
+                ExecutableSelectionV1::AdapterDirectLauncherRefinement,
+                vec![(
+                    "python3",
+                    which::which("python3")
+                        .context("python3 is required for the legacy backend bridge")?,
+                )],
+            )
+        }
+        BackendAdapterKind::LegacyPythonShim | BackendAdapterKind::NativeRust => {
+            let (index, commands) = select_complete_alternative(requirement.alternatives)
+                .with_context(|| {
+                    format!(
+                        "backend `{}` has no complete direct executable alternative for requirement `{}`",
+                        spec.name, requirement.key
+                    )
+                })?;
+            (
+                index,
+                ExecutableSelectionV1::CompleteCatalogAlternative,
+                commands,
+            )
+        }
+        BackendAdapterKind::Inline => {
+            bail!("shim backend `{}` has no process adapter", spec.name)
+        }
+    };
+    Ok(ResolvedBackendLaunchSelectionV1 {
+        requirement_key: requirement.key.to_owned(),
+        selected_alternative,
+        selection,
+        direct_commands: direct_commands
+            .into_iter()
+            .map(|(logical, path)| (logical.to_owned(), path))
+            .collect(),
+    })
+}
+
 /// Capture one exact direct-launch alternative per plan-used shim backend.
 /// Missing direct entrypoints reject execution before evidence/admission and
 /// before any plan operation is dispatched.
@@ -715,56 +879,26 @@ pub fn capture_execution_manifest_with_current_executable(
     plan: &ExecutionPlan,
     current_executable: &Path,
 ) -> Result<(ExecutableManifestV1, Arc<ExecutableLeaseSet>)> {
-    let registry = BackendRegistry::global();
     let shim_backends = shim_backends(plan);
     let backends = shim_backends.clone();
     let mut artifacts = Vec::new();
     let mut retained = BTreeMap::new();
 
     for backend in backends {
-        let adapter = registry.adapter_for(&backend);
-        let requirement = registry.runtime_requirements_for(&backend);
-        let (selected_alternative, selection, direct_commands) = match adapter {
-            BackendAdapterKind::LegacyPythonShim
-                if backend == "nixos_test" && !nixos_test_uses_nix_on_this_host() =>
-            {
-                (
-                    0,
-                    ExecutableSelectionV1::AdapterDirectLauncherRefinement,
-                    vec![(
-                        "python3",
-                        which::which("python3")
-                            .context("python3 is required for the legacy backend bridge")?,
-                    )],
-                )
-            }
-            BackendAdapterKind::LegacyPythonShim | BackendAdapterKind::NativeRust => {
-                let (index, commands) = select_complete_alternative(requirement.alternatives)
-                    .with_context(|| {
-                        format!(
-                            "backend `{backend}` has no complete direct executable alternative for requirement `{}`",
-                            requirement.key
-                        )
-                    })?;
-                (
-                    index,
-                    ExecutableSelectionV1::CompleteCatalogAlternative,
-                    commands,
-                )
-            }
-            BackendAdapterKind::Inline => continue,
-        };
-
-        for (logical, path) in direct_commands {
+        let launch_selection = resolve_backend_launch_selection(&backend)?;
+        let selected_alternative = launch_selection.selected_alternative;
+        let selection = launch_selection.selection;
+        let requirement_key = launch_selection.requirement_key;
+        for (logical, path) in launch_selection.direct_commands {
             let selection_context = ArtifactSelection {
-                requirement_key: requirement.key,
+                requirement_key: &requirement_key,
                 selected_alternative: Some(selected_alternative),
                 selection,
             };
             artifacts.push(capture_artifact(
                 &backend,
                 selection_context,
-                logical,
+                &logical,
                 "direct-launcher",
                 &path,
                 &mut retained,
@@ -775,7 +909,7 @@ pub fn capture_execution_manifest_with_current_executable(
             artifacts.push(capture_artifact(
                 &backend,
                 ArtifactSelection {
-                    requirement_key: requirement.key,
+                    requirement_key: &requirement_key,
                     selected_alternative: Some(selected_alternative),
                     selection,
                 },
@@ -789,7 +923,7 @@ pub fn capture_execution_manifest_with_current_executable(
             artifacts.push(capture_artifact(
                 &backend,
                 ArtifactSelection {
-                    requirement_key: requirement.key,
+                    requirement_key: &requirement_key,
                     selected_alternative: Some(selected_alternative),
                     selection,
                 },
@@ -1855,6 +1989,59 @@ mod tests {
                 && artifact.sha256.is_none()
                 && artifact.file_identity.is_none()
         }));
+    }
+
+    #[test]
+    fn executable_set_v2_rejects_unprobed_manifest_rows() {
+        let manifest = inspection_executable_manifest(&shell_plan());
+        let error = backend_executable_set_v2_from_manifest(&manifest, "shell").unwrap_err();
+        assert!(
+            format!("{error:#}").contains("not launch-bound"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn executable_set_v2_ignores_paths_but_detects_byte_changes() {
+        fn manifest_for(path: &Path) -> ExecutableManifestV1 {
+            let selection = ArtifactSelection {
+                requirement_key: "shell",
+                selected_alternative: Some(0),
+                selection: ExecutableSelectionV1::CompleteCatalogAlternative,
+            };
+            let mut retained = BTreeMap::new();
+            let artifact = capture_artifact(
+                "shell",
+                selection,
+                "sh",
+                "direct-launcher",
+                path,
+                &mut retained,
+            )
+            .unwrap();
+            ExecutableManifestV1::finish(vec![artifact])
+        }
+
+        let first_dir = tempfile::tempdir().unwrap();
+        let second_dir = tempfile::tempdir().unwrap();
+        let first_path = first_dir.path().join("sh");
+        let second_path = second_dir.path().join("sh");
+        fs::write(&first_path, b"#!/bin/sh\nprintf same").unwrap();
+        fs::write(&second_path, b"#!/bin/sh\nprintf same").unwrap();
+        fs::set_permissions(&first_path, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&second_path, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let first =
+            backend_executable_set_v2_from_manifest(&manifest_for(&first_path), "shell").unwrap();
+        let relocated =
+            backend_executable_set_v2_from_manifest(&manifest_for(&second_path), "shell").unwrap();
+        assert_eq!(first, relocated);
+
+        fs::write(&second_path, b"#!/bin/sh\nprintf changed").unwrap();
+        fs::set_permissions(&second_path, fs::Permissions::from_mode(0o755)).unwrap();
+        let changed =
+            backend_executable_set_v2_from_manifest(&manifest_for(&second_path), "shell").unwrap();
+        assert_ne!(first, changed);
     }
 
     #[test]
