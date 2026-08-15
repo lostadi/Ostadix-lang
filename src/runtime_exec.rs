@@ -806,9 +806,30 @@ impl BackendToolchain {
 /// host refinement rules consumed by runtime admission.
 pub fn resolve_backend_launch_selection(backend: &str) -> Result<ResolvedBackendLaunchSelectionV1> {
     let registry = BackendRegistry::global();
-    let spec = registry
-        .get(backend)
-        .with_context(|| format!("unknown backend `{backend}`"))?;
+    let Some(spec) = registry.get(backend) else {
+        // Unknown language tags remain locally executable through the
+        // conservative compatibility bridge. This is launch discovery only:
+        // the authoritative V4 implementation-identity constructor still
+        // rejects an unknown backend, so this fallback grants no placement
+        // or registry-publication authority.
+        let requirement = registry.runtime_requirements_for(backend);
+        let (selected_alternative, direct_commands) =
+            select_complete_alternative(requirement.alternatives).with_context(|| {
+                format!(
+                    "backend `{backend}` has no complete direct executable alternative for requirement `{}`",
+                    requirement.key
+                )
+            })?;
+        return Ok(ResolvedBackendLaunchSelectionV1 {
+            requirement_key: requirement.key.to_owned(),
+            selected_alternative,
+            selection: ExecutableSelectionV1::CompleteCatalogAlternative,
+            direct_commands: direct_commands
+                .into_iter()
+                .map(|(logical, path)| (logical.to_owned(), path))
+                .collect(),
+        });
+    };
     if spec.execution != ExecutionMode::Shim {
         bail!(
             "backend `{}` is not a shim-backed execution target",
@@ -2124,6 +2145,48 @@ mod tests {
             .map(|artifact| artifact.logical_command.as_str())
             .collect::<BTreeSet<_>>();
         assert_eq!(launchers, BTreeSet::from(["multipass", "python3"]));
+    }
+
+    #[test]
+    fn unknown_extension_launch_is_local_only_legacy_python_fallback() {
+        let backend = "research_backend";
+        let launch = resolve_backend_launch_selection(backend).unwrap();
+        assert_eq!(launch.requirement_key(), "unknown-legacy-python-shim");
+        assert_eq!(
+            launch.selection(),
+            ExecutableSelectionV1::CompleteCatalogAlternative
+        );
+        assert_eq!(
+            launch
+                .direct_commands()
+                .iter()
+                .map(|(logical, _)| logical.as_str())
+                .collect::<Vec<_>>(),
+            vec!["python3"]
+        );
+
+        let registry = BackendRegistry::global();
+        assert_eq!(
+            registry.adapter_for(backend),
+            BackendAdapterKind::LegacyPythonShim
+        );
+        assert!(registry.specification_sha256(backend).is_none());
+        let error = registry
+            .backend_implementation_id_v1(
+                backend,
+                None,
+                ArtifactId::from_sha256("11".repeat(32)).unwrap(),
+                SemanticDigestV1::from_sha256("22".repeat(32)).unwrap(),
+                crate::registry::bundle::LOCAL_BACKEND_PROTOCOL_ABI_V1,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::placement::PlacementValidationError::InvalidToken {
+                field: "backend implementation canonical backend",
+                ..
+            }
+        ));
     }
 
     #[test]
