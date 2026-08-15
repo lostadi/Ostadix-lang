@@ -16,6 +16,7 @@ use o_lang::placement::{
     NodeProfileV1 as PlacementNodeProfileV1, PlatformDescriptorV1, SemanticDigestV1,
     TargetCapabilityModelV1, TargetDescriptorV1, UnixMillisV1,
 };
+use o_lang::registry::bundle::LOCAL_BACKEND_PROTOCOL_ABI_V1;
 use o_lang::registry::{
     append_profile_to_registry_state, atomic_write_node_profile_json, export_registry_store,
     import_registry_store, read_node_profile_json, read_registry_store, read_registry_trust,
@@ -452,33 +453,16 @@ fn discover_backend_implementations(
         let adapter_artifact =
             ArtifactId::from_sha256(&adapter_sha256).context("invalid adapter artifact digest")?;
         let executable_set = discover_executable_set(registry, spec.name, &adapter_path)?;
-        let backend_specification = SemanticDigestV1::from_sha256(
-            registry
-                .specification_sha256(spec.name)
-                .context("backend specification digest is unavailable")?,
-        )
-        .context("invalid backend specification digest")?;
-        let realization_material = serde_json::json!({
-            "schema": "ostadix.local-realization/v1",
-            "backend_specification": backend_specification.as_sha256(),
-            "adapter_kind": spec.adapter.name(),
-            "adapter_artifact": adapter_sha256,
-            "executable_set": executable_set.as_sha256(),
-            "protocol": "o-backend-cbor-v1",
-        });
-        let realization_pipeline = SemanticDigestV1::hash_bytes(
-            "ostadix/registry/local-realization/v1",
-            &serde_json::to_vec(&realization_material)?,
-        );
         output.push(
-            BackendImplementationIdV1::new(
-                backend_specification,
-                adapter_artifact,
-                executable_set,
-                "o-backend-cbor-v1",
-                realization_pipeline,
-            )
-            .context("invalid discovered backend implementation")?,
+            registry
+                .backend_implementation_id_v1(
+                    spec.name,
+                    None,
+                    adapter_artifact,
+                    executable_set,
+                    LOCAL_BACKEND_PROTOCOL_ABI_V1,
+                )
+                .context("invalid discovered backend implementation")?,
         );
     }
     Ok(output)
@@ -628,6 +612,37 @@ mod tests {
 
         let backend = vec!["html".to_owned()];
         let first = discover_backend_implementations(&backend, Some(&evaluator), None).unwrap();
+        let canonical_evaluator = evaluator.canonicalize().unwrap();
+        let adapter_artifact =
+            ArtifactId::from_sha256(sha256_file(&canonical_evaluator).unwrap()).unwrap();
+        let executable_set =
+            discover_executable_set(BackendRegistry::global(), "html", &canonical_evaluator)
+                .unwrap();
+        let expected_specification = SemanticDigestV1::from_sha256(
+            BackendRegistry::global()
+                .specification_sha256("html")
+                .unwrap(),
+        )
+        .unwrap();
+        let shared_builder = BackendRegistry::global()
+            .backend_implementation_id_v1(
+                "html",
+                Some(&expected_specification),
+                adapter_artifact,
+                executable_set,
+                LOCAL_BACKEND_PROTOCOL_ABI_V1,
+            )
+            .unwrap();
+        assert_eq!(first[0], shared_builder);
+
+        let aliases = discover_backend_implementations(
+            &["markdown".to_owned(), "md".to_owned()],
+            Some(&evaluator),
+            None,
+        )
+        .unwrap();
+        assert_eq!(aliases[0], aliases[1]);
+
         write_executable(&evaluator, &native_test_image(b"second-runtime"));
         let second = discover_backend_implementations(&backend, Some(&evaluator), None).unwrap();
         assert_ne!(first[0].adapter_artifact(), second[0].adapter_artifact());
