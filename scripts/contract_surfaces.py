@@ -62,7 +62,7 @@ def workflow_jobs(text: str) -> set[str]:
 
 def catalog_schema() -> str:
     match = re.search(
-        r'backend_catalog_metadata!\s*\{\s*schema:\s*"([^"]+)"',
+        r'backend_catalog_metadata!\s*\{\s*current_schema:\s*"([^"]+)"',
         CATALOG.read_text(encoding="utf-8"),
         re.DOTALL,
     )
@@ -113,11 +113,14 @@ def validate() -> None:
         )
     validate_manifest_versions()
     validate_action_pins()
-    schema = catalog_schema()
+    catalog_schema()
     smoke = MCP_SMOKE.read_text(encoding="utf-8")
-    if f"runtime-catalog-schema={schema}" not in smoke:
+    if (
+        "_current_catalog_schema(root)" not in smoke
+        or 'f"runtime-catalog-schema={catalog_schema}"' not in smoke
+    ):
         raise ContractError(
-            f"MCP smoke does not project current backend catalog schema {schema}"
+            "MCP smoke does not derive the backend catalog schema from the canonical catalog"
         )
 
 
