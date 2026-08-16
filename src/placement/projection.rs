@@ -166,7 +166,7 @@ pub fn requirement_footprint_for_program_node(
             len: flattened.len(),
         });
     };
-    let intent = if crate::hgraph::from_oir::autonomous_ephemeral_group(plan, node, oir).is_some() {
+    let intent = if crate::dispatch_model::autonomous_ephemeral_group(plan, node, oir).is_some() {
         PlacementIntentV1::AutonomousUnknownEffects
     } else {
         PlacementIntentV1::Strict

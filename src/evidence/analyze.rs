@@ -8,8 +8,8 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 
+use crate::dispatch_model;
 use crate::effects::{EffectConfidence, EffectSummary, Fallibility, ResourceKey};
-use crate::executor::parallel;
 use crate::hgraph::{
     HEdgeKind, HGraph, HNodeKind, MemOrder, OcoreOpKind, OpKind, PortRole, ValueState,
 };
@@ -470,12 +470,14 @@ pub fn analyze_execution(
             .with_context(|| format!("operation {} has no effect summary", info.plan_node.0))?;
         let effect_provenance = effect_provenance(summary.confidence);
         let (reads, writes) = summary.scheduling_accesses();
-        let worker_kind = parallel::classify(plan, flat[info.plan_node.0], info.plan_node)
-            .filter(|_| parallel::effect_contract_worker_safe(summary, flat[info.plan_node.0]));
+        let worker_kind = dispatch_model::classify(plan, flat[info.plan_node.0], info.plan_node)
+            .filter(|_| {
+                dispatch_model::effect_contract_worker_safe(summary, flat[info.plan_node.0])
+            });
         let worker_candidate = worker_kind.is_some();
         let dispatch_adapter = worker_kind
             .as_ref()
-            .map(parallel::TaskKind::adapter)
+            .map(dispatch_model::TaskKind::adapter)
             .unwrap_or(DispatchAdapterV1::CoordinatorV1);
         let (capability_disposition, capability_provenance) =
             capability_contract(&plan.nodes[info.plan_node.0].kind);

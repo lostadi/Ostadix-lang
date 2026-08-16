@@ -16,6 +16,7 @@ use crate::placement::protocol::{
     BackendImplementationIdV1, BackendStateSupportV2, CurrentBackendCatalogV1,
     PlacementValidationError, SemanticDigestV1, SnapshotCompatibilityV2,
 };
+use crate::syntax_dialect::SyntaxDialect;
 use crate::value::BackendAuthority;
 use crate::world::ArtifactId;
 
@@ -752,6 +753,21 @@ pub(crate) fn finish_catalog_hash(hash: Sha256) -> String {
 #[derive(Debug)]
 pub struct BackendRegistry {
     specs: &'static [BackendSpec],
+}
+
+impl SyntaxDialect for std::collections::HashSet<String> {
+    fn is_registered_syntax_tag(&self, name: &str) -> bool {
+        self.contains(name)
+    }
+
+    fn canonical_syntax_name(&self, name: &str) -> String {
+        BackendRegistry::global().canonical(name).to_owned()
+    }
+
+    fn owns_quoted_syntax(&self, canonical_name: &str) -> bool {
+        let backend = BackendRegistry::global().interface_for(canonical_name);
+        backend.execution == ExecutionMode::InlineAst && backend.canonical == "quote"
+    }
 }
 
 impl BackendRegistry {

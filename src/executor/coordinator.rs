@@ -473,7 +473,7 @@ impl<'a> Coordinator<'a> {
                 (self.ops[index].dispatch_adapter == DispatchAdapterV1::AutonomousEphemeralShimV1
                     && self.is_worker_safe(index))
                 .then(|| {
-                    crate::hgraph::from_oir::autonomous_ephemeral_group(
+                    crate::dispatch_model::autonomous_ephemeral_group(
                         self.plan,
                         self.ops[index].plan_node,
                         self.flat[self.ops[index].plan_node.0],
@@ -489,7 +489,7 @@ impl<'a> Coordinator<'a> {
             let boundary_clear = (0..self.ops.len()).all(|index| {
                 self.ops[index].state == OpRunState::Settled
                     || self.ops[index].ordinal >= self.ops[first].ordinal
-                    || crate::hgraph::from_oir::autonomous_ephemeral_group(
+                    || crate::dispatch_model::autonomous_ephemeral_group(
                         self.plan,
                         self.ops[index].plan_node,
                         self.flat[self.ops[index].plan_node.0],

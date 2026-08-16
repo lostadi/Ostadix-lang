@@ -57,6 +57,10 @@ name = "o-registry"
 path = "src/bin/o-registry.rs"
 
 [[bin]]
+name = "o-info"
+path = "src/bin/o-info.rs"
+
+[[bin]]
 name = "ocore-kernel-world-record"
 path = "src/bin/ocore-kernel-world-record.rs"
 
@@ -134,6 +138,7 @@ tokio       = { version = "1", features = ["full"], optional = true }
 # Process-group termination for cooperative route cancellation
 [target.'cfg(unix)'.dependencies]
 libc        = "0.2"
+signal-hook = "0.3"
 
 [dev-dependencies]
 proptest = "1"

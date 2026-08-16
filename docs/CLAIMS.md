@@ -485,6 +485,25 @@
   empty structural set normalizes to `Lossless`, so semantically identical
   states cannot retain two evidence encodings. Composition is covered by
   identity, idempotence, commutativity, and associativity checks.
+- `BackendMorphismV1` is an additive shadow kernel, not an admission claim. Its
+  Python profile is bounded to recursive acyclic plain data; it rejects
+  cycles/shared references, non-string or duplicate map keys, excessive depth,
+  and unsupported native objects. Its JavaScript profile has executable
+  evidence for recursive profiled-JSON stdout and scalar bindings, not native
+  recursive container bindings. Its Rust profile has executable evidence for
+  bounded scalar source constants plus profiled stdout, not arbitrary Rust
+  program, type, ABI, or binding equivalence. `inject` names conversion of an
+  already acquired profiled backend output into O; it is not an assertion that
+  the backend can accept that value as input. Both legs carry explicit
+  compositional fidelity and their exact boundary descriptions appear in each
+  shadow assessment.
+- These shadow profiles are not fields of backend-catalog V4 and therefore do
+  not change its specification digests, placement compatibility, evidence, or
+  protocol bytes. Enforcing them later requires an explicit catalog/evidence
+  version rollover. `tests/backend_morphism_v1.rs` exercises a real nested
+  Python input binding, a real JavaScript scalar input binding, and the exact
+  emitted Rust scalar program through Python, Node.js, and rustc; kernel unit
+  tests cover negative values and numeric bounds.
 - O-core Milestones 0.1 through 0.3 are complete for their bounded, single-CPU
   QEMU bootstrap gates. They prove CPL3 `SYSCALL` and IRQ return, page-granular
   kernel and user protection, normalized faults, fault-aware bounded user copy,

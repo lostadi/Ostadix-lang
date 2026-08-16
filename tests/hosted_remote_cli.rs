@@ -2,19 +2,89 @@
 
 use std::fs;
 use std::net::TcpListener;
+#[cfg(unix)]
+use std::net::TcpStream;
 use std::path::Path;
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
+
 mod support;
 
-struct ServerGuard(Child);
+struct ServerGuard(Option<Child>);
+
+impl ServerGuard {
+    fn new(child: Child) -> Self {
+        Self(Some(child))
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        self.0
+            .as_mut()
+            .expect("server guard no longer owns a child")
+            .try_wait()
+    }
+
+    fn request_graceful_shutdown(&mut self) -> std::io::Result<()> {
+        let child = self
+            .0
+            .as_mut()
+            .expect("server guard no longer owns a child");
+        #[cfg(unix)]
+        {
+            // SAFETY: this sends SIGTERM only to the exact child PID still
+            // owned by this guard; the child has not been reaped or detached.
+            if unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) } == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        #[cfg(not(unix))]
+        child.kill()?;
+        Ok(())
+    }
+
+    fn wait_for_exit(&mut self, timeout: Duration) -> std::io::Result<Option<ExitStatus>> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = self.try_wait()? {
+                self.0.take();
+                return Ok(Some(status));
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    fn shutdown_gracefully(&mut self) -> ExitStatus {
+        self.request_graceful_shutdown().unwrap();
+        if let Some(status) = self.wait_for_exit(Duration::from_secs(10)).unwrap() {
+            return status;
+        }
+        self.force_kill_and_wait();
+        panic!("o-node did not complete graceful shutdown within 10 seconds");
+    }
+
+    fn force_kill_and_wait(&mut self) -> ExitStatus {
+        let mut child = self.0.take().expect("server child was already reaped");
+        let _ = child.kill();
+        child.wait().unwrap()
+    }
+}
 
 impl Drop for ServerGuard {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        if self.0.is_none() {
+            return;
+        }
+        let _ = self.request_graceful_shutdown();
+        if !matches!(self.wait_for_exit(Duration::from_secs(10)), Ok(Some(_))) {
+            let _ = self.force_kill_and_wait();
+        }
     }
 }
 
@@ -92,7 +162,7 @@ fn provision_profile_doctor_and_run_are_usable_end_to_end() {
         .stderr(Stdio::from(stderr_file))
         .spawn()
         .unwrap();
-    let mut server = ServerGuard(server);
+    let mut server = ServerGuard::new(server);
 
     let deadline = Instant::now() + Duration::from_secs(10);
     let profile = loop {
@@ -100,7 +170,7 @@ fn provision_profile_doctor_and_run_are_usable_end_to_end() {
         if output.status.success() {
             break output;
         }
-        if let Some(status) = server.0.try_wait().unwrap() {
+        if let Some(status) = server.try_wait().unwrap() {
             panic!(
                 "o-node exited before profile with {status}\n{}",
                 diagnostic(&output, &server_stderr)
@@ -239,20 +309,24 @@ fn exercise_durable_v2_dev_flow(continue_through_execute: bool) {
         .stderr(Stdio::from(stderr_file))
         .spawn()
         .unwrap();
-    let mut server = ServerGuard(server);
+    let mut server = ServerGuard::new(server);
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let output = client_command("profile", &address, &pki).output().unwrap();
         if output.status.success() {
             break;
         }
-        if let Some(status) = server.0.try_wait().unwrap() {
+        if let Some(status) = server.try_wait().unwrap() {
             panic!(
                 "V2 node exited before profile with {status}\n{}",
                 diagnostic(&output, &server_stderr)
             );
         }
-        assert!(Instant::now() < deadline, "V2 node readiness timed out");
+        assert!(
+            Instant::now() < deadline,
+            "V2 node readiness timed out\n{}",
+            diagnostic(&output, &server_stderr)
+        );
         thread::sleep(Duration::from_millis(50));
     }
 
@@ -533,9 +607,12 @@ fn durable_v2_integrated_dev_submit_and_checkpoint_recovery_are_usable_end_to_en
     let ambiguous_operation = root.path().join("ambiguous-operation.json");
     let recovery_warrant = root.path().join("recovery-warrant.json");
     let recovery_lease = root.path().join("recovery-lease.json");
+    let graceful_operation = root.path().join("graceful-operation.json");
+    let graceful_lease = root.path().join("graceful-execute.json");
     let capability = root.path().join("session.json");
     let server_stderr = root.path().join("server-integrated.stderr");
     let restarted_stderr = root.path().join("server-integrated-restarted.stderr");
+    let graceful_stderr = root.path().join("server-integrated-graceful.stderr");
     fs::write(
         &source,
         "python[7]^(\n__oval_result__ = 1 + 1\n)_python[7]\n",
@@ -700,8 +777,7 @@ fn durable_v2_integrated_dev_submit_and_checkpoint_recovery_are_usable_end_to_en
         &server_stderr,
     );
 
-    server.0.kill().unwrap();
-    server.0.wait().unwrap();
+    server.force_kill_and_wait();
     server = spawn_v2_cli_server(&address, &pki, &state, &authority, &restarted_stderr);
     wait_for_v2_cli_server(&address, &pki, &restarted_stderr, &mut server);
     let recovery_required = wait_for_operation_status(
@@ -782,13 +858,87 @@ fn durable_v2_integrated_dev_submit_and_checkpoint_recovery_are_usable_end_to_en
         first_actor
     );
 
+    let mut graceful = dev_execute_command(
+        &address,
+        &pki,
+        &state,
+        &authority,
+        &capability,
+        &open_lease,
+        &slow_source,
+        "integrated-graceful-drain",
+        "4444444444444444444444444444444444444444444444444444444444444444",
+        &graceful_operation,
+        &graceful_lease,
+    );
+    graceful.arg("--submit");
+    let accepted = graceful.output().unwrap();
+    assert!(
+        accepted.status.success(),
+        "integrated graceful-drain Execute admission failed\n{}",
+        diagnostic(&accepted, &restarted_stderr)
+    );
+    wait_for_operation_status(
+        &address,
+        &pki,
+        &state,
+        &capability,
+        "integrated-graceful-drain",
+        "running",
+        &restarted_stderr,
+    );
+
+    let graceful_exit = server.shutdown_gracefully();
+    #[cfg(unix)]
+    assert!(
+        graceful_exit.success(),
+        "first SIGTERM must complete the graceful V2 barrier: {graceful_exit}"
+    );
+    #[cfg(not(unix))]
+    let _ = graceful_exit;
+    server = spawn_v2_cli_server(&address, &pki, &state, &authority, &graceful_stderr);
+    wait_for_v2_cli_server(&address, &pki, &graceful_stderr, &mut server);
+    let settled = wait_for_operation_terminal_status(
+        &address,
+        &pki,
+        &state,
+        &capability,
+        "integrated-graceful-drain",
+        &graceful_stderr,
+    );
+    assert_ne!(
+        settled["session"]["operations"]["integrated-graceful-drain"]["status"], "ambiguous",
+        "graceful shutdown must settle accepted work before releasing the root"
+    );
+
     let mut close = session_command("close", &address, &pki, &state, &capability);
     let closed = close.output().unwrap();
     assert!(
         closed.status.success(),
         "integrated session close failed\n{}",
-        diagnostic(&closed, &restarted_stderr)
+        diagnostic(&closed, &graceful_stderr)
     );
+
+    #[cfg(unix)]
+    {
+        // Keep one accepted TLS worker blocked before it can submit a request.
+        // The first signal must therefore remain in its join/drain barrier long
+        // enough for a second signal to exercise the explicit force policy.
+        let _blocked_connection = TcpStream::connect(&address).unwrap();
+        thread::sleep(Duration::from_millis(100));
+        server.request_graceful_shutdown().unwrap();
+        thread::sleep(Duration::from_millis(100));
+        assert!(
+            server.try_wait().unwrap().is_none(),
+            "blocked connection did not hold the graceful join barrier"
+        );
+        server.request_graceful_shutdown().unwrap();
+        let forced = server
+            .wait_for_exit(Duration::from_secs(5))
+            .unwrap()
+            .expect("second SIGTERM did not force o-node termination");
+        assert_eq!(forced.signal(), Some(libc::SIGTERM));
+    }
 }
 
 fn spawn_v2_cli_server(
@@ -825,7 +975,7 @@ fn spawn_v2_cli_server(
         .stderr(Stdio::from(stderr_file))
         .spawn()
         .unwrap();
-    ServerGuard(server)
+    ServerGuard::new(server)
 }
 
 fn wait_for_v2_cli_server(
@@ -840,13 +990,17 @@ fn wait_for_v2_cli_server(
         if output.status.success() {
             return;
         }
-        if let Some(status) = server.0.try_wait().unwrap() {
+        if let Some(status) = server.try_wait().unwrap() {
             panic!(
                 "V2 node exited before profile with {status}\n{}",
                 diagnostic(&output, server_stderr)
             );
         }
-        assert!(Instant::now() < deadline, "V2 node readiness timed out");
+        assert!(
+            Instant::now() < deadline,
+            "V2 node readiness timed out\n{}",
+            diagnostic(&output, server_stderr)
+        );
         thread::sleep(Duration::from_millis(50));
     }
 }
@@ -930,6 +1084,45 @@ fn wait_for_operation_status(
     expected: &str,
     server_stderr: &Path,
 ) -> serde_json::Value {
+    wait_for_operation_statuses(
+        address,
+        pki,
+        state,
+        capability,
+        operation_id,
+        &[expected],
+        server_stderr,
+    )
+}
+
+fn wait_for_operation_terminal_status(
+    address: &str,
+    pki: &Path,
+    state: &Path,
+    capability: &Path,
+    operation_id: &str,
+    server_stderr: &Path,
+) -> serde_json::Value {
+    wait_for_operation_statuses(
+        address,
+        pki,
+        state,
+        capability,
+        operation_id,
+        &["succeeded", "failed"],
+        server_stderr,
+    )
+}
+
+fn wait_for_operation_statuses(
+    address: &str,
+    pki: &Path,
+    state: &Path,
+    capability: &Path,
+    operation_id: &str,
+    expected: &[&str],
+    server_stderr: &Path,
+) -> serde_json::Value {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let mut status = session_command("status", address, pki, state, capability);
@@ -944,12 +1137,12 @@ fn wait_for_operation_status(
         let operation_status = value["session"]["operations"][operation_id]["status"]
             .as_str()
             .unwrap_or("missing");
-        if operation_status == expected {
+        if expected.contains(&operation_status) {
             return value;
         }
         assert!(
             Instant::now() < deadline,
-            "operation `{operation_id}` did not reach `{expected}`; last status: {value}"
+            "operation `{operation_id}` did not reach one of {expected:?}; last status: {value}"
         );
         thread::sleep(Duration::from_millis(25));
     }
