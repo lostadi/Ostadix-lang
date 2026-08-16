@@ -293,12 +293,23 @@ if (( PROBE_MODE == 26 || PROBE_MODE == 31 )); then
 fi
 
 M6_SOURCE="$KERNEL_DIR/m6_stub.oc"
+M6_MODE25_DIAGNOSTICS_SOURCES=()
 BOUNDED_PERSONALITY_SOURCES=()
 if (( PROBE_MODE == 18 || PROBE_MODE == 24 )); then
   M6_SOURCE="$KERNEL_DIR/m6.oc"
 fi
 if (( PROBE_MODE == 25 || PROBE_MODE == 26 )); then
   M6_SOURCE="$KERNEL_DIR/m6_linux.oc"
+fi
+if (( PROBE_MODE == 25 )); then
+  M6_MODE25_DIAGNOSTICS_SOURCES=(
+    "$KERNEL_DIR/m6_mode25_diagnostics.oc"
+  )
+fi
+if (( PROBE_MODE == 26 )); then
+  M6_MODE25_DIAGNOSTICS_SOURCES=(
+    "$KERNEL_DIR/m6_mode25_diagnostics_stub.oc"
+  )
 fi
 if (( PROBE_MODE == 31 )); then
   M6_SOURCE="$KERNEL_DIR/m7b_logical_read.oc"
@@ -402,6 +413,7 @@ fi
   "$M5_SOURCE" \
   "$M5_SELFTEST_SOURCE" \
   "$M5_SEMANTICS_SOURCE" \
+  ${M6_MODE25_DIAGNOSTICS_SOURCES[@]+"${M6_MODE25_DIAGNOSTICS_SOURCES[@]}"} \
   "$M6_SOURCE" \
   "$M6B_SEMANTICS_SOURCE" \
   "$KERNEL_WORLD_SEMANTICS_SOURCE" \
