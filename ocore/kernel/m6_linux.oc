@@ -1,5 +1,9 @@
 module kernel::m6;
 
+use kernel::m6_mode25_diagnostics::arm_post_s2 as mode25_arm_post_s2;
+use kernel::m6_mode25_diagnostics::emit as mode25_emit;
+use kernel::m6_mode25_diagnostics::emit_post_s2_once as mode25_emit_post_s2_once;
+use kernel::m6_mode25_diagnostics::reset_post_s2 as mode25_reset_post_s2;
 use runtime::address_space::create_loaded_for_owner;
 use runtime::address_space::destroy as destroy_address_space;
 use runtime::address_space::is_live as address_space_is_live;
@@ -218,6 +222,7 @@ use runtime::delegated_resource::destroy_count as delegated_resource_destroy_cou
 use runtime::delegated_resource::DELEGATED_RESOURCE_DEVICE;
 use runtime::personality_supervision::arm_monitor;
 use runtime::personality_supervision::crash_count as supervision_crash_count;
+use runtime::personality_supervision::current_generation_monitor_was_armed;
 use runtime::personality_supervision::generation as supervision_generation;
 use runtime::personality_supervision::init as personality_supervision_init;
 use runtime::personality_supervision::install_replacement as install_supervision_replacement;
@@ -457,6 +462,51 @@ static LINUX_CLEANUP_MESSAGE: [u8; 35] =
     b"M6 Linux resources reclaimed: PASS\n";
 static LINUX_POST_TIMER_MESSAGE: [u8; 38] =
     b"M6 Linux post-lifecycle timer: online\n";
+// Numeric marker identities are compile-time only.  Probe 25 selects the full
+// marker module; Probe 26 selects its no-data, no-op stub.  Diagnostics never
+// replace the canonical live-personality evidence markers below.
+const MODE25_DIAG_S1: u8 = 1;
+const MODE25_DIAG_S2: u8 = 2;
+const MODE25_DIAG_S3: u8 = 3;
+const MODE25_DIAG_S4: u8 = 4;
+const MODE25_DIAG_S5: u8 = 5;
+const MODE25_DIAG_S6: u8 = 6;
+const MODE25_DIAG_S7: u8 = 7;
+const MODE25_DIAG_S8: u8 = 8;
+const MODE25_DIAG_S9: u8 = 9;
+const MODE25_DIAG_S10: u8 = 10;
+const MODE25_DIAG_S11: u8 = 11;
+const MODE25_DIAG_S12: u8 = 12;
+const MODE25_DIAG_S13: u8 = 13;
+const MODE25_DIAG_S14: u8 = 14;
+const MODE25_DIAG_R0: u8 = 15;
+const MODE25_DIAG_R0B: u8 = 16;
+const MODE25_DIAG_R0S: u8 = 17;
+const MODE25_DIAG_R1: u8 = 18;
+const MODE25_DIAG_R2: u8 = 19;
+const MODE25_DIAG_R3: u8 = 20;
+const MODE25_DIAG_C1: u8 = 21;
+const MODE25_DIAG_C2: u8 = 22;
+const MODE25_DIAG_C3: u8 = 23;
+const MODE25_DIAG_C4: u8 = 24;
+const MODE25_DIAG_C5: u8 = 25;
+const MODE25_DIAG_C6: u8 = 26;
+const MODE25_DIAG_C7: u8 = 27;
+const MODE25_DIAG_C8: u8 = 28;
+const MODE25_DIAG_C9: u8 = 29;
+const MODE25_DIAG_C10: u8 = 30;
+const MODE25_DIAG_D1: u8 = 31;
+const MODE25_DIAG_D2: u8 = 32;
+const MODE25_DIAG_D3: u8 = 33;
+const MODE25_DIAG_D4: u8 = 34;
+const MODE25_DIAG_D5: u8 = 35;
+const MODE25_DIAG_F1: u8 = 36;
+const MODE25_DIAG_F2: u8 = 37;
+const MODE25_DIAG_F3: u8 = 38;
+const MODE25_DIAG_F4: u8 = 39;
+const MODE25_DIAG_F5: u8 = 40;
+const MODE25_DIAG_F6: u8 = 41;
+const MODE25_DIAG_F7: u8 = 42;
 static M7_IMAGE_MESSAGE: [u8; 36] =
     b"M7 Linux/9P OVFS image import: PASS\n";
 static M7_LOAD_MESSAGE: [u8; 44] =
@@ -553,6 +603,11 @@ unsafe fn fail_closed() -> never {
     loop {
         halt();
     }
+}
+
+unsafe fn mode25_diagnostic_halt(code: u8) -> never {
+    mode25_emit(code);
+    fail_closed();
 }
 
 unsafe fn management_context() -> bool {
@@ -1066,8 +1121,9 @@ unsafe fn create_replacement_service() -> bool {
     if DEBUG_CAPS[SERVICE] == 0 || !create_generation_endpoints() {
         return false;
     }
+    let stale_supervision: u64 = SUPERVISION;
     let replacement: u64 = install_supervision_replacement(
-        SUPERVISION,
+        stale_supervision,
         PROCESSES[SUPERVISOR],
         STALE_SERVICE_PROCESS,
         PROCESSES[SERVICE]
@@ -1090,6 +1146,8 @@ unsafe fn create_replacement_service() -> bool {
     if SUPERVISION_CAP == 0
         || supervision_state(SUPERVISION)
             != SUPERVISION_STATE_REPLACEMENT_STARTING
+        || current_generation_monitor_was_armed(stale_supervision)
+        || current_generation_monitor_was_armed(SUPERVISION)
         || install_rpc_replacement(
             STALE_SERVICE_PROCESS,
             1,
@@ -1472,19 +1530,19 @@ pub unsafe fn kernel_m6_linux_syscall(
         (&mut wait)
     );
     if dispatch == RPC_CONSUMED {
-        fail_closed();
+        mode25_diagnostic_halt(MODE25_DIAG_D1);
     }
     if dispatch != RPC_DISPATCHED {
         return LINUX_NEG_EAGAIN;
     }
     if (wait & 0xff00_0000) != 0xb300_0000
         || commit_personality_wait(request, wait) != request {
-        fail_closed();
+        mode25_diagnostic_halt(MODE25_DIAG_D2);
     }
     let control: u64 = request_ipc_wait(wait, ERR_IPC_RETRY);
     if control != SYSCALL_CONTROL_SCHEDULE {
         if abort_bounded_wait(request, wait) != 1 {
-            fail_closed();
+            mode25_diagnostic_halt(MODE25_DIAG_D3);
         }
         return LINUX_NEG_EAGAIN;
     }
@@ -1521,13 +1579,13 @@ pub unsafe fn kernel_m6_linux_complete(
         if linux_stdout_length() != stdout_before + count as usize
             || linux_stderr_length() != stderr_before
             || !emit_linux_stream(fd, stdout_before, count as usize) {
-            fail_closed();
+            mode25_diagnostic_halt(MODE25_DIAG_D4);
         }
     } else {
         if linux_stderr_length() != stderr_before + count as usize
             || linux_stdout_length() != stdout_before
             || !emit_linux_stream(fd, stderr_before, count as usize) {
-            fail_closed();
+            mode25_diagnostic_halt(MODE25_DIAG_D4);
         }
     }
     if supervision_generation(SUPERVISION) == 1 {
@@ -1723,6 +1781,7 @@ pub unsafe fn kernel_m6_personality_supervise(
                 caller,
                 PROCESSES[SERVICE]
             ) != 1
+            || !current_generation_monitor_was_armed(SUPERVISION)
             || (generation == 1
                 && publish_personality_rpc(
                     PROCESSES[SERVICE],
@@ -1732,26 +1791,55 @@ pub unsafe fn kernel_m6_personality_supervise(
                     CLIENT_WAIT_ENDPOINT
                 ) != 1)
             || !install_call_capability(generation) {
+            if generation == 2 {
+                mode25_diagnostic_halt(MODE25_DIAG_D5);
+            }
             fail_closed();
         }
         return 1;
     }
     if action == SUPERVISE_MONITOR {
+        if subject == 0 {
+            if generation == 1 && SERVICE_FAULT_RECORDED == 1 {
+                mode25_emit_post_s2_once(MODE25_DIAG_R0);
+            }
+            if current_generation_monitor_was_armed(SUPERVISION) {
+                if generation == 1 && SERVICE_FAULT_RECORDED == 1 {
+                    mode25_emit_post_s2_once(MODE25_DIAG_R0S);
+                }
+                return 1;
+            }
+            if supervision_state(SUPERVISION) == SUPERVISION_STATE_STARTING
+                || supervision_state(SUPERVISION)
+                    == SUPERVISION_STATE_REPLACEMENT_STARTING {
+                if generation == 1 && SERVICE_FAULT_RECORDED == 1 {
+                    mode25_reset_post_s2();
+                    mode25_diagnostic_halt(MODE25_DIAG_R0B);
+                }
+                return ERR_PERSONALITY_BUSY;
+            }
+            if generation == 1 && SERVICE_FAULT_RECORDED == 1 {
+                mode25_reset_post_s2();
+                mode25_diagnostic_halt(MODE25_DIAG_R0B);
+            }
+            fail_closed();
+        }
         if linux_mode()
             && subject == MONITOR_SERVICE_CRASH {
+            if generation == 1 && SERVICE_FAULT_RECORDED == 1 {
+                mode25_emit_post_s2_once(MODE25_DIAG_R1);
+            }
             if generation == 1
                 && SERVICE_FAULT_RECORDED == 1
                 && supervision_state(SUPERVISION)
                     == SUPERVISION_STATE_CRASHED {
+                mode25_emit_post_s2_once(MODE25_DIAG_R2);
                 return 1;
             }
             return ERR_PERSONALITY_BUSY;
         }
         if supervision_state(SUPERVISION) != SUPERVISION_STATE_ACTIVE {
             return ERR_PERSONALITY_BUSY;
-        }
-        if subject == 0 {
-            return 1;
         }
         if subject == OP_HOLD_CANCEL
             || (ACTIVE_MODE == MODE_BOUNDED_PERSONALITY
@@ -1891,21 +1979,39 @@ pub unsafe fn kernel_m6_personality_supervise(
         if generation != 1 || subject != 2 {
             return ERR_PERSONALITY_STALE;
         }
-        return request_restart(
+        mode25_emit_post_s2_once(MODE25_DIAG_R3);
+        let restarted: u64 = request_restart(
             SUPERVISION,
             caller,
             PROCESSES[SERVICE]
         );
+        if restarted == 1 {
+            if !current_generation_monitor_was_armed(SUPERVISION) {
+                mode25_emit(MODE25_DIAG_C10);
+                mode25_reset_post_s2();
+                fail_closed();
+            }
+            mode25_emit(MODE25_DIAG_S3);
+        } else {
+            mode25_emit(MODE25_DIAG_C10);
+        }
+        mode25_reset_post_s2();
+        return restarted;
     }
     if action == SUPERVISE_STOP {
         if generation != 2 || subject != 0 {
             return ERR_PERSONALITY_STALE;
         }
-        return request_stop(
+        let stopped: u64 = request_stop(
             SUPERVISION,
             caller,
             PROCESSES[SERVICE]
         );
+        if stopped == 1
+            && !current_generation_monitor_was_armed(SUPERVISION) {
+            fail_closed();
+        }
+        return stopped;
     }
     return ERR_PERSONALITY_UNSUPPORTED;
 }
@@ -1913,6 +2019,7 @@ pub unsafe fn kernel_m6_personality_supervise(
 @export
 @no_mangle
 pub unsafe fn kernel_m6_service_fault(process: u64) -> u64 {
+    mode25_emit(MODE25_DIAG_S1);
     if ARMED == 0
         || SERVICE_FAULT_RECORDED != 0
         || process != PROCESSES[SERVICE]
@@ -1957,6 +2064,9 @@ pub unsafe fn kernel_m6_service_fault(process: u64) -> u64 {
         if record_crash(process) != 1 {
             return 0;
         }
+        if !current_generation_monitor_was_armed(SUPERVISION) {
+            return 0;
+        }
         if !personality_rpc_invariants_hold()
             || !bounded_rpc_invariants_hold()
             || !linux_invariants_hold()
@@ -1967,6 +2077,8 @@ pub unsafe fn kernel_m6_service_fault(process: u64) -> u64 {
         volatile_store((PHYSICALS[SERVICE] + 24) as *mut u64, 0);
         volatile_store((PHYSICALS[SUPERVISOR] + 24) as *mut u64, 0);
         SERVICE_FAULT_RECORDED = 1;
+        mode25_arm_post_s2();
+        mode25_emit(MODE25_DIAG_S2);
         return 1;
     }
     PRIOR_REQUEST = PENDING_CRASH_REQUEST;
@@ -1980,6 +2092,7 @@ pub unsafe fn kernel_m6_service_fault(process: u64) -> u64 {
         || failed_requests != 1
         || ipc_process_died(process) == 0
         || record_crash(process) != 1
+        || !current_generation_monitor_was_armed(SUPERVISION)
         || !personality_rpc_invariants_hold()
         || (ACTIVE_MODE == MODE_BOUNDED_PERSONALITY
             && !bounded_rpc_invariants_hold())
@@ -2387,6 +2500,8 @@ pub unsafe fn kernel_m6_final_ready() -> u64 {
 @export
 @no_mangle
 pub unsafe fn kernel_m6_crash_continue() -> never {
+    mode25_emit(MODE25_DIAG_S4);
+    mode25_reset_post_s2();
     if !management_context()
         || scheduler_failed()
         || !scheduler_complete()
@@ -2416,7 +2531,7 @@ pub unsafe fn kernel_m6_crash_continue() -> never {
                 || !linux_invariants_hold()
                 || linux_fd_active_count() != 0))
         || !supervision_invariants_hold() {
-        fail_closed();
+        mode25_diagnostic_halt(MODE25_DIAG_C1);
     }
     if ACTIVE_MODE == MODE_LINUX_PLAN9 {
         write((&M7_FAULT_MESSAGE[0]), 46);
@@ -2444,29 +2559,32 @@ pub unsafe fn kernel_m6_crash_continue() -> never {
         PHYSICALS[OBSERVER] as *const u64
     );
     if !revoke_call_capability() {
-        fail_closed();
+        mode25_diagnostic_halt(MODE25_DIAG_C2);
     }
+    mode25_emit(MODE25_DIAG_S5);
     if ACTIVE_MODE == MODE_LINUX_PLAN9
         && (PLAN9_CALL_CAP != 0
             || capability_handle_at(CSPACES[OBSERVER], 1) != 0) {
-        fail_closed();
+        mode25_diagnostic_halt(MODE25_DIAG_C3);
     }
     if !close_generation_endpoints() {
-        fail_closed();
+        mode25_diagnostic_halt(MODE25_DIAG_C4);
     }
+    mode25_emit(MODE25_DIAG_S6);
     if reap_thread(STALE_SERVICE_THREAD) == 0
         || thread_is_live(STALE_SERVICE_THREAD) {
-        fail_closed();
+        mode25_diagnostic_halt(MODE25_DIAG_C5);
     }
     if unbind_process(
             NAMESPACES[SERVICE],
             STALE_SERVICE_PROCESS
         ) == 0 {
-        fail_closed();
+        mode25_diagnostic_halt(MODE25_DIAG_C6);
     }
     if !reap_loaded_process(SERVICE) {
-        fail_closed();
+        mode25_diagnostic_halt(MODE25_DIAG_C7);
     }
+    mode25_emit(MODE25_DIAG_S7);
     if !create_replacement_service()
         || PROCESSES[SERVICE] == STALE_SERVICE_PROCESS
         || THREADS[SERVICE] == STALE_SERVICE_THREAD
@@ -2483,8 +2601,9 @@ pub unsafe fn kernel_m6_crash_continue() -> never {
                 || linux_fd_creation_count() != 4
                 || linux_fd_revocation_count() != 2
                 || !linux_invariants_hold())) {
-        fail_closed();
+        mode25_diagnostic_halt(MODE25_DIAG_C8);
     }
+    mode25_emit(MODE25_DIAG_S8);
 
     disable_interrupts();
     if arm_personality_restart(
@@ -2501,8 +2620,9 @@ pub unsafe fn kernel_m6_crash_continue() -> never {
         PROCESSES[OBSERVER],
         PHYSICALS[OBSERVER]
     ) == 0 {
-        fail_closed();
+        mode25_diagnostic_halt(MODE25_DIAG_C9);
     }
+    mode25_emit(MODE25_DIAG_S9);
     enable_interrupts();
     loop {
         halt();
@@ -2512,6 +2632,7 @@ pub unsafe fn kernel_m6_crash_continue() -> never {
 @export
 @no_mangle
 pub unsafe fn kernel_m6_complete_continue() -> never {
+    mode25_emit(MODE25_DIAG_S10);
     if !management_context()
         || scheduler_failed()
         || !scheduler_complete()
@@ -2530,7 +2651,7 @@ pub unsafe fn kernel_m6_complete_continue() -> never {
                 || linux_fd_active_count() != 0
                 || LINUX_EXIT_RECORDED != 42))
         || !supervision_invariants_hold() {
-        fail_closed();
+        mode25_diagnostic_halt(MODE25_DIAG_F1);
     }
     if ACTIVE_MODE == MODE_LINUX_PLAN9 {
         write((&M7_TERMINAL_MESSAGE[0]), 37);
@@ -2558,10 +2679,11 @@ pub unsafe fn kernel_m6_complete_continue() -> never {
         || endpoint_is_live(CLIENT_WAIT_ENDPOINT)
         || endpoint_is_draining(CLIENT_WAIT_ENDPOINT)
         {
-        fail_closed();
+        mode25_diagnostic_halt(MODE25_DIAG_F2);
     }
     SUPERVISION_CAP = 0;
     CLIENT_WAIT_ENDPOINT = 0;
+    mode25_emit(MODE25_DIAG_S11);
 
     let mut namespace_index: usize = 0;
     while namespace_index < PROCESS_COUNT {
@@ -2572,29 +2694,31 @@ pub unsafe fn kernel_m6_complete_continue() -> never {
                 NAMESPACES[namespace_index]
             ) == 0
             || namespace_process_refs(NAMESPACES[namespace_index]) != 0 {
-            fail_closed();
+            mode25_diagnostic_halt(MODE25_DIAG_F3);
         }
         ROOT_MOUNTS[namespace_index] = 0;
         namespace_index += 1;
     }
+    mode25_emit(MODE25_DIAG_S12);
 
     let mut index: usize = 0;
     while index < PROCESS_COUNT {
         if reap_thread(THREADS[index]) == 0
             || thread_is_live(THREADS[index])
             || !reap_loaded_process(index) {
-            fail_closed();
+            mode25_diagnostic_halt(MODE25_DIAG_F4);
         }
         index += 1;
     }
     if destroy_image(IMAGE) == 0 || image_id_for(IMAGE) != 0 {
-        fail_closed();
+        mode25_diagnostic_halt(MODE25_DIAG_F5);
     }
+    mode25_emit(MODE25_DIAG_S13);
     namespace_index = 0;
     while namespace_index < PROCESS_COUNT {
         if finish_namespace_teardown(NAMESPACES[namespace_index]) == 0
             || namespace_is_live(NAMESPACES[namespace_index]) {
-            fail_closed();
+            mode25_diagnostic_halt(MODE25_DIAG_F6);
         }
         namespace_index += 1;
     }
@@ -2617,7 +2741,7 @@ pub unsafe fn kernel_m6_complete_continue() -> never {
         || !namespace_invariants_hold()
         || !image_invariants_hold()
         || !elf_invariants_hold() {
-        fail_closed();
+        mode25_diagnostic_halt(MODE25_DIAG_F7);
     }
     if ACTIVE_MODE == MODE_LINUX_PLAN9 {
         write((&M7_CLEANUP_MESSAGE[0]), 38);
@@ -2634,6 +2758,7 @@ pub unsafe fn kernel_m6_complete_continue() -> never {
     }
 
     let tick_before: u64 = ticks();
+    mode25_emit(MODE25_DIAG_S14);
     enable_interrupts();
     while ticks() == tick_before {
         halt();
@@ -2675,6 +2800,7 @@ pub unsafe fn start(mode: u64, native_domain: u64) -> never {
         fail_closed();
     }
     ACTIVE_MODE = mode;
+    mode25_reset_post_s2();
     PENDING_CANCEL_REQUEST = 0;
     PENDING_LIFECYCLE_OPERATION = 0;
     PENDING_CRASH_REQUEST = 0;
@@ -2915,6 +3041,7 @@ pub unsafe fn start(mode: u64, native_domain: u64) -> never {
     if SUPERVISION == 0
         || SUPERVISION_CAP == 0
         || supervision_state(SUPERVISION) != SUPERVISION_STATE_STARTING
+        || current_generation_monitor_was_armed(SUPERVISION)
         || publish_count() != 1
         || personality_rpc_init() != 1 {
         fail_closed();
