@@ -31,6 +31,7 @@ authors:
     given-names: Lee Daghlar
     orcid: "https://orcid.org/0009-0001-6380-9558"
 version: "0.2.0"
+date-released: 2026-08-16
 license: LGPL-2.1-only
 repository-code: "https://github.com/lostadi/Ostadix-lang"
 url: "https://github.com/lostadi/Ostadix-lang"
@@ -56,8 +57,6 @@ preferred-citation:
   month: 7
   publisher:
     name: Zenodo
-# date-released: intentionally omitted until an actual public release is
-# published. Set it to the real release date when tagging.
 # doi: "10.5281/zenodo.XXXXXXX"
 # ^ This slot is reserved for a DIFFERENT, future DOI — the one Zenodo mints
 #   automatically once the GitHub release-integration archives an actual
@@ -65,6 +64,6 @@ preferred-citation:
 #   above, which points at the existing Zenodo preprint/package record
 #   (10.5281/zenodo.21544345), not an archive of a tagged Ostadix-lang source
 #   release. Once the tagged-release DOI exists, uncomment this and set it to
-#   that one — GitHub's "Cite this repository" button will then surface both:
-#   the preprint via preferred-citation, and the exact tagged source snapshot
-#   via the top-level doi.
+#   that one. Because `preferred-citation` selects the preprint for generated
+#   GitHub citation text, document both scholarly objects explicitly in the
+#   README rather than claiming that one generated citation exposes both.
