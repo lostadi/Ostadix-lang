@@ -8,6 +8,7 @@ pub mod bundle;
 mod crypto;
 mod error;
 mod model;
+mod placement_compat;
 mod store;
 mod verify;
 

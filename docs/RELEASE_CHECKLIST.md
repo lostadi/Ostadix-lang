@@ -63,7 +63,12 @@ make -C c_cpp warnings-as-errors
 cmake -S c_cpp -B /tmp/olang-cmake-build -DCMAKE_BUILD_TYPE=Release && cmake --build /tmp/olang-cmake-build --parallel && ctest --test-dir /tmp/olang-cmake-build --output-on-failure
 bash scripts/check_release_claims.sh
 python3 -m unittest -v tests.test_source_release
+python3 scripts/local_ci_posture.py --profile baseline --format text
 ```
+
+The posture command is a standard-library-only, read-only contract check. See
+[`CI_POSTURE.md`](CI_POSTURE.md) for its machine-readable form, optional local
+analyzers, remote read-only inspection, and exit-code contract.
 
 `smoke-world-project-runtime-qemu.sh` is the required no-argument Mode 32 gate.
 It runs the focused hosted World-project test to produce a fresh caller-signed

@@ -15,9 +15,10 @@ use clap::{Args, Parser, Subcommand};
 
 use o_lang::hosted_remote::v2::{
     default_hosted_v2_state_dir, read_node_signing_key_v2, read_placement_public_key_v2,
-    serve_node_dual, write_new_node_public_key_v2, write_new_node_signing_key_v2,
-    DurableSessionStoreV2, HostedDualNodeServerConfig, HostedNodeSignerV2, HostedV2Runtime,
-    HostedV2RuntimeConfig, PinnedEd25519PlacementAuthorizerV2, DEFAULT_MAX_ACTORS_PER_SESSION_V2,
+    serve_owned_node_dual_until_shutdown, write_new_node_public_key_v2,
+    write_new_node_signing_key_v2, DurableSessionStoreV2, HostedDualNodeShutdown,
+    HostedNodeSignerV2, HostedOwnedDualNodeServerConfig, HostedV2RuntimeConfig,
+    HostedV2RuntimeOwner, PinnedEd25519PlacementAuthorizerV2, DEFAULT_MAX_ACTORS_PER_SESSION_V2,
     DEFAULT_MAX_OPEN_SESSIONS_V2, DEFAULT_MAX_SNAPSHOT_BYTES_PER_ACTOR_V2,
     DEFAULT_MAX_STATE_BYTES_PER_SESSION_V2, DEFAULT_MAX_STATE_BYTES_TOTAL_V2,
 };
@@ -509,6 +510,12 @@ fn serve(args: ServeArgs) -> Result<()> {
     let (shim_dir, _shim_guard) = resolve_shim_dir(args.runtime.shim_dir.clone())?;
     let v1_runtime = runtime_from_args(args.runtime, shim_dir)?;
     if let Some(state_dir) = args.v2_state_dir {
+        let shutdown = HostedDualNodeShutdown::new();
+        // Register termination handling before opening the durable root. A
+        // signal delivered during startup therefore cannot strand a newly
+        // acquired state lock behind the old implicit-Drop lifecycle.
+        #[cfg(unix)]
+        let _termination_signals = NodeTerminationSignalGuard::install(shutdown.clone())?;
         let node_key_path = args
             .v2_node_signing_key
             .unwrap_or_else(|| state_dir.join("node-signing-key.v2"));
@@ -527,7 +534,7 @@ fn serve(args: ServeArgs) -> Result<()> {
             args.v2_max_state_bytes_total,
         )?;
         let store = DurableSessionStoreV2::open(&state_dir, signer)?;
-        let v2_runtime = HostedV2Runtime::open(
+        let v2_runtime = HostedV2RuntimeOwner::open(
             HostedV2RuntimeConfig {
                 node_id: v1_runtime.node_id.clone(),
                 node_generation: node_state_epoch,
@@ -551,7 +558,7 @@ fn serve(args: ServeArgs) -> Result<()> {
             node_state_epoch.get(),
             state_dir.display()
         );
-        let unreadable_sessions = v2_runtime.unreadable_sessions()?;
+        let unreadable_sessions = v2_runtime.handle().unreadable_sessions()?;
         if !unreadable_sessions.is_empty() {
             eprintln!(
                 "o-node: retained {} unreadable durable V2 session(s); no session was evicted. A node-state epoch change requires a new state root or an archived old root",
@@ -565,12 +572,15 @@ fn serve(args: ServeArgs) -> Result<()> {
             "o-node: serving {} on {} (TLS 1.3 mTLS; frozen V1 + durable V2; max {} connections)",
             v1_runtime.node_id, args.bind, v1_runtime.max_concurrent_connections
         );
-        return serve_node_dual(HostedDualNodeServerConfig {
-            bind_address: args.bind,
-            v1_runtime,
-            v2_runtime,
-            tls_identity: tls_identity(args.tls),
-        });
+        return serve_owned_node_dual_until_shutdown(
+            HostedOwnedDualNodeServerConfig {
+                bind_address: args.bind,
+                v1_runtime,
+                v2_runtime,
+                tls_identity: tls_identity(args.tls),
+            },
+            shutdown,
+        );
     }
     if args.v2_node_signing_key.is_some() || args.v2_authority_public_key.is_some() {
         bail!("--v2-state-dir is required when any V2 key option is supplied");
@@ -585,6 +595,99 @@ fn serve(args: ServeArgs) -> Result<()> {
         config.runtime.node_id, config.bind_address, config.runtime.max_concurrent_connections
     );
     serve_node(config)
+}
+
+#[cfg(unix)]
+struct NodeTerminationSignalGuard {
+    handle: signal_hook::iterator::Handle,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+#[cfg(unix)]
+impl NodeTerminationSignalGuard {
+    fn install(shutdown: HostedDualNodeShutdown) -> Result<Self> {
+        use signal_hook::consts::{SIGINT, SIGTERM};
+        use signal_hook::iterator::Signals;
+
+        let mut signals = Signals::new([SIGINT, SIGTERM])
+            .context("failed to register SIGINT/SIGTERM handling for durable V2 shutdown")?;
+        let handle = signals.handle();
+        let worker = thread::Builder::new()
+            .name("ostadix-node-signals".to_owned())
+            .spawn(move || {
+                let mut received_first = false;
+                for signal in &mut signals {
+                    match observe_node_termination_signal(
+                        &shutdown,
+                        &mut received_first,
+                        signal,
+                    ) {
+                        NodeTerminationSignalAction::Drain => {
+                            eprintln!(
+                                "o-node: received signal {signal}; stopping admission and draining accepted work (send another termination signal to force exit)"
+                            );
+                        }
+                        NodeTerminationSignalAction::Force(signal) => {
+                            eprintln!(
+                                "o-node: received a second termination signal {signal}; forcing process termination"
+                            );
+                            if let Err(error) =
+                                signal_hook::low_level::emulate_default_handler(signal)
+                            {
+                                eprintln!(
+                                    "o-node: failed to restore the default signal handler: {error}; aborting"
+                                );
+                            }
+                            std::process::abort();
+                        }
+                    }
+                }
+            })
+            .context("failed to spawn o-node termination-signal worker")?;
+        Ok(Self {
+            handle,
+            worker: Some(worker),
+        })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for NodeTerminationSignalGuard {
+    fn drop(&mut self) {
+        self.handle.close();
+        if let Some(worker) = self.worker.take() {
+            if let Err(payload) = worker.join() {
+                let detail = payload
+                    .downcast_ref::<&str>()
+                    .map(|message| (*message).to_owned())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "non-string panic payload".to_owned());
+                eprintln!("o-node: termination-signal worker panicked: {detail}");
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NodeTerminationSignalAction {
+    Drain,
+    Force(i32),
+}
+
+#[cfg(unix)]
+fn observe_node_termination_signal(
+    shutdown: &HostedDualNodeShutdown,
+    received_first: &mut bool,
+    signal: i32,
+) -> NodeTerminationSignalAction {
+    if *received_first {
+        NodeTerminationSignalAction::Force(signal)
+    } else {
+        *received_first = true;
+        shutdown.request();
+        NodeTerminationSignalAction::Drain
+    }
 }
 
 fn runtime_from_args(args: RuntimeArgs, shim_dir: PathBuf) -> Result<HostedNodeRuntime> {
@@ -859,6 +962,22 @@ mod tests {
         assert!(certificate_san("bad\n[evil]").is_err());
         assert!(certificate_san("*.example.test").is_err());
         assert!(certificate_san("-bad.example").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn first_termination_signal_drains_and_second_forces() {
+        let shutdown = HostedDualNodeShutdown::new();
+        let mut received_first = false;
+        assert_eq!(
+            observe_node_termination_signal(&shutdown, &mut received_first, libc::SIGTERM),
+            NodeTerminationSignalAction::Drain
+        );
+        assert!(shutdown.is_requested());
+        assert_eq!(
+            observe_node_termination_signal(&shutdown, &mut received_first, libc::SIGINT),
+            NodeTerminationSignalAction::Force(libc::SIGINT)
+        );
     }
 
     #[test]

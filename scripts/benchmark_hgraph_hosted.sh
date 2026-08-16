@@ -273,12 +273,13 @@ PY
 
 analyze_fixture() {
     local shape=$1 program=$2 shape_dir=$3
-    local explanation=$shape_dir/explain-schedule.txt
+    local explanation=$shape_dir/explain-schedule.json
     local fields=$shape_dir/prediction-fields.txt
 
     if ! "$olangc_bin" "$program" \
         --target ir \
         --explain-schedule \
+        --format json \
         --workers "$workers" \
         --shim-dir "$backends_dir" >"$explanation"
     then
@@ -287,135 +288,239 @@ analyze_fixture() {
     fi
 
     if ! python3 - "$explanation" >"$fields" <<'PY'
-import re
+import json
 from pathlib import Path
 import sys
 
 path = Path(sys.argv[1])
-lines = path.read_text(encoding="utf-8").splitlines()
-admission_schema = "oexec.admission/v5"
-admission_header = f"; ExecutionAdmission {admission_schema}"
-admission_headers = [
-    line for line in lines if line.startswith("; ExecutionAdmission ")
-]
-if admission_headers != [admission_header]:
-    raise SystemExit(f"expected exactly one {admission_header!r} marker")
+try:
+    document = json.loads(path.read_text(encoding="utf-8"))
+except (OSError, UnicodeError, json.JSONDecodeError) as error:
+    raise SystemExit(f"invalid schedule-explanation JSON: {error}")
 
-digest_pattern = r"[0-9a-f]{64}"
-binding_pattern = re.compile(
-    rf"binding analyzer-sha256=({digest_pattern}) "
-    rf"evidence-sha256=({digest_pattern}) "
-    rf"admitted-graph-sha256=({digest_pattern}) "
-    rf"admission-sha256=({digest_pattern})"
-)
-admission_binding_lines = [
-    line for line in lines if line.startswith("binding analyzer-sha256=")
-]
-if len(admission_binding_lines) != 1:
-    raise SystemExit("expected exactly one canonical admission digest binding")
-admission_binding = binding_pattern.fullmatch(admission_binding_lines[0])
-if admission_binding is None:
-    raise SystemExit("malformed canonical admission digest binding")
-admission_sha256 = admission_binding.group(4)
 
-schema = "oexec.schedule-prediction/v1"
-header = f"; SchedulePrediction {schema}"
-prediction_headers = [
-    line for line in lines if line.startswith("; SchedulePrediction ")
-]
-if prediction_headers != [header]:
-    raise SystemExit(f"expected exactly one {header!r} marker")
+def exact_object(value, fields, label):
+    if not isinstance(value, dict):
+        raise SystemExit(f"{label} must be a JSON object")
+    actual = set(value)
+    if actual != fields:
+        raise SystemExit(
+            f"{label} fields differ from the v1 contract: "
+            f"missing={sorted(fields - actual)}, unexpected={sorted(actual - fields)}"
+        )
+    return value
 
-summaries = [line for line in lines if line.startswith("schedule-prediction ")]
-if len(summaries) != 1:
-    raise SystemExit("expected exactly one schedule-prediction record")
 
-fields = {}
-for item in summaries[0].split()[1:]:
-    if "=" not in item:
-        raise SystemExit(f"malformed schedule-prediction field: {item!r}")
-    key, value = item.split("=", 1)
-    if key in fields:
-        raise SystemExit(f"duplicate schedule-prediction field: {key}")
-    fields[key] = value
+def lowercase_sha256(value, label):
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise SystemExit(f"{label} is not lowercase SHA-256")
+    return value
 
-required = {
-    "schema",
-    "status",
-    "provenance",
-    "model",
-    "admission-sha256",
-    "task-count",
-    "predicted-width",
-    "predicted-span",
-    "span-unit",
-}
-if set(fields) != required:
-    raise SystemExit(
-        "schedule-prediction fields differ from the v1 contract: "
-        f"missing={sorted(required - set(fields))}, "
-        f"unexpected={sorted(set(fields) - required)}"
+
+def positive_integer(value, label):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise SystemExit(f"{label} must be a positive integer")
+    return value
+
+
+def nonnegative_integer(value, label):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise SystemExit(f"{label} must be a non-negative integer")
+    return value
+
+
+def canonical_plan_node(value):
+    return (
+        isinstance(value, str)
+        and value.startswith("P")
+        and value[1:].isdigit()
+        and (value[1:] == "0" or not value[1:].startswith("0"))
     )
-if fields["schema"] != schema:
-    raise SystemExit(f"unsupported schedule-prediction schema: {fields['schema']}")
-if fields["status"] != "admitted-static":
-    raise SystemExit(f"unexpected prediction status: {fields['status']}")
-if fields["provenance"] != "evidence-bound-admission":
-    raise SystemExit(f"unexpected prediction provenance: {fields['provenance']}")
-if fields["model"] != "unit-cost-shim-hosted-tasks":
-    raise SystemExit(f"unexpected prediction model: {fields['model']}")
-if fields["span-unit"] != "hosted-task-layers":
-    raise SystemExit(f"unexpected prediction span unit: {fields['span-unit']}")
-if re.fullmatch(r"[0-9a-f]{64}", fields["admission-sha256"]) is None:
-    raise SystemExit("prediction admission digest is not lowercase SHA-256")
-if fields["admission-sha256"] != admission_sha256:
+
+
+root = exact_object(
+    document,
+    {"schema", "admission", "realizability", "prediction"},
+    "schedule-explanation",
+)
+if root["schema"] != "oexec.schedule-explanation/v1":
+    raise SystemExit(f"unsupported schedule-explanation schema: {root['schema']}")
+
+admission = exact_object(
+    root["admission"],
+    {"schema", "analyzer", "runtime_snapshot_kind", "base_policy", "bindings"},
+    "schedule-explanation admission",
+)
+if admission["schema"] != "oexec.admission/v5":
+    raise SystemExit(f"unsupported admission schema: {admission['schema']}")
+if not isinstance(admission["analyzer"], str) or not admission["analyzer"]:
+    raise SystemExit("admission analyzer must be a non-empty string")
+if admission["runtime_snapshot_kind"] != "inspection":
+    raise SystemExit("schedule explanation is not bound to an inspection snapshot")
+if admission["base_policy"] != "eager":
+    raise SystemExit(f"unexpected admission policy: {admission['base_policy']}")
+
+binding_fields = {
+    "lowered_oir_sha256",
+    "plan_sha256",
+    "analyzed_graph_sha256",
+    "backend_catalog_projection_sha256",
+    "backend_set_sha256",
+    "direct_executable_manifest_sha256",
+    "launch_context_sha256",
+    "environment_sha256",
+    "ambient_world_sha256",
+    "analyzer_sha256",
+    "evidence_sha256",
+    "admitted_graph_sha256",
+    "placement_admission_sha256",
+    "admission_sha256",
+}
+bindings = exact_object(
+    admission["bindings"], binding_fields, "schedule-explanation bindings"
+)
+for field in binding_fields:
+    lowercase_sha256(bindings[field], f"admission binding {field}")
+
+realizability = exact_object(
+    root["realizability"],
+    {
+        "schema",
+        "status",
+        "execution_realizable",
+        "dispatch",
+        "scope",
+        "worker_count_covers_static_wave",
+        "runtime_readiness",
+        "placement_lease",
+        "observed_overlap",
+        "source",
+        "available_parallelism",
+        "admitted_static_max_wave_width",
+        "admitted_max_local_worker_wave_width",
+        "selected_workers",
+    },
+    "schedule realizability",
+)
+expected_realizability = {
+    "schema": "oexec.realizability/v1",
+    "status": "inspection-only",
+    "execution_realizable": "unknown",
+    "dispatch": "not-run",
+    "scope": "local-worker-static-wave",
+    "runtime_readiness": "unknown",
+    "placement_lease": "none",
+    "observed_overlap": "not-run",
+    "source": "cli-override",
+}
+for field, expected in expected_realizability.items():
+    if realizability[field] != expected:
+        raise SystemExit(f"unexpected realizability {field}: {realizability[field]}")
+available_parallelism = positive_integer(
+    realizability["available_parallelism"], "available_parallelism"
+)
+admitted_static_width = nonnegative_integer(
+    realizability["admitted_static_max_wave_width"],
+    "admitted_static_max_wave_width",
+)
+local_worker_width = nonnegative_integer(
+    realizability["admitted_max_local_worker_wave_width"],
+    "admitted_max_local_worker_wave_width",
+)
+selected_workers = positive_integer(realizability["selected_workers"], "selected_workers")
+expected_coverage = (
+    "not-applicable"
+    if local_worker_width == 0
+    else "yes"
+    if selected_workers >= local_worker_width
+    else "no"
+)
+if realizability["worker_count_covers_static_wave"] != expected_coverage:
+    raise SystemExit("worker-count coverage disagrees with the admitted static wave")
+if admitted_static_width < local_worker_width:
+    raise SystemExit("local-worker width exceeds the admitted static width")
+
+prediction = exact_object(
+    root["prediction"],
+    {
+        "schema",
+        "status",
+        "provenance",
+        "model",
+        "admission_sha256",
+        "task_count",
+        "predicted_width",
+        "predicted_span",
+        "span_unit",
+        "layers",
+    },
+    "schedule prediction",
+)
+expected_prediction = {
+    "schema": "oexec.schedule-prediction/v1",
+    "status": "admitted-static",
+    "provenance": "evidence-bound-admission",
+    "model": "unit-cost-shim-hosted-tasks",
+    "span_unit": "hosted-task-layers",
+}
+for field, expected in expected_prediction.items():
+    if prediction[field] != expected:
+        raise SystemExit(f"unexpected prediction {field}: {prediction[field]}")
+admission_sha256 = lowercase_sha256(
+    prediction["admission_sha256"], "prediction admission digest"
+)
+if admission_sha256 != bindings["admission_sha256"]:
     raise SystemExit("prediction digest does not match the enclosing admission")
 
-numeric = {}
-for key in ("task-count", "predicted-width", "predicted-span"):
-    if re.fullmatch(r"[1-9][0-9]*", fields[key]) is None:
-        raise SystemExit(f"{key} must be a positive integer")
-    numeric[key] = int(fields[key])
-
-layer_pattern = re.compile(
-    r"schedule-prediction-layer index=([1-9][0-9]*) operations=\[(P[0-9]+(?:,P[0-9]+)*)\]"
-)
-layers = []
+task_count = positive_integer(prediction["task_count"], "task_count")
+predicted_width = positive_integer(prediction["predicted_width"], "predicted_width")
+predicted_span = positive_integer(prediction["predicted_span"], "predicted_span")
+layers = prediction["layers"]
+if not isinstance(layers, list):
+    raise SystemExit("prediction layers must be a JSON array")
 seen_operations = set()
-for line in lines:
-    if not line.startswith("schedule-prediction-layer "):
-        continue
-    match = layer_pattern.fullmatch(line)
-    if match is None:
-        raise SystemExit(f"malformed schedule-prediction layer: {line!r}")
-    index = int(match.group(1))
-    if index != len(layers) + 1:
+layer_widths = []
+for expected_index, layer_value in enumerate(layers, 1):
+    layer = exact_object(
+        layer_value, {"index", "operations"}, f"prediction layer {expected_index}"
+    )
+    if layer["index"] != expected_index:
         raise SystemExit("schedule-prediction layer indices are not contiguous")
-    operations = match.group(2).split(",")
+    operations = layer["operations"]
+    if not isinstance(operations, list) or not operations:
+        raise SystemExit("prediction layer operations must be a non-empty JSON array")
+    if any(not canonical_plan_node(operation) for operation in operations):
+        raise SystemExit(f"prediction layer contains a non-canonical operation: {operations}")
+    if len(set(operations)) != len(operations):
+        raise SystemExit("prediction layer contains a duplicate operation")
     duplicate = seen_operations.intersection(operations)
     if duplicate:
         raise SystemExit(f"hosted operation appears in multiple layers: {sorted(duplicate)}")
     seen_operations.update(operations)
-    layers.append(operations)
+    layer_widths.append(len(operations))
 
-if len(layers) != numeric["predicted-span"]:
+if len(layers) != predicted_span:
     raise SystemExit("predicted span does not match the emitted layer count")
-if sum(map(len, layers)) != numeric["task-count"]:
+if sum(layer_widths) != task_count:
     raise SystemExit("predicted task count does not match the emitted layers")
-if max(map(len, layers)) != numeric["predicted-width"]:
+if max(layer_widths) != predicted_width:
     raise SystemExit("predicted width does not match the emitted layers")
 
 print(
     "\t".join(
         [
-            fields["schema"],
-            fields["provenance"],
-            fields["model"],
-            fields["admission-sha256"],
-            fields["task-count"],
-            fields["predicted-width"],
-            fields["predicted-span"],
-            fields["span-unit"],
+            prediction["schema"],
+            prediction["provenance"],
+            prediction["model"],
+            admission_sha256,
+            str(task_count),
+            str(predicted_width),
+            str(predicted_span),
+            prediction["span_unit"],
         ]
     )
 )
@@ -703,7 +808,7 @@ for shape in "${shapes[@]}"; do
     printf 'fixture=%s\n' "$fixture"
     printf 'required_runtimes=%s\n' "$required"
     printf 'missing_runtimes=%s\n' "$missing"
-    printf 'prediction_source=olangc--explain-schedule\n'
+    printf 'prediction_source=olangc--explain-schedule-json\n'
     printf 'prediction_schema=%s\n' "$prediction_schema"
     printf 'prediction_provenance=%s\n' "$prediction_provenance"
     printf 'prediction_model=%s\n' "$prediction_model"

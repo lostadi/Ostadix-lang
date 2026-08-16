@@ -51,6 +51,7 @@ system.
 **Start here:** [Quickstart](#quickstart) ·
 [Full setup](#getting-started-full-setup-guide) · [Docker](#docker) ·
 [Architecture](#architecture) · [Semantic custody](docs/SEMANTIC_CUSTODY.md) ·
+[Information Kernel V1](docs/INFORMATION_KERNEL_V1.md) ·
 [Versioning](docs/VERSIONING.md) · [Testing](#running-the-tests) ·
 [Evidence claims](docs/CLAIMS.md) ·
 [Hosted Placement V6](docs/HOSTED_PLACEMENT_V6.md)
@@ -115,6 +116,23 @@ Choose the next path according to what you want to inspect:
 | Run durable signed sessions | [Hosted V2 development quickstart](#hosted-v2-development-quickstart) |
 | Compile freestanding native code | [O-core native systems language](#o-core-native-systems-language) |
 | Run the repository gates | [Running the tests](#running-the-tests) |
+
+### Maturity at a glance
+
+| Surface | Current status |
+|---|---|
+| Typed-parenthesis hosted language and OValue crossing | Supported core |
+| OIR, ExecutionPlan, HGraph, V5 evidence/admission, local executor | Supported core under hardening |
+| Information Kernel V1 and backend-morphism V1 | Experimental local shadow surfaces; non-authorizing |
+| Hosted V2 durable sessions and direct-node placement | Experimental integration with dedicated lifecycle and recovery tests |
+| Project lifting, route execution, and live supervision | Experimental integration |
+| O-core compiler and OKernel gates | Bounded research implementation; see exact QEMU nonclaims |
+| O-Machine and elastic governed World | Research direction with bounded offline records and milestone proofs |
+
+“Experimental” here does not mean simulated: these surfaces have executable
+implementations and tests. It means their compatibility, operational, or
+distributed guarantees are narrower than the supported hosted core. See
+[claims and nonclaims](docs/CLAIMS.md) for the exact evidence boundary.
 
 ## Hosted Placement V6
 
@@ -401,17 +419,35 @@ result encoding, checkpointing, journal fsync, and terminal response publication
 may finish later. They do not cancel or roll back effects already performed by
 a backend.
 
-For direct Rust embedders, `HostedV2Runtime::shutdown()` is the deterministic
-runtime lifecycle barrier. It stops admission, waits for in-flight API calls,
-queues actor close behind already accepted mailbox work, joins every actor
-thread owned by the runtime, and releases durable-store/root-lock ownership
-before returning. Operation terminality or a session-level Close alone does
-not prove runtime quiescence. Concurrent and repeated shutdown calls observe
-the same result; later direct calls receive `HostedV2RuntimeClosedV2`, while
-wire requests receive non-retryable `runtime-closed`. A worker panic produces
-`HostedV2RuntimeShutdownErrorV2` only after the root lock is released, allowing
-an immediate same-directory reopen. `Drop` remains bounded best-effort cleanup,
-not the deterministic shutdown contract.
+For direct Rust embedders, the preferred lifecycle API is a non-cloneable
+`HostedV2RuntimeOwner` plus cloneable `HostedV2RuntimeHandle` values. The owner
+alone carries deterministic shutdown authority and durable-store/worker
+lifetime; handles can submit and query but cannot shut the runtime down.
+`HostedV2RuntimeOwner::shutdown()` stops admission, waits for in-flight API
+calls, queues actor close behind already accepted mailbox work, joins every
+actor thread, and releases durable-store/root-lock ownership before returning.
+Dropping the owner runs that same barrier, while an explicit call is required
+to observe a worker failure. Operation terminality or a session-level Close
+alone does not prove runtime quiescence. Concurrent and repeated shutdown calls
+observe the same result; surviving handles receive `HostedV2RuntimeClosedV2`,
+while wire requests receive non-retryable `runtime-closed`. A worker panic
+produces `HostedV2RuntimeShutdownErrorV2` only after the root lock is released,
+allowing an immediate same-directory reopen even while old handles remain.
+
+The cloneable `HostedV2Runtime` remains source-compatible through the 0.2 line
+for existing embedders and `serve_node_dual` callers. It combines request and
+shutdown authority and its final `Drop` remains bounded best-effort cleanup.
+New code should use the owner/handle API and `serve_owned_node_dual`; this is a
+documentation-level compatibility transition, not a Rust `#[deprecated]`
+warning that would break downstream warnings-as-errors builds.
+
+On Unix, `o-node serve` installs SIGINT/SIGTERM handling before it opens an
+enabled V2 state root. The first termination signal stops TCP admission, runs
+the same deterministic V2 shutdown barrier, and joins every already-accepted
+V1/V2 connection before returning. A second termination signal restores the
+signal's default action and forces process termination; work interrupted by
+that escape hatch is classified by the existing restart rules. Graceful node
+shutdown does not close a durable session, delete its payloads, or perform GC.
 
 The current state tiers are deliberately narrow: `Stateless` requires a fresh
 fragment and a catalogued stateless backend; `CheckpointRestore` requires a
@@ -452,6 +488,32 @@ an arbitrary explicit image receives a format preflight and proves protocol
 compatibility only when an admitted hosted block launches. Registry `profile-local`
 records default to 45 seconds and accept `--valid-for-seconds` from 1 through
 the placement-core maximum of 60.
+
+For a laptop-only information workflow, the installed `o info` route (backed
+by `o-info`) creates a deterministic local
+head, keeps the Ed25519 private key separate from its public-only trust file,
+records one declared public scalar, and emits a canonical signed offline pack:
+
+```bash
+o info init --state .ostadix-information
+o info keygen --key .ostadix-keys/info-private.json \
+    --trust .ostadix-keys/info-trust.json
+o info record --state .ostadix-information \
+    --key .ostadix-keys/info-private.json --pack result.info.cbor \
+    --namespace local --kind research-result --coordinate name=demo \
+    --predicate ostadix.local/public-scalar-v1 --scalar text --value "ready" \
+    --acknowledge-public
+o info verify --pack result.info.cbor --trust .ostadix-keys/info-trust.json
+o info head --state .ostadix-information
+```
+
+No daemon, cloud service, cluster, VM, or laboratory hardware is involved.
+`o info import` advances a local head only when the signed pack has the exact
+current base and every bounded object proves its canonical type and expected
+base-plus-addition revision. Otherwise it retains the verified pack under
+`historical-packs/`, reports `historical-only`, and leaves the head unchanged.
+Neither a signature nor head membership grants execution authority. See
+[Information Kernel V1](docs/INFORMATION_KERNEL_V1.md) for the exact boundary.
 
 This hosted profile is not a World, Governor, G1/G10, physical-machine,
 exactly-once, global-effect-isolation, project-migration, cancellation, or mid-
@@ -1583,7 +1645,7 @@ needs QEMU and the local Rust linker toolchain.
 | Binary | Location | What it does |
 |--------|----------|--------------|
 | `O` | `target/release/O` | Runs `.O` documents and provides the interactive REPL. |
-| `o` | `scripts/o-cli.sh` through an installed wrapper | Unifies `run`, `plan`, `why`, `node`, `node-host`, `registry`, `live`, `receipt`, and `kernel`; unknown command forms retain lowercase evaluator compatibility. |
+| `o` | `scripts/o-cli.sh` through an installed wrapper | Unifies `run`, `plan`, `why`, `node`, `node-host`, `registry`, `info`, `live`, `receipt`, and `kernel`; unknown command forms retain lowercase evaluator compatibility. |
 | `olangc` | `target/release/olangc` | Produces native hosted binaries, WASI modules, script execution, OIR dumps, or Graphviz DOT hypergraph export. |
 | `ocorec` | `target/release/ocorec` | Compiles `.oc` modules through AST, typed HIR, and SSA MIR to freestanding ELF64 objects for the primary x86_64 and bounded AArch64 targets. |
 | `o-link` | `target/release/o-link` | Recursively literal-links and runs a bare single directory; `--project` creates an inert route-preserving bundle. |
@@ -1592,6 +1654,7 @@ needs QEMU and the local Rust linker toolchain.
 | `o-node` | `target/release/o-node` | Provisions development mTLS identities, reports a descriptive profile, checks readiness, and serves bounded prepared operations. |
 | `octl` | `target/release/octl` | Inspects or directly invokes one explicitly selected mutually authenticated hosted node. |
 | `o-registry` | `target/release/o-registry` | Generates local placement profiles and creates, signs, verifies, lists, exports, and imports local registry snapshots. |
+| `o-info` | `target/release/o-info` | Maintains a local authority-free information head and exchanges signed canonical offline delta packs. |
 | `o-notebook` | feature-gated Cargo binary | Runs the local notebook server when built with `--features notebook`. |
 | `ostadix-mcp` | `mcp/ostadix_lang_mcp_server/target/release/ostadix-mcp` | Exposes the local agent tools above through MCP stdio; normal setup also installs `~/.local/bin/ostadix-mcp`. |
 | `O` | `c_cpp/O` | Runs `.O` through the standalone C17 edition. |
@@ -3867,6 +3930,12 @@ parser properties as their own gate, checks that the libFuzzer harness builds,
 and runs a named reproducibility test. That test compiles the same O-core module
 from two different source directories and asserts that the emitted x86_64 ELF
 object bytes are identical.
+
+The required contract lane also runs the zero-dependency, read-only
+[`local CI posture audit`](docs/CI_POSTURE.md). Run its baseline locally with
+`python3 scripts/local_ci_posture.py --profile baseline --format text`; the
+optional full profile detects external analyzers but never installs them or
+invokes Cargo in this live checkout.
 
 The separate `Parser fuzz campaign` workflow runs the seeded libFuzzer target
 for five minutes every Monday and whenever it is manually dispatched. This

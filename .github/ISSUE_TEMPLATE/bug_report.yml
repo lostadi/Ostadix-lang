@@ -1,0 +1,44 @@
+name: Bug report
+description: Report a reproducible Ostadix defect without sensitive data.
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Do not disclose suspected vulnerabilities here. Use
+        https://github.com/lostadi/Ostadix-lang/security/advisories/new instead.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What failed, and what is the smallest affected surface?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction
+      description: Include minimal source, commands, and deterministic inputs.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: Expected and observed result
+      description: Include exact diagnostics or output with secrets removed.
+    validations:
+      required: true
+  - type: input
+    id: revision
+    attributes:
+      label: Revision and environment
+      description: Commit, OS, architecture, toolchain, backend, and relevant flags.
+    validations:
+      required: true
+  - type: textarea
+    id: boundary
+    attributes:
+      label: Evidence boundary
+      description: What did you not test or reproduce?
+

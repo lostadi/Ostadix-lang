@@ -1203,7 +1203,7 @@ impl HGraph {
             let actual_outputs = resource_keys(self, &info.outputs);
             let autonomous_ephemeral = self.source_plan.as_ref().is_some_and(|plan| {
                 self.ir_map.get(&info.value_output).is_some_and(|oir| {
-                    crate::hgraph::from_oir::autonomous_ephemeral_group(plan, info.plan_node, oir)
+                    crate::dispatch_model::autonomous_ephemeral_group(plan, info.plan_node, oir)
                         .is_some()
                 })
             });
@@ -1292,12 +1292,8 @@ impl HGraph {
                 }
                 let autonomous_ephemeral = self.source_plan.as_ref().is_some_and(|plan| {
                     self.ir_map.get(&info.value_output).is_some_and(|oir| {
-                        crate::hgraph::from_oir::autonomous_ephemeral_group(
-                            plan,
-                            info.plan_node,
-                            oir,
-                        )
-                        .is_some()
+                        crate::dispatch_model::autonomous_ephemeral_group(plan, info.plan_node, oir)
+                            .is_some()
                     })
                 });
                 for resource in [ResourceKey::HostWorld, ResourceKey::EvaluatorState] {
@@ -1748,7 +1744,7 @@ impl HGraph {
             let oir = self.ir_map.get(&info.value_output).ok_or_else(|| {
                 format!("operation {} has no recorded OIR value node", plan_node.0)
             })?;
-            if crate::hgraph::from_oir::autonomous_ephemeral_group(plan, plan_node, oir).is_some() {
+            if crate::dispatch_model::autonomous_ephemeral_group(plan, plan_node, oir).is_some() {
                 continue;
             }
             let (reads, writes) = summary.scheduling_accesses();

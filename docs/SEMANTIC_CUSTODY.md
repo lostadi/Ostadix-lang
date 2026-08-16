@@ -45,8 +45,32 @@ Fidelity assessments distinguish definite loss from possible loss and compose
 those bounds across modeled paths. They do not yet prove every backend
 crossing: render fidelity, capability transfer, wire serialization, and World
 portability are separate checks. `BackendMorphism` is a law-bearing extension
-point; claims should name concrete implementations and tests rather than the
-trait alone.
+point; its unversioned declaration alone establishes no backend claim.
+
+`BackendMorphismV1` adds a bounded semantic kernel for the current Python,
+JavaScript, and Rust adapters. It reports O-to-backend-input and profiled
+backend-output-to-O fidelity as distinct legs, composes them, checks the
+lossless round-trip law, and returns typed rejection for cycles/shared
+references, non-string or duplicate map keys, excessive nesting, unsupported
+values, and numeric/profile limits. The method named `inject` consumes an
+already acquired backend-output value; for JavaScript and Rust, recursive
+containers on that leg mean JSON/stdout egress only and do not imply a generic
+input-binding channel. The Python profile covers recursive acyclic plain data.
+JavaScript admits only scalar native inputs; Rust covers bounded scalar source
+constants and profiled stdout, not arbitrary Rust programs or bindings.
+Executable conformance tests exercise a nested OValue binding into Python, a
+cross-runtime scalar binding into JavaScript, and the exact Rust program emitted
+from each projected scalar before it is compiled and run by the real shim.
+They also cover negative boundaries. Richer runtime values outside these
+profiles remain executable but acquire no V1 morphism claim.
+
+V1 is shadow-only. It is resolved through canonical backend names and aliases,
+but is not hashed into backend-catalog V4, does not alter existing solver facts,
+and cannot authorize evidence, admission, placement, or dispatch. The explicit
+shadow result exposes differences such as the compatibility solver's optimistic
+container classification without reducing current execution capacity. A future
+enforcing integration requires a separately reviewed catalog/evidence schema
+rollover rather than silently changing V4 identity.
 
 ## Executable artifact
 
@@ -78,4 +102,3 @@ contracts.
   graph migration or transparent fallback.
 - O-core/native evidence is a related compiler/runtime chain, not evidence that
   every hosted operation passed through O-core.
-

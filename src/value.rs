@@ -559,7 +559,13 @@ impl ProjectionError {
     }
 }
 
-/// Backend morphism law for native <-> OValue crossings.
+/// Historical unversioned extension point for native <-> OValue crossings.
+///
+/// No production backend currently establishes a claim merely by implementing
+/// this declaration. New bounded claims use
+/// [`crate::backend_morphism::BackendMorphismV1`], which makes rejection and
+/// both fidelity legs explicit and currently integrates with the solver only
+/// in shadow mode.
 ///
 /// For native values a backend reports as `Fidelity::Lossless`:
 /// `project(inject(v).0)` must produce a native value equivalent to `v` under

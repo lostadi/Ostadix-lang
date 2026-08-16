@@ -12,6 +12,7 @@ OGIT_BIN=${O_LANG_OGIT_BIN:-"$ROOT/target/release/ogit"}
 NODE_BIN=${O_LANG_NODE_BIN:-"$ROOT/target/release/o-node"}
 OCTL_BIN=${O_LANG_OCTL_BIN:-"$ROOT/target/release/octl"}
 REGISTRY_BIN=${O_LANG_REGISTRY_BIN:-"$ROOT/target/release/o-registry"}
+INFO_BIN=${O_LANG_INFO_BIN:-"$ROOT/target/release/o-info"}
 
 usage() {
     cat <<'USAGE'
@@ -25,6 +26,7 @@ Repository commands:
                                   Inspect or invoke one explicit hosted node
   node-host <command> ...         Provision or serve a hosted node
   registry <command> ...          Manage the local signed node registry
+  info <command> ...              Manage the local authority-free information store
   live <command> ...              Run the hosted live-system control plane
   receipt [ogit arguments]        Emit the O-Git semantic receipt demo
   kernel <command>               Build, boot, or verify the O-core kernel
@@ -95,6 +97,14 @@ case "${1:-}" in
             exit 1
         fi
         exec "$REGISTRY_BIN" "$@"
+        ;;
+    info)
+        shift
+        if [[ ! -x "$INFO_BIN" ]]; then
+            printf 'error: information CLI is missing or not executable: %s\n' "$INFO_BIN" >&2
+            exit 1
+        fi
+        exec "$INFO_BIN" "$@"
         ;;
     live)
         shift

@@ -9,7 +9,7 @@
 
 pub mod codec;
 pub mod grounding;
-pub mod identity;
+pub use crate::resource_identity as identity;
 pub mod identity_wire;
 pub mod protocol;
 pub mod receipt;

@@ -4,6 +4,8 @@ use crate::ir::PlanNodeId;
 use crate::runtime_exec::{ExecutableLeaseSet, ExecutableManifestV1};
 use std::sync::Arc;
 
+pub use crate::dispatch_model::DispatchAdapterV1;
+
 pub const EVIDENCE_SCHEMA_V5: &str = "oexec.evidence/v5";
 pub const ADMISSION_SCHEMA_V5: &str = "oexec.admission/v5";
 pub const ANALYZER_ID_V5: &str = "ostadix-oir-evidence-compiler/v5";
@@ -68,32 +70,6 @@ impl DispatchLaneV1 {
             Self::RemoteProvider => "remote-provider",
             Self::Ocore => "ocore",
         }
-    }
-}
-
-/// Stable preparation adapter selected by evidence analysis. The runtime may
-/// validate the bound adapter against the admitted OIR, but it may not choose
-/// a different adapter as a second scheduling authority.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DispatchAdapterV1 {
-    CoordinatorV1,
-    OScopeLoadV1,
-    TrustedInlineRendererV1,
-    AutonomousEphemeralShimV1,
-}
-
-impl DispatchAdapterV1 {
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::CoordinatorV1 => "coordinator/v1",
-            Self::OScopeLoadV1 => "o-scope-load/v1",
-            Self::TrustedInlineRendererV1 => "trusted-inline-renderer/v1",
-            Self::AutonomousEphemeralShimV1 => "autonomous-ephemeral-shim/v1",
-        }
-    }
-
-    pub const fn is_local_worker(self) -> bool {
-        !matches!(self, Self::CoordinatorV1)
     }
 }
 

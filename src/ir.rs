@@ -167,21 +167,6 @@ impl OIrProgram {
     pub fn flatten_for_plan(&self) -> Vec<&OIr> {
         flatten_nodes_for_plan(&self.nodes)
     }
-
-    /// Build the value-node/operation-edge hypergraph for this program from
-    /// the canonical execution plan.
-    pub fn hgraph(&self) -> crate::hgraph::HGraph {
-        let plan = self.plan();
-        self.hgraph_for_plan(&plan)
-            .expect("freshly-built OIR execution plan should project to HGraph")
-    }
-
-    /// Project an already-validated execution plan into the hypergraph
-    /// substrate. This keeps dependency ownership in `ExecutionPlan`; HGraph
-    /// is a scheduling/type/fidelity projection over that plan.
-    pub fn hgraph_for_plan(&self, plan: &ExecutionPlan) -> Result<crate::hgraph::HGraph, String> {
-        crate::hgraph::from_oir::build_program_with_plan(self, plan)
-    }
 }
 
 fn flatten_nodes_for_plan(nodes: &[OIr]) -> Vec<&OIr> {
@@ -376,6 +361,12 @@ fn dump_node(node: &OIr, depth: usize, out: &mut String) {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PlanNodeId(pub usize);
+
+impl From<PlanNodeId> for usize {
+    fn from(value: PlanNodeId) -> Self {
+        value.0
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanEdgeKind {
