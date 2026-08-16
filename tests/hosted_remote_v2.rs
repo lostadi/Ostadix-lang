@@ -17,7 +17,7 @@ use o_lang::hosted_remote::v2::{
     SessionStateTierV2, SignedJournalEntryV2, SignedPlacementLeaseV2, SubmitOperationRequestV2,
     HOSTED_COMMAND_BINDING_SCHEMA_V2, HOSTED_JOURNAL_ENTRY_SCHEMA_V2, HOSTED_PROTOCOL_V2,
 };
-use o_lang::hosted_remote::{canonical_hosted_sha256, unix_time_ms};
+use o_lang::hosted_remote::{canonical_hosted_sha256, unix_time_ms, MAX_HOSTED_OUTPUT_BYTES};
 use o_lang::ir::BackendRegistry;
 use o_lang::placement::{
     ActorGenerationIdV1, CanonicalPlacementRecordV1, EnvironmentRequirementV1, GenerationV1,
@@ -1723,52 +1723,39 @@ fn durable_capacity_refusal_preserves_reserved_close_headroom() {
         small_reservation,
     );
 
-    let mut next_sequence = 1_u64;
-    let mut saw_capacity_refusal = false;
-    for ordinal in 0..8 {
-        let operation_id = format!("fill-{ordinal}");
-        let source = format!("bash^(\nprintf '2'\n#{}\n)_bash", "x".repeat(24 * 1024));
-        let prepared = PreparedOperationV2::new(
-            operation_id.clone(),
-            TaskAttemptIdV1::new(
-                digest(&format!("task:{operation_id}")),
-                GenerationV1::new(1).unwrap(),
-            ),
-            source,
-            BackendRegistry::global().catalog_sha256(),
-            unix_time_ms().unwrap() + 60_000,
-            4096,
-        )
-        .unwrap();
-        let request_id = format!("execute-{operation_id}");
-        let response = submit_with_fresh_placement_until_not_expired(
-            &runtime,
-            &placement_signer,
-            &principal,
-            &opened,
-            &request_id,
-            next_sequence,
-            &prepared,
-            &state_quotas,
-            None,
-        );
-        match response {
-            HostedResponseV2::Committed { .. } => {
-                wait_for_terminal(&runtime, &principal, &opened.capability, &operation_id);
-                next_sequence += 1;
-            }
-            HostedResponseV2::Error { error } => {
-                assert_eq!(error.code, "quota-exceeded", "{error:?}");
-                saw_capacity_refusal = true;
-                break;
-            }
-            other => panic!("capacity-fill submit returned the wrong response: {other:?}"),
-        }
-    }
-    assert!(
-        saw_capacity_refusal,
-        "test failed to reach the hard capacity boundary"
+    // The output reservation alone exceeds the entire per-session durable
+    // reservation. A tiny source therefore reaches the hard quota in one
+    // admission without making proof freshness depend on repeated parsing or
+    // backend execution under a loaded CI runner.
+    let operation_id = "fill-once";
+    let prepared = PreparedOperationV2::new(
+        operation_id,
+        TaskAttemptIdV1::new(digest("task:fill-once"), GenerationV1::new(1).unwrap()),
+        "bash^(\nprintf '2'\n)_bash",
+        BackendRegistry::global().catalog_sha256(),
+        unix_time_ms().unwrap() + 60_000,
+        MAX_HOSTED_OUTPUT_BYTES as u64,
+    )
+    .unwrap();
+    assert!(prepared.output_limit_bytes > reservation_bytes);
+    let response = submit_with_fresh_placement_until_not_expired(
+        &runtime,
+        &placement_signer,
+        &principal,
+        &opened,
+        "execute-fill-once",
+        1,
+        &prepared,
+        &state_quotas,
+        None,
     );
+    let HostedResponseV2::Error { error } = response else {
+        panic!("one-shot capacity fixture returned the wrong response: {response:?}")
+    };
+    assert_eq!(error.code, "quota-exceeded", "{error:?}");
+    let refused = current_session_view(&runtime, &principal, &opened.capability);
+    assert_eq!(refused.next_client_sequence, 1);
+    assert!(refused.operations.is_empty());
 
     let session_id = opened.capability.session_id.clone();
     runtime
@@ -1777,11 +1764,11 @@ fn durable_capacity_refusal_preserves_reserved_close_headroom() {
             SessionMutationRequestV2 {
                 credentials: opened.capability.into(),
                 client_request_id: "close-after-fill".to_owned(),
-                client_sequence: next_sequence,
+                client_sequence: 1,
             },
         )
         .expect("reserved control headroom must keep Close durable");
-    drop(runtime);
+    runtime.shutdown().unwrap();
     let store = DurableSessionStoreV2::open(&state_root, node_signer.clone()).unwrap();
     assert!(
         store.session_durable_bytes(&session_id).unwrap() <= reservation_bytes,
