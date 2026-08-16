@@ -33,6 +33,13 @@ def write_minimal_tree(root: Path) -> None:
         "src/placement/mod.rs",
         "src/placement/projection.rs",
         "src/placement/protocol/mod.rs",
+        "src/placement/protocol/records.rs",
+        "src/placement/protocol/state.rs",
+        "src/placement/protocol/target.rs",
+        "src/placement/protocol/warrant.rs",
+        "src/registry/bundle/mod.rs",
+        "src/eval.rs",
+        "src/runtime_exec.rs",
         "src/evidence/admit.rs",
         "src/evidence/analyze.rs",
         "src/evidence/fact.rs",
@@ -66,12 +73,513 @@ class ArchitectureBoundaryTests(unittest.TestCase):
             root = Path(directory)
             write_minimal_tree(root)
             (root / "src/parser.rs").write_text(
-                "pub struct Syntax;\n#[cfg(test)]\n"
+                "pub struct Syntax;\n# [ cfg ( test ) ]\n"
+                "mod tests {\n"
+                "    const MARKER: &str = r###\"} #[cfg(test)] {\"###;\n"
+                "    /* nested /* comment */ remains test-only */\n"
+                "    use crate::ir::PlanNodeId;\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_production_after_unit_test_module_is_still_checked(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/parser.rs").write_text(
+                "#[cfg(test)]\n"
+                "mod tests { use crate::ir::PlanNodeId; }\n"
+                "use crate::registry::BackendRegistry;\n",
+                encoding="utf-8",
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("forbidden dependency `crate::registry`", result.stderr)
+
+    def test_test_only_const_unsafe_function_does_not_mask_following_code(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/parser.rs").write_text(
+                "#[cfg(test)]\n"
+                "const unsafe fn helper() { use crate::ir::PlanNodeId; }\n"
+                "use crate::registry::BackendRegistry;\n",
+                encoding="utf-8",
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn("forbidden dependency `crate::ir`", result.stderr)
+        self.assertIn("forbidden dependency `crate::registry`", result.stderr)
+
+    def test_test_only_impl_const_expression_signature_masks_its_full_body(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/parser.rs").write_text(
+                "#[cfg(test)]\n"
+                "impl Trait for Foo<{ 1 + { 2 } }> { use crate::ir::PlanNodeId; }\n"
+                "use crate::registry::BackendRegistry;\n",
+                encoding="utf-8",
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn("forbidden dependency `crate::ir`", result.stderr)
+        self.assertIn("forbidden dependency `crate::registry`", result.stderr)
+
+    def test_test_only_function_macro_type_signature_masks_its_full_body(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/parser.rs").write_text(
+                "#[cfg(test)]\n"
+                "fn helper() -> ty!{} { use crate::ir::PlanNodeId; }\n"
+                "use crate::registry::BackendRegistry;\n",
+                encoding="utf-8",
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn("forbidden dependency `crate::ir`", result.stderr)
+        self.assertIn("forbidden dependency `crate::registry`", result.stderr)
+
+    def test_cfg_test_text_in_comments_literals_and_macros_cannot_hide_code(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/parser.rs").write_text(
+                'const COOKED: &str = "#[cfg(test)]";\n'
+                "const RAW: &str = r###\"#[cfg(test)]\"###;\n"
+                "// #[cfg(test)]\n"
+                "/* #[cfg(test)] */\n"
+                "macro_rules! marker { () => { #[cfg(test)] mod tests {} }; }\n"
+                "use crate :: ir :: PlanNodeId;\n",
+                encoding="utf-8",
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("forbidden dependency `crate::ir`", result.stderr)
+
+    def test_dependency_text_in_comments_and_literals_is_not_code(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/parser.rs").write_text(
+                'const NOTE: &str = "use crate::ir::PlanNodeId;";\n'
+                "const RAW: &str = r#\"crate::registry::BackendRegistry\"#;\n"
+                "// use crate::ir::PlanNodeId;\n"
+                "/* use crate::registry::BackendRegistry; */\n"
+                "pub struct Syntax;\n",
+                encoding="utf-8",
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_grouped_and_spaced_crate_import_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/parser.rs").write_text(
+                "use crate :: { ir :: PlanNodeId, value::OValue };\n",
+                encoding="utf-8",
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("forbidden dependency `crate::{ir::...}`", result.stderr)
+
+    def test_raw_identifiers_cannot_obscure_forbidden_root_modules(self) -> None:
+        cases = (
+            ("src/parser.rs", "use crate::r#ir::PlanNodeId;\n", "crate::ir"),
+            (
+                "src/placement/protocol/target.rs",
+                "use crate::{r#world::ArtifactId};\n",
+                "crate::{world::...}",
+            ),
+        )
+        for relative, source, expected in cases:
+            with self.subTest(source=source):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    write_minimal_tree(root)
+                    (root / relative).write_text(source, encoding="utf-8")
+                    result = run_checker(root)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(f"forbidden dependency `{expected}`", result.stderr)
+
+    def test_cfg_that_can_exist_in_production_is_not_discarded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/parser.rs").write_text(
+                '#[cfg(any(test, feature = "fixture"))]\n'
+                "mod maybe_production { use crate::ir::PlanNodeId; }\n",
+                encoding="utf-8",
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("forbidden dependency `crate::ir`", result.stderr)
+
+    def test_cfg_all_with_false_test_is_definitely_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/parser.rs").write_text(
+                "#[cfg(all(test, unix))]\n"
+                "mod tests { use crate::ir::PlanNodeId; }\n"
+                "pub struct Production;\n",
+                encoding="utf-8",
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_cfg_not_test_is_definitely_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/parser.rs").write_text(
+                "#[cfg(not(test))]\nuse crate::ir::PlanNodeId;\n",
+                encoding="utf-8",
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("forbidden dependency `crate::ir`", result.stderr)
+
+    def test_valid_cfg_name_value_is_unknown_and_opaque(self) -> None:
+        literals = ('"crate::ir must remain opaque"', 'r#"crate::ir must remain opaque"#')
+        for literal in literals:
+            with self.subTest(literal=literal):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    write_minimal_tree(root)
+                    (root / "src/parser.rs").write_text(
+                        f"#[cfg(feature = {literal})]\n"
+                        "mod maybe_production { use crate::ir::PlanNodeId; }\n",
+                        encoding="utf-8",
+                    )
+                    result = run_checker(root)
+                self.assertEqual(result.returncode, 1)
+                self.assertNotIn("requires exactly one ordinary string", result.stderr)
+                self.assertEqual(result.stderr.count("forbidden dependency `crate::ir`"), 1)
+
+    def test_false_cfg_with_valid_name_value_is_definitely_disabled(self) -> None:
+        for literal in ('"fixture"', 'r#"fixture"#'):
+            with self.subTest(literal=literal):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    write_minimal_tree(root)
+                    (root / "src/parser.rs").write_text(
+                        f"#[cfg(all(test, feature = {literal}))]\n"
+                        "mod tests { use crate::ir::PlanNodeId; }\n",
+                        encoding="utf-8",
+                    )
+                    result = run_checker(root)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_cfg_rejects_non_string_literal_kinds_before_evaluation(self) -> None:
+        invalid_literals = ("'x'", 'b"x"', 'c"x"', 'br#"x"#', 'cr#"x"#')
+        for literal in invalid_literals:
+            for predicate in (
+                f"feature = {literal}",
+                f"all(test, feature = {literal})",
+            ):
+                with self.subTest(predicate=predicate):
+                    with tempfile.TemporaryDirectory() as directory:
+                        root = Path(directory)
+                        write_minimal_tree(root)
+                        (root / "src/parser.rs").write_text(
+                            f"#[cfg({predicate})]\nmod invalid {{}}\n",
+                            encoding="utf-8",
+                        )
+                        result = run_checker(root)
+                    self.assertEqual(result.returncode, 1)
+                    self.assertIn(
+                        "requires exactly one ordinary string literal value",
+                        result.stderr,
+                    )
+
+    def test_injected_literal_sentinel_cannot_hide_a_dependency(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/parser.rs").write_text(
+                "#[cfg(all(test, feature = \0))]\n"
+                "mod hidden { use crate::ir::PlanNodeId; }\n",
+                encoding="utf-8",
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("reserved literal sentinel U+0000", result.stderr)
+        self.assertNotIn("architecture dependency boundaries: PASS", result.stdout)
+
+    def test_nested_cfg_false_is_masked_under_production_projection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/parser.rs").write_text(
+                "#[cfg(all(unix, any(test, all(windows, test))))]\n"
                 "mod tests { use crate::ir::PlanNodeId; }\n",
                 encoding="utf-8",
             )
             result = run_checker(root)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_nested_cfg_true_remains_visible_under_production_projection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/parser.rs").write_text(
+                "#[cfg(not(any(test, all(test, unix))))]\n"
+                "mod production { use crate::ir::PlanNodeId; }\n",
+                encoding="utf-8",
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("forbidden dependency `crate::ir`", result.stderr)
+
+    def test_nested_cfg_unknown_remains_visible_under_production_projection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/parser.rs").write_text(
+                '#[cfg(not(any(test, all(unix, feature = "fixture"))))]\n'
+                "mod maybe_production { use crate::ir::PlanNodeId; }\n",
+                encoding="utf-8",
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("forbidden dependency `crate::ir`", result.stderr)
+
+    def test_root_aliases_and_globs_fail_closed(self) -> None:
+        cases = (
+            "use crate as root;\n",
+            "use crate::{self as root};\n",
+            "extern crate self as root;\n",
+            "use crate::*;\n",
+            "use crate::{*};\n",
+            "use super as root;\n",
+            "use super::{self as root};\n",
+            "use super::*;\n",
+            "use super::{*};\n",
+        )
+        for source in cases:
+            with self.subTest(source=source):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    write_minimal_tree(root)
+                    (root / "src/parser.rs").write_text(source, encoding="utf-8")
+                    result = run_checker(root)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("is not analyzable", result.stderr)
+                self.assertIn("require explicit root paths", result.stderr)
+
+    def test_bare_root_imports_fail_closed(self) -> None:
+        cases = (
+            ("use crate;\n", "bare crate root path"),
+            ("use {crate};\n", "bare crate root path"),
+            ("use super;\n", "bare super root path"),
+            (
+                "use super::super;\n",
+                "bare super::super root path",
+            ),
+        )
+        for source, expected in cases:
+            with self.subTest(source=source):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    write_minimal_tree(root)
+                    (root / "src/evidence/admit.rs").write_text(source, encoding="utf-8")
+                    result = run_checker(root)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(expected, result.stderr)
+                self.assertIn("require explicit root paths", result.stderr)
+
+    def test_visibility_and_extern_crate_roots_are_not_dependencies(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/parser.rs").write_text(
+                "extern crate dependency;\n"
+                "pub(crate) struct CrateVisible;\n"
+                "pub(super) struct ParentVisible;\n"
+                "pub(in crate) struct RestrictedToCrate;\n"
+                "crate fn LegacyCrateVisible() {}\n",
+                encoding="utf-8",
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_raw_use_identifier_is_not_promoted_to_use_keyword(self) -> None:
+        cases = (
+            "fn r#use() {}\npub(crate) struct CrateVisible;\n",
+            "mod r#use {}\npub(super) struct ParentVisible;\n",
+            "mod r#use {}\nextern crate dependency;\n",
+        )
+        for source in cases:
+            with self.subTest(source=source):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    write_minimal_tree(root)
+                    (root / "src/evidence/admit.rs").write_text(
+                        source, encoding="utf-8"
+                    )
+                    result = run_checker(root)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_precise_capture_use_keyword_is_not_an_import(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/evidence/admit.rs").write_text(
+                "fn f<'a>(x: &'a ()) -> impl Sized + use<'a> { x }\n"
+                "pub(crate) struct CrateVisible;\n",
+                encoding="utf-8",
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_macro_literal_use_keyword_is_not_an_import(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/evidence/admit.rs").write_text(
+                "macro_rules! keyword { () => { use } }\n"
+                "pub(crate) struct CrateVisible;\n",
+                encoding="utf-8",
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_direct_super_chains_expose_forbidden_modules(self) -> None:
+        cases = (
+            ("src/parser.rs", "use super::ir::PlanNodeId;\n", "super::ir"),
+            ("src/eval.rs", "use super::world::ArtifactId;\n", "super::world"),
+            (
+                "src/placement/protocol/target.rs",
+                "use super::super::super::world::ArtifactId;\n",
+                "super::super::super::world",
+            ),
+        )
+        for relative, source, expected in cases:
+            with self.subTest(source=source):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    write_minimal_tree(root)
+                    (root / relative).write_text(source, encoding="utf-8")
+                    result = run_checker(root)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(f"forbidden dependency `{expected}`", result.stderr)
+
+    def test_nested_super_paths_remain_local_before_reaching_crate_root(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/placement/protocol/target.rs").write_text(
+                "use super::world::ArtifactId;\n"
+                "use super::super::world::OtherArtifactId;\n",
+                encoding="utf-8",
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_excessive_super_hops_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/placement/protocol/target.rs").write_text(
+                "use super::super::super::super::world::ArtifactId;\n",
+                encoding="utf-8",
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("exceeds file module depth 3", result.stderr)
+
+    def test_inline_module_super_path_fails_closed_as_ambiguous(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/placement/protocol/target.rs").write_text(
+                "mod nested { use super::world::ArtifactId; }\n",
+                encoding="utf-8",
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("inline production module has ambiguous module depth", result.stderr)
+
+    def test_explicit_allowed_super_dependencies_remain_analyzable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/placement/protocol/target.rs").write_text(
+                "use super::digest::validate_token;\n", encoding="utf-8"
+            )
+            (root / "src/evidence/admit.rs").write_text(
+                "use super::fact::EvidenceFact;\n", encoding="utf-8"
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_malformed_test_item_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/parser.rs").write_text(
+                "#[cfg(test)]\nmod tests {\n", encoding="utf-8"
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("could not analyze Rust tokens", result.stderr)
+
+    def test_malformed_cfg_operator_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/parser.rs").write_text(
+                "#[cfg(not(test, unix))]\nmod invalid {}\n", encoding="utf-8"
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("cfg operator `not` requires exactly one predicate", result.stderr)
+
+    def test_malformed_cfg_cannot_be_hidden_by_false_test_operand(self) -> None:
+        cases = (
+            "#[cfg(all(test, unix extra))]\nmod invalid {}\n",
+            "#[cfg(all(test, feature =))]\nmod invalid {}\n",
+            "#[cfg(all(test, bogus(,)))]\nmod invalid {}\n",
+            "#[cfg(all(test, bogus()))]\nmod invalid {}\n",
+        )
+        for source in cases:
+            with self.subTest(source=source):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    write_minimal_tree(root)
+                    (root / "src/parser.rs").write_text(source, encoding="utf-8")
+                    result = run_checker(root)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("could not analyze Rust tokens", result.stderr)
+
+    def test_unclosed_literal_cannot_hide_a_dependency(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/parser.rs").write_text(
+                'const BROKEN: &str = "#[cfg(test)]\n'
+                "use crate::ir::PlanNodeId;\n",
+                encoding="utf-8",
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("unclosed string", result.stderr)
+
+    def test_artifact_consumers_cannot_reenter_through_world_facade(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/placement/protocol/target.rs").write_text(
+                "use crate::{world::ArtifactId};\n", encoding="utf-8"
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("resource_identity", result.stderr)
 
 
 if __name__ == "__main__":
