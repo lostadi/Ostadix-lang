@@ -495,6 +495,12 @@ class SourceReleaseTests(unittest.TestCase):
             "ocore/kernel/build-x86_64-uefi-media.sh": "#!/bin/sh\nexit 0\n",
             "ocore/kernel/build.sh": "#!/bin/sh\nexit 0\n",
             "ocore/kernel/main.oc": "module kernel::main;\n",
+            "ocore/kernel/m6_mode25_diagnostics.oc": (
+                "module kernel::m6_mode25_diagnostics;\n"
+            ),
+            "ocore/kernel/m6_mode25_diagnostics_stub.oc": (
+                "module kernel::m6_mode25_diagnostics;\n"
+            ),
             "ocore/kernel/resolve-x86_64-ovmf-code.sh": "# resolver fixture\n",
             "ocore/kernel/smp_probe.oc": "module kernel::smp_probe;\n",
             "ocore/kernel/smp_probe_stub.oc": "module kernel::smp_probe;\n",
@@ -509,6 +515,9 @@ class SourceReleaseTests(unittest.TestCase):
             "ocore/kernel/smoke-world-protocol-qemu.sh": "#!/bin/sh\nexit 0\n",
             "ocore/kernel/smoke-world-identity-qemu.sh": "#!/bin/sh\nexit 0\n",
             "ocore/kernel/smoke-aarch64-g2-qemu.sh": "#!/bin/sh\nexit 0\n",
+            "ocore/kernel/stress-live-linux-personality-qemu.sh": (
+                "#!/bin/bash\nexit 0\n"
+            ),
             "ocore/kernel/world_value_semantics.oc": (
                 "module kernel::world_value_semantics;\n"
             ),
@@ -756,6 +765,7 @@ class SourceReleaseTests(unittest.TestCase):
                     "ocore/kernel/smoke-world-protocol-qemu.sh",
                     "ocore/kernel/smoke-world-identity-qemu.sh",
                     "ocore/kernel/smoke-aarch64-g2-qemu.sh",
+                    "ocore/kernel/stress-live-linux-personality-qemu.sh",
                     "scripts/o-cli.sh",
                     "scripts/o-kernel.sh",
                     "scripts/ostadix_boot_media.py",
@@ -955,6 +965,8 @@ class SourceReleaseTests(unittest.TestCase):
                 "ocore/kernel/build-x86_64-uefi-media.sh",
                 "ocore/kernel/build.sh",
                 "ocore/kernel/main.oc",
+                "ocore/kernel/m6_mode25_diagnostics.oc",
+                "ocore/kernel/m6_mode25_diagnostics_stub.oc",
                 "ocore/kernel/resolve-x86_64-ovmf-code.sh",
                 "ocore/kernel/smp_probe.oc",
                 "ocore/kernel/smp_probe_stub.oc",
@@ -969,6 +981,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "ocore/kernel/smoke-world-protocol-qemu.sh",
                 "ocore/kernel/smoke-world-identity-qemu.sh",
                 "ocore/kernel/smoke-aarch64-g2-qemu.sh",
+                "ocore/kernel/stress-live-linux-personality-qemu.sh",
                 "ocore/kernel/world_protocol_semantics.oc",
                 "ocore/kernel/world_protocol_semantics_stub.oc",
                 "ocore/kernel/world_value_semantics.oc",
@@ -1217,6 +1230,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "ocore/kernel/smoke-x86_64-boot-info-qemu.sh",
                 "ocore/kernel/smoke-x86_64-smp-qemu.sh",
                 "ocore/kernel/smoke-x86_64-uefi-media-qemu.sh",
+                "ocore/kernel/stress-live-linux-personality-qemu.sh",
                 "scripts/ostadix_boot_media.py",
                 "scripts/ostadix_media_writer.py",
                 "scripts/ostadix_physical_evidence.py",
