@@ -2,7 +2,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::{
     effects::{effect_summary_for_plan_node, EffectSummary, ResourceKey},
-    environment::EnvironmentRefV2,
     ir::{
         BackendInterface, ExecutionMode, ExecutionPlan, OIr, OIrProgram, PlanEdgeKind, PlanNodeId,
         PlanNodeKind, PlanScheduleKind,
@@ -14,6 +13,24 @@ use super::{
     graph::{HEdge, HGraph, HNode, NodeId, Port, PortRole},
     kinds::{DomainFlags, ExecutableOp, OpKind, RepFlags},
 };
+
+// Keep the historical inherent convenience surface while placing its
+// implementation in the projection layer. This preserves 0.2 callers without
+// making the lower IR module depend on HGraph.
+impl OIrProgram {
+    /// Build the value-node/operation-edge hypergraph for this program from
+    /// the canonical execution plan.
+    pub fn hgraph(&self) -> HGraph {
+        build_program(self)
+    }
+
+    /// Project an already-validated execution plan into HGraph. Dependency
+    /// ownership remains in `ExecutionPlan`; HGraph is its scheduling, type,
+    /// and fidelity projection.
+    pub fn hgraph_for_plan(&self, plan: &ExecutionPlan) -> Result<HGraph, String> {
+        build_program_with_plan(self, plan)
+    }
+}
 
 pub fn build_program(program: &OIrProgram) -> HGraph {
     let plan = program.plan();
@@ -160,7 +177,7 @@ fn add_execute_edges(
         // may opt into non-strict hosted-effect overlap. Ordinary ephemeral
         // blocks retain HostWorld/EvaluatorState state chains and strict source
         // sequencing exactly like the serial reference executor.
-        if autonomous_ephemeral_group(plan, id, oir_nodes[id.0]).is_none() {
+        if crate::dispatch_model::autonomous_ephemeral_group(plan, id, oir_nodes[id.0]).is_none() {
             add_resource_state_transitions(
                 graph,
                 &mut state,
@@ -366,85 +383,6 @@ pub(super) fn sequence_can_relax(
         && right.is_verified_pure_infallible()
         && verified_reorderable_inline(plan, predecessor, summaries, &mut HashSet::new())
         && verified_reorderable_inline(plan, successor, summaries, &mut HashSet::new())
-}
-
-/// Return the explicit concurrent group that authorizes non-strict execution
-/// of one bare hosted shim.
-///
-/// This is deliberately narrower than "ephemeral": the operation must be a
-/// direct member of a coordination group nested under `autonomous(...)`, must
-/// carry no effect/capability attributes, and must have a source body that can
-/// be prepared without forcing an O value on a worker. Unknown hosted effects
-/// remain unknown; the returned group is an explicit semantic opt-in, not an
-/// effect-independence proof.
-pub(crate) fn autonomous_ephemeral_group(
-    plan: &ExecutionPlan,
-    node: PlanNodeId,
-    oir: &OIr,
-) -> Option<PlanNodeId> {
-    let OIr::Exec {
-        env_id,
-        attr,
-        backend,
-        body,
-        ..
-    } = oir
-    else {
-        return None;
-    };
-    if !EnvironmentRefV2::from_encoded(*env_id).is_fresh()
-        || attr.is_some()
-        || backend.execution != ExecutionMode::Shim
-        || !body
-            .iter()
-            .all(|child| matches!(child, OIr::Text(_) | OIr::Store { .. }))
-    {
-        return None;
-    }
-
-    let group = plan.edges.iter().find_map(|edge| {
-        (edge.kind == PlanEdgeKind::Structural
-            && edge.from == node
-            && matches!(plan.nodes[edge.to.0].kind, PlanNodeKind::Group { .. }))
-        .then_some(edge.to)
-    })?;
-
-    nearest_policy_schedule_is_autonomous(plan, group).then_some(group)
-}
-
-/// Policy schedules override outer schedules. Walk the unique structural
-/// ancestry from the group outward and accept only when the nearest Lazy-or-
-/// Autonomous schedule is Autonomous. This mirrors `derive_policy_contexts`
-/// without treating `autonomous(lazy(batch(...)))` as autonomous work.
-fn nearest_policy_schedule_is_autonomous(plan: &ExecutionPlan, node: PlanNodeId) -> bool {
-    let mut current = node;
-    let mut visited = HashSet::new();
-    loop {
-        if !visited.insert(current) {
-            return false;
-        }
-        let parents = plan
-            .edges
-            .iter()
-            .filter_map(|edge| {
-                (edge.kind == PlanEdgeKind::Structural && edge.from == current).then_some(edge.to)
-            })
-            .collect::<Vec<_>>();
-        let [parent] = parents.as_slice() else {
-            return false;
-        };
-        match plan.nodes[parent.0].kind {
-            PlanNodeKind::Schedule {
-                kind: PlanScheduleKind::Autonomous,
-                ..
-            } => return true,
-            PlanNodeKind::Schedule {
-                kind: PlanScheduleKind::Lazy,
-                ..
-            } => return false,
-            _ => current = *parent,
-        }
-    }
 }
 
 fn verified_read_only(summary: &EffectSummary) -> bool {

@@ -106,7 +106,7 @@ async fn eval(State(state): State<AppState>, Json(req): Json<EvalRequest>) -> Js
     }
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut parser = Parser::new(&code, &backends);
+        let mut parser = Parser::new(&code, backends.as_ref());
         let nodes = parser.parse()?;
         // Lock inside spawn_blocking so we don't hold the Mutex across an
         // await point — this is fine since the closure runs on a thread pool.

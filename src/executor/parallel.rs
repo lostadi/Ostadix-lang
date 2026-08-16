@@ -21,41 +21,16 @@ use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
 use crate::capability::BackendSandboxPolicy;
-use crate::effects::{EffectConfidence, EffectSummary, Fallibility, ResourceKey};
-use crate::environment::EnvironmentRefV2;
+use crate::dispatch_model::renderer_inputs_statically_preparable;
+pub use crate::dispatch_model::TaskKind;
+pub(crate) use crate::dispatch_model::{adapter_matches, effect_contract_worker_safe};
 use crate::eval::{render_with, GraphEvalFrame};
 use crate::evidence::DispatchAdapterV1;
-use crate::ir::{ExecutionMode, ExecutionPlan, OIr, PlanNodeId, PlanNodeKind, SpliceRenderer};
+use crate::ir::{ExecutionPlan, OIr, PlanNodeId, PlanNodeKind, SpliceRenderer};
 use crate::process::run_ephemeral_with_eval_callback;
 use crate::value::OValue;
 
 use super::task::{PreparedTask, TaskContext};
-
-/// A statically-determined parallel task classification for a plan node.
-#[derive(Clone, Debug)]
-pub enum TaskKind {
-    Renderer {
-        renderer: SpliceRenderer,
-        canonical: String,
-    },
-    Load {
-        name: String,
-    },
-    EphemeralShim {
-        language: String,
-        renderer: SpliceRenderer,
-    },
-}
-
-impl TaskKind {
-    pub(crate) const fn adapter(&self) -> DispatchAdapterV1 {
-        match self {
-            Self::Renderer { .. } => DispatchAdapterV1::TrustedInlineRendererV1,
-            Self::Load { .. } => DispatchAdapterV1::OScopeLoadV1,
-            Self::EphemeralShim { .. } => DispatchAdapterV1::AutonomousEphemeralShimV1,
-        }
-    }
-}
 
 /// A fully-built, Send-only render task.
 #[derive(Clone, Debug)]
@@ -393,116 +368,6 @@ impl Drop for TestOverlapGuard {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.active -= 1;
         self.probe.changed.notify_all();
-    }
-}
-
-/// Classify a plan node when a local Send-only task adapter is available.
-pub(crate) fn classify(plan: &ExecutionPlan, oir: &OIr, id: PlanNodeId) -> Option<TaskKind> {
-    match oir {
-        OIr::Load(name) => Some(TaskKind::Load { name: name.clone() }),
-        OIr::Exec { attr, backend, .. }
-            if attr.is_none()
-                && backend.pure
-                && backend.execution == ExecutionMode::InlineValue
-                && renderer_inputs_statically_preparable(oir) =>
-        {
-            match backend.canonical.as_str() {
-                "html" | "markdown" | "text" | "latex" => Some(TaskKind::Renderer {
-                    renderer: backend.renderer,
-                    canonical: backend.canonical.clone(),
-                }),
-                _ => None,
-            }
-        }
-        OIr::Exec { backend, .. }
-            if crate::hgraph::from_oir::autonomous_ephemeral_group(plan, id, oir).is_some() =>
-        {
-            Some(TaskKind::EphemeralShim {
-                language: backend.canonical.clone(),
-                renderer: backend.renderer,
-            })
-        }
-        _ => None,
-    }
-}
-
-/// Validate that the exact adapter selected by admission still matches the
-/// admitted OIR shape. This is a consistency check, not a second adapter
-/// selection step.
-pub(crate) fn adapter_matches(
-    adapter: DispatchAdapterV1,
-    plan: &ExecutionPlan,
-    id: PlanNodeId,
-    oir: &OIr,
-) -> bool {
-    match adapter {
-        DispatchAdapterV1::OScopeLoadV1 => matches!(oir, OIr::Load(_)),
-        DispatchAdapterV1::TrustedInlineRendererV1 => renderer_inputs_statically_preparable(oir),
-        DispatchAdapterV1::AutonomousEphemeralShimV1 => {
-            crate::hgraph::from_oir::autonomous_ephemeral_group(plan, id, oir).is_some()
-        }
-        DispatchAdapterV1::CoordinatorV1 => false,
-    }
-}
-
-/// Admission may claim an exact local-worker lane only when preparation is
-/// source-proven. Arbitrary materialized values can contain a lazy Eval
-/// request that needs the mutable evaluator to force, so v1 admits only the
-/// closed renderer tree already trusted by automatic sequence relaxation.
-fn renderer_inputs_statically_preparable(oir: &OIr) -> bool {
-    let OIr::Exec {
-        attr,
-        backend,
-        body,
-        ..
-    } = oir
-    else {
-        return false;
-    };
-    attr.is_none()
-        && backend.pure
-        && backend.execution == ExecutionMode::InlineValue
-        && matches!(
-            backend.canonical.as_str(),
-            "html" | "markdown" | "text" | "latex"
-        )
-        && body.iter().all(|child| match child {
-            OIr::Text(_) | OIr::Store { .. } => true,
-            OIr::Exec { .. } => renderer_inputs_statically_preparable(child),
-            OIr::Load(_) | OIr::Invoke { .. } => false,
-        })
-}
-
-/// Hard effect/failure predicate for worker preparation. Fallible loads are
-/// admitted because they can only read an O scope binding and their outcome is
-/// buffered; hosted or user-declared reads never enter this class.
-pub(crate) fn effect_contract_worker_safe(summary: &EffectSummary, oir: &OIr) -> bool {
-    match oir {
-        OIr::Exec {
-            env_id, backend, ..
-        } if EnvironmentRefV2::from_encoded(*env_id).is_fresh()
-            && backend.execution == ExecutionMode::Shim =>
-        {
-            summary.unknown
-                && summary.fallibility == Fallibility::MayFail
-                && summary.actor_state.is_none()
-        }
-        OIr::Load(_) => {
-            summary.confidence == EffectConfidence::Verified
-                && summary.deterministic
-                && summary.fallibility == Fallibility::MayFail
-                && !summary.unknown
-                && summary.actor_state.is_none()
-                && summary.writes.is_empty()
-                && summary
-                    .reads
-                    .iter()
-                    .all(|resource| matches!(resource, ResourceKey::ScopeBinding(_)))
-                && !summary.network
-                && !summary.spawn
-                && !summary.clock
-        }
-        _ => summary.is_verified_pure_infallible(),
     }
 }
 

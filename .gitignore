@@ -58,6 +58,8 @@
 /extracted_md/
 /extracted_segments/
 /.ogit/
+/.ostadix-information/
+/.ostadix-keys/
 /examples/group_pipeline/generated/
 /examples/group_pipeline/output.txt
 # Local archive/reference checkout. The project bundler consumes this ignore

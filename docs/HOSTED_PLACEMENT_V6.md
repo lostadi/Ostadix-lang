@@ -775,6 +775,24 @@ Use each command's `--help` for certificate, endpoint, timeout, limit, and
 output options. The uppercase `O`, existing MCP tools, and `o-link` do not
 contact a node implicitly.
 
+On Unix, a V2-enabled `o-node serve` registers SIGINT/SIGTERM before acquiring
+the durable state-root lock. The first signal stops new connection admission,
+drains the explicit `HostedV2RuntimeOwner::shutdown()` barrier, joins accepted
+connection workers, and releases the root before a clean return. The server
+distributes only cloneable `HostedV2RuntimeHandle` request/query access; those
+handles have no shutdown authority and report the typed closed state after the
+owner barrier, without retaining the durable-root lock. A second
+termination signal is an operator escape hatch that restores the default signal
+action and terminates immediately. Neither path closes a session or performs
+offline GC; a forced interruption is interpreted using the ordinary durable
+restart classifications.
+
+The historical cloneable `HostedV2Runtime` and `serve_node_dual` entry points
+remain source-compatible through the 0.2 line. They are documentation-deprecated
+for new embedders, without a Rust `#[deprecated]` attribute; new code should
+pair `HostedV2RuntimeOwner` with `HostedV2RuntimeHandle` and use
+`serve_owned_node_dual`.
+
 ## Explicit non-claims
 
 Hosted Placement V6 does **not** establish:

@@ -25,6 +25,7 @@ O_BIN="./target/release/O"
 OLANGC_BIN="./target/release/olangc"
 OCOREC_BIN="./target/release/ocorec"
 OGIT_BIN="./target/release/ogit"
+OINFO_BIN="./target/release/o-info"
 if [ -x ./target/release/olink ]; then
     OLINK_BIN="./target/release/olink"
 else
@@ -35,7 +36,7 @@ O_CLI="./scripts/o-cli.sh"
 O_KERNEL_CLI="./scripts/o-kernel.sh"
 O_KERNEL_QEMU_RUNNER="./ocore/kernel/run-qemu.sh"
 
-for bin in "$O_BIN" "$OLANGC_BIN" "$OCOREC_BIN" "$OGIT_BIN" "$OLINK_BIN" "$OUNLINK_BIN"; do
+for bin in "$O_BIN" "$OLANGC_BIN" "$OCOREC_BIN" "$OGIT_BIN" "$OINFO_BIN" "$OLINK_BIN" "$OUNLINK_BIN"; do
     if [ ! -x "$bin" ]; then
         echo "Missing executable: $bin" >&2
         exit 1
@@ -262,6 +263,7 @@ EOF
     fi
     for pattern in \
         '^; ExecutionAdmission oexec\.admission/v5$' \
+        '^binding analyzer-sha256=[0-9a-f]{64} evidence-sha256=[0-9a-f]{64} admitted-graph-sha256=[0-9a-f]{64} placement-admission-sha256=[0-9a-f]{64} admission-sha256=[0-9a-f]{64}$' \
         '^binding lowered-oir-sha256=' \
         '^runtime-snapshot kind=inspection dispatch-context=inspection-only$' \
         '^; ScheduleRealizability oexec\.realizability/v1$' \
@@ -320,6 +322,82 @@ EOF
     fi
     if [ -e "$marker" ]; then
         fail "$desc" "(--explain-schedule executed an autonomous backend)"
+        return
+    fi
+    pass "$desc"
+}
+
+check_olangc_schedule_explanation_json() {
+    local desc="$1"
+    local source="$ARTIFACT_DIR/explain-json-do-not-run.O"
+    local marker="$ARTIFACT_DIR/explain-json-executed"
+
+    cat >"$source" <<EOF
+python^(
+from pathlib import Path
+Path(r"$marker").write_text("executed")
+__oval_result__ = 2
+)_python
+EOF
+
+    run_command "$OLANGC_BIN" "$source" \
+        --target ir --explain-schedule --format json --workers 1
+    if [ "$RUN_EXIT" -ne 0 ]; then
+        fail "$desc" "(JSON schedule explanation failed with exit $RUN_EXIT)"
+        return
+    fi
+    if ! python3 - "$STDOUT_FILE" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+document = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+assert set(document) == {"schema", "admission", "realizability", "prediction"}
+assert document["schema"] == "oexec.schedule-explanation/v1"
+admission = document["admission"]
+assert set(admission) == {
+    "schema", "analyzer", "runtime_snapshot_kind", "base_policy", "bindings"
+}
+assert admission["schema"] == "oexec.admission/v5"
+assert admission["runtime_snapshot_kind"] == "inspection"
+bindings = admission["bindings"]
+assert set(bindings) == {
+    "lowered_oir_sha256", "plan_sha256", "analyzed_graph_sha256",
+    "backend_catalog_projection_sha256", "backend_set_sha256",
+    "direct_executable_manifest_sha256", "launch_context_sha256",
+    "environment_sha256", "ambient_world_sha256", "analyzer_sha256",
+    "evidence_sha256", "admitted_graph_sha256",
+    "placement_admission_sha256", "admission_sha256",
+}
+assert all(
+    isinstance(value, str)
+    and len(value) == 64
+    and all(character in "0123456789abcdef" for character in value)
+    for value in bindings.values()
+)
+realizability = document["realizability"]
+assert realizability["schema"] == "oexec.realizability/v1"
+assert realizability["source"] == "cli-override"
+assert realizability["selected_workers"] == 1
+prediction = document["prediction"]
+assert prediction["schema"] == "oexec.schedule-prediction/v1"
+assert prediction["admission_sha256"] == bindings["admission_sha256"]
+assert prediction["task_count"] == 1
+assert prediction["predicted_width"] == 1
+assert prediction["predicted_span"] == 1
+assert len(prediction["layers"]) == 1
+layer = prediction["layers"][0]
+assert set(layer) == {"index", "operations"}
+assert layer["index"] == 1
+assert len(layer["operations"]) == 1
+assert layer["operations"][0].startswith("P")
+PY
+    then
+        fail "$desc" "(schedule explanation was not strict v1 JSON)"
+        return
+    fi
+    if [ -e "$marker" ]; then
+        fail "$desc" "(--format json executed the inspected backend)"
         return
     fi
     pass "$desc"
@@ -818,11 +896,15 @@ check_stdout_contains "O help defines graph worker pool capacity" 0 'local-worke
 check_nonzero_stderr_contains "O rejects a zero graph worker bound" '--workers must be at least 1' "$O_BIN" --workers 0 examples/hello.O backends/
 check_stdout_contains "olangc --help shows usage" 0 '^Usage: olangc' "$OLANGC_BIN" --help
 check_stdout_contains "olangc help advertises schedule explanation" 0 '--explain-schedule' "$OLANGC_BIN" --help
+check_stdout_contains "olangc help advertises schedule explanation formats" 0 '--format <FORMAT>' "$OLANGC_BIN" --help
 check_stdout_contains "olangc help advertises focused schedule why" 0 '--why <PLAN_NODE>' "$OLANGC_BIN" --help
 check_stdout_contains "olangc help advertises schedule worker override" 0 '--workers <N>' "$OLANGC_BIN" --help
 check_nonzero_stderr_contains "olangc rejects schedule workers without explanation" '--workers requires --explain-schedule --target ir' "$OLANGC_BIN" examples/hello.O --target ir --workers 2
 check_nonzero_stderr_contains "olangc rejects a zero schedule worker override" '--workers must be at least 1' "$OLANGC_BIN" examples/hello.O --target ir --explain-schedule --workers 0
+check_nonzero_stderr_contains "olangc rejects schedule formats without explanation" '--format requires --explain-schedule --target ir' "$OLANGC_BIN" examples/hello.O --target ir --format json
+check_nonzero_stderr_contains "olangc rejects JSON schedule output combined with grounding" '--format json is a standalone schedule view' "$OLANGC_BIN" examples/hello.O --target ir --explain-schedule --format json --grounding
 check_olangc_schedule_explanation "olangc explains digest-bound admission without execution"
+check_olangc_schedule_explanation_json "olangc emits typed schedule JSON without execution"
 check_olangc_schedule_why "olangc and o explain one admitted operation without execution"
 check_nonzero_stderr_contains "olangc schedule why rejects a non-IR target" \
     '--why is available only with --target ir' \
@@ -869,6 +951,11 @@ check_stdout_contains "ocorec --help shows usage" 0 '^Usage: ocorec' "$OCOREC_BI
 check_ocore_compile "ocorec emits x86-64 freestanding ELF object"
 check_stdout_contains "lowercase o help advertises the kernel CLI" 0 \
     'kernel <command>' "$O_CLI" help
+check_stdout_contains "lowercase o help advertises local information" 0 \
+    'info <command>' "$O_CLI" help
+check_stdout_contains "lowercase o dispatches local information help" 0 \
+    'authority-free Ostadix information store' env O_LANG_INFO_BIN="$OINFO_BIN" \
+    "$O_CLI" info --help
 check_stdout_contains "lowercase o dispatches kernel help" 0 \
     '^Usage: o kernel <command>' "$O_CLI" kernel help
 check_stdout_contains "kernel CLI with no command is non-booting help" 0 \

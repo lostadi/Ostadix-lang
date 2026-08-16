@@ -1,0 +1,6 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a vulnerability privately
+    url: https://github.com/lostadi/Ostadix-lang/security/advisories/new
+    about: Do not disclose suspected vulnerabilities in a public issue.
+

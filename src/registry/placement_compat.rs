@@ -1,12 +1,14 @@
-//! Compatibility entrypoints that bind protocol validation to the process's
-//! compiled backend catalog. The protocol core itself remains registry-free.
+//! Integration entrypoints binding placement protocol validation to the
+//! process's compiled backend catalog.
+//!
+//! This implementation lives above both protocol and registry storage so the
+//! placement protocol remains registry-independent.
 
-use crate::registry::bundle::BackendRegistry;
-
-use super::protocol::{
+use crate::placement::protocol::{
     CandidateDecisionV1, NodeProfileV1, PlacementCandidateInputV1, PlacementValidationError,
     RecordAuthenticatorV1, TargetDescriptorV1, UnixMillisV1,
 };
+use crate::registry::bundle::BackendRegistry;
 
 impl TargetDescriptorV1 {
     pub fn validate_current_backend_catalog(&self) -> Result<(), PlacementValidationError> {

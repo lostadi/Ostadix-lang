@@ -5,7 +5,6 @@
 //! remain responsible for authenticating the detached record envelopes.  A
 //! record is never authority merely because it deserialized successfully.
 
-mod catalog_compat;
 mod projection;
 pub mod protocol;
 
