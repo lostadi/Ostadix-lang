@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::world::ArtifactId;
+use crate::resource_identity::ArtifactId;
 
 use super::digest::{validate_fresh, validate_window};
 use super::records::scope_mismatch;

@@ -16,9 +16,9 @@ use crate::placement::protocol::{
     BackendImplementationIdV1, BackendStateSupportV2, CurrentBackendCatalogV1,
     PlacementValidationError, SemanticDigestV1, SnapshotCompatibilityV2,
 };
+use crate::resource_identity::ArtifactId;
 use crate::syntax_dialect::SyntaxDialect;
 use crate::value::BackendAuthority;
-use crate::world::ArtifactId;
 
 /// Wire ABI spoken by the current local evaluator/backend process boundary.
 pub const LOCAL_BACKEND_PROTOCOL_ABI_V1: &str = "o-backend-cbor-v1";
