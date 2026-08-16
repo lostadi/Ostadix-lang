@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::world::ArtifactId;
+use crate::resource_identity::ArtifactId;
 
 use super::digest::{validate_label, validate_token};
 use super::{

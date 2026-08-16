@@ -503,7 +503,7 @@ pub struct PlacementFragmentBindingsV1 {
     source_sha256: String,
     canonical_backend: String,
     plan_node: PlanNodeId,
-    operation_oir: crate::world::ArtifactId,
+    operation_oir: crate::resource_identity::ArtifactId,
     requirement_footprint: crate::placement::RequirementFootprintV1,
     requirement_footprint_sha256: crate::placement::SemanticDigestV1,
     placement_admission: crate::placement::SemanticDigestV1,
@@ -529,7 +529,7 @@ impl PlacementFragmentBindingsV1 {
         self.plan_node
     }
 
-    pub fn operation_oir(&self) -> &crate::world::ArtifactId {
+    pub fn operation_oir(&self) -> &crate::resource_identity::ArtifactId {
         &self.operation_oir
     }
 
@@ -2304,7 +2304,7 @@ impl Evaluator {
         let backend_launch_generation = crate::placement::SemanticDigestV1::from_sha256(
             admitted.backend_launch_generation_sha256(&backend.canonical)?,
         )?;
-        let operation_oir = crate::world::ArtifactId::from_sha256(
+        let operation_oir = crate::resource_identity::ArtifactId::from_sha256(
             admitted.admission().bindings().oir_sha256.clone(),
         )?;
         let placement_admission = admitted.admission().placement_admission().clone();
@@ -3621,7 +3621,7 @@ fn prepared_backend_implementation(
             )
         }
     };
-    let adapter_artifact = crate::world::ArtifactId::from_sha256(adapter_sha256)?;
+    let adapter_artifact = crate::resource_identity::ArtifactId::from_sha256(adapter_sha256)?;
     let executable_set = admitted
         .executable_leases()?
         .backend_executable_set_v2(&backend.canonical)?;

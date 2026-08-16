@@ -3168,6 +3168,7 @@ use ostadix_generated_serde::registry::bundle::{
     BackendRegistry, IntegerExactness, BACKEND_CATALOG_CURRENT_SCHEMA,
     BACKEND_CATALOG_SCHEMA_V4,
 };
+use ostadix_generated_serde::{resource_identity, world};
 
 #[test]
 fn catalog_placement_and_checkpoint_sources_are_live() {
@@ -3185,6 +3186,17 @@ fn catalog_placement_and_checkpoint_sources_are_live() {
     let checkpoint = empty_checkpoint("rust", runtime.as_sha256()).unwrap();
     checkpoint.validate().unwrap();
     validate_empty_restore("rust", runtime.as_sha256(), &checkpoint).unwrap();
+}
+
+#[test]
+fn world_artifact_id_is_the_shared_identity_in_generated_aot_runtime() {
+    let shared = resource_identity::ArtifactId::from_sha256("ab".repeat(32)).unwrap();
+    let through_world: world::ArtifactId = shared.clone();
+    let through_world_identity_module: world::identity::ArtifactId = shared.clone();
+    let shared_again: resource_identity::ArtifactId = through_world;
+
+    assert_eq!(shared_again, shared);
+    assert_eq!(through_world_identity_module, shared);
 }
 "#,
         )
