@@ -64,6 +64,6 @@ preferred-citation:
 #   above, which points at the existing Zenodo preprint/package record
 #   (10.5281/zenodo.21544345), not an archive of a tagged Ostadix-lang source
 #   release. Once the tagged-release DOI exists, uncomment this and set it to
-#   that one — GitHub's "Cite this repository" button will then surface both:
-#   the preprint via preferred-citation, and the exact tagged source snapshot
-#   via the top-level doi.
+#   that one. Because `preferred-citation` selects the preprint for generated
+#   GitHub citation text, document both scholarly objects explicitly in the
+#   README rather than claiming that one generated citation exposes both.
