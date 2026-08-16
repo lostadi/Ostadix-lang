@@ -185,6 +185,7 @@ use runtime::delegated_resource::destroy_count as delegated_resource_destroy_cou
 use runtime::delegated_resource::DELEGATED_RESOURCE_DEVICE;
 use runtime::personality_supervision::arm_monitor;
 use runtime::personality_supervision::crash_count as supervision_crash_count;
+use runtime::personality_supervision::current_generation_monitor_was_armed;
 use runtime::personality_supervision::generation as supervision_generation;
 use runtime::personality_supervision::init as personality_supervision_init;
 use runtime::personality_supervision::install_replacement as install_supervision_replacement;
@@ -788,8 +789,9 @@ unsafe fn create_replacement_service() -> bool {
     if DEBUG_CAPS[SERVICE] == 0 || !create_generation_endpoints() {
         return false;
     }
+    let stale_supervision: u64 = SUPERVISION;
     let replacement: u64 = install_supervision_replacement(
-        SUPERVISION,
+        stale_supervision,
         PROCESSES[SUPERVISOR],
         STALE_SERVICE_PROCESS,
         PROCESSES[SERVICE]
@@ -812,6 +814,8 @@ unsafe fn create_replacement_service() -> bool {
     if SUPERVISION_CAP == 0
         || supervision_state(SUPERVISION)
             != SUPERVISION_STATE_REPLACEMENT_STARTING
+        || current_generation_monitor_was_armed(stale_supervision)
+        || current_generation_monitor_was_armed(SUPERVISION)
         || install_rpc_replacement(
             STALE_SERVICE_PROCESS,
             1,
@@ -1224,6 +1228,7 @@ pub unsafe fn kernel_m6_personality_supervise(
                 caller,
                 PROCESSES[SERVICE]
             ) != 1
+            || !current_generation_monitor_was_armed(SUPERVISION)
             || (generation == 1
                 && publish_personality_rpc(
                     PROCESSES[SERVICE],
@@ -1238,11 +1243,19 @@ pub unsafe fn kernel_m6_personality_supervise(
         return 1;
     }
     if action == SUPERVISE_MONITOR {
+        if subject == 0 {
+            if current_generation_monitor_was_armed(SUPERVISION) {
+                return 1;
+            }
+            if supervision_state(SUPERVISION) == SUPERVISION_STATE_STARTING
+                || supervision_state(SUPERVISION)
+                    == SUPERVISION_STATE_REPLACEMENT_STARTING {
+                return ERR_PERSONALITY_BUSY;
+            }
+            fail_closed();
+        }
         if supervision_state(SUPERVISION) != SUPERVISION_STATE_ACTIVE {
             return ERR_PERSONALITY_BUSY;
-        }
-        if subject == 0 {
-            return 1;
         }
         if subject == OP_HOLD_CANCEL
             || (ACTIVE_MODE == MODE_BOUNDED_PERSONALITY
@@ -1353,21 +1366,31 @@ pub unsafe fn kernel_m6_personality_supervise(
         if generation != 1 || subject != 2 {
             return ERR_PERSONALITY_STALE;
         }
-        return request_restart(
+        let restarted: u64 = request_restart(
             SUPERVISION,
             caller,
             PROCESSES[SERVICE]
         );
+        if restarted == 1
+            && !current_generation_monitor_was_armed(SUPERVISION) {
+            fail_closed();
+        }
+        return restarted;
     }
     if action == SUPERVISE_STOP {
         if generation != 2 || subject != 0 {
             return ERR_PERSONALITY_STALE;
         }
-        return request_stop(
+        let stopped: u64 = request_stop(
             SUPERVISION,
             caller,
             PROCESSES[SERVICE]
         );
+        if stopped == 1
+            && !current_generation_monitor_was_armed(SUPERVISION) {
+            fail_closed();
+        }
+        return stopped;
     }
     return ERR_PERSONALITY_UNSUPPORTED;
 }
@@ -1393,6 +1416,7 @@ pub unsafe fn kernel_m6_service_fault(process: u64) -> u64 {
         || failed_requests != 1
         || ipc_process_died(process) == 0
         || record_crash(process) != 1
+        || !current_generation_monitor_was_armed(SUPERVISION)
         || !personality_rpc_invariants_hold()
         || (ACTIVE_MODE == MODE_BOUNDED_PERSONALITY
             && !bounded_rpc_invariants_hold())
@@ -2022,6 +2046,7 @@ pub unsafe fn start(mode: u64, native_domain: u64) -> never {
     if SUPERVISION == 0
         || SUPERVISION_CAP == 0
         || supervision_state(SUPERVISION) != SUPERVISION_STATE_STARTING
+        || current_generation_monitor_was_armed(SUPERVISION)
         || publish_count() != 1
         || personality_rpc_init() != 1 {
         fail_closed();
