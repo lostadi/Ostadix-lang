@@ -1,0 +1,36 @@
+name: Feature request
+description: Propose a bounded capability or compatibility improvement.
+title: "[Feature] "
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Security vulnerabilities belong in private reporting, not this public
+        form: https://github.com/lostadi/Ostadix-lang/security/advisories/new
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What concrete workflow or capability is missing?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed contract
+      description: Describe behavior, boundaries, and a minimal example.
+    validations:
+      required: true
+  - type: textarea
+    id: compatibility
+    attributes:
+      label: Compatibility and capacity
+      description: Identify affected APIs, schemas, backends, and execution capacity.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Acceptance evidence
+      description: Which positive and negative gates should establish the result?
+

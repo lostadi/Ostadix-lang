@@ -1392,7 +1392,7 @@ mod tests {
         for node in &plan.nodes {
             if matches!(node.kind, crate::ir::PlanNodeKind::Exec { .. }) {
                 assert_eq!(
-                    crate::hgraph::from_oir::autonomous_ephemeral_group(
+                    crate::dispatch_model::autonomous_ephemeral_group(
                         &plan,
                         node.id,
                         flat[node.id.0]

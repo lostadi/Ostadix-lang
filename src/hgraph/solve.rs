@@ -8,6 +8,7 @@ use num_traits::ToPrimitive;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::backend_morphism::{shadow_assess_backend_morphism_v1, BackendMorphismAssessmentV1};
 use crate::ir::{
     BackendRegistry, BackendValueCapabilities, IntegerExactness, RichNumberPreservation,
 };
@@ -868,6 +869,16 @@ pub fn fidelity_for_value(value: &OValue, to_lang: &str) -> Fidelity {
         return Fidelity::Unsupported;
     };
     fidelity_for_value_with_capabilities(value, &spec.value_capabilities)
+}
+
+/// Return the bounded V1 morphism assessment beside the compatibility solver
+/// result. This is deliberately shadow-only: callers can inspect divergences,
+/// but it does not alter graph facts, evidence, admission, or dispatch.
+pub fn backend_morphism_shadow_assessment_for_value(
+    value: &OValue,
+    to_lang: &str,
+) -> Option<BackendMorphismAssessmentV1> {
+    shadow_assess_backend_morphism_v1(to_lang, value)
 }
 
 pub(super) fn fidelity_for_value_with_capabilities(

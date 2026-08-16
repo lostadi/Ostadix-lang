@@ -935,6 +935,7 @@ fn direct_recovery_fixture(
     let actor_id = settled.actor.actor_id.clone().unwrap();
     let mut checkpoint_sha256 = settled.actor.checkpoint_sha256.clone().unwrap();
     let checkpoint_bytes = settled.actor.checkpoint_bytes.unwrap();
+    running.shutdown().unwrap();
     drop(running);
 
     if corrupt_backend_checkpoint {
@@ -2097,6 +2098,7 @@ fn near_total_tail_repair_runtime_open_and_clean_reopen_preserve_remaining_headr
         running.open_session(&principal, open_request).unwrap(),
         HostedResponseV2::SessionOpened { .. }
     ));
+    running.shutdown().unwrap();
     drop(running);
     drop(store);
 
@@ -2123,6 +2125,7 @@ fn near_total_tail_repair_runtime_open_and_clean_reopen_preserve_remaining_headr
         panic!("wrong repaired-runtime status response")
     };
     assert_eq!(session.status, SessionStatusV2::Ready);
+    repaired_runtime.shutdown().unwrap();
     drop(repaired_runtime);
     drop(repaired_store);
 
@@ -2523,6 +2526,7 @@ fn failed_second_actor_loss_append_keeps_first_frame_head_and_generation_fence()
     assert_eq!(runtime_root_bytes, store.durable_bytes().unwrap());
     assert_eq!(runtime_session_bytes, bytes_before_restart);
     assert_eq!(runtime_reserved_bytes, 0);
+    running.shutdown().unwrap();
     drop(running);
     drop(store);
 
@@ -2678,6 +2682,7 @@ fn failed_first_prestart_append_quarantines_until_restart_fences_generation() {
         panic!("wrong exact-retry response")
     };
     assert_eq!(duplicate.entry_sha256, accepted.entry_sha256);
+    running.shutdown().unwrap();
     drop(running);
     drop(store);
 
@@ -2826,6 +2831,7 @@ fn failed_second_prestart_append_keeps_interruption_head_and_quarantines_actor()
     assert_eq!(runtime_root_bytes, store.durable_bytes().unwrap());
     assert_eq!(runtime_session_bytes, session_bytes);
     assert_eq!(runtime_reserved_bytes, 0);
+    running.shutdown().unwrap();
     drop(running);
     drop(store);
 

@@ -1,8 +1,6 @@
-use anyhow::{bail, Result};
-use std::collections::HashSet;
-
 use crate::environment::{EnvironmentRefV2, EPHEMERAL_ENV_ID};
-use crate::ir::{BackendRegistry, ExecutionMode, PlanNodeId};
+use crate::syntax_dialect::SyntaxDialect;
+use anyhow::{bail, Result};
 
 /// Languages whose bodies are SEQUENCED (children are O-level statements)
 /// rather than SPLICED (children are raw source text for a target backend).
@@ -87,8 +85,8 @@ impl SourceSpanV1 {
 /// Additive parse result carrying the unchanged syntax tree plus a source-span
 /// sidecar in canonical executable-plan preorder.
 ///
-/// `plan_origins()[PlanNodeId.0]` corresponds to the OIR node returned at the
-/// same index by `OIrProgram::flatten_for_plan`. Bodies owned by `quote` are
+/// `plan_origins()[index]` corresponds to the OIR node returned at the same
+/// index by `OIrProgram::flatten_for_plan`. Bodies owned by `quote` are
 /// intentionally absent because they are captured syntax, not executable plan
 /// nodes. A caller associates this parser-relative map with its own source path
 /// and/or source digest; neither is inferred here.
@@ -107,8 +105,11 @@ impl ParsedDocumentV1 {
         self.plan_origins.get(plan_index)
     }
 
-    pub fn origin_for_plan_node(&self, plan_node: PlanNodeId) -> Option<&SourceSpanV1> {
-        self.origin_for_plan_index(plan_node.0)
+    /// Historical 0.2 convenience accepting either a plain index or an IR
+    /// `PlanNodeId`. The parser itself owns only syntax-relative indices; the
+    /// `From<PlanNodeId> for usize` bridge lives in the lowering layer.
+    pub fn origin_for_plan_node(&self, plan_node: impl Into<usize>) -> Option<&SourceSpanV1> {
+        self.origin_for_plan_index(plan_node.into())
     }
 
     pub fn into_nodes(self) -> Vec<ONode> {
@@ -137,11 +138,11 @@ pub struct Parser<'a> {
     line_starts: Option<Vec<usize>>,
     plan_origins: Option<Vec<SourceSpanV1>>,
     origin_suppression_depth: usize,
-    registered_backends: &'a HashSet<String>,
+    syntax_dialect: &'a dyn SyntaxDialect,
 }
 
 impl<'a> Parser<'a> {
-    pub fn new(source: &'a str, registered_backends: &'a HashSet<String>) -> Self {
+    pub fn new(source: &'a str, syntax_dialect: &'a dyn SyntaxDialect) -> Self {
         Self {
             source,
             pos: 0,
@@ -149,7 +150,7 @@ impl<'a> Parser<'a> {
             line_starts: None,
             plan_origins: None,
             origin_suppression_depth: 0,
-            registered_backends,
+            syntax_dialect,
         }
     }
 
@@ -362,10 +363,7 @@ impl<'a> Parser<'a> {
     /// the parent before descending reproduces `ExecutionPlan`'s preorder.
     fn parse_typed_expr(&mut self, tag: Tag) -> Result<ONode> {
         let origin = self.begin_origin(tag.start);
-        let owns_quoted_syntax = {
-            let backend = BackendRegistry::global().interface_for(&tag.lang);
-            backend.execution == ExecutionMode::InlineAst && backend.canonical == "quote"
-        };
+        let owns_quoted_syntax = self.syntax_dialect.owns_quoted_syntax(&tag.lang);
         if owns_quoted_syntax {
             self.origin_suppression_depth += 1;
         }
@@ -469,7 +467,8 @@ impl<'a> Parser<'a> {
         // registered backend (or `name[N](`). For a call we want plain
         // `name(` with `name` NOT being a registered backend (otherwise it
         // would be ambiguous with a typed expression with no body).
-        if self.registered_backends.contains(&name) || self.current_byte() != Some(b'(') {
+        if self.syntax_dialect.is_registered_syntax_tag(&name) || self.current_byte() != Some(b'(')
+        {
             self.pos = original_pos;
             self.line = original_line;
             return Ok(None);
@@ -575,7 +574,7 @@ impl<'a> Parser<'a> {
 
         let lang = self.source[start..i].to_string();
 
-        if !self.registered_backends.contains(&lang) {
+        if !self.syntax_dialect.is_registered_syntax_tag(&lang) {
             return Ok(None);
         }
 
@@ -697,7 +696,7 @@ impl<'a> Parser<'a> {
             // …) so the AST, evaluator env keys, and shim resolution all see
             // the canonical name. `raw` keeps the source spelling so the
             // closer `)_py` still matches its opener.
-            let lang = BackendRegistry::global().canonical(&lang).to_string();
+            let lang = self.syntax_dialect.canonical_syntax_name(&lang);
             Ok(Some(Tag {
                 start,
                 lang,
@@ -1094,7 +1093,10 @@ fn reconstruct_node(node: &ONode, buf: &mut String) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
+    use crate::ir::PlanNodeId;
 
     fn make_backends(tags: &[&str]) -> HashSet<String> {
         tags.iter().map(|s| s.to_string()).collect()

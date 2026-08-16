@@ -10,7 +10,7 @@ use std::fmt;
 
 use crate::environment::EnvironmentRefV2;
 use crate::ir::{ExecutionMode, PlanNodeId, PlanNodeKind};
-use crate::world::identity::{
+use crate::resource_identity::{
     ArtifactPublicationIdentity, CapabilityIdentity, DomainIdentity, GovernorIdentity,
     NodeIdentity, ObjectIdentity, ProcessIdentity, ResourceIdentity, TaskAttemptIdentity,
     WorldIdentity,
@@ -844,7 +844,7 @@ pub fn effect_summary_for_plan_node(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::world::identity::{
+    use crate::resource_identity::{
         ResourceGeneration, ResourceId, ResourceOwner, WorldEpoch, WorldId,
     };
 
