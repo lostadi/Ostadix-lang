@@ -313,6 +313,14 @@ jobs:
         run: ./boot-and-test.sh smoke
       # END GENERATED: REQUIRED_QEMU_EVIDENCE_CI
 
+      # This required, blocking diagnostic-quality check repeats Mode 25 under
+      # bounded host pressure. It is not an additional admissible evidence gate.
+      - name: Repeat Mode 25 lifecycle diagnostics (non-admissible)
+        env:
+          OCORE_M6_LINUX_STRESS_PRESSURE_WORKERS: "2"
+          OCORE_M6_LINUX_STRESS_RUNS: "2"
+        run: ocore/kernel/stress-live-linux-personality-qemu.sh
+
   required-ci:
     name: Required CI
     if: ${{ always() }}

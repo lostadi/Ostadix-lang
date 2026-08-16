@@ -127,6 +127,72 @@ also requires unrelated-observer progress and zero remaining requests, views,
 fd objects, capabilities, processes, address spaces, and frames, plus a later
 timer and a one-second post-completion survival window.
 
+Mode 25 also emits `M25D:` lifecycle diagnostics. `S` markers identify bounded
+progress through fault containment, generation replacement, terminal teardown,
+and the post-cleanup timer arm. `R0`, `R0S`, and `R1` through `R3` identify the
+post-S2 supervisor's generation-one monitor-arm observation, crash-monitor
+observation, and restart request. `R0B` is fatal because a current generation
+that reached S2 must retain its earlier monitor-arm milestone. `C`, `D`, and
+`F` markers identify a specific crash-continuation, Linux dispatch/stream, or
+finalization failure and are acceptance-fatal. Most immediately precede a
+fail-closed halt; `C10` also identifies a typed restart rejection returned to
+the supervisor. These markers are diagnostic only: none is accepted in place
+of any canonical marker required by the live acceptance gate.
+
+The marker bytes, post-S2 latch, and marker dispatcher are build-selected in
+`kernel::m6_mode25_diagnostics` only for Mode 25. Mode 26 links the same module
+surface as a no-data, no-op stub. The shared `kernel::m6` implementation still
+carries the monotonic monitor-arm rule and its lifecycle assertions in both
+modes; the selection removes diagnostics from Mode 26 without weakening that
+semantic repair or increasing fixed kernel-image headroom.
+
+The monitor-arm fact is generation-scoped and monotonic. The current generation
+reports it after the initial arm while `ACTIVE`, `CRASHED`,
+`RESTART_REQUESTED`, or `STOP_REQUESTED`; a stale handle is rejected, and a
+new `REPLACEMENT_STARTING` generation reports it only after its own monitor arm.
+This prevents a supervisor that observes the initial arm after the service
+crash from waiting forever on an already-crossed state transition.
+
+The pinned CPL3 personality and supervisor binaries retain their existing
+pause-on-protocol-mismatch behavior and are not assigned `M25D:` codes, because
+changing those binaries would change the canonical corpus and OVFS identities.
+For those user-principal stalls, QMP register state and the last serial-marker
+arrival provide generic diagnostic context; they do not claim exact source-site
+localization.
+
+When QEMU remains alive without satisfying the gate, the harness first freezes
+the failed lifecycle classification, then uses a private QMP socket for a
+bounded, best-effort capture of pre-stop status and vCPU state. It asks QEMU to
+stop, confirms the resulting status, and captures post-stop vCPU, register,
+PIC, and IRQ state before terminating the process. It also resolves the
+just-built kernel's data-symbol addresses with `nm` and reads bounded physical
+memory ranges for thread states and queues, current/prepared threads, run and
+switch counts, the supervisor's saved 22-word frame, scheduler state, M6
+process/thread/physical identities and fault latch, and supervision states and
+counters. The post-stop snapshot is a stable QEMU safe point, not the exact
+timeout instant. An early QEMU exit and any QMP connection, stop, symbol, or
+command failure are reported separately; QMP output never changes a failed gate
+into a pass. Passing runs do not request QMP state.
+
+For a non-admissible repeat check with fresh build directories and no silent
+retry, run:
+
+```bash
+OCORE_M6_LINUX_STRESS_RUNS=2 \
+  ./ocore/kernel/stress-live-linux-personality-qemu.sh
+```
+
+Every requested invocation must independently pass. This wrapper is a CI
+lifecycle-stress diagnostic and is intentionally not listed as an evidence
+gate in `evidence/gates.toml`. Local runs default to no synthetic host load.
+Set `OCORE_M6_LINUX_STRESS_PRESSURE_WORKERS` to an integer from `0` through `8`
+to run that exact number of tracked `yes` workers during the repeated smokes;
+the wrapper terminates and waits for only those recorded PIDs. CI uses two
+workers to exercise the scheduler interleaving that exposed the generation-1
+monitor-observation race. That two-run pressure check is intentionally blocking
+in Required CI as a diagnostic-quality requirement; it does not become
+admissible execution evidence or substitute for any canonical gate marker.
+
 The complete Mode 25 OVFS image is 60,104 bytes with SHA-256:
 
 ```text
