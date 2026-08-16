@@ -18,8 +18,10 @@ and keeps the mixed generated crates `publish = false`.
 
 ## Pre-tag validation
 
-Run these commands from the repository root before creating an archival tag.
-They are the release gate copied from CI plus the local release-claim guard:
+Run these manual preflight commands from the repository root before creating an
+archival tag. They overlap the CI coverage but are not a byte-for-byte copy of
+the workflow. The tag-triggered `Required CI` aggregate is the authoritative
+release gate; this list is complementary local evidence.
 
 The native artifact and QEMU gates require Clang, LLD, `llvm-objdump`, `nm`
 (provided by binutils in CI), and `qemu-system-x86_64`. CI installs each
@@ -373,8 +375,9 @@ After DOI minting:
 2. Keep `date-released` set to the actual v0.2.0 publication date,
    `2026-08-16`; do not replace it with the later DOI-minting date.
 3. Update the README citation section to cite the DOI-bearing archived release.
-4. Re-tag, amend, or make a follow-up metadata release as appropriate for the
-   repository policy; preserve a clear public trail from source tag to DOI.
+4. Use a follow-up metadata commit and a subsequent release as appropriate for
+   repository policy. Never move or recreate the archival `v0.2.0` tag after
+   publication; preserve a clear public trail from source tag to DOI.
 
 ## Generated artifacts must not be published
 
