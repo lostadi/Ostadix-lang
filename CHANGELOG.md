@@ -7,6 +7,10 @@ Package SemVer is only one of the independent coordinates documented in
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-16
+
+Release notes: [docs/releases/v0.2.0.md](docs/releases/v0.2.0.md).
+
 ### Added
 
 - Contribution, private security-reporting, conduct, and review-ownership
@@ -54,3 +58,6 @@ here or in source does not itself assert a tag, publication, production
 readiness, hardware result, remote placement result, or live-World result.
 Release entries must be dated and linked to the exact released commit or tag
 when a release is cut.
+
+[Unreleased]: https://github.com/lostadi/Ostadix-lang/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/lostadi/Ostadix-lang/releases/tag/v0.2.0
