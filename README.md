@@ -28,6 +28,9 @@ elastic governed computer; it is not part of the release name. Existing
 Ostadix-lang commands, package identities, URLs, and citation metadata remain
 compatible.
 
+The bounded v0.2.0 release record, verification boundary, and explicit
+nonclaims are in [docs/releases/v0.2.0.md](docs/releases/v0.2.0.md).
+
 Ostadix-lang is a language system built on one
 radical idea: the language an expression is written in is a structural part
 of the expression itself, not a file extension, not a global mode switch, not
