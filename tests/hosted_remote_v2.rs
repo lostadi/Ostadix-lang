@@ -8,16 +8,16 @@ use o_lang::eval::{Evaluator, PlacementFragmentBindingsV1};
 use o_lang::hosted_remote::v2::{
     build_local_dev_placement_proof_v2, open_capability_commitment_v2, validate_hosted_response_v2,
     DenyAllPlacementAuthorizerV2, DurableSessionStoreV2, HostedCommandBindingV2,
-    HostedNodeSignerV2, HostedPlacementAuthorityV2, HostedRequestV2, HostedResponseV2,
-    HostedV2RuntimeClosedV2, HostedV2RuntimeConfig, HostedV2RuntimeHandle, HostedV2RuntimeOwner,
-    HostedV2RuntimeShutdownErrorV2, JournalEntryV2, JournalEventV2, LocalDevPlacementConfigV2,
-    OpenSessionRequestV2, OperationStatusV2, PinnedEd25519PlacementAuthorizerV2,
-    PlacementLeaseSignerV2, PlacementPurposeV2, PreparedOperationV2, SessionCapabilityV2,
-    SessionMutationRequestV2, SessionQueryV2, SessionStateTierV2, SignedJournalEntryV2,
-    SignedPlacementLeaseV2, SubmitOperationRequestV2, HOSTED_COMMAND_BINDING_SCHEMA_V2,
-    HOSTED_JOURNAL_ENTRY_SCHEMA_V2, HOSTED_PROTOCOL_V2,
+    HostedNodeSignerV2, HostedPlacementAuthorityV2, HostedProtocolErrorV2, HostedRequestV2,
+    HostedResponseV2, HostedV2RuntimeClosedV2, HostedV2RuntimeConfig, HostedV2RuntimeHandle,
+    HostedV2RuntimeOwner, HostedV2RuntimeShutdownErrorV2, JournalEntryV2, JournalEventV2,
+    LocalDevPlacementConfigV2, OpenSessionRequestV2, OperationStatusV2,
+    PinnedEd25519PlacementAuthorizerV2, PlacementLeaseSignerV2, PlacementPurposeV2,
+    PreparedOperationV2, SessionCapabilityV2, SessionMutationRequestV2, SessionQueryV2,
+    SessionStateTierV2, SignedJournalEntryV2, SignedPlacementLeaseV2, SubmitOperationRequestV2,
+    HOSTED_COMMAND_BINDING_SCHEMA_V2, HOSTED_JOURNAL_ENTRY_SCHEMA_V2, HOSTED_PROTOCOL_V2,
 };
-use o_lang::hosted_remote::{canonical_hosted_sha256, unix_time_ms};
+use o_lang::hosted_remote::{canonical_hosted_sha256, unix_time_ms, MAX_HOSTED_OUTPUT_BYTES};
 use o_lang::ir::BackendRegistry;
 use o_lang::placement::{
     ActorGenerationIdV1, CanonicalPlacementRecordV1, EnvironmentRequirementV1, GenerationV1,
@@ -32,6 +32,7 @@ const NODE_ID: &str = "node-v2-test";
 // fixtures start one millisecond before `now`, so 4_999 is the exact maximum.
 const TEST_EVIDENCE_VALIDITY_MS: u64 = 4_999;
 const EXPIRED_RETRY_VALIDITY_MS: u64 = 4_000;
+const MAX_FRESH_PLACEMENT_ATTEMPTS: usize = 3;
 
 #[derive(Clone)]
 struct OpenedSession {
@@ -549,6 +550,150 @@ fn submit(
             },
         )
         .unwrap()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn submit_with_fresh_placement_until_not_expired(
+    runtime: &HostedV2RuntimeHandle,
+    signer: &PlacementLeaseSignerV2,
+    principal: &str,
+    opened: &OpenedSession,
+    request_id: &str,
+    sequence: u64,
+    operation: &PreparedOperationV2,
+    state_quotas: &StateQuotaLimitsV2,
+    expected_lease_nonce: Option<&str>,
+) -> HostedResponseV2 {
+    let operation_sha256 = operation.sha256().unwrap();
+    for attempt in 1..=MAX_FRESH_PLACEMENT_ATTEMPTS {
+        let actor_generation = current_actor_generation(runtime, principal, &opened.capability);
+        let placement_lease = lease(
+            signer,
+            principal,
+            opened.state_session.clone(),
+            opened.tier,
+            state_quotas.clone(),
+            opened.reservation.clone(),
+            Some(&opened.target),
+            actor_generation.as_ref(),
+            request_id,
+            sequence,
+            PlacementPurposeV2::Execute,
+            Some(operation_sha256.clone()),
+            operation,
+        )
+        .0;
+        if let Some(expected_lease_nonce) = expected_lease_nonce {
+            assert_eq!(
+                placement_lease.authority.lease_nonce().to_string(),
+                expected_lease_nonce,
+                "fresh test evidence changed the deterministic lease nonce"
+            );
+        }
+        let freshness_deadline = test_placement_freshness_deadline(&placement_lease);
+        let response = runtime.handle_request(
+            principal,
+            HostedRequestV2::SubmitOperation {
+                protocol: HOSTED_PROTOCOL_V2.to_owned(),
+                request: SubmitOperationRequestV2 {
+                    credentials: opened.capability.clone().into(),
+                    client_request_id: request_id.to_owned(),
+                    client_sequence: sequence,
+                    placement_lease,
+                    operation: operation.clone(),
+                },
+            },
+        );
+        let response_time = unix_time_ms().unwrap();
+        if should_refresh_self_minted_test_placement(
+            &response,
+            attempt,
+            response_time,
+            freshness_deadline,
+        ) {
+            continue;
+        }
+        return response;
+    }
+    unreachable!("bounded fresh-placement attempts always return a response")
+}
+
+fn test_placement_freshness_deadline(lease: &SignedPlacementLeaseV2) -> u64 {
+    let mut deadline = [
+        lease.authority.expires_at().get(),
+        lease.evidence.node_profile.expires_at().get(),
+        lease.evidence.capacity_observation.expires_at().get(),
+    ]
+    .into_iter()
+    .min()
+    .unwrap();
+    if let Some(state_capacity) = lease.state_capacity_observation.as_ref() {
+        deadline = deadline.min(state_capacity.expires_at().get());
+    }
+    for warrant in &lease.evidence.warrants {
+        if let Some(expires_at) = warrant.expires_at() {
+            deadline = deadline.min(expires_at.get());
+        }
+    }
+    deadline
+}
+
+fn should_refresh_self_minted_test_placement(
+    response: &HostedResponseV2,
+    attempt: usize,
+    response_time: u64,
+    freshness_deadline: u64,
+) -> bool {
+    matches!(
+        response,
+        HostedResponseV2::Error { error }
+            if matches!(error.code.as_str(), "placement-denied" | "placement-expired")
+                && response_time >= freshness_deadline
+                && attempt < MAX_FRESH_PLACEMENT_ATTEMPTS
+    )
+}
+
+#[test]
+fn self_minted_placement_refresh_is_code_and_deadline_bounded() {
+    let response = |code| HostedResponseV2::Error {
+        error: HostedProtocolErrorV2::new(code, "test rejection", false),
+    };
+    assert!(should_refresh_self_minted_test_placement(
+        &response("placement-denied"),
+        1,
+        101,
+        100,
+    ));
+    assert!(!should_refresh_self_minted_test_placement(
+        &response("placement-denied"),
+        1,
+        99,
+        100,
+    ));
+    assert!(should_refresh_self_minted_test_placement(
+        &response("placement-expired"),
+        1,
+        101,
+        100,
+    ));
+    assert!(!should_refresh_self_minted_test_placement(
+        &response("placement-expired"),
+        1,
+        99,
+        100,
+    ));
+    assert!(!should_refresh_self_minted_test_placement(
+        &response("placement-denied"),
+        MAX_FRESH_PLACEMENT_ATTEMPTS,
+        101,
+        100,
+    ));
+    assert!(!should_refresh_self_minted_test_placement(
+        &response("quota-exceeded"),
+        1,
+        101,
+        100,
+    ));
 }
 
 fn current_actor_generation(
@@ -1578,65 +1723,39 @@ fn durable_capacity_refusal_preserves_reserved_close_headroom() {
         small_reservation,
     );
 
-    let mut next_sequence = 1_u64;
-    let mut saw_capacity_refusal = false;
-    for ordinal in 0..8 {
-        let operation_id = format!("fill-{ordinal}");
-        let source = format!("bash^(\nprintf '2'\n#{}\n)_bash", "x".repeat(24 * 1024));
-        let prepared = PreparedOperationV2::new(
-            operation_id.clone(),
-            TaskAttemptIdV1::new(
-                digest(&format!("task:{operation_id}")),
-                GenerationV1::new(1).unwrap(),
-            ),
-            source,
-            BackendRegistry::global().catalog_sha256(),
-            unix_time_ms().unwrap() + 60_000,
-            4096,
-        )
-        .unwrap();
-        let request_id = format!("execute-{operation_id}");
-        let response = runtime.submit_operation(
-            &principal,
-            SubmitOperationRequestV2 {
-                credentials: opened.capability.clone().into(),
-                client_request_id: request_id.clone(),
-                client_sequence: next_sequence,
-                placement_lease: lease(
-                    &placement_signer,
-                    &principal,
-                    opened.state_session.clone(),
-                    opened.tier,
-                    state_quotas.clone(),
-                    opened.reservation.clone(),
-                    Some(&opened.target),
-                    None,
-                    &request_id,
-                    next_sequence,
-                    PlacementPurposeV2::Execute,
-                    Some(prepared.sha256().unwrap()),
-                    &prepared,
-                )
-                .0,
-                operation: prepared,
-            },
-        );
-        match response {
-            Ok(_) => {
-                wait_for_terminal(&runtime, &principal, &opened.capability, &operation_id);
-                next_sequence += 1;
-            }
-            Err(error) => {
-                assert!(format!("{error:#}").contains("quota"), "{error:#}");
-                saw_capacity_refusal = true;
-                break;
-            }
-        }
-    }
-    assert!(
-        saw_capacity_refusal,
-        "test failed to reach the hard capacity boundary"
+    // The output reservation alone exceeds the entire per-session durable
+    // reservation. A tiny source therefore reaches the hard quota in one
+    // admission without making proof freshness depend on repeated parsing or
+    // backend execution under a loaded CI runner.
+    let operation_id = "fill-once";
+    let prepared = PreparedOperationV2::new(
+        operation_id,
+        TaskAttemptIdV1::new(digest("task:fill-once"), GenerationV1::new(1).unwrap()),
+        "bash^(\nprintf '2'\n)_bash",
+        BackendRegistry::global().catalog_sha256(),
+        unix_time_ms().unwrap() + 60_000,
+        MAX_HOSTED_OUTPUT_BYTES as u64,
+    )
+    .unwrap();
+    assert!(prepared.output_limit_bytes > reservation_bytes);
+    let response = submit_with_fresh_placement_until_not_expired(
+        &runtime,
+        &placement_signer,
+        &principal,
+        &opened,
+        "execute-fill-once",
+        1,
+        &prepared,
+        &state_quotas,
+        None,
     );
+    let HostedResponseV2::Error { error } = response else {
+        panic!("one-shot capacity fixture returned the wrong response: {response:?}")
+    };
+    assert_eq!(error.code, "quota-exceeded", "{error:?}");
+    let refused = current_session_view(&runtime, &principal, &opened.capability);
+    assert_eq!(refused.next_client_sequence, 1);
+    assert!(refused.operations.is_empty());
 
     let session_id = opened.capability.session_id.clone();
     runtime
@@ -1645,16 +1764,105 @@ fn durable_capacity_refusal_preserves_reserved_close_headroom() {
             SessionMutationRequestV2 {
                 credentials: opened.capability.into(),
                 client_request_id: "close-after-fill".to_owned(),
-                client_sequence: next_sequence,
+                client_sequence: 1,
             },
         )
         .expect("reserved control headroom must keep Close durable");
-    drop(runtime);
+    runtime.shutdown().unwrap();
     let store = DurableSessionStoreV2::open(&state_root, node_signer.clone()).unwrap();
     assert!(
         store.session_durable_bytes(&session_id).unwrap() <= reservation_bytes,
         "durable Close must remain inside the exact session reservation"
     );
+}
+
+#[test]
+fn expired_self_minted_execute_placement_does_not_consume_sequence_or_lease_nonce() {
+    let directory = tempfile::tempdir().unwrap();
+    let state_root = directory.path().join("state");
+    let node_signer = HostedNodeSignerV2::generate().unwrap();
+    let placement_signer = PlacementLeaseSignerV2::generate().unwrap();
+    let state_quotas = quotas(8);
+    let principal = principal_digest('a');
+    let runtime = runtime(
+        &state_root,
+        node_signer,
+        &placement_signer,
+        state_quotas.clone(),
+    );
+    let opened = open_session(
+        &runtime,
+        &placement_signer,
+        &principal,
+        "open-expired-execute",
+        SessionStateTierV2::Stateless,
+        state_quotas.clone(),
+    );
+    let prepared = operation("expired-execute", opened.tier);
+    let request_id = "execute-expired";
+    let expired_lease = lease_with_validity(
+        &placement_signer,
+        &principal,
+        opened.state_session.clone(),
+        opened.tier,
+        state_quotas.clone(),
+        opened.reservation.clone(),
+        Some(&opened.target),
+        None,
+        request_id,
+        1,
+        PlacementPurposeV2::Execute,
+        Some(prepared.sha256().unwrap()),
+        &prepared,
+        1,
+    )
+    .0;
+    let expired_nonce = expired_lease.authority.lease_nonce().to_string();
+    let expired_deadline = test_placement_freshness_deadline(&expired_lease);
+    thread::sleep(Duration::from_millis(5));
+
+    let expired = runtime.handle_request(
+        &principal,
+        HostedRequestV2::SubmitOperation {
+            protocol: HOSTED_PROTOCOL_V2.to_owned(),
+            request: SubmitOperationRequestV2 {
+                credentials: opened.capability.clone().into(),
+                client_request_id: request_id.to_owned(),
+                client_sequence: 1,
+                placement_lease: expired_lease,
+                operation: prepared.clone(),
+            },
+        },
+    );
+    let HostedResponseV2::Error { error } = expired else {
+        panic!("expired placement was not rejected: {expired:?}")
+    };
+    assert_eq!(error.code, "placement-denied");
+    assert!(!error.retryable);
+    assert!(unix_time_ms().unwrap() >= expired_deadline);
+    let unchanged = current_session_view(&runtime, &principal, &opened.capability);
+    assert_eq!(unchanged.next_client_sequence, 1);
+    assert!(unchanged.operations.is_empty());
+
+    let accepted = submit_with_fresh_placement_until_not_expired(
+        &runtime,
+        &placement_signer,
+        &principal,
+        &opened,
+        request_id,
+        1,
+        &prepared,
+        &state_quotas,
+        Some(&expired_nonce),
+    );
+    assert!(matches!(accepted, HostedResponseV2::Committed { .. }));
+    wait_for_terminal(
+        &runtime,
+        &principal,
+        &opened.capability,
+        &prepared.operation_id,
+    );
+    runtime.shutdown().unwrap();
 }
 
 #[test]
