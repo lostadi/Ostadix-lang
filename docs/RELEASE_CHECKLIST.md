@@ -321,7 +321,7 @@ Before tagging, verify all public version references agree:
 - `Cargo.toml` and `CITATION.cff` both declare `LGPL-2.1-only`, matching the root
   `LICENSE`; the attribution-only `NOTICE` does not grant an alternate license.
 
-For the current release candidate these all point at `0.2.0`; do not tag while
+For v0.2.0 these all point at `0.2.0`; do not tag while
 any one of them disagrees.
 
 ## Git tag and GitHub release
@@ -335,12 +335,18 @@ any one of them disagrees.
 6. Record the printed whole-archive SHA-256 in the release notes.
 7. Publish the GitHub release when the release notes and metadata are final.
 
+The `release-package` CI job uploads a source archive only for a `v*` tag push
+or an explicit `workflow_dispatch`. An ordinary `master` push still builds and
+verifies a temporary source ZIP in the `release-claims` job, but it does not
+upload that ZIP as a workflow artifact. Use the successful tag run's
+`Ostadix-lang-source-<github.sha>` artifact for the GitHub release.
+
 ## Zenodo DOI minting
 
 The existing DOI `10.5281/zenodo.21544345` identifies the preprint/package
 record. It is not an archive of a tagged Ostadix-lang source release and must
 remain the `preferred-citation` DOI. The steps below mint a separate DOI for a
-future tagged source snapshot:
+tagged v0.2.0 source snapshot:
 
 1. Enable the repository in Zenodo's GitHub integration.
 2. Confirm Zenodo sees `lostadi/Ostadix-lang` and is authorized to archive releases.
@@ -364,7 +370,8 @@ After DOI minting:
 
 1. Fill the top-level `doi` field in `CITATION.cff` with the separate tagged
    source-release DOI; do not replace the existing `preferred-citation` DOI.
-2. Set `date-released` to the actual release date.
+2. Keep `date-released` set to the actual v0.2.0 publication date,
+   `2026-08-16`; do not replace it with the later DOI-minting date.
 3. Update the README citation section to cite the DOI-bearing archived release.
 4. Re-tag, amend, or make a follow-up metadata release as appropriate for the
    repository policy; preserve a clear public trail from source tag to DOI.
