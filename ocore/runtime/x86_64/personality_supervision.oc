@@ -449,6 +449,29 @@ pub unsafe fn is_current(supervision: u64) -> bool {
         < MAX_PERSONALITY_SUPERVISIONS;
 }
 
+// A monitor arm is a generation-scoped monotonic milestone, not merely a view
+// of the current ACTIVE state.  Once the current generation has been armed,
+// later CRASHED, RESTART_REQUESTED, and STOP_REQUESTED transitions retain that
+// fact.  Installing a replacement advances the handle generation and leaves
+// the new REPLACEMENT_STARTING generation unarmed until arm_monitor succeeds.
+// The per-binding counter relation prevents a state label alone from implying
+// the milestone, while checked_supervision rejects stale or poisoned handles.
+pub unsafe fn current_generation_monitor_was_armed(
+    supervision: u64
+) -> bool {
+    let slot: usize = checked_supervision(supervision);
+    if slot >= MAX_PERSONALITY_SUPERVISIONS
+        || REPLACEMENTS_PER_BINDING[slot] == MAX_COUNTER
+        || MONITOR_ARMS_PER_BINDING[slot]
+            != REPLACEMENTS_PER_BINDING[slot] + 1 {
+        return false;
+    }
+    return STATES[slot] == SUPERVISION_ACTIVE
+        || STATES[slot] == SUPERVISION_CRASHED
+        || STATES[slot] == SUPERVISION_RESTART_REQUESTED
+        || STATES[slot] == SUPERVISION_STOP_REQUESTED;
+}
+
 pub unsafe fn state(supervision: u64) -> u64 {
     let slot: usize = checked_supervision(supervision);
     if slot >= MAX_PERSONALITY_SUPERVISIONS {

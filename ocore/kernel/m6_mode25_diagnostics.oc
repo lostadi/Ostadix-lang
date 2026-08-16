@@ -1,0 +1,129 @@
+module kernel::m6_mode25_diagnostics;
+
+use runtime::serial::write;
+
+// Diagnostic-only Mode 25 marker storage and dispatch.  This module is never
+// linked into Mode 26, so the shared Linux/Plan-9 kernel keeps its fixed image
+// headroom while retaining the same supervision semantics.
+static DIAG_S1: [u8; 8] = b"M25D:S1\n";
+static DIAG_S2: [u8; 8] = b"M25D:S2\n";
+static DIAG_S3: [u8; 8] = b"M25D:S3\n";
+static DIAG_S4: [u8; 8] = b"M25D:S4\n";
+static DIAG_S5: [u8; 8] = b"M25D:S5\n";
+static DIAG_S6: [u8; 8] = b"M25D:S6\n";
+static DIAG_S7: [u8; 8] = b"M25D:S7\n";
+static DIAG_S8: [u8; 8] = b"M25D:S8\n";
+static DIAG_S9: [u8; 8] = b"M25D:S9\n";
+static DIAG_S10: [u8; 9] = b"M25D:S10\n";
+static DIAG_S11: [u8; 9] = b"M25D:S11\n";
+static DIAG_S12: [u8; 9] = b"M25D:S12\n";
+static DIAG_S13: [u8; 9] = b"M25D:S13\n";
+static DIAG_S14: [u8; 9] = b"M25D:S14\n";
+static DIAG_R0: [u8; 8] = b"M25D:R0\n";
+static DIAG_R0B: [u8; 9] = b"M25D:R0B\n";
+static DIAG_R0S: [u8; 9] = b"M25D:R0S\n";
+static DIAG_R1: [u8; 8] = b"M25D:R1\n";
+static DIAG_R2: [u8; 8] = b"M25D:R2\n";
+static DIAG_R3: [u8; 8] = b"M25D:R3\n";
+static DIAG_C1: [u8; 8] = b"M25D:C1\n";
+static DIAG_C2: [u8; 8] = b"M25D:C2\n";
+static DIAG_C3: [u8; 8] = b"M25D:C3\n";
+static DIAG_C4: [u8; 8] = b"M25D:C4\n";
+static DIAG_C5: [u8; 8] = b"M25D:C5\n";
+static DIAG_C6: [u8; 8] = b"M25D:C6\n";
+static DIAG_C7: [u8; 8] = b"M25D:C7\n";
+static DIAG_C8: [u8; 8] = b"M25D:C8\n";
+static DIAG_C9: [u8; 8] = b"M25D:C9\n";
+static DIAG_C10: [u8; 9] = b"M25D:C10\n";
+static DIAG_D1: [u8; 8] = b"M25D:D1\n";
+static DIAG_D2: [u8; 8] = b"M25D:D2\n";
+static DIAG_D3: [u8; 8] = b"M25D:D3\n";
+static DIAG_D4: [u8; 8] = b"M25D:D4\n";
+static DIAG_D5: [u8; 8] = b"M25D:D5\n";
+static DIAG_F1: [u8; 8] = b"M25D:F1\n";
+static DIAG_F2: [u8; 8] = b"M25D:F2\n";
+static DIAG_F3: [u8; 8] = b"M25D:F3\n";
+static DIAG_F4: [u8; 8] = b"M25D:F4\n";
+static DIAG_F5: [u8; 8] = b"M25D:F5\n";
+static DIAG_F6: [u8; 8] = b"M25D:F6\n";
+static DIAG_F7: [u8; 8] = b"M25D:F7\n";
+
+const POST_S2_ARMED: u8 = 0x01;
+const POST_S2_R0: u8 = 0x02;
+const POST_S2_R0_SUCCESS: u8 = 0x04;
+const POST_S2_R1: u8 = 0x08;
+const POST_S2_R2: u8 = 0x10;
+const POST_S2_R3: u8 = 0x20;
+
+// The host resolves this build-selected symbol only after a failed Mode 25
+// run.  It is diagnostic state, never admissible success evidence.
+static mut POST_S2_DIAGNOSTICS: u8 = 0;
+
+pub unsafe fn emit(code: u8) -> void {
+    if code == 1 { write((&DIAG_S1[0]), 8); return; }
+    if code == 2 { write((&DIAG_S2[0]), 8); return; }
+    if code == 3 { write((&DIAG_S3[0]), 8); return; }
+    if code == 4 { write((&DIAG_S4[0]), 8); return; }
+    if code == 5 { write((&DIAG_S5[0]), 8); return; }
+    if code == 6 { write((&DIAG_S6[0]), 8); return; }
+    if code == 7 { write((&DIAG_S7[0]), 8); return; }
+    if code == 8 { write((&DIAG_S8[0]), 8); return; }
+    if code == 9 { write((&DIAG_S9[0]), 8); return; }
+    if code == 10 { write((&DIAG_S10[0]), 9); return; }
+    if code == 11 { write((&DIAG_S11[0]), 9); return; }
+    if code == 12 { write((&DIAG_S12[0]), 9); return; }
+    if code == 13 { write((&DIAG_S13[0]), 9); return; }
+    if code == 14 { write((&DIAG_S14[0]), 9); return; }
+    if code == 15 { write((&DIAG_R0[0]), 8); return; }
+    if code == 16 { write((&DIAG_R0B[0]), 9); return; }
+    if code == 17 { write((&DIAG_R0S[0]), 9); return; }
+    if code == 18 { write((&DIAG_R1[0]), 8); return; }
+    if code == 19 { write((&DIAG_R2[0]), 8); return; }
+    if code == 20 { write((&DIAG_R3[0]), 8); return; }
+    if code == 21 { write((&DIAG_C1[0]), 8); return; }
+    if code == 22 { write((&DIAG_C2[0]), 8); return; }
+    if code == 23 { write((&DIAG_C3[0]), 8); return; }
+    if code == 24 { write((&DIAG_C4[0]), 8); return; }
+    if code == 25 { write((&DIAG_C5[0]), 8); return; }
+    if code == 26 { write((&DIAG_C6[0]), 8); return; }
+    if code == 27 { write((&DIAG_C7[0]), 8); return; }
+    if code == 28 { write((&DIAG_C8[0]), 8); return; }
+    if code == 29 { write((&DIAG_C9[0]), 8); return; }
+    if code == 30 { write((&DIAG_C10[0]), 9); return; }
+    if code == 31 { write((&DIAG_D1[0]), 8); return; }
+    if code == 32 { write((&DIAG_D2[0]), 8); return; }
+    if code == 33 { write((&DIAG_D3[0]), 8); return; }
+    if code == 34 { write((&DIAG_D4[0]), 8); return; }
+    if code == 35 { write((&DIAG_D5[0]), 8); return; }
+    if code == 36 { write((&DIAG_F1[0]), 8); return; }
+    if code == 37 { write((&DIAG_F2[0]), 8); return; }
+    if code == 38 { write((&DIAG_F3[0]), 8); return; }
+    if code == 39 { write((&DIAG_F4[0]), 8); return; }
+    if code == 40 { write((&DIAG_F5[0]), 8); return; }
+    if code == 41 { write((&DIAG_F6[0]), 8); return; }
+    if code == 42 { write((&DIAG_F7[0]), 8); return; }
+}
+
+pub unsafe fn arm_post_s2() -> void {
+    POST_S2_DIAGNOSTICS = POST_S2_ARMED;
+}
+
+pub unsafe fn reset_post_s2() -> void {
+    POST_S2_DIAGNOSTICS = 0;
+}
+
+pub unsafe fn emit_post_s2_once(code: u8) -> void {
+    let mut bit: u8 = 0;
+    if code == 15 { bit = POST_S2_R0; }
+    if code == 17 { bit = POST_S2_R0_SUCCESS; }
+    if code == 18 { bit = POST_S2_R1; }
+    if code == 19 { bit = POST_S2_R2; }
+    if code == 20 { bit = POST_S2_R3; }
+    if bit == 0
+        || (POST_S2_DIAGNOSTICS & POST_S2_ARMED) == 0
+        || (POST_S2_DIAGNOSTICS & bit) != 0 {
+        return;
+    }
+    POST_S2_DIAGNOSTICS |= bit;
+    emit(code);
+}

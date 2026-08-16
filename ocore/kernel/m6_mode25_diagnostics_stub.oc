@@ -1,0 +1,17 @@
+module kernel::m6_mode25_diagnostics;
+
+// Mode 26 shares the Linux/Plan-9 supervision semantics but not Mode 25's
+// diagnostic strings, latch, or dispatch implementation.
+pub unsafe fn emit(code: u8) -> void {
+    let _unused_code: u8 = code;
+    return;
+}
+
+pub unsafe fn arm_post_s2() -> void { return; }
+
+pub unsafe fn reset_post_s2() -> void { return; }
+
+pub unsafe fn emit_post_s2_once(code: u8) -> void {
+    let _unused_code: u8 = code;
+    return;
+}
