@@ -104,6 +104,7 @@ class HostedHGraphBenchmarkTests(unittest.TestCase):
                 f"""\
                 #!{sys.executable}
                 import hashlib
+                import json
                 import os
                 from pathlib import Path
                 import sys
@@ -112,10 +113,20 @@ class HostedHGraphBenchmarkTests(unittest.TestCase):
                 if not args:
                     raise SystemExit(64)
                 program = Path(args[0])
-                required = ["--target", "ir", "--explain-schedule", "--workers", "--shim-dir"]
+                required = [
+                    "--target",
+                    "ir",
+                    "--explain-schedule",
+                    "--format",
+                    "json",
+                    "--workers",
+                    "--shim-dir",
+                ]
                 for item in required:
                     if item not in args:
                         raise SystemExit(f"missing analyzer argument: {{item}}")
+                if args[args.index("--format") + 1] != "json":
+                    raise SystemExit("benchmark did not request JSON schedule output")
                 source = program.read_text(encoding="utf-8")
                 if "__SLEEP_" in source:
                     raise SystemExit("analyzer received an unresolved timing placeholder")
@@ -138,52 +149,112 @@ class HostedHGraphBenchmarkTests(unittest.TestCase):
                 width = max(map(len, layers))
                 span = len(layers)
                 digest = hashlib.sha256(program.stem.encode()).hexdigest()
-                header = "; SchedulePrediction oexec.schedule-prediction/v1"
-                if mode != "missing-header":
-                    print(header)
-                if mode == "duplicate-header":
-                    print(header)
-                if mode == "bad-digest":
-                    digest = "not-a-digest"
-                if mode == "bad-span":
-                    span += 1
                 admission_digest = digest
                 if mode == "mismatched-admission":
                     admission_digest = hashlib.sha256(b"different-admission").hexdigest()
-                admission_header = "; ExecutionAdmission oexec.admission/v5"
+                placement_admission_digest = hashlib.sha256(
+                    b"placement-admission"
+                ).hexdigest()
+                if mode == "malformed-placement-admission-binding":
+                    placement_admission_digest = "not-a-digest"
+                if mode == "nonlowercase-placement-admission-binding":
+                    placement_admission_digest = placement_admission_digest.upper()
+                bindings = {{
+                    "lowered_oir_sha256": hashlib.sha256(b"oir").hexdigest(),
+                    "plan_sha256": hashlib.sha256(b"plan").hexdigest(),
+                    "analyzed_graph_sha256": hashlib.sha256(b"analyzed-graph").hexdigest(),
+                    "backend_catalog_projection_sha256": hashlib.sha256(b"catalog").hexdigest(),
+                    "backend_set_sha256": hashlib.sha256(b"backend-set").hexdigest(),
+                    "direct_executable_manifest_sha256": hashlib.sha256(b"executables").hexdigest(),
+                    "launch_context_sha256": hashlib.sha256(b"launch-context").hexdigest(),
+                    "environment_sha256": hashlib.sha256(b"environment").hexdigest(),
+                    "ambient_world_sha256": hashlib.sha256(b"ambient-world").hexdigest(),
+                    "analyzer_sha256": hashlib.sha256(b"analyzer").hexdigest(),
+                    "evidence_sha256": hashlib.sha256(b"evidence").hexdigest(),
+                    "admitted_graph_sha256": hashlib.sha256(b"graph").hexdigest(),
+                    "placement_admission_sha256": placement_admission_digest,
+                    "admission_sha256": admission_digest,
+                }}
+                workers = int(args[args.index("--workers") + 1])
+                coverage = "yes" if workers >= width else "no"
+                document = {{
+                    "schema": "oexec.schedule-explanation/v1",
+                    "admission": {{
+                        "schema": "oexec.admission/v5",
+                        "analyzer": "fixture-analyzer/v5",
+                        "runtime_snapshot_kind": "inspection",
+                        "base_policy": "eager",
+                        "bindings": bindings,
+                    }},
+                    "realizability": {{
+                        "schema": "oexec.realizability/v1",
+                        "status": "inspection-only",
+                        "execution_realizable": "unknown",
+                        "dispatch": "not-run",
+                        "scope": "local-worker-static-wave",
+                        "worker_count_covers_static_wave": coverage,
+                        "runtime_readiness": "unknown",
+                        "placement_lease": "none",
+                        "observed_overlap": "not-run",
+                        "source": "cli-override",
+                        "available_parallelism": 8,
+                        "admitted_static_max_wave_width": width,
+                        "admitted_max_local_worker_wave_width": width,
+                        "selected_workers": workers,
+                    }},
+                    "prediction": {{
+                        "schema": "oexec.schedule-prediction/v1",
+                        "status": "admitted-static",
+                        "provenance": "evidence-bound-admission",
+                        "model": "unit-cost-shim-hosted-tasks",
+                        "admission_sha256": digest,
+                        "task_count": task_count,
+                        "predicted_width": width,
+                        "predicted_span": span,
+                        "span_unit": "hosted-task-layers",
+                        "layers": [
+                            {{
+                                "index": index,
+                                "operations": [f"P{{operation}}" for operation in operations],
+                            }}
+                            for index, operations in enumerate(layers, 1)
+                        ],
+                    }},
+                }}
+                if mode == "invalid-json":
+                    print("{{")
+                    raise SystemExit(0)
+                if mode == "wrong-explanation-schema":
+                    document["schema"] = "oexec.schedule-explanation/v999"
+                if mode == "extra-top-level-field":
+                    document["unexpected"] = True
+                if mode == "missing-admission":
+                    del document["admission"]
                 if mode == "wrong-admission-schema":
-                    admission_header = "; ExecutionAdmission oexec.admission/v999"
-                if mode != "missing-admission":
-                    print(admission_header)
-                if mode == "duplicate-admission":
-                    print(admission_header)
-                binding = (
-                    f"binding analyzer-sha256={{hashlib.sha256(b'analyzer').hexdigest()}} "
-                    f"evidence-sha256={{hashlib.sha256(b'evidence').hexdigest()}} "
-                    f"admitted-graph-sha256={{hashlib.sha256(b'graph').hexdigest()}} "
-                    f"admission-sha256={{admission_digest}}"
-                )
-                if mode == "malformed-admission-binding":
-                    binding += " unexpected=true"
-                if mode != "missing-admission-binding":
-                    print(binding)
-                if mode == "duplicate-admission-binding":
-                    print(binding)
-                print(
-                    "schedule-prediction "
-                    "schema=oexec.schedule-prediction/v1 "
-                    "status=admitted-static "
-                    "provenance=evidence-bound-admission "
-                    "model=unit-cost-shim-hosted-tasks "
-                    f"admission-sha256={{digest}} task-count={{task_count}} "
-                    f"predicted-width={{width}} predicted-span={{span}} "
-                    "span-unit=hosted-task-layers"
-                )
-                for index, operations in enumerate(layers, 1):
-                    if mode == "duplicate-operation" and index == len(layers):
-                        operations = [layers[0][0]]
-                    labels = ",".join(f"P{{operation}}" for operation in operations)
-                    print(f"schedule-prediction-layer index={{index}} operations=[{{labels}}]")
+                    document["admission"]["schema"] = "oexec.admission/v999"
+                if mode == "missing-binding-field":
+                    del bindings["placement_admission_sha256"]
+                if mode == "extra-binding-field":
+                    bindings["unexpected_sha256"] = hashlib.sha256(b"unexpected").hexdigest()
+                if mode == "missing-prediction":
+                    del document["prediction"]
+                if mode == "extra-prediction-field":
+                    document["prediction"]["unexpected"] = True
+                if mode == "wrong-prediction-schema":
+                    document["prediction"]["schema"] = "oexec.schedule-prediction/v999"
+                if mode == "bad-digest":
+                    document["prediction"]["admission_sha256"] = "not-a-digest"
+                if mode == "bad-span":
+                    document["prediction"]["predicted_span"] += 1
+                if mode == "duplicate-operation":
+                    document["prediction"]["layers"][-1]["operations"] = [
+                        document["prediction"]["layers"][0]["operations"][0]
+                    ]
+                if mode == "noncanonical-operation":
+                    document["prediction"]["layers"][0]["operations"][0] = "P01"
+                if mode == "wrong-realizability-source":
+                    document["realizability"]["source"] = "machine-default"
+                print(json.dumps(document, separators=(",", ":")))
                 """
             ),
             encoding="utf-8",
@@ -522,7 +593,7 @@ class HostedHGraphBenchmarkTests(unittest.TestCase):
             marker = f"shape={shape}.O\n"
             self.assertIn(marker, result.stdout)
             block = result.stdout.split(marker, 1)[1].split("\nshape=", 1)[0]
-            self.assertIn("prediction_source=olangc--explain-schedule\n", block)
+            self.assertIn("prediction_source=olangc--explain-schedule-json\n", block)
             self.assertIn(
                 "prediction_schema=oexec.schedule-prediction/v1\n", block
             )
@@ -543,7 +614,8 @@ class HostedHGraphBenchmarkTests(unittest.TestCase):
             self.assertIn("graph_elapsed_ms median=10 min=10 max=10\n", block)
             self.assertIn("median_speedup_serial_over_graph=2.000000\n", block)
             self.assertIn(
-                f"{shape}.O --target ir --explain-schedule --workers 4 --shim-dir",
+                f"{shape}.O --target ir --explain-schedule --format json "
+                "--workers 4 --shim-dir",
                 analyzer_invocations,
             )
         self.assertEqual(result.stderr.count("semantic_equivalence=true"), 8)
@@ -601,18 +673,24 @@ class HostedHGraphBenchmarkTests(unittest.TestCase):
     def test_invalid_analyzer_prediction_fails_before_execution(self) -> None:
         modes = (
             "exit",
-            "missing-header",
-            "duplicate-header",
+            "invalid-json",
+            "wrong-explanation-schema",
+            "extra-top-level-field",
             "missing-admission",
-            "duplicate-admission",
             "wrong-admission-schema",
-            "missing-admission-binding",
-            "duplicate-admission-binding",
-            "malformed-admission-binding",
+            "missing-binding-field",
+            "malformed-placement-admission-binding",
+            "nonlowercase-placement-admission-binding",
+            "extra-binding-field",
             "mismatched-admission",
+            "missing-prediction",
+            "extra-prediction-field",
+            "wrong-prediction-schema",
             "bad-digest",
             "bad-span",
             "duplicate-operation",
+            "noncanonical-operation",
+            "wrong-realizability-source",
         )
         for mode in modes:
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp_dir:
@@ -738,7 +816,7 @@ class HostedHGraphBenchmarkTests(unittest.TestCase):
             self.assertIn("runtime_node=unavailable", result.stdout)
             self.assertIn("runtime_node_version=unavailable", result.stdout)
             self.assertIn("missing_runtimes=node", result.stdout)
-            self.assertIn("prediction_source=olangc--explain-schedule", result.stdout)
+            self.assertIn("prediction_source=olangc--explain-schedule-json", result.stdout)
             self.assertIn("predicted_width=3", result.stdout)
             self.assertIn("predicted_span=1", result.stdout)
             self.assertIn("status=skipped", result.stdout)

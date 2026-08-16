@@ -25,6 +25,67 @@ FUZZ_WORKFLOW = ROOT / ".github" / "workflows" / "fuzz.yml"
 CATALOG = ROOT / "src" / "backend_catalog.inc.rs"
 MCP_SMOKE = ROOT / "scripts" / "smoke_ostadix_mcp.py"
 RUST_TEST_SUPPORT = ROOT / "tests" / "support" / "mod.rs"
+LOCAL_CI_POSTURE = ROOT / "scripts" / "local_ci_posture.py"
+LOCAL_CI_POSTURE_TEST = ROOT / "tests" / "test_local_ci_posture.py"
+EVIDENCE_ADMISSION = ROOT / "src" / "evidence" / "admit.rs"
+HGRAPH_BENCHMARK = ROOT / "scripts" / "benchmark_hgraph_hosted.sh"
+CLI_TEST = ROOT / "tests" / "test_cli.sh"
+
+SCHEDULE_EXPLANATION_STRUCT_FIELDS = {
+    "ScheduleExplanationV1": ("schema", "admission", "realizability", "prediction"),
+    "ScheduleExplanationAdmissionV1": (
+        "schema",
+        "analyzer",
+        "runtime_snapshot_kind",
+        "base_policy",
+        "bindings",
+    ),
+    "ScheduleExplanationBindingsV1": (
+        "lowered_oir_sha256",
+        "plan_sha256",
+        "analyzed_graph_sha256",
+        "backend_catalog_projection_sha256",
+        "backend_set_sha256",
+        "direct_executable_manifest_sha256",
+        "launch_context_sha256",
+        "environment_sha256",
+        "ambient_world_sha256",
+        "analyzer_sha256",
+        "evidence_sha256",
+        "admitted_graph_sha256",
+        "placement_admission_sha256",
+        "admission_sha256",
+    ),
+    "ScheduleRealizabilityV1": (
+        "schema",
+        "status",
+        "execution_realizable",
+        "dispatch",
+        "scope",
+        "worker_count_covers_static_wave",
+        "runtime_readiness",
+        "placement_lease",
+        "observed_overlap",
+        "source",
+        "available_parallelism",
+        "admitted_static_max_wave_width",
+        "admitted_max_local_worker_wave_width",
+        "selected_workers",
+    ),
+    "SchedulePredictionV1": (
+        "schema",
+        "status",
+        "provenance",
+        "model",
+        "admission_sha256",
+        "task_count",
+        "predicted_width",
+        "predicted_span",
+        "span_unit",
+        "layers",
+    ),
+    "SchedulePredictionLayerV1": ("index", "operations"),
+}
 
 
 class ContractError(RuntimeError):
@@ -186,6 +247,65 @@ def catalog_schema() -> str:
     return match.group(1)
 
 
+def schedule_explanation_schema() -> str:
+    match = re.search(
+        r'pub const SCHEDULE_EXPLANATION_SCHEMA_V1:\s*&str\s*=\s*"([^"]+)"',
+        EVIDENCE_ADMISSION.read_text(encoding="utf-8"),
+    )
+    if match is None:
+        raise ContractError("evidence admission does not declare the schedule schema")
+    return match.group(1)
+
+
+def rust_public_struct_fields(source: str, name: str) -> tuple[str, ...]:
+    match = re.search(
+        rf"(?ms)^pub struct {re.escape(name)}\s*\{{(?P<body>.*?)^\}}",
+        source,
+    )
+    if match is None:
+        raise ContractError(f"evidence admission does not declare {name}")
+    return tuple(re.findall(r"(?m)^\s+pub ([a-z][a-z0-9_]*):", match.group("body")))
+
+
+def validate_schedule_explanation_contract() -> None:
+    source = EVIDENCE_ADMISSION.read_text(encoding="utf-8")
+    for name, expected in SCHEDULE_EXPLANATION_STRUCT_FIELDS.items():
+        actual = rust_public_struct_fields(source, name)
+        if actual != expected:
+            raise ContractError(
+                f"{name} fields differ from the schedule-explanation v1 contract: "
+                f"expected={list(expected)!r}, actual={list(actual)!r}"
+            )
+
+    schema = schedule_explanation_schema()
+    if schema != "oexec.schedule-explanation/v1":
+        raise ContractError(f"unsupported schedule-explanation schema: {schema}")
+    benchmark = HGRAPH_BENCHMARK.read_text(encoding="utf-8")
+    if benchmark.count("--format json") != 1:
+        raise ContractError("hosted benchmark must request JSON schedule output exactly once")
+    if benchmark.count(f'"{schema}"') != 1:
+        raise ContractError("hosted benchmark does not consume the authoritative schedule schema")
+    if "binding_pattern" in benchmark or "binding analyzer-sha256=" in benchmark:
+        raise ContractError("hosted benchmark must not parse the human admission binding")
+    for fields in SCHEDULE_EXPLANATION_STRUCT_FIELDS.values():
+        for field in fields:
+            if f'"{field}"' not in benchmark:
+                raise ContractError(
+                    f"hosted benchmark does not validate schedule field {field!r}"
+                )
+
+    cli_test = CLI_TEST.read_text(encoding="utf-8")
+    if schema not in cli_test:
+        raise ContractError("CLI tests do not validate the JSON schedule schema")
+    legacy_binding = (
+        "admitted-graph-sha256=[0-9a-f]{64} "
+        "placement-admission-sha256=[0-9a-f]{64} "
+        "admission-sha256=[0-9a-f]{64}"
+    )
+    if legacy_binding not in cli_test:
+        raise ContractError("CLI tests do not retain the canonical V5 text binding")
+
+
 def validate_manifest_versions() -> None:
     for path in (ROOT / "Cargo.toml", ROOT / "mcp/ostadix_lang_mcp_server/Cargo.toml"):
         package = load_toml(path).get("package", {})
@@ -231,6 +351,28 @@ def validate_runtime_probe_consumers(workflow: str) -> None:
         raise ContractError("MCP CI must install Clippy before invoking it")
 
 
+def validate_local_ci_posture_consumer(workflow: str) -> None:
+    contracts = workflow_job_body(workflow, "contracts")
+    posture_command = (
+        "python3 scripts/local_ci_posture.py --profile baseline --format text"
+    )
+    test_command = (
+        "python3 -m unittest -v tests.test_contract_surfaces "
+        "tests.test_local_ci_posture"
+    )
+    if contracts.count(posture_command) != 1:
+        raise ContractError(
+            "contracts CI must run the stdlib-only local posture baseline exactly once"
+        )
+    if contracts.count(test_command) != 1:
+        raise ContractError(
+            "contracts CI must run contract and local-posture tests together exactly once"
+        )
+    for path in (LOCAL_CI_POSTURE, LOCAL_CI_POSTURE_TEST):
+        if not path.is_file():
+            raise ContractError(f"missing local CI posture surface: {path.relative_to(ROOT)}")
+
+
 def validate() -> None:
     suites = test_suites()
     required = load_toml(REQUIRED_JOBS)
@@ -266,6 +408,8 @@ def validate() -> None:
     validate_manifest_versions()
     validate_action_pins()
     validate_runtime_probe_consumers(workflow)
+    validate_local_ci_posture_consumer(workflow)
+    validate_schedule_explanation_contract()
     catalog_schema()
     smoke = MCP_SMOKE.read_text(encoding="utf-8")
     if (

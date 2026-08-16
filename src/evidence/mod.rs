@@ -15,9 +15,12 @@ pub mod profile;
 pub(crate) use admit::PreparedAdmissionPartsV1;
 pub use admit::{
     admit_execution, AdmittedExecution, AdmittedOperationV1, BlockerReasonV1, ExecutionAdmissionV5,
-    OperationBlockerV1, RetainedSequenceV1, ScheduleWhyDependentV1, ScheduleWhyViewV1,
+    OperationBlockerV1, RetainedSequenceV1, ScheduleExplanationAdmissionV1,
+    ScheduleExplanationBindingsV1, ScheduleExplanationV1, SchedulePredictionLayerV1,
+    SchedulePredictionV1, ScheduleRealizabilityV1, ScheduleWhyDependentV1, ScheduleWhyViewV1,
     ScheduleWhyWitnessV1, SequenceRetentionReasonV1, PLACEMENT_ADMISSION_DIGEST_DOMAIN_V1,
-    SCHEDULE_WHY_SCHEMA_V1,
+    SCHEDULE_EXPLANATION_SCHEMA_V1, SCHEDULE_PREDICTION_SCHEMA_V1,
+    SCHEDULE_REALIZABILITY_SCHEMA_V1, SCHEDULE_WHY_SCHEMA_V1,
 };
 pub use analyze::{
     analyze_execution, runtime_binding_from_adapter_bytes, runtime_binding_from_directory,

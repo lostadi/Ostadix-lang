@@ -12,6 +12,7 @@
 //   olangc <input.O> --target script              # run in-process
 //   olangc <input.O> --target ir                  # dump the lowered OIR
 //   olangc <input.O> --target ir --execution-intent-json
+//   olangc <input.O> --target ir --explain-schedule --format json
 //   olangc <input.O> --target ir --why P3         # explain one admitted operation
 //   olangc <input.O> --target dot                 # Graphviz DOT hypergraph
 //   olangc <input.O> --shim-dir ./backends        # custom shim directory
@@ -102,10 +103,14 @@ const RUNTIME_BACKEND_CATALOG_RS: &str = include_str!("../backend_catalog.inc.rs
 const RUNTIME_EVAL_RS: &str = include_str!("../eval.rs");
 const RUNTIME_PROCESS_RS: &str = include_str!("../process.rs");
 const RUNTIME_BACKEND_RS: &str = include_str!("../backend.rs");
+const RUNTIME_BACKEND_MORPHISM_RS: &str = include_str!("../backend_morphism.rs");
 const RUNTIME_BACKEND_STATE_RS: &str = include_str!("../backend_state.rs");
 const RUNTIME_NIX_OPS_RS: &str = include_str!("../nix_ops.rs");
 const RUNTIME_NIXOS_OPS_RS: &str = include_str!("../nixos_ops.rs");
 const RUNTIME_SCHEDULER_RS: &str = include_str!("../scheduler.rs");
+const RUNTIME_CANONICAL_CBOR_RS: &str = include_str!("../canonical_cbor.rs");
+const RUNTIME_DISPATCH_MODEL_RS: &str = include_str!("../dispatch_model.rs");
+const RUNTIME_SYNTAX_DIALECT_RS: &str = include_str!("../syntax_dialect.rs");
 const RUNTIME_WIRE_RS: &str = include_str!("../wire.rs");
 const RUNTIME_EFFECTS_RS: &str = include_str!("../effects.rs");
 const RUNTIME_RUNTIME_EXEC_RS: &str = include_str!("../runtime_exec.rs");
@@ -115,10 +120,6 @@ const RUNTIME_RUNTIME_EXEC_RS: &str = include_str!("../runtime_exec.rs");
 // runtimes receive the same source rather than a reduced compatibility stub.
 const RUNTIME_PLACEMENT_SOURCES: &[(&str, &str)] = &[
     ("mod.rs", include_str!("../placement/mod.rs")),
-    (
-        "catalog_compat.rs",
-        include_str!("../placement/catalog_compat.rs"),
-    ),
     ("projection.rs", include_str!("../placement/projection.rs")),
     (
         "protocol/mod.rs",
@@ -162,6 +163,7 @@ const RUNTIME_PLACEMENT_SOURCES: &[(&str, &str)] = &[
     ),
 ];
 const RUNTIME_REGISTRY_BUNDLE_RS: &str = include_str!("../registry/bundle/mod.rs");
+const RUNTIME_REGISTRY_PLACEMENT_COMPAT_RS: &str = include_str!("../registry/placement_compat.rs");
 
 // evidence — pre-execution facts and the admission compiler. These modules
 // are part of every generated runtime because eval.rs cannot construct a
@@ -329,6 +331,14 @@ enum CompileTarget {
     Dot,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ScheduleExplanationFormat {
+    /// Preserve the historical OIR, HGraph, and human admission explanation.
+    Text,
+    /// Emit one versioned schedule-explanation JSON document.
+    Json,
+}
+
 #[derive(ClapParser, Debug)]
 #[command(
     name = "olangc",
@@ -398,6 +408,11 @@ struct Cli {
     /// This is non-executing and is currently available for ordinary .O IR.
     #[arg(long)]
     explain_schedule: bool,
+
+    /// Select the schedule-explanation rendering. This option is valid only
+    /// with --target ir --explain-schedule; omitting it preserves text output.
+    #[arg(long, value_enum, value_name = "FORMAT")]
+    format: Option<ScheduleExplanationFormat>,
 
     /// Emit one authority-free, stable JSON identity for the exact source,
     /// lowered OIR, plan, solved graph, canonical backend-catalog projection,
@@ -532,6 +547,7 @@ fn main() -> Result<()> {
             cli.grounding,
             grounding_world,
             cli.workers,
+            cli.format.unwrap_or(ScheduleExplanationFormat::Text),
         ),
         CompileTarget::Ir if cli.grounding => dump_ir_with_grounding(&source, grounding_world),
         CompileTarget::Ir => dump_ir(&source),
@@ -548,6 +564,16 @@ fn validate_admission_inspection(cli: &Cli) -> Result<()> {
     }
     if cli.workers.is_some() && !cli.explain_schedule {
         bail!("--workers requires --explain-schedule --target ir");
+    }
+    if cli.format.is_some() && !cli.explain_schedule {
+        bail!("--format requires --explain-schedule --target ir");
+    }
+    if cli.format == Some(ScheduleExplanationFormat::Json)
+        && (cli.grounding || cli.world_id.is_some() || cli.world_epoch.is_some())
+    {
+        bail!(
+            "--format json is a standalone schedule view and cannot be combined with grounding or World inspection options"
+        );
     }
     if cli.why.is_some() && cli.target != CompileTarget::Ir {
         bail!("--why is available only with --target ir");
@@ -1204,10 +1230,17 @@ fn write_runtime_sources(src_dir: &Path) -> Result<()> {
     fs::write(src_dir.join("eval.rs"), RUNTIME_EVAL_RS)?;
     fs::write(src_dir.join("process.rs"), RUNTIME_PROCESS_RS)?;
     fs::write(src_dir.join("backend.rs"), RUNTIME_BACKEND_RS)?;
+    fs::write(
+        src_dir.join("backend_morphism.rs"),
+        RUNTIME_BACKEND_MORPHISM_RS,
+    )?;
     fs::write(src_dir.join("backend_state.rs"), RUNTIME_BACKEND_STATE_RS)?;
     fs::write(src_dir.join("nix_ops.rs"), RUNTIME_NIX_OPS_RS)?;
     fs::write(src_dir.join("nixos_ops.rs"), RUNTIME_NIXOS_OPS_RS)?;
     fs::write(src_dir.join("scheduler.rs"), RUNTIME_SCHEDULER_RS)?;
+    fs::write(src_dir.join("canonical_cbor.rs"), RUNTIME_CANONICAL_CBOR_RS)?;
+    fs::write(src_dir.join("dispatch_model.rs"), RUNTIME_DISPATCH_MODEL_RS)?;
+    fs::write(src_dir.join("syntax_dialect.rs"), RUNTIME_SYNTAX_DIALECT_RS)?;
     fs::write(src_dir.join("wire.rs"), RUNTIME_WIRE_RS)?;
     fs::write(src_dir.join("effects.rs"), RUNTIME_EFFECTS_RS)?;
     fs::write(src_dir.join("runtime_exec.rs"), RUNTIME_RUNTIME_EXEC_RS)?;
@@ -1223,10 +1256,17 @@ fn write_runtime_sources(src_dir: &Path) -> Result<()> {
     }
     let registry_bundle_dir = src_dir.join("registry").join("bundle");
     fs::create_dir_all(&registry_bundle_dir)?;
-    fs::write(src_dir.join("registry/mod.rs"), "pub mod bundle;\n")?;
+    fs::write(
+        src_dir.join("registry/mod.rs"),
+        "pub mod bundle;\nmod placement_compat;\n",
+    )?;
     fs::write(
         registry_bundle_dir.join("mod.rs"),
         RUNTIME_REGISTRY_BUNDLE_RS,
+    )?;
+    fs::write(
+        src_dir.join("registry/placement_compat.rs"),
+        RUNTIME_REGISTRY_PLACEMENT_COMPAT_RS,
     )?;
 
     // ── evidence — evidence-bound execution admission ──────────────────────
@@ -1439,6 +1479,7 @@ fn dump_ir_with_admission(
     include_grounding: bool,
     world: Option<WorldIdentity>,
     worker_override: Option<usize>,
+    format: ScheduleExplanationFormat,
 ) -> Result<()> {
     let (program, plan, graph) = inspect_ir(source)?;
     let graph = solve_ir_admission_graph(graph)?;
@@ -1448,16 +1489,27 @@ fn dump_ir_with_admission(
         .context("failed to validate grounding plan/HGraph")?;
     let admitted = admit_ir_for_inspection(&program, &plan, graph, shim_dir)?;
 
-    print!(
-        "{}\n{}\n{}",
-        program.to_text(),
-        admitted.graph().to_execution_text(),
-        admitted
-            .admission()
-            .to_explanation_text_with_worker_override(worker_override)
-    );
-    if let Some(grounding) = grounding {
-        print!("\n{}", grounding.to_text());
+    match format {
+        ScheduleExplanationFormat::Text => {
+            print!(
+                "{}\n{}\n{}",
+                program.to_text(),
+                admitted.graph().to_execution_text(),
+                admitted
+                    .admission()
+                    .to_explanation_text_with_worker_override(worker_override)
+            );
+            if let Some(grounding) = grounding {
+                print!("\n{}", grounding.to_text());
+            }
+        }
+        ScheduleExplanationFormat::Json => println!(
+            "{}",
+            admitted
+                .admission()
+                .to_explanation_json_with_worker_override(worker_override)
+                .context("failed to serialize schedule explanation")?
+        ),
     }
     Ok(())
 }
@@ -2025,6 +2077,7 @@ pub mod value;
 mod capability;
 pub mod environment;
 pub mod backend;
+pub mod backend_morphism;
 pub mod parser;
 pub mod placement;
 pub mod registry;
@@ -2039,8 +2092,13 @@ pub mod nix_ops;
 pub mod nixos_ops;
 pub mod runtime_exec;
 pub mod scheduler;
+#[path = \"world/identity.rs\"]
+pub mod resource_identity;
 pub mod world;
-{project_mod}pub mod wire;
+{project_mod}mod canonical_cbor;
+mod dispatch_model;
+pub mod syntax_dialect;
+pub mod wire;
 "
     )
 }
@@ -2802,22 +2860,30 @@ mod tests {
         let lib_rs = fs::read_to_string(src_dir.join("lib.rs")).unwrap();
         assert!(lib_rs.contains("pub mod effects;"));
         assert!(lib_rs.contains("pub mod environment;"));
+        assert!(lib_rs.contains("pub mod backend_morphism;"));
         assert!(lib_rs.contains("pub mod placement;"));
         assert!(lib_rs.contains("pub mod registry;"));
         assert!(lib_rs.contains("pub mod evidence;"));
         assert!(lib_rs.contains("pub mod hgraph;"));
         assert!(lib_rs.contains("pub mod executor;"));
         assert!(lib_rs.contains("pub mod runtime_exec;"));
+        assert!(lib_rs.contains("pub mod resource_identity;"));
         assert!(lib_rs.contains("pub mod world;"));
+        assert!(lib_rs.contains("mod canonical_cbor;"));
+        assert!(lib_rs.contains("mod dispatch_model;"));
+        assert!(lib_rs.contains("pub mod syntax_dialect;"));
 
         for path in [
             "backend_catalog.inc.rs",
+            "backend_morphism.rs",
             "backend_state.rs",
+            "canonical_cbor.rs",
+            "dispatch_model.rs",
+            "syntax_dialect.rs",
             "environment.rs",
             "effects.rs",
             "runtime_exec.rs",
             "placement/mod.rs",
-            "placement/catalog_compat.rs",
             "placement/projection.rs",
             "placement/protocol/mod.rs",
             "placement/protocol/candidate.rs",
@@ -2831,6 +2897,7 @@ mod tests {
             "placement/protocol/warrant.rs",
             "registry/mod.rs",
             "registry/bundle/mod.rs",
+            "registry/placement_compat.rs",
             "evidence/mod.rs",
             "evidence/fact.rs",
             "evidence/analyze.rs",
@@ -2875,6 +2942,11 @@ mod tests {
             "generated runtimes must receive the canonical backend catalog verbatim"
         );
         assert_eq!(
+            fs::read_to_string(src_dir.join("backend_morphism.rs")).unwrap(),
+            RUNTIME_BACKEND_MORPHISM_RS,
+            "generated runtimes must receive the bounded backend morphism kernel verbatim"
+        );
+        assert_eq!(
             fs::read_to_string(src_dir.join("backend_state.rs")).unwrap(),
             RUNTIME_BACKEND_STATE_RS,
             "generated runtimes must receive the state wire protocol verbatim"
@@ -2883,6 +2955,11 @@ mod tests {
             fs::read_to_string(src_dir.join("registry/bundle/mod.rs")).unwrap(),
             RUNTIME_REGISTRY_BUNDLE_RS,
             "generated runtimes must receive the canonical backend bundle verbatim"
+        );
+        assert_eq!(
+            fs::read_to_string(src_dir.join("registry/placement_compat.rs")).unwrap(),
+            RUNTIME_REGISTRY_PLACEMENT_COMPAT_RS,
+            "generated runtimes must receive catalog/placement integration verbatim"
         );
         for &(relative_path, embedded) in RUNTIME_PLACEMENT_SOURCES {
             assert_eq!(
@@ -2895,6 +2972,11 @@ mod tests {
             fs::read_to_string(src_dir.join("effects.rs")).unwrap(),
             RUNTIME_EFFECTS_RS,
             "generated runtimes must receive the shared semantic effect model verbatim"
+        );
+        assert_eq!(
+            fs::read_to_string(src_dir.join("dispatch_model.rs")).unwrap(),
+            RUNTIME_DISPATCH_MODEL_RS,
+            "generated runtimes must receive the shared dispatch classification verbatim"
         );
         assert_eq!(
             fs::read_to_string(src_dir.join("evidence/admit.rs")).unwrap(),

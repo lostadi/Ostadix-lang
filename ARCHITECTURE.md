@@ -18,10 +18,12 @@ Ostadix-lang/
 │   ├── ir.rs         #   OIR intermediate representation & backend registry
 │   ├── eval.rs       #   Recursive evaluator
 │   ├── effects.rs    #   Semantic effect/resource summaries
+│   ├── dispatch_model.rs # Pure evidence/executor dispatch classification
 │   ├── evidence/     #   Pre-execution analysis and admission compiler
 │   ├── executor/     #   Graph coordinator and serial oracle
 │   ├── hgraph/       #   Directed value/state/control hypergraph
 │   ├── value.rs      #   OValue universal type system
+│   ├── information/  #   Authority-free identity/projection sidecar
 │   ├── process.rs    #   Subprocess management for backends
 │   ├── nix_ops.rs    #   Nix build/realise operations
 │   ├── nixos_ops.rs  #   NixOS-specific operations
@@ -47,6 +49,30 @@ Ostadix-lang/
 ├── SPEC.md           # Language specification
 └── README.md         # Project overview
 ```
+
+## Frozen dependency direction
+
+The first cycle-breaking boundaries are executable repository contracts:
+
+- parser production code depends only on `syntax_dialect.rs`, a narrow view
+  answering registration, canonical spelling, and quoted-body ownership;
+- `src/ir.rs` owns OIR and plans but does not import HGraph; the historical
+  inherent HGraph convenience methods are implemented in
+  `src/hgraph/from_oir.rs`;
+- `dispatch_model.rs` is a pure classification layer shared by evidence and
+  executor, so evidence no longer imports worker implementation;
+- governed identity is rooted below both Effects and World (the historical
+  `world::identity` path is a compatibility re-export);
+- backend-catalog/placement integration lives in Registry above the
+  registry-independent placement protocol.
+
+`python3 scripts/check_architecture_boundaries.py` rejects regressions to these
+wrong-way edges. More cycles remain to be separated before converting the
+monolith into a multi-crate workspace.
+
+The experimental authority-free information substrate is described in
+[`docs/INFORMATION_KERNEL_V1.md`](docs/INFORMATION_KERNEL_V1.md). It references
+existing native records without changing their bytes or execution authority.
 
 ## Evaluation Pipeline
 

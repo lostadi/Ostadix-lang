@@ -365,6 +365,7 @@ class SetupScriptTests(unittest.TestCase):
                 "o-node",
                 "octl",
                 "o-registry",
+                "o-info",
             ):
                 with self.subTest(binary=binary):
                     self.assertIn(f"--bin {binary}", output)

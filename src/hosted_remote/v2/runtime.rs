@@ -48,9 +48,34 @@ pub struct HostedV2RuntimeConfig {
     pub state_quotas: StateQuotaLimitsV2,
 }
 
+/// Historical 0.2 compatibility façade combining request access and shutdown
+/// authority. New embedders should use [`HostedV2RuntimeOwner`] and distribute
+/// only [`HostedV2RuntimeHandle`] values. This façade remains source-compatible
+/// through 0.2 and is intentionally not marked with Rust's `deprecated`
+/// attribute so downstream warnings-as-errors builds keep working.
 #[derive(Clone)]
 pub struct HostedV2Runtime {
     inner: Arc<RuntimeInnerV2>,
+}
+
+/// Unique owner of Hosted V2 worker lifetime, durable-store ownership, and the
+/// deterministic shutdown barrier.
+///
+/// Dropping the owner invokes the same idempotent barrier as [`Self::shutdown`].
+/// Call `shutdown` explicitly when the caller must observe worker failures.
+pub struct HostedV2RuntimeOwner {
+    runtime: HostedV2Runtime,
+}
+
+/// Cloneable request/query access to an owner-managed Hosted V2 runtime.
+///
+/// A handle deliberately has no shutdown method. Once its owner begins
+/// shutdown, every direct method returns [`HostedV2RuntimeClosedV2`] (or the
+/// matching non-retryable wire error), and the handle cannot retain the
+/// durable state-root lock.
+#[derive(Clone)]
+pub struct HostedV2RuntimeHandle {
+    runtime: HostedV2Runtime,
 }
 
 /// Stable direct-call error returned once explicit runtime shutdown begins.
@@ -81,6 +106,24 @@ impl std::fmt::Debug for HostedV2Runtime {
             .field("node_id", &self.inner.config.node_id)
             .field("store", &self.inner.store)
             .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for HostedV2RuntimeOwner {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HostedV2RuntimeOwner")
+            .field("runtime", &self.runtime)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for HostedV2RuntimeHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HostedV2RuntimeHandle")
+            .field("runtime", &self.runtime)
+            .finish()
     }
 }
 
@@ -318,6 +361,7 @@ impl RuntimeStoreV2 {
 
 struct ActorWorkerV2 {
     sender: mpsc::Sender<ActorCommandV2>,
+    #[cfg(debug_assertions)]
     lifecycle: Arc<ActorWorkerLifecycleV2>,
 }
 
@@ -335,6 +379,7 @@ impl ActorWorkerV2 {
         let _ = self.sender.send(ActorCommandV2::Close);
     }
 
+    #[cfg(debug_assertions)]
     fn join(&self) -> Option<thread::Result<()>> {
         self.lifecycle.join()
     }
@@ -582,6 +627,163 @@ impl Drop for RuntimeInnerV2 {
     }
 }
 
+impl HostedV2RuntimeOwner {
+    pub fn open(
+        config: HostedV2RuntimeConfig,
+        store: DurableSessionStoreV2,
+        authorizer: SharedPlacementAuthorizerV2,
+    ) -> Result<Self> {
+        Ok(Self {
+            runtime: HostedV2Runtime::open(config, store, authorizer)?,
+        })
+    }
+
+    pub fn handle(&self) -> HostedV2RuntimeHandle {
+        self.runtime.handle()
+    }
+
+    /// Stop admission, settle owned workers, and release the durable root lock.
+    /// Existing handles remain valid objects but observe the typed closed state.
+    pub fn shutdown(&self) -> Result<()> {
+        self.runtime.shutdown()
+    }
+}
+
+impl Drop for HostedV2RuntimeOwner {
+    fn drop(&mut self) {
+        // The explicit method is how callers observe a typed worker failure.
+        // Drop still executes the full idempotent barrier so a surviving
+        // request handle can never extend durable-root ownership.
+        let _ = self.runtime.shutdown();
+    }
+}
+
+impl HostedV2RuntimeHandle {
+    pub fn node_id(&self) -> Result<&str> {
+        self.runtime.node_id()
+    }
+
+    pub fn state_quotas(&self) -> Result<&StateQuotaLimitsV2> {
+        self.runtime.state_quotas()
+    }
+
+    pub fn unreadable_sessions(&self) -> Result<Vec<String>> {
+        self.runtime.unreadable_sessions()
+    }
+
+    pub fn handle_request(
+        &self,
+        principal_sha256: &str,
+        request: HostedRequestV2,
+    ) -> HostedResponseV2 {
+        self.runtime.handle_request(principal_sha256, request)
+    }
+
+    pub fn open_session(
+        &self,
+        principal_sha256: &str,
+        request: OpenSessionRequestV2,
+    ) -> Result<HostedResponseV2> {
+        self.runtime.open_session(principal_sha256, request)
+    }
+
+    pub fn submit_operation(
+        &self,
+        principal_sha256: &str,
+        request: SubmitOperationRequestV2,
+    ) -> Result<HostedResponseV2> {
+        self.runtime.submit_operation(principal_sha256, request)
+    }
+
+    pub fn status(
+        &self,
+        principal_sha256: &str,
+        query: SessionQueryV2,
+    ) -> Result<HostedResponseV2> {
+        self.runtime.status(principal_sha256, query)
+    }
+
+    pub fn actors(
+        &self,
+        principal_sha256: &str,
+        query: SessionQueryV2,
+    ) -> Result<HostedResponseV2> {
+        self.runtime.actors(principal_sha256, query)
+    }
+
+    pub fn reset_session(
+        &self,
+        principal_sha256: &str,
+        request: SessionMutationRequestV2,
+    ) -> Result<HostedResponseV2> {
+        self.runtime.reset_session(principal_sha256, request)
+    }
+
+    pub fn recover_session(
+        &self,
+        principal_sha256: &str,
+        request: RecoverSessionRequestV2,
+    ) -> Result<HostedResponseV2> {
+        self.runtime.recover_session(principal_sha256, request)
+    }
+
+    pub fn close_session(
+        &self,
+        principal_sha256: &str,
+        request: SessionMutationRequestV2,
+    ) -> Result<HostedResponseV2> {
+        self.runtime.close_session(principal_sha256, request)
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn durable_accounting_for_test(&self, session_id: &str) -> Result<(u64, u64, u64)> {
+        self.runtime.durable_accounting_for_test(session_id)
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn inject_actor_close_before_execute_for_test(&self, session_id: &str) -> Result<()> {
+        self.runtime
+            .inject_actor_close_before_execute_for_test(session_id)
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn inject_checkpoint_failure_gap_for_test(
+        &self,
+        session_id: &str,
+        entered: Arc<std::sync::Barrier>,
+        release: Arc<std::sync::Barrier>,
+    ) -> Result<()> {
+        self.runtime
+            .inject_checkpoint_failure_gap_for_test(session_id, entered, release)
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn has_worker_for_test(&self, session_id: &str) -> Result<bool> {
+        self.runtime.has_worker_for_test(session_id)
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn inject_worker_panic_for_test(&self, session_id: &str) -> Result<()> {
+        self.runtime.inject_worker_panic_for_test(session_id)
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn inject_current_view_prelock_barrier_for_test(
+        &self,
+        entered: Arc<std::sync::Barrier>,
+        release: Arc<std::sync::Barrier>,
+    ) -> Result<()> {
+        self.runtime
+            .inject_current_view_prelock_barrier_for_test(entered, release)
+    }
+}
+
 impl HostedV2Runtime {
     pub fn open(
         config: HostedV2RuntimeConfig,
@@ -617,6 +819,14 @@ impl HostedV2Runtime {
         let runtime = Self { inner };
         runtime.load_durable_sessions()?;
         Ok(runtime)
+    }
+
+    /// Create request/query access without transferring this historical
+    /// façade's shutdown authority.
+    pub fn handle(&self) -> HostedV2RuntimeHandle {
+        HostedV2RuntimeHandle {
+            runtime: self.clone(),
+        }
     }
 
     pub fn node_id(&self) -> Result<&str> {
@@ -3792,6 +4002,7 @@ fn spawn_actor(
     });
     let worker = Arc::new(ActorWorkerV2 {
         sender,
+        #[cfg(debug_assertions)]
         lifecycle: Arc::clone(&lifecycle),
     });
     runtime
@@ -4477,10 +4688,12 @@ fn checkpoint_actor(
     actor_generation: &ActorGenerationIdV1,
 ) -> Result<()> {
     let snapshot_limit = {
-        let mut state = inner
+        let state = inner
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("hosted V2 state lock is poisoned"))?;
+        #[cfg(debug_assertions)]
+        let mut state = state;
         #[cfg(debug_assertions)]
         if state.force_checkpoint_failure_for_test.remove(session_id) {
             bail!("test-injected persistent evaluator checkpoint failure");

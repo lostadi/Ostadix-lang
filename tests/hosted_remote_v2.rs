@@ -1,3 +1,4 @@
+use std::ops::Deref;
 use std::path::Path;
 use std::sync::Arc;
 use std::thread;
@@ -8,7 +9,7 @@ use o_lang::hosted_remote::v2::{
     build_local_dev_placement_proof_v2, open_capability_commitment_v2, validate_hosted_response_v2,
     DenyAllPlacementAuthorizerV2, DurableSessionStoreV2, HostedCommandBindingV2,
     HostedNodeSignerV2, HostedPlacementAuthorityV2, HostedRequestV2, HostedResponseV2,
-    HostedV2Runtime, HostedV2RuntimeClosedV2, HostedV2RuntimeConfig,
+    HostedV2RuntimeClosedV2, HostedV2RuntimeConfig, HostedV2RuntimeHandle, HostedV2RuntimeOwner,
     HostedV2RuntimeShutdownErrorV2, JournalEntryV2, JournalEventV2, LocalDevPlacementConfigV2,
     OpenSessionRequestV2, OperationStatusV2, PinnedEd25519PlacementAuthorizerV2,
     PlacementLeaseSignerV2, PlacementPurposeV2, PreparedOperationV2, SessionCapabilityV2,
@@ -73,28 +74,58 @@ fn reservation() -> StateReservationV2 {
     StateReservationV2::new(1, 4 * 1024 * 1024, 8 * 1024 * 1024).unwrap()
 }
 
+struct OwnedRuntimeV2 {
+    owner: HostedV2RuntimeOwner,
+    handle: HostedV2RuntimeHandle,
+}
+
+impl OwnedRuntimeV2 {
+    fn from_owner(owner: HostedV2RuntimeOwner) -> Self {
+        let handle = owner.handle();
+        Self { owner, handle }
+    }
+
+    fn handle(&self) -> HostedV2RuntimeHandle {
+        self.handle.clone()
+    }
+
+    fn shutdown(&self) -> anyhow::Result<()> {
+        self.owner.shutdown()
+    }
+}
+
+impl Deref for OwnedRuntimeV2 {
+    type Target = HostedV2RuntimeHandle;
+
+    fn deref(&self) -> &Self::Target {
+        &self.handle
+    }
+}
+
 fn runtime(
     root: &Path,
     node_signer: HostedNodeSignerV2,
     placement_signer: &PlacementLeaseSignerV2,
     state_quotas: StateQuotaLimitsV2,
-) -> HostedV2Runtime {
+) -> OwnedRuntimeV2 {
     let store = DurableSessionStoreV2::open(root, node_signer).unwrap();
-    HostedV2Runtime::open(
-        HostedV2RuntimeConfig {
-            node_id: NODE_ID.to_owned(),
-            node_generation: GenerationV1::new(1).unwrap(),
-            shim_dir: Path::new(env!("CARGO_MANIFEST_DIR")).join("backends"),
-            runtime_executable: Path::new(env!("CARGO_BIN_EXE_O")).to_path_buf(),
-            state_quota_generation: GenerationV1::new(1).unwrap(),
-            state_quotas,
-        },
-        store,
-        Arc::new(PinnedEd25519PlacementAuthorizerV2::new(
-            placement_signer.public_key(),
-        )),
+    OwnedRuntimeV2::from_owner(
+        HostedV2RuntimeOwner::open(
+            HostedV2RuntimeConfig {
+                node_id: NODE_ID.to_owned(),
+                node_generation: GenerationV1::new(1).unwrap(),
+                shim_dir: Path::new(env!("CARGO_MANIFEST_DIR")).join("backends"),
+                runtime_executable: Path::new(env!("CARGO_BIN_EXE_O")).to_path_buf(),
+                state_quota_generation: GenerationV1::new(1).unwrap(),
+                state_quotas,
+            },
+            store,
+            Arc::new(PinnedEd25519PlacementAuthorizerV2::new(
+                placement_signer.public_key(),
+            )),
+        )
+        .unwrap(),
     )
-    .unwrap()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -351,7 +382,7 @@ fn resign_operation_actor(
 }
 
 fn open_session(
-    runtime: &HostedV2Runtime,
+    runtime: &HostedV2RuntimeHandle,
     placement_signer: &PlacementLeaseSignerV2,
     principal: &str,
     request_id: &str,
@@ -370,7 +401,7 @@ fn open_session(
 }
 
 fn open_session_with_reservation(
-    runtime: &HostedV2Runtime,
+    runtime: &HostedV2RuntimeHandle,
     placement_signer: &PlacementLeaseSignerV2,
     principal: &str,
     request_id: &str,
@@ -392,7 +423,7 @@ fn open_session_with_reservation(
 
 #[allow(clippy::too_many_arguments)]
 fn open_session_with_reservation_and_validity(
-    runtime: &HostedV2Runtime,
+    runtime: &HostedV2RuntimeHandle,
     placement_signer: &PlacementLeaseSignerV2,
     principal: &str,
     request_id: &str,
@@ -481,7 +512,7 @@ fn operation(operation_id: &str, tier: SessionStateTierV2) -> PreparedOperationV
 
 #[allow(clippy::too_many_arguments)]
 fn submit(
-    runtime: &HostedV2Runtime,
+    runtime: &HostedV2RuntimeHandle,
     signer: &PlacementLeaseSignerV2,
     principal: &str,
     opened: &OpenedSession,
@@ -521,7 +552,7 @@ fn submit(
 }
 
 fn current_actor_generation(
-    runtime: &HostedV2Runtime,
+    runtime: &HostedV2RuntimeHandle,
     principal: &str,
     capability: &SessionCapabilityV2,
 ) -> Option<ActorGenerationIdV1> {
@@ -541,7 +572,7 @@ fn current_actor_generation(
 }
 
 fn wait_for_terminal(
-    runtime: &HostedV2Runtime,
+    runtime: &HostedV2RuntimeHandle,
     principal: &str,
     capability: &SessionCapabilityV2,
     operation_id: &str,
@@ -572,7 +603,7 @@ fn wait_for_terminal(
 }
 
 fn wait_for_ambiguous(
-    runtime: &HostedV2Runtime,
+    runtime: &HostedV2RuntimeHandle,
     principal: &str,
     capability: &SessionCapabilityV2,
     operation_id: &str,
@@ -599,7 +630,7 @@ fn wait_for_ambiguous(
 }
 
 fn current_session_view(
-    runtime: &HostedV2Runtime,
+    runtime: &HostedV2RuntimeHandle,
     principal: &str,
     capability: &SessionCapabilityV2,
 ) -> o_lang::hosted_remote::v2::SessionViewV2 {
@@ -1241,6 +1272,7 @@ fn checkpoint_tier_reuses_identical_snapshot_and_restores_after_restart() {
             first_checkpoint, second_checkpoint,
             "unchanged actor state must reuse its content-addressed snapshot"
         );
+        runtime.shutdown().unwrap();
     }
     let restarted = runtime(&state_root, node_signer, &placement_signer, state_quotas);
     let status = restarted
@@ -1634,21 +1666,23 @@ fn near_quota_retry_admits_preexisting_exact_operation_blob_at_zero_new_bytes() 
     let state_quotas = quotas(8);
     let principal = principal_digest('9');
     let store = DurableSessionStoreV2::open(&state_root, node_signer.clone()).unwrap();
-    let running = HostedV2Runtime::open(
-        HostedV2RuntimeConfig {
-            node_id: NODE_ID.to_owned(),
-            node_generation: GenerationV1::new(1).unwrap(),
-            shim_dir: Path::new(env!("CARGO_MANIFEST_DIR")).join("backends"),
-            runtime_executable: Path::new(env!("CARGO_BIN_EXE_O")).to_path_buf(),
-            state_quota_generation: GenerationV1::new(1).unwrap(),
-            state_quotas: state_quotas.clone(),
-        },
-        store.clone(),
-        Arc::new(PinnedEd25519PlacementAuthorizerV2::new(
-            placement_signer.public_key(),
-        )),
-    )
-    .unwrap();
+    let running = OwnedRuntimeV2::from_owner(
+        HostedV2RuntimeOwner::open(
+            HostedV2RuntimeConfig {
+                node_id: NODE_ID.to_owned(),
+                node_generation: GenerationV1::new(1).unwrap(),
+                shim_dir: Path::new(env!("CARGO_MANIFEST_DIR")).join("backends"),
+                runtime_executable: Path::new(env!("CARGO_BIN_EXE_O")).to_path_buf(),
+                state_quota_generation: GenerationV1::new(1).unwrap(),
+                state_quotas: state_quotas.clone(),
+            },
+            store.clone(),
+            Arc::new(PinnedEd25519PlacementAuthorizerV2::new(
+                placement_signer.public_key(),
+            )),
+        )
+        .unwrap(),
+    );
     let tight_reservation = StateReservationV2::new(1, 0, 208 * 1024).unwrap();
     let opened = open_session_with_reservation(
         &running,
@@ -1816,6 +1850,7 @@ fn accepted_execute_nonce_cannot_authorize_another_session_after_restart() {
             state_quotas.clone(),
         );
         wait_for_terminal(&runtime, &principal, &first.capability, "nonce-op-a");
+        runtime.shutdown().unwrap();
     }
 
     let restarted = runtime(
@@ -1865,19 +1900,21 @@ fn unconfigured_authority_denies_before_state_creation() {
     let node_signer = HostedNodeSignerV2::generate().unwrap();
     let placement_signer = PlacementLeaseSignerV2::generate().unwrap();
     let state_quotas = quotas(8);
-    let denied = HostedV2Runtime::open(
-        HostedV2RuntimeConfig {
-            node_id: NODE_ID.to_owned(),
-            node_generation: GenerationV1::new(1).unwrap(),
-            shim_dir: Path::new(env!("CARGO_MANIFEST_DIR")).join("backends"),
-            runtime_executable: Path::new(env!("CARGO_BIN_EXE_O")).to_path_buf(),
-            state_quota_generation: GenerationV1::new(1).unwrap(),
-            state_quotas: state_quotas.clone(),
-        },
-        DurableSessionStoreV2::open(&state_root, node_signer).unwrap(),
-        Arc::new(DenyAllPlacementAuthorizerV2),
-    )
-    .unwrap();
+    let denied = OwnedRuntimeV2::from_owner(
+        HostedV2RuntimeOwner::open(
+            HostedV2RuntimeConfig {
+                node_id: NODE_ID.to_owned(),
+                node_generation: GenerationV1::new(1).unwrap(),
+                shim_dir: Path::new(env!("CARGO_MANIFEST_DIR")).join("backends"),
+                runtime_executable: Path::new(env!("CARGO_BIN_EXE_O")).to_path_buf(),
+                state_quota_generation: GenerationV1::new(1).unwrap(),
+                state_quotas: state_quotas.clone(),
+            },
+            DurableSessionStoreV2::open(&state_root, node_signer).unwrap(),
+            Arc::new(DenyAllPlacementAuthorizerV2),
+        )
+        .unwrap(),
+    );
     let principal = principal_digest('e');
     let state_session = StateSessionIdV2::new(
         NODE_ID,
@@ -1931,7 +1968,7 @@ fn explicit_shutdown_drains_terminal_and_checkpoint_workers_then_reopens_immedia
         &placement_signer,
         state_quotas.clone(),
     );
-    let clone = running.clone();
+    let handle = running.handle();
 
     let first = open_session(
         &running,
@@ -1994,10 +2031,9 @@ fn explicit_shutdown_drains_terminal_and_checkpoint_workers_then_reopens_immedia
 
     // This is the only settlement barrier: there is no status polling, sleep,
     // or debug acknowledgement. Close is FIFO behind every accepted Execute.
-    clone.shutdown().unwrap();
     running.shutdown().unwrap();
 
-    let closed = running
+    let closed = handle
         .status(
             &principal,
             SessionQueryV2 {
@@ -2007,17 +2043,17 @@ fn explicit_shutdown_drains_terminal_and_checkpoint_workers_then_reopens_immedia
         )
         .unwrap_err();
     assert!(closed.downcast_ref::<HostedV2RuntimeClosedV2>().is_some());
-    assert!(running
+    assert!(handle
         .node_id()
         .unwrap_err()
         .downcast_ref::<HostedV2RuntimeClosedV2>()
         .is_some());
-    assert!(running
+    assert!(handle
         .state_quotas()
         .unwrap_err()
         .downcast_ref::<HostedV2RuntimeClosedV2>()
         .is_some());
-    let HostedResponseV2::Error { error } = running.handle_request(
+    let HostedResponseV2::Error { error } = handle.handle_request(
         &principal,
         HostedRequestV2::Status {
             protocol: HOSTED_PROTOCOL_V2.to_owned(),
@@ -2032,8 +2068,8 @@ fn explicit_shutdown_drains_terminal_and_checkpoint_workers_then_reopens_immedia
     assert_eq!(error.code, "runtime-closed");
     assert!(!error.retryable);
 
-    // Old runtime clones remain alive, so this immediate successful open proves
-    // explicit shutdown removed the runtime-owned store/root-lock reference.
+    // The request handle remains alive, so this immediate successful open
+    // proves owner shutdown removed the runtime-owned store/root-lock reference.
     let restarted = runtime(&state_root, node_signer, &placement_signer, state_quotas);
     let first_view = current_session_view(&restarted, &principal, &first.capability);
     let second_view = current_session_view(&restarted, &principal, &second.capability);
@@ -2056,6 +2092,29 @@ fn explicit_shutdown_drains_terminal_and_checkpoint_workers_then_reopens_immedia
 }
 
 #[test]
+fn owner_drop_closes_surviving_handle_and_releases_root_lock() {
+    let directory = tempfile::tempdir().unwrap();
+    let state_root = directory.path().join("state");
+    let node_signer = HostedNodeSignerV2::generate().unwrap();
+    let placement_signer = PlacementLeaseSignerV2::generate().unwrap();
+    let state_quotas = quotas(8);
+    let owner = runtime(
+        &state_root,
+        node_signer.clone(),
+        &placement_signer,
+        state_quotas.clone(),
+    );
+    let handle = owner.handle();
+
+    drop(owner);
+
+    let closed = handle.node_id().unwrap_err();
+    assert!(closed.downcast_ref::<HostedV2RuntimeClosedV2>().is_some());
+    let reopened = runtime(&state_root, node_signer, &placement_signer, state_quotas);
+    reopened.shutdown().unwrap();
+}
+
+#[test]
 fn worker_panic_shutdown_is_typed_idempotent_and_releases_root_lock() {
     let directory = tempfile::tempdir().unwrap();
     let state_root = directory.path().join("state");
@@ -2069,7 +2128,7 @@ fn worker_panic_shutdown_is_typed_idempotent_and_releases_root_lock() {
         &placement_signer,
         state_quotas.clone(),
     );
-    let clone = running.clone();
+    let handle = running.handle();
     let opened = open_session(
         &running,
         &placement_signer,
@@ -2087,13 +2146,13 @@ fn worker_panic_shutdown_is_typed_idempotent_and_releases_root_lock() {
         .downcast_ref::<HostedV2RuntimeShutdownErrorV2>()
         .expect("worker panic did not produce the typed shutdown error");
     assert!(first.message().contains(&opened.capability.session_id));
-    let repeated = clone.shutdown().unwrap_err();
+    let repeated = running.shutdown().unwrap_err();
     let repeated = repeated
         .downcast_ref::<HostedV2RuntimeShutdownErrorV2>()
         .expect("repeated shutdown did not preserve the typed outcome");
     assert_eq!(repeated, first);
 
-    let closed = clone.unreadable_sessions().unwrap_err();
+    let closed = handle.unreadable_sessions().unwrap_err();
     assert!(closed.downcast_ref::<HostedV2RuntimeClosedV2>().is_some());
     let reopened = runtime(&state_root, node_signer, &placement_signer, state_quotas);
     let view = current_session_view(&reopened, &principal, &opened.capability);

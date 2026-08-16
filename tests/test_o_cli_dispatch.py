@@ -31,6 +31,7 @@ class LowercaseCliDispatchTests(unittest.TestCase):
             "O_LANG_NODE_BIN",
             "O_LANG_OCTL_BIN",
             "O_LANG_REGISTRY_BIN",
+            "O_LANG_INFO_BIN",
         ):
             self.environment[variable] = str(self.fake)
 
@@ -88,6 +89,13 @@ class LowercaseCliDispatchTests(unittest.TestCase):
             "demo",
             "--state",
             "state",
+        ])
+
+    def test_information_command_forwards_exact_local_cli_arguments(self) -> None:
+        self.assert_dispatch(("info", "head", "--state", "facts"), [
+            "head",
+            "--state",
+            "facts",
         ])
 
     def test_receipt_default_is_explicit_and_custom_ogit_commands_remain_available(self) -> None:

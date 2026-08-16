@@ -4,6 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::effects::{EffectSummary, ResourceKey};
@@ -90,7 +91,89 @@ pub struct AdmittedOperationV1 {
 }
 
 pub const SCHEDULE_WHY_SCHEMA_V1: &str = "oexec.admission-why/v1";
+pub const SCHEDULE_EXPLANATION_SCHEMA_V1: &str = "oexec.schedule-explanation/v1";
+pub const SCHEDULE_REALIZABILITY_SCHEMA_V1: &str = "oexec.realizability/v1";
+pub const SCHEDULE_PREDICTION_SCHEMA_V1: &str = "oexec.schedule-prediction/v1";
 pub const PLACEMENT_ADMISSION_DIGEST_DOMAIN_V1: &str = "ostadix/placement-admission/v1";
+
+/// Digest coordinates identifying the exact admitted computation rendered by
+/// a schedule explanation. These are copied from [`ExecutionAdmissionV5`]; the
+/// explanation is inspection-only and carries no execution authority.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ScheduleExplanationBindingsV1 {
+    pub lowered_oir_sha256: String,
+    pub plan_sha256: String,
+    pub analyzed_graph_sha256: String,
+    pub backend_catalog_projection_sha256: String,
+    pub backend_set_sha256: String,
+    pub direct_executable_manifest_sha256: String,
+    pub launch_context_sha256: String,
+    pub environment_sha256: String,
+    pub ambient_world_sha256: String,
+    pub analyzer_sha256: String,
+    pub evidence_sha256: String,
+    pub admitted_graph_sha256: String,
+    pub placement_admission_sha256: String,
+    pub admission_sha256: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ScheduleExplanationAdmissionV1 {
+    pub schema: &'static str,
+    pub analyzer: &'static str,
+    pub runtime_snapshot_kind: &'static str,
+    pub base_policy: &'static str,
+    pub bindings: ScheduleExplanationBindingsV1,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ScheduleRealizabilityV1 {
+    pub schema: &'static str,
+    pub status: &'static str,
+    pub execution_realizable: &'static str,
+    pub dispatch: &'static str,
+    pub scope: &'static str,
+    pub worker_count_covers_static_wave: &'static str,
+    pub runtime_readiness: &'static str,
+    pub placement_lease: &'static str,
+    pub observed_overlap: &'static str,
+    pub source: &'static str,
+    pub available_parallelism: usize,
+    pub admitted_static_max_wave_width: usize,
+    pub admitted_max_local_worker_wave_width: usize,
+    pub selected_workers: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SchedulePredictionLayerV1 {
+    pub index: usize,
+    pub operations: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SchedulePredictionV1 {
+    pub schema: &'static str,
+    pub status: &'static str,
+    pub provenance: &'static str,
+    pub model: &'static str,
+    pub admission_sha256: String,
+    pub task_count: usize,
+    pub predicted_width: usize,
+    pub predicted_span: usize,
+    pub span_unit: &'static str,
+    pub layers: Vec<SchedulePredictionLayerV1>,
+}
+
+/// Stable machine projection used by `olangc --explain-schedule --format
+/// json`. Human and JSON renderers derive their realizability and prediction
+/// values from this same typed view.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ScheduleExplanationV1 {
+    pub schema: &'static str,
+    pub admission: ScheduleExplanationAdmissionV1,
+    pub realizability: ScheduleRealizabilityV1,
+    pub prediction: SchedulePredictionV1,
+}
 
 /// One exact HGraph input/producer correspondence behind a blocker.
 ///
@@ -278,6 +361,106 @@ impl ExecutionAdmissionV5 {
         )
     }
 
+    /// Build the stable inspection-only projection shared by human and JSON
+    /// schedule renderers.
+    pub fn schedule_explanation_with_worker_override(
+        &self,
+        cli_override: Option<usize>,
+    ) -> ScheduleExplanationV1 {
+        let available = available_parallelism();
+        let admitted_max_local_worker_wave_width = self.admitted_max_wave_width();
+        let selected_workers = resolve_worker_count(
+            cli_override,
+            available,
+            admitted_max_local_worker_wave_width,
+        );
+        let worker_count_covers_static_wave = if admitted_max_local_worker_wave_width == 0 {
+            "not-applicable"
+        } else if selected_workers >= admitted_max_local_worker_wave_width {
+            "yes"
+        } else {
+            "no"
+        };
+        ScheduleExplanationV1 {
+            schema: SCHEDULE_EXPLANATION_SCHEMA_V1,
+            admission: ScheduleExplanationAdmissionV1 {
+                schema: self.schema,
+                analyzer: self.analyzer,
+                runtime_snapshot_kind: self.runtime_snapshot_kind.name(),
+                base_policy: policy_name(self.base_policy),
+                bindings: ScheduleExplanationBindingsV1 {
+                    lowered_oir_sha256: self.bindings.oir_sha256.clone(),
+                    plan_sha256: self.bindings.plan_sha256.clone(),
+                    analyzed_graph_sha256: self.bindings.analyzed_graph_sha256.clone(),
+                    backend_catalog_projection_sha256: self
+                        .bindings
+                        .backend_catalog_projection_sha256
+                        .clone(),
+                    backend_set_sha256: self.bindings.backend_set_sha256.clone(),
+                    direct_executable_manifest_sha256: self
+                        .bindings
+                        .executable_manifest_sha256
+                        .clone(),
+                    launch_context_sha256: self.bindings.launch_context_sha256.clone(),
+                    environment_sha256: self.bindings.environment_sha256.clone(),
+                    ambient_world_sha256: self.bindings.ambient_world_sha256.clone(),
+                    analyzer_sha256: self.bindings.analyzer_sha256.clone(),
+                    evidence_sha256: self.evidence_sha256.clone(),
+                    admitted_graph_sha256: self.admitted_graph_sha256.clone(),
+                    placement_admission_sha256: self.placement_admission.as_sha256().to_string(),
+                    admission_sha256: self.admission_sha256.clone(),
+                },
+            },
+            realizability: ScheduleRealizabilityV1 {
+                schema: SCHEDULE_REALIZABILITY_SCHEMA_V1,
+                status: "inspection-only",
+                execution_realizable: "unknown",
+                dispatch: "not-run",
+                scope: "local-worker-static-wave",
+                worker_count_covers_static_wave,
+                runtime_readiness: "unknown",
+                placement_lease: "none",
+                observed_overlap: "not-run",
+                source: if cli_override.is_some() {
+                    "cli-override"
+                } else {
+                    "machine-default"
+                },
+                available_parallelism: available,
+                admitted_static_max_wave_width: self.admitted_static_max_wave_width(),
+                admitted_max_local_worker_wave_width,
+                selected_workers,
+            },
+            prediction: SchedulePredictionV1 {
+                schema: SCHEDULE_PREDICTION_SCHEMA_V1,
+                status: "admitted-static",
+                provenance: "evidence-bound-admission",
+                model: "unit-cost-shim-hosted-tasks",
+                admission_sha256: self.admission_sha256.clone(),
+                task_count: self.hosted_task_layers.iter().map(Vec::len).sum(),
+                predicted_width: self.admitted_hosted_task_max_wave_width(),
+                predicted_span: self.admitted_hosted_task_wave_count(),
+                span_unit: "hosted-task-layers",
+                layers: self
+                    .hosted_task_layers
+                    .iter()
+                    .enumerate()
+                    .map(|(index, layer)| SchedulePredictionLayerV1 {
+                        index: index + 1,
+                        operations: layer.iter().map(|node| format!("P{}", node.0)).collect(),
+                    })
+                    .collect(),
+            },
+        }
+    }
+
+    pub fn to_explanation_json_with_worker_override(
+        &self,
+        cli_override: Option<usize>,
+    ) -> serde_json::Result<String> {
+        serde_json::to_string(&self.schedule_explanation_with_worker_override(cli_override))
+    }
+
     /// Non-executing explanation of the exact admitted scheduling geometry.
     /// The evidence-bound admission text is stable, while the explicitly
     /// advisory realizability marker samples the inspection host's current
@@ -289,41 +472,42 @@ impl ExecutionAdmissionV5 {
     /// Render the admission together with a descriptive worker-capacity
     /// realizability marker. The marker is not part of the admission digest.
     pub fn to_explanation_text_with_worker_override(&self, cli_override: Option<usize>) -> String {
-        let mut out = format!("; ExecutionAdmission {}\n", self.schema);
+        let explanation = self.schedule_explanation_with_worker_override(cli_override);
+        let admission = &explanation.admission;
+        let bindings = &admission.bindings;
+        let mut out = format!("; ExecutionAdmission {}\n", admission.schema);
         writeln!(
             out,
             "binding lowered-oir-sha256={} plan-sha256={} analyzed-graph-sha256={}",
-            self.bindings.oir_sha256,
-            self.bindings.plan_sha256,
-            self.bindings.analyzed_graph_sha256
+            bindings.lowered_oir_sha256, bindings.plan_sha256, bindings.analyzed_graph_sha256
         )
         .expect("writing to a String cannot fail");
         writeln!(
             out,
             "binding backend-catalog-projection-sha256={} backend-set-sha256={} direct-executable-manifest-sha256={} launch-context-sha256={} environment-sha256={} ambient-world-sha256={}",
-            self.bindings.backend_catalog_projection_sha256,
-            self.bindings.backend_set_sha256,
-            self.bindings.executable_manifest_sha256,
-            self.bindings.launch_context_sha256,
-            self.bindings.environment_sha256,
-            self.bindings.ambient_world_sha256
+            bindings.backend_catalog_projection_sha256,
+            bindings.backend_set_sha256,
+            bindings.direct_executable_manifest_sha256,
+            bindings.launch_context_sha256,
+            bindings.environment_sha256,
+            bindings.ambient_world_sha256
         )
         .expect("writing to a String cannot fail");
         writeln!(
             out,
             "binding analyzer-sha256={} evidence-sha256={} admitted-graph-sha256={} placement-admission-sha256={} admission-sha256={}",
-            self.bindings.analyzer_sha256,
-            self.evidence_sha256,
-            self.admitted_graph_sha256,
-            self.placement_admission,
-            self.admission_sha256
+            bindings.analyzer_sha256,
+            bindings.evidence_sha256,
+            bindings.admitted_graph_sha256,
+            bindings.placement_admission_sha256,
+            bindings.admission_sha256
         )
         .expect("writing to a String cannot fail");
-        writeln!(out, "analyzer {}", self.analyzer).expect("writing to a String cannot fail");
+        writeln!(out, "analyzer {}", admission.analyzer).expect("writing to a String cannot fail");
         writeln!(
             out,
             "runtime-snapshot kind={} dispatch-context={}",
-            self.runtime_snapshot_kind.name(),
+            admission.runtime_snapshot_kind,
             match self.runtime_snapshot_kind {
                 RuntimeSnapshotKindV1::Execution => "execution",
                 RuntimeSnapshotKindV1::Inspection => "inspection-only",
@@ -386,56 +570,51 @@ impl ExecutionAdmissionV5 {
             )
             .expect("writing to a String cannot fail");
         }
-        writeln!(out, "policy {}", policy_name(self.base_policy))
+        writeln!(out, "policy {}", admission.base_policy).expect("writing to a String cannot fail");
+        let realizability = &explanation.realizability;
+        writeln!(out, "; ScheduleRealizability {}", realizability.schema)
             .expect("writing to a String cannot fail");
-        let available = available_parallelism();
-        let admitted_max_wave_width = self.admitted_max_wave_width();
-        let selected_workers =
-            resolve_worker_count(cli_override, available, admitted_max_wave_width);
-        let worker_count_covers_static_wave = if admitted_max_wave_width == 0 {
-            "not-applicable"
-        } else if selected_workers >= admitted_max_wave_width {
-            "yes"
-        } else {
-            "no"
-        };
-        out.push_str("; ScheduleRealizability oexec.realizability/v1\n");
         writeln!(
             out,
-            "realizability status=inspection-only execution-realizable=unknown dispatch=not-run scope=local-worker-static-wave worker-count-covers-static-wave={} runtime-readiness=unknown placement-lease=none observed-overlap=not-run source={} available-parallelism={} admitted-static-max-wave-width={} admitted-max-local-worker-wave-width={} selected-workers={}",
-            worker_count_covers_static_wave,
-            if cli_override.is_some() {
-                "cli-override"
-            } else {
-                "machine-default"
-            },
-            available,
-            self.admitted_static_max_wave_width(),
-            admitted_max_wave_width,
-            selected_workers
+            "realizability status={} execution-realizable={} dispatch={} scope={} worker-count-covers-static-wave={} runtime-readiness={} placement-lease={} observed-overlap={} source={} available-parallelism={} admitted-static-max-wave-width={} admitted-max-local-worker-wave-width={} selected-workers={}",
+            realizability.status,
+            realizability.execution_realizable,
+            realizability.dispatch,
+            realizability.scope,
+            realizability.worker_count_covers_static_wave,
+            realizability.runtime_readiness,
+            realizability.placement_lease,
+            realizability.observed_overlap,
+            realizability.source,
+            realizability.available_parallelism,
+            realizability.admitted_static_max_wave_width,
+            realizability.admitted_max_local_worker_wave_width,
+            realizability.selected_workers
         )
         .expect("writing to a String cannot fail");
-        out.push_str("; SchedulePrediction oexec.schedule-prediction/v1\n");
+        let prediction = &explanation.prediction;
+        writeln!(out, "; SchedulePrediction {}", prediction.schema)
+            .expect("writing to a String cannot fail");
         writeln!(
             out,
-            "schedule-prediction schema=oexec.schedule-prediction/v1 status=admitted-static provenance=evidence-bound-admission model=unit-cost-shim-hosted-tasks admission-sha256={} task-count={} predicted-width={} predicted-span={} span-unit=hosted-task-layers",
-            self.admission_sha256,
-            self.hosted_task_layers.iter().map(Vec::len).sum::<usize>(),
-            self.admitted_hosted_task_max_wave_width(),
-            self.admitted_hosted_task_wave_count()
+            "schedule-prediction schema={} status={} provenance={} model={} admission-sha256={} task-count={} predicted-width={} predicted-span={} span-unit={}",
+            prediction.schema,
+            prediction.status,
+            prediction.provenance,
+            prediction.model,
+            prediction.admission_sha256,
+            prediction.task_count,
+            prediction.predicted_width,
+            prediction.predicted_span,
+            prediction.span_unit
         )
         .expect("writing to a String cannot fail");
-        for (index, layer) in self.hosted_task_layers.iter().enumerate() {
-            let operations = layer
-                .iter()
-                .map(|node| format!("P{}", node.0))
-                .collect::<Vec<_>>()
-                .join(",");
+        for layer in &prediction.layers {
             writeln!(
                 out,
                 "schedule-prediction-layer index={} operations=[{}]",
-                index + 1,
-                operations
+                layer.index,
+                layer.operations.join(",")
             )
             .expect("writing to a String cannot fail");
         }
@@ -1284,7 +1463,7 @@ fn validate_node_evidence(
         DispatchLaneV1::LocalWorker => {
             let explicitly_autonomous_shim = evidence.dispatch_contract.adapter
                 == DispatchAdapterV1::AutonomousEphemeralShimV1
-                && crate::hgraph::from_oir::autonomous_ephemeral_group(plan, plan_node, oir)
+                && crate::dispatch_model::autonomous_ephemeral_group(plan, plan_node, oir)
                     .is_some()
                 && summary.unknown
                 && !evidence.effect_contract.footprint_closed;
@@ -2230,6 +2409,28 @@ mod tests {
         assert!(explanation.contains(
             "task-count=4 predicted-width=4 predicted-span=1 span-unit=hosted-task-layers"
         ));
+        let explanation_json = admitted
+            .admission()
+            .to_explanation_json_with_worker_override(Some(2))
+            .unwrap();
+        let explanation_value: serde_json::Value = serde_json::from_str(&explanation_json).unwrap();
+        assert_eq!(explanation_value["schema"], SCHEDULE_EXPLANATION_SCHEMA_V1);
+        assert_eq!(
+            explanation_value["admission"]["bindings"]["admission_sha256"],
+            admitted.admission().admission_sha256()
+        );
+        assert_eq!(
+            explanation_value["prediction"]["admission_sha256"],
+            admitted.admission().admission_sha256()
+        );
+        assert_eq!(explanation_value["prediction"]["task_count"], 4);
+        assert_eq!(explanation_value["prediction"]["predicted_width"], 4);
+        assert_eq!(explanation_value["prediction"]["predicted_span"], 1);
+        assert_eq!(explanation_value["realizability"]["selected_workers"], 2);
+        assert_eq!(
+            explanation_value["realizability"]["worker_count_covers_static_wave"],
+            "no"
+        );
 
         let mut forged = evidence;
         forged

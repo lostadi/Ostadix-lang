@@ -78,6 +78,37 @@ class ContractSurfacesTests(unittest.TestCase):
             match.index("cargo +1.97.1 clippy"),
         )
 
+    def test_contract_lane_runs_local_posture_baseline_and_tests(self) -> None:
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        contracts.validate_local_ci_posture_consumer(workflow)
+        job = contracts.workflow_job_body(workflow, "contracts")
+        self.assertEqual(
+            job.count(
+                "python3 scripts/local_ci_posture.py --profile baseline --format text"
+            ),
+            1,
+        )
+        self.assertEqual(
+            job.count(
+                "python3 -m unittest -v tests.test_contract_surfaces "
+                "tests.test_local_ci_posture"
+            ),
+            1,
+        )
+
+    def test_schedule_explanation_schema_and_fields_are_governed(self) -> None:
+        self.assertEqual(
+            contracts.schedule_explanation_schema(),
+            "oexec.schedule-explanation/v1",
+        )
+        contracts.validate_schedule_explanation_contract()
+        source = contracts.EVIDENCE_ADMISSION.read_text(encoding="utf-8")
+        for name, expected in contracts.SCHEDULE_EXPLANATION_STRUCT_FIELDS.items():
+            self.assertEqual(
+                contracts.rust_public_struct_fields(source, name),
+                expected,
+            )
+
     def test_docker_smoke_is_an_independent_required_lane(self) -> None:
         workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         job = contracts.workflow_job_body(workflow, "docker")
