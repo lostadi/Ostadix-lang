@@ -60,8 +60,25 @@ RULES = (
     ),
     Rule(
         ("src/ir.rs",),
-        ("hgraph", "placement", "placement_protocol"),
-        "IR must not depend on its HGraph or placement projections",
+        ("hgraph", "placement", "placement_protocol", "registry"),
+        "IR must not depend on its HGraph or placement projections and must depend directly on the canonical backend catalog rather than registry compatibility projections",
+    ),
+    Rule(
+        ("src/backend_catalog.rs",),
+        (
+            "backend",
+            "eval",
+            "evidence",
+            "executor",
+            "hgraph",
+            "ir",
+            "placement",
+            "registry",
+            "runtime_exec",
+            "scheduler",
+            "world",
+        ),
+        "the canonical backend catalog must remain below backend realization, IR, analysis, execution, scheduling, registry storage, public placement projections, and World",
     ),
     Rule(
         ("src/effects.rs",),
@@ -115,6 +132,7 @@ RULES = (
     ),
     Rule(
         (
+            "src/backend_catalog.rs",
             "src/registry/bundle/mod.rs",
             "src/registry/model.rs",
             "src/registry/placement_compat.rs",
@@ -129,7 +147,7 @@ RULES = (
             "src/placement/protocol/state.rs",
             "src/placement/protocol/target.rs",
             "src/placement/protocol/warrant.rs",
-            "src/registry/bundle/mod.rs",
+            "src/backend_catalog.rs",
             "src/eval.rs",
             "src/runtime_exec.rs",
         ),

@@ -8,8 +8,9 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
+use crate::backend_catalog::ExecutionMode;
 use crate::environment::EnvironmentRefV2;
-use crate::ir::{ExecutionMode, PlanNodeId, PlanNodeKind};
+use crate::ir::{PlanNodeId, PlanNodeKind};
 use crate::resource_identity::{
     ArtifactPublicationIdentity, CapabilityIdentity, DomainIdentity, GovernorIdentity,
     NodeIdentity, ObjectIdentity, ProcessIdentity, ResourceIdentity, TaskAttemptIdentity,
@@ -873,7 +874,7 @@ mod tests {
             lang: "html".to_string(),
             env_id: 7,
             attr: None,
-            backend: crate::ir::BackendRegistry::global().interface_for("html"),
+            backend: crate::backend_catalog::BackendRegistry::global().interface_for("html"),
         };
         let inline_summary = effect_summary_for_plan_node(PlanNodeId(0), &inline).unwrap();
         assert_eq!(inline_summary.actor_state, None);
@@ -882,7 +883,7 @@ mod tests {
             lang: "python".to_string(),
             env_id: 7,
             attr: None,
-            backend: crate::ir::BackendRegistry::global().interface_for("python"),
+            backend: crate::backend_catalog::BackendRegistry::global().interface_for("python"),
         };
         let persistent_summary =
             effect_summary_for_plan_node(PlanNodeId(1), &persistent_shim).unwrap();
@@ -895,7 +896,7 @@ mod tests {
             lang: "python".to_string(),
             env_id: crate::environment::LINKER_ISOLATED_ENV_ID,
             attr: None,
-            backend: crate::ir::BackendRegistry::global().interface_for("python"),
+            backend: crate::backend_catalog::BackendRegistry::global().interface_for("python"),
         };
         let fresh_summary =
             effect_summary_for_plan_node(PlanNodeId(2), &linker_isolated_shim).unwrap();

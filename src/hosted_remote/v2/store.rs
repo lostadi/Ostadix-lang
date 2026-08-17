@@ -2922,8 +2922,8 @@ mod tests {
     use crate::backend::state::{
         BackendCheckpointV1, BackendStateTierV1, EvaluatorActorCheckpointV1,
     };
+    use crate::backend_catalog::BackendRegistry;
     use crate::hosted_remote::v2::{HostedPlacementIdentityV2, SessionStateTierV2};
-    use crate::ir::BackendRegistry;
     use crate::placement::{
         CanonicalPlacementRecordV1, GenerationV1, PlacementReservationV1, SemanticDigestV1,
         StateQuotaLimitsV2, StateReservationV2, StateSessionIdV2, TaskAttemptIdV1,

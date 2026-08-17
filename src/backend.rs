@@ -22,7 +22,7 @@ use self::state::{
     BackendStateReasonV1, BackendStateTierV1, BackendWireCommandV2, BackendWireResponseV2,
     SQL_CLI_CODEC_V1,
 };
-use crate::ir::{BackendAdapterKind, BackendRegistry};
+use crate::backend_catalog::{BackendAdapterKind, BackendRegistry};
 use crate::runtime_exec::BackendToolchain;
 use crate::value::{FloatFormat, ONumber, OValue};
 use crate::wire;
@@ -1600,10 +1600,10 @@ mod tests {
 
     #[test]
     fn native_backend_dispatch_is_projected_from_the_canonical_catalog() {
-        let catalog_native = crate::ir::BackendRegistry::global()
+        let catalog_native = crate::backend_catalog::BackendRegistry::global()
             .canonical_specs()
             .iter()
-            .filter(|spec| spec.adapter == crate::ir::BackendAdapterKind::NativeRust)
+            .filter(|spec| spec.adapter == crate::backend_catalog::BackendAdapterKind::NativeRust)
             .map(|spec| spec.name)
             .collect::<std::collections::BTreeSet<_>>();
         let implemented = super::NATIVE_BACKEND_HANDLERS

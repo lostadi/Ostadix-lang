@@ -11,7 +11,7 @@ use anyhow::{bail, Context, Result};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::ir::BackendRegistry;
+use crate::backend_catalog::BackendRegistry;
 use crate::value::OValue;
 
 pub const HOSTED_PROTOCOL_V1: &str = "ostadix.hosted-transport/v1";

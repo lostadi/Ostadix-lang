@@ -95,7 +95,7 @@ pub fn lower_to_o(bundle: &ProjectBundle) -> String {
 /// Lower a bundle and validate the result reparses as `.O` source.
 pub fn lower_to_o_validated(bundle: &ProjectBundle) -> Result<String> {
     let source = lower_to_o(bundle);
-    let backends = crate::ir::BackendRegistry::global().registered_backend_tags();
+    let backends = crate::backend_catalog::BackendRegistry::global().registered_backend_tags();
     let mut parser = crate::parser::Parser::new(&source, &backends);
     parser
         .parse()
