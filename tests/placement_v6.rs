@@ -57,6 +57,22 @@ fn artifact(byte: u8) -> ArtifactId {
     ArtifactId::from_sha256(format!("{byte:02x}").repeat(32)).unwrap()
 }
 
+#[test]
+fn public_flat_and_nested_placement_paths_share_one_type_identity() {
+    let nested = o_lang::placement::protocol::SemanticDigestV1::hash_bytes(
+        "ostadix/placement/public-alias-test/v1",
+        b"one-canonical-module",
+    );
+    let flat: o_lang::placement::SemanticDigestV1 = nested;
+    let nested_again: o_lang::placement::protocol::SemanticDigestV1 = flat;
+
+    assert_eq!(nested_again.as_sha256().len(), 64);
+    assert_eq!(
+        std::any::TypeId::of::<o_lang::placement::SemanticDigestV1>(),
+        std::any::TypeId::of::<o_lang::placement::protocol::SemanticDigestV1>()
+    );
+}
+
 fn lease_expectation_v2(state_binding: LeaseStateBindingV2) -> LeaseExpectationV2 {
     LeaseExpectationV2::new(
         "lease-v2-node",
