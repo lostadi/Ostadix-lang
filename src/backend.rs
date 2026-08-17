@@ -14,15 +14,18 @@ use base64::Engine as _;
 use num_bigint::BigInt;
 use serde_json::Value;
 
-#[path = "backend_state.rs"]
-pub mod state;
+/// Compatibility projection over the canonical backend-state protocol.
+///
+/// The implementation is compiled exactly once as [`crate::backend_state`];
+/// this historical path preserves source and type identity for existing users.
+pub use crate::backend_state as state;
 
-use self::state::{
-    BackendCheckpointV1, BackendRestoreReceiptV1, BackendStateCapabilitiesV1, BackendStateErrorV1,
-    BackendStateReasonV1, BackendStateTierV1, BackendWireCommandV2, BackendWireResponseV2,
-    SQL_CLI_CODEC_V1,
-};
 use crate::backend_catalog::{BackendAdapterKind, BackendRegistry};
+use crate::backend_state::{
+    self, BackendCheckpointV1, BackendRestoreReceiptV1, BackendStateCapabilitiesV1,
+    BackendStateErrorV1, BackendStateReasonV1, BackendStateTierV1, BackendWireCommandV2,
+    BackendWireResponseV2, SQL_CLI_CODEC_V1,
+};
 use crate::runtime_exec::BackendToolchain;
 use crate::value::{FloatFormat, ONumber, OValue};
 use crate::wire;
@@ -251,7 +254,7 @@ impl RustBackend {
                 true,
             )
         } else {
-            state::empty_state_capabilities(lang)
+            backend_state::empty_state_capabilities(lang)
         }
     }
 
@@ -259,19 +262,21 @@ impl RustBackend {
         let checkpoint = if lang == "sql" {
             self.sql_checkpoint()
         } else {
-            state::empty_checkpoint(lang, self.tools.executable_set_sha256())
+            backend_state::empty_checkpoint(lang, self.tools.executable_set_sha256())
         };
         match checkpoint {
-            Ok(checkpoint) => match state::ensure_checkpoint_bound(&checkpoint, max_bytes) {
-                Ok(()) => BackendWireResponseV2::CheckpointV1 { checkpoint },
-                Err(error) => BackendWireResponseV2::StateErrorV1 {
-                    error: BackendStateErrorV1::new(
-                        lang,
-                        "state.checkpoint-too-large",
-                        format!("{error:#}"),
-                    ),
-                },
-            },
+            Ok(checkpoint) => {
+                match backend_state::ensure_checkpoint_bound(&checkpoint, max_bytes) {
+                    Ok(()) => BackendWireResponseV2::CheckpointV1 { checkpoint },
+                    Err(error) => BackendWireResponseV2::StateErrorV1 {
+                        error: BackendStateErrorV1::new(
+                            lang,
+                            "state.checkpoint-too-large",
+                            format!("{error:#}"),
+                        ),
+                    },
+                }
+            }
             Err(error) => {
                 if let Some(pin) = error.downcast_ref::<BackendStatePinRequired>() {
                     BackendWireResponseV2::StatePinRequiredV1 {
@@ -302,7 +307,11 @@ impl RustBackend {
         let result = if lang == "sql" {
             self.restore_sql(&checkpoint)
         } else {
-            state::validate_empty_restore(lang, self.tools.executable_set_sha256(), &checkpoint)
+            backend_state::validate_empty_restore(
+                lang,
+                self.tools.executable_set_sha256(),
+                &checkpoint,
+            )
         };
         match result.and_then(|()| BackendRestoreReceiptV1::restored(lang, &checkpoint)) {
             Ok(receipt) => BackendWireResponseV2::RestoreV1 { receipt },

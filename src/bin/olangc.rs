@@ -2093,6 +2093,7 @@ pub mod environment;
 pub mod backend;
 pub(crate) mod backend_catalog;
 pub mod backend_morphism;
+pub mod backend_state;
 pub mod parser;
 #[path = \"placement/protocol/mod.rs\"]
 pub(crate) mod placement_protocol;
@@ -2888,6 +2889,12 @@ mod tests {
         assert!(lib_rs.contains("pub mod environment;"));
         assert!(lib_rs.contains("pub(crate) mod backend_catalog;"));
         assert!(lib_rs.contains("pub mod backend_morphism;"));
+        assert!(lib_rs.contains("pub mod backend_state;"));
+        assert_eq!(
+            lib_rs.matches("mod backend_state;").count(),
+            1,
+            "generated runtimes must compile the backend-state protocol exactly once"
+        );
         assert!(lib_rs.contains("#[path = \"placement/protocol/mod.rs\"]"));
         assert!(lib_rs.contains("pub(crate) mod placement_protocol;"));
         assert!(lib_rs.contains("pub mod placement;"));
@@ -3212,8 +3219,9 @@ mod tests {
         fs::write(
             probe_dir.join("generated_runtime_closure.rs"),
             r#"use ostadix_generated_serde::backend::state::{
-    empty_checkpoint, validate_empty_restore,
+    empty_checkpoint, validate_empty_restore, BackendStateTierV1 as CompatibilityBackendStateTierV1,
 };
+use ostadix_generated_serde::backend_state::BackendStateTierV1 as CanonicalBackendStateTierV1;
 use ostadix_generated_serde::placement::SemanticDigestV1;
 use ostadix_generated_serde::placement::protocol::SemanticDigestV1 as NestedSemanticDigestV1;
 use ostadix_generated_serde::execution_contract::Policy as CanonicalPolicy;
@@ -3240,6 +3248,14 @@ fn catalog_placement_and_checkpoint_sources_are_live() {
     let checkpoint = empty_checkpoint("rust", runtime.as_sha256()).unwrap();
     checkpoint.validate().unwrap();
     validate_empty_restore("rust", runtime.as_sha256(), &checkpoint).unwrap();
+}
+
+#[test]
+fn backend_state_root_and_legacy_paths_share_one_type_identity() {
+    let canonical = CanonicalBackendStateTierV1::SemanticSnapshot;
+    let compatibility: CompatibilityBackendStateTierV1 = canonical;
+    let canonical_again: CanonicalBackendStateTierV1 = compatibility;
+    assert_eq!(canonical_again, CanonicalBackendStateTierV1::SemanticSnapshot);
 }
 
 #[test]
