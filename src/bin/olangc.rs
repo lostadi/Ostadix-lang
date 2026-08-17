@@ -1591,7 +1591,7 @@ fn admit_ir_for_inspection<'a>(
 fn print_schedule_why_origins(
     input: &Path,
     source: &str,
-    why: &o_lang::evidence::ScheduleWhyViewV1,
+    why: &o_lang::evidence::ScheduleWhyViewV2,
     origins: &[o_lang::parser::SourceSpanV1],
 ) -> Result<()> {
     use std::collections::BTreeSet;
@@ -3186,6 +3186,17 @@ mod tests {
                     expected_dependencies.insert("ignore");
                 }
                 assert_eq!(actual_dependencies, expected_dependencies);
+                assert_eq!(
+                    packages
+                        .iter()
+                        .filter_map(toml::Value::as_table)
+                        .filter(|package| {
+                            package.get("name").and_then(toml::Value::as_str) == Some("ostadix-api")
+                        })
+                        .count(),
+                    0,
+                    "the facade must remain unreachable from generated-runtime locks"
+                );
             }
         }
     }
@@ -3227,10 +3238,13 @@ use ostadix_generated_serde::placement::protocol::SemanticDigestV1 as NestedSema
 use ostadix_generated_serde::execution_contract::Policy as CanonicalPolicy;
 use ostadix_generated_serde::eval::Policy as CompatibilityPolicy;
 use ostadix_generated_serde::evidence::{
-    admit_execution_v6, analyze_execution, analyze_execution_v6, graph_sha256_v1,
-    graph_sha256_v2, runtime_binding_from_adapter_bytes, ADMISSION_SCHEMA_V6,
-    EVIDENCE_SCHEMA_V5, EVIDENCE_SCHEMA_V6, PLACEMENT_ADMISSION_DIGEST_DOMAIN_V2,
-    SCHEDULE_WHY_SCHEMA_V2, SOLVED_EXECUTABLE_HGRAPH_DIGEST_DOMAIN_V2,
+    admit_execution, admit_execution_v5, analyze_execution, analyze_execution_v5,
+    analyze_execution_v6, graph_sha256_v1, graph_sha256_v2,
+    runtime_binding_from_adapter_bytes, ExecutionIntentV1, ADMISSION_SCHEMA_V5,
+    ADMISSION_SCHEMA_V6, EVIDENCE_SCHEMA_V5, EVIDENCE_SCHEMA_V6,
+    EXECUTION_INTENT_SCHEMA_V1, PLACEMENT_ADMISSION_DIGEST_DOMAIN_V2,
+    SCHEDULE_WHY_SCHEMA_V2, SOLVED_EXECUTABLE_HGRAPH_DIGEST_DOMAIN_V1,
+    SOLVED_EXECUTABLE_HGRAPH_DIGEST_DOMAIN_V2,
 };
 use ostadix_generated_serde::ir::{OIr, OIrProgram};
 use ostadix_generated_serde::registry::bundle::{
@@ -3301,7 +3315,7 @@ fn execution_policy_is_one_type_in_generated_aot_runtime() {
 }
 
 #[test]
-fn explicit_evidence_v6_symbols_admit_a_real_generated_runtime_fixture() {
+fn current_v6_and_archival_v5_authorities_are_distinct_in_generated_runtime() {
     let program = OIrProgram {
         nodes: vec![OIr::Load("generated-runtime-input".to_string())],
     };
@@ -3315,22 +3329,58 @@ fn explicit_evidence_v6_symbols_admit_a_real_generated_runtime_fixture() {
     );
 
     let current = analyze_execution(&program, &plan, &graph, runtime.clone()).unwrap();
-    assert_eq!(current.schema(), EVIDENCE_SCHEMA_V5);
+    assert_eq!(current.schema(), EVIDENCE_SCHEMA_V6);
     let v6 = analyze_execution_v6(&program, &plan, &graph, runtime.clone()).unwrap();
     assert_eq!(v6.schema(), EVIDENCE_SCHEMA_V6);
+    assert_eq!(current, v6);
     assert_eq!(v6.bindings().analyzed_graph_sha256, graph_sha256_v2(&graph));
     assert_ne!(graph_sha256_v1(&graph), graph_sha256_v2(&graph));
 
-    let admitted = admit_execution_v6(
+    let mut archival_graph = program.hgraph_for_plan(&plan).unwrap();
+    ostadix_generated_serde::hgraph::solve::solve_types(&mut archival_graph).unwrap();
+    let archival =
+        analyze_execution_v5(&program, &plan, &archival_graph, runtime.clone()).unwrap();
+    assert_eq!(archival.schema(), EVIDENCE_SCHEMA_V5);
+    assert_eq!(
+        archival.bindings().analyzed_graph_sha256,
+        graph_sha256_v1(&archival_graph)
+    );
+    let archival_admitted = admit_execution_v5(
+        &program,
+        &plan,
+        archival_graph,
+        CanonicalPolicy::Eager,
+        runtime.clone(),
+        archival,
+    )
+    .unwrap();
+    assert_eq!(archival_admitted.admission().schema(), ADMISSION_SCHEMA_V5);
+
+    let intent = ExecutionIntentV1::compile(
+        b"generated-runtime-intent-v1",
+        &program,
+        &plan,
+        &graph,
+        CanonicalPolicy::Eager,
+    )
+    .unwrap();
+    assert_eq!(intent.schema, EXECUTION_INTENT_SCHEMA_V1);
+    assert_eq!(intent.analyzed_graph_sha256, graph_sha256_v1(&graph));
+
+    let admitted = admit_execution(
         &program,
         &plan,
         graph,
         CanonicalPolicy::Eager,
         runtime,
-        v6,
+        current,
     )
     .unwrap();
     assert_eq!(admitted.admission().schema(), ADMISSION_SCHEMA_V6);
+    assert_eq!(
+        SOLVED_EXECUTABLE_HGRAPH_DIGEST_DOMAIN_V1,
+        "ostadix-solved-executable-hgraph/v1"
+    );
     assert_eq!(
         SOLVED_EXECUTABLE_HGRAPH_DIGEST_DOMAIN_V2,
         "ostadix-solved-executable-hgraph/v2"

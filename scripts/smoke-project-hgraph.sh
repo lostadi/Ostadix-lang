@@ -53,7 +53,7 @@ mark() {
 
 tests_log="$work_dir/project-hgraph-tests.log"
 run_logged "$tests_log" env CARGO_TERM_COLOR=never \
-    cargo test --locked --test project_hgraph
+    cargo test --locked --package o-lang --test project_hgraph
 require_test_count "$tests_log" 10
 for name in \
     real_bundle_constructs_all_five_project_operations \
@@ -74,7 +74,7 @@ mark 'Project HGraph malformed/substitution rejection: PASS'
 
 logical_tests_log="$work_dir/project-logical-hgraph-tests.log"
 run_logged "$logical_tests_log" env CARGO_TERM_COLOR=never \
-    cargo test --locked --test project_logical_hgraph
+    cargo test --locked --package o-lang --test project_logical_hgraph
 require_test_count "$logical_tests_log" 12
 for name in \
     directory_and_lifted_project_have_identical_canonical_bytes_and_digest \
@@ -97,7 +97,7 @@ mark 'LogicalHGraphV1 HostWorld and no-authority boundary: PASS'
 
 deployment_tests_log="$work_dir/project-deployment-plan-tests.log"
 run_logged "$deployment_tests_log" env CARGO_TERM_COLOR=never \
-    cargo test --locked --test project_deployment_plan
+    cargo test --locked --package o-lang --test project_deployment_plan
 require_test_count "$deployment_tests_log" 9
 for name in \
     hosted_plan_is_canonical_explicit_and_never_mints_world_identity \
@@ -115,7 +115,7 @@ done
 mark 'DeploymentPlanV1 canonical hosted intent and bundle-scoped snapshot proposal: PASS'
 mark 'DeploymentPlanV1 World-epoch, hierarchy/task, and substitution rejection: PASS'
 
-run cargo build --locked --bin olangc
+run cargo build --locked --package o-lang --bin olangc
 first="$work_dir/project-plan-first.log"
 second="$work_dir/project-plan-second.log"
 run_logged "$first" "$ROOT/target/debug/olangc" "$fixture" \
