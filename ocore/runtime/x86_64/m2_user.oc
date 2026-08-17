@@ -78,21 +78,23 @@ unsafe fn wait_for_timer_tick() -> void {
 
 // Arm NT without crossing a syscall boundary, publish that fact to the sibling
 // thread, and spin until it rotates this TCB back in through another thread's
-// scheduling syscall. IRETQ must consume a sanitized selected frame.
+// scheduling syscall. The kernel binds the hostile preemption through its
+// exact-generation pending-selection counter; userspace checks only the flags
+// observed after IRETQ sanitizes the selected frame. Sampling the armed flags
+// here would be racy because IRQ0 may land immediately after POPF and resume
+// this TCB only after the scheduler has correctly cleared NT.
 @link_section(".text.user")
 unsafe fn cross_thread_hostile_rflags() -> void {
     volatile_store(HOSTILE_ARMED_VA as *mut u64, 0);
     volatile_store(HOSTILE_RELEASE_VA as *mut u64, 0);
-    let mut armed_flags: u64 = 0;
     let mut resumed_flags: u64 = 0;
     asm!(
-        "pushfq\nor qword ptr [rsp], 0x4000\npopfq\npushfq\npop rdx\nmov qword ptr [rdi], 1\n2:\ncmp qword ptr [rsi], 0\njne 3f\npause\njmp 2b\n3:\npushfq\npop rax",
+        "pushfq\nor qword ptr [rsp], 0x4000\npopfq\nmov qword ptr [rdi], 1\n2:\ncmp qword ptr [rsi], 0\njne 3f\npause\njmp 2b\n3:\npushfq\npop rax",
         in("rdi") HOSTILE_ARMED_VA,
         in("rsi") HOSTILE_RELEASE_VA,
-        out("rdx") armed_flags,
         out("rax") resumed_flags
     );
-    if (armed_flags & 0x4000) == 0 || (resumed_flags & 0x4000) != 0 {
+    if (resumed_flags & 0x4000) != 0 {
         stop();
     }
     emit(

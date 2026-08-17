@@ -222,7 +222,7 @@ jobs:
           python3 -m tests.test_parser
           python3 tests/example_manifest.py validate
           python3 -m unittest -v tests.test_example_manifest tests.test_benchmark_hgraph_hosted
-          python3 -m unittest -v tests.test_ostadix_boot_media tests.test_ostadix_media_writer tests.test_ostadix_physical_evidence tests.test_setup tests.test_o_cli_dispatch
+          python3 -m unittest -v tests.test_ostadix_boot_media tests.test_ostadix_boot_info_qemu tests.test_ostadix_media_writer tests.test_ostadix_physical_evidence tests.test_setup tests.test_o_cli_dispatch
           python3 -m tests.test_evaluator
           python3 -B tests/test_backend_state_protocol.py -v
           python3 -B tests/test_bundled_shim_protocol.py -v
@@ -312,6 +312,21 @@ jobs:
       - name: Run all required portable QEMU evidence gates
         run: ./boot-and-test.sh smoke
       # END GENERATED: REQUIRED_QEMU_EVIDENCE_CI
+
+      - name: Upload bounded BootInfo diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: boot-info-qemu-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            target/ostadix-boot-info-smoke/challenged-mode0.serial
+            target/ostadix-boot-info-smoke/challenged-mode0.stderr
+            target/ostadix-boot-info-smoke/challenged-mode0-diagnostic.json
+            target/ostadix-boot-info-smoke/mode0-build.txt
+            target/ostadix-boot-info-smoke/kernel-mode0/kernel.elf
+            target/ostadix-boot-info-smoke/kernel-mode0/kernel.s
+          if-no-files-found: warn
+          retention-days: 14
 
       # This required, blocking diagnostic-quality check repeats Mode 25 under
       # bounded host pressure. It is not an additional admissible evidence gate.
