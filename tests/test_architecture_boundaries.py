@@ -158,7 +158,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         self.assertEqual(
             result.stdout,
             "architecture dependency boundaries: PASS "
-            "(148 production files, 39 roots, 163 cross-root edges)\n",
+            "(149 production files, 40 roots, 174 cross-root edges)\n",
         )
 
     def test_manifest_inventories_every_current_root_edge_override_and_facade(self) -> None:
@@ -175,9 +175,9 @@ class ArchitectureBoundaryTests(unittest.TestCase):
                 }
             ],
         )
-        self.assertEqual(len(roots), 39)
+        self.assertEqual(len(roots), 40)
         self.assertEqual(
-            sum(len(root["allowed_dependencies"]) for root in roots), 163
+            sum(len(root["allowed_dependencies"]) for root in roots), 174
         )
         self.assertEqual(
             {
@@ -1026,6 +1026,50 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         self.assertIn(
             "root edge `canonical_cbor -> value` is not declared", result.stderr
         )
+
+    def test_native_roots_cannot_depend_back_on_information_bridge(self) -> None:
+        for native_root in (
+            "information",
+            "parser",
+            "value",
+            "hgraph",
+            "evidence",
+            "registry",
+            "world",
+            "project",
+            "hosted_remote",
+        ):
+            with self.subTest(native_root=native_root):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    write_minimal_tree(root)
+                    path = root / "src" / native_root
+                    source = path / "mod.rs" if path.is_dir() else path.with_suffix(".rs")
+                    source.write_text(
+                        "use crate::information_bridge::Boundary;\n", encoding="utf-8"
+                    )
+                    result = run_checker(root)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(
+                    f"root edge `{native_root} -> information_bridge` is not declared",
+                    result.stderr,
+                )
+
+    def test_information_bridge_cannot_import_authority_or_execution_roots(self) -> None:
+        for forbidden in ("capability", "eval", "executor", "placement", "runtime_exec"):
+            with self.subTest(forbidden=forbidden):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    write_minimal_tree(root)
+                    (root / "src/information_bridge.rs").write_text(
+                        f"use crate::{forbidden}::Boundary;\n", encoding="utf-8"
+                    )
+                    result = run_checker(root)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(
+                    f"root edge `information_bridge -> {forbidden}` is not declared",
+                    result.stderr,
+                )
 
     def test_new_production_root_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

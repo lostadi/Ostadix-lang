@@ -79,4 +79,31 @@ fn facade_source_has_no_glob_or_public_evaluator_reexport() {
         let line = line.trim();
         line.starts_with("pub use") && line.contains("BackendRegistry")
     }));
+    for forbidden in [
+        "information_bridge",
+        "ParsedDocumentV1",
+        "ParsedDocumentInformationV1",
+        "PublicValueInformationV1",
+        "HGraphInformationV1",
+        "EvidenceInformationV1",
+        "RegistryProfileInformationV1",
+        "WorldReceiptInformationV1",
+        "ProjectGraphInformationV1",
+        "HostedJournalInformationV1",
+        "InformationBridgeErrorV1",
+        "NativeRecordRefV1",
+        "project_parsed_document_v1",
+        "project_public_value_v1",
+        "project_hgraph_v1",
+        "project_evidence_v6",
+        "project_registry_profile_v1",
+        "project_world_receipt_v1",
+        "project_logical_hgraph_v1",
+        "project_hosted_journal_v2",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "stable facade must not reexport experimental bridge symbol {forbidden}"
+        );
+    }
 }
