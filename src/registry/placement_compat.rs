@@ -4,7 +4,7 @@
 //! This implementation lives above both protocol and registry storage so the
 //! placement protocol remains registry-independent.
 
-use crate::placement::protocol::{
+use crate::placement_protocol::{
     CandidateDecisionV1, NodeProfileV1, PlacementCandidateInputV1, PlacementValidationError,
     RecordAuthenticatorV1, TargetDescriptorV1, UnixMillisV1,
 };
