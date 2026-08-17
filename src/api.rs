@@ -35,6 +35,26 @@ pub use crate::hosted_remote::v2::{
     HostedV2Runtime, HostedV2RuntimeClosedV2, HostedV2RuntimeConfig, HostedV2RuntimeHandle,
     HostedV2RuntimeOwner, HostedV2RuntimeShutdownErrorV2,
 };
+pub use crate::information_bridge::{
+    project_evidence_v6, project_hgraph_v1, project_hosted_journal_v2, project_logical_hgraph_v1,
+    project_parsed_document_v1, project_public_value_v1, project_registry_profile_v1,
+    project_world_receipt_v1, EvidenceInformationV1, HGraphInformationV1,
+    HostedJournalInformationV1, InformationBridgeErrorV1, ParsedDocumentInformationV1,
+    ProjectGraphInformationV1, PublicValueInformationV1, RegistryProfileInformationV1,
+    WorldReceiptInformationV1, EVIDENCE_INFORMATION_SCHEMA_V1,
+    EVIDENCE_METADATA_PROJECTION_DIGEST_DOMAIN_V1, HGRAPH_INFORMATION_SCHEMA_V1,
+    HGRAPH_METADATA_PROJECTION_DIGEST_DOMAIN_V1, HOSTED_ENTRY_IDENTITY_DIGEST_DOMAIN_V1,
+    HOSTED_JOURNAL_INFORMATION_SCHEMA_V1, HOSTED_SESSION_IDENTITY_DIGEST_DOMAIN_V1,
+    INFORMATION_BRIDGE_MEDIA_TYPE_V1, INFORMATION_BRIDGE_SCHEMA_V1,
+    MAX_INFORMATION_BRIDGE_DECODE_DEPTH_V1, MAX_INFORMATION_BRIDGE_DECODE_ITEMS_V1,
+    MAX_INFORMATION_BRIDGE_RECORD_BYTES_V1, MAX_PUBLIC_VALUE_CANONICAL_BYTES_V1,
+    MAX_PUBLIC_VALUE_IDENTIFIER_BYTES_V1, MAX_PUBLIC_VALUE_NUMBER_BYTES_V1,
+    MAX_PUBLIC_VALUE_NUMBER_DEPTH_V1, MAX_PUBLIC_VALUE_NUMBER_NODES_V1,
+    MAX_PUBLIC_VALUE_TEXT_BYTES_V1, PARSED_DOCUMENT_INFORMATION_SCHEMA_V1,
+    PROJECT_GRAPH_INFORMATION_SCHEMA_V1, PUBLIC_VALUE_INFORMATION_SCHEMA_V1,
+    REGISTRY_NODE_IDENTITY_DIGEST_DOMAIN_V1, REGISTRY_PROFILE_INFORMATION_SCHEMA_V1,
+    WORLD_RECEIPT_INFORMATION_SCHEMA_V1,
+};
 pub use crate::parser::Parser;
 pub use crate::value::{
     BackendAuthority, CapabilityKind, DecimalSpecial, Fidelity, FidelityAssessmentV2,

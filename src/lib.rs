@@ -25,6 +25,7 @@ pub mod executor;
 pub mod hgraph;
 pub mod hosted_remote;
 pub mod information;
+pub mod information_bridge;
 pub mod ir;
 pub mod kernel_world;
 pub mod live_system;

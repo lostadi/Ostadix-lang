@@ -475,6 +475,12 @@ class WorkspaceFacadeReleaseValidationTests(unittest.TestCase):
                 FIXTURE_API_SOURCE + "\npub use o_lang::ir::BackendRegistry;\n",
                 r"must not expose BackendRegistry",
             ),
+            "information bridge leakage": (
+                "crates/ostadix-api/src/lib.rs",
+                FIXTURE_API_SOURCE
+                + "\npub use o_lang::api::{HGraphInformationV1, project_hgraph_v1};\n",
+                r"must not expose experimental Information bridge symbol",
+            ),
             "parser seam": (
                 "crates/ostadix-api/src/lib.rs",
                 FIXTURE_API_SOURCE.replace("use o_lang::api::Parser;\n", ""),
@@ -823,6 +829,7 @@ class SourceReleaseTests(unittest.TestCase):
             "src/information/projection.rs": "// fixture information projections\n",
             "src/information/root.rs": "// fixture information roots\n",
             "src/information/store.rs": "// fixture local information store\n",
+            "src/information_bridge/mod.rs": "// fixture read-only information bridge\n",
             "src/ir.rs": "// fixture canonical backend catalog projection\n",
             "src/lib.rs": "pub mod placement;\n",
             "src/main.rs": "fn main() {}\n",
@@ -896,6 +903,7 @@ class SourceReleaseTests(unittest.TestCase):
             "tests/test_world_alpha_evidence.py": "# fixture World evidence tests\n",
             "tests/hosted_remote_cli.rs": "#[test] fn hosted_remote_cli_fixture() {}\n",
             "tests/o_info_cli.rs": "#[test] fn o_info_cli_fixture() {}\n",
+            "tests/information_bridge_v1.rs": "#[test] fn information_bridge_fixture() {}\n",
             "tests/placement_v6.rs": "#[test] fn placement_v6_fixture() {}\n",
             "tests/registry_v1.rs": "#[test] fn registry_v1_fixture() {}\n",
             "backends/o_shim_common.py": "# fixture common shim protocol loop\n",
@@ -1277,6 +1285,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "src/information/projection.rs",
                 "src/information/root.rs",
                 "src/information/store.rs",
+                "src/information_bridge/mod.rs",
                 "src/ir.rs",
                 "src/lib.rs",
                 "src/main.rs",
@@ -1348,6 +1357,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "tests/hosted_remote_cli.rs",
                 "tests/hosted_remote_v2.rs",
                 "tests/o_info_cli.rs",
+                "tests/information_bridge_v1.rs",
                 "tests/placement_v6.rs",
                 "tests/registry_v1.rs",
                 "tests/project_hgraph.rs",
@@ -1788,7 +1798,9 @@ class SourceReleaseTests(unittest.TestCase):
             "src/information/projection.rs",
             "src/information/root.rs",
             "src/information/store.rs",
+            "src/information_bridge/mod.rs",
             "tests/o_info_cli.rs",
+            "tests/information_bridge_v1.rs",
         )
         self._commit()
         self._git("rm", *required)
