@@ -177,12 +177,12 @@ PY
 
 if [[ ! -x "$o_bin" ]]; then
     printf 'release O binary is missing or not executable: %s\n' "$o_bin" >&2
-    printf 'build it with: cargo build --release --locked --bin O\n' >&2
+    printf 'build it with: cargo build --release --locked --package o-lang --bin O\n' >&2
     exit 1
 fi
 if [[ ! -x "$olangc_bin" ]]; then
     printf 'release olangc binary is missing or not executable: %s\n' "$olangc_bin" >&2
-    printf 'build it with: cargo build --release --locked --bin olangc\n' >&2
+    printf 'build it with: cargo build --release --locked --package o-lang --bin olangc\n' >&2
     exit 1
 fi
 if [[ ! -d "$backends_dir" ]]; then
@@ -305,7 +305,7 @@ def exact_object(value, fields, label):
     actual = set(value)
     if actual != fields:
         raise SystemExit(
-            f"{label} fields differ from the v1 contract: "
+            f"{label} fields differ from the v2 contract: "
             f"missing={sorted(fields - actual)}, unexpected={sorted(actual - fields)}"
         )
     return value
@@ -347,7 +347,7 @@ root = exact_object(
     {"schema", "admission", "realizability", "prediction"},
     "schedule-explanation",
 )
-if root["schema"] != "oexec.schedule-explanation/v1":
+if root["schema"] != "oexec.schedule-explanation/v2":
     raise SystemExit(f"unsupported schedule-explanation schema: {root['schema']}")
 
 admission = exact_object(
@@ -355,7 +355,7 @@ admission = exact_object(
     {"schema", "analyzer", "runtime_snapshot_kind", "base_policy", "bindings"},
     "schedule-explanation admission",
 )
-if admission["schema"] != "oexec.admission/v5":
+if admission["schema"] != "oexec.admission/v6":
     raise SystemExit(f"unsupported admission schema: {admission['schema']}")
 if not isinstance(admission["analyzer"], str) or not admission["analyzer"]:
     raise SystemExit("admission analyzer must be a non-empty string")

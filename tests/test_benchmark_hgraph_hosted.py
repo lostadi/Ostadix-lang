@@ -178,10 +178,10 @@ class HostedHGraphBenchmarkTests(unittest.TestCase):
                 workers = int(args[args.index("--workers") + 1])
                 coverage = "yes" if workers >= width else "no"
                 document = {{
-                    "schema": "oexec.schedule-explanation/v1",
+                    "schema": "oexec.schedule-explanation/v2",
                     "admission": {{
-                        "schema": "oexec.admission/v5",
-                        "analyzer": "fixture-analyzer/v5",
+                        "schema": "oexec.admission/v6",
+                        "analyzer": "fixture-analyzer/v6",
                         "runtime_snapshot_kind": "inspection",
                         "base_policy": "eager",
                         "bindings": bindings,

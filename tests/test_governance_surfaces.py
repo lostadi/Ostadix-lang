@@ -86,6 +86,9 @@ class GovernanceSurfaceTests(unittest.TestCase):
         changelog = read("CHANGELOG.md")
         self.assertIn("## [Unreleased]", changelog)
         self.assertIn("does not itself assert a tag", changelog)
+        citation = read("CITATION.cff")
+        self.assertIn('version: "0.3.0"', citation)
+        self.assertNotIn("date-released:", citation)
 
     def test_versioning_document_tracks_source_coordinates(self) -> None:
         versioning = read("docs/VERSIONING.md")
@@ -102,6 +105,19 @@ class GovernanceSurfaceTests(unittest.TestCase):
             ("src/evidence/intent.rs", "EXECUTION_INTENT_SCHEMA_V1"),
             ("src/evidence/fact.rs", "EVIDENCE_SCHEMA_V5"),
             ("src/evidence/fact.rs", "ADMISSION_SCHEMA_V5"),
+            ("src/evidence/fact.rs", "EVIDENCE_SCHEMA_V6"),
+            ("src/evidence/fact.rs", "ADMISSION_SCHEMA_V6"),
+            ("src/evidence/fact.rs", "ANALYZER_ID_V6"),
+            ("src/evidence/admit.rs", "SCHEDULE_EXPLANATION_SCHEMA_V1"),
+            ("src/evidence/admit.rs", "SCHEDULE_EXPLANATION_SCHEMA_V2"),
+            ("src/evidence/admit.rs", "SCHEDULE_WHY_SCHEMA_V1"),
+            ("src/evidence/admit.rs", "SCHEDULE_WHY_SCHEMA_V2"),
+            ("src/evidence/admit.rs", "PLACEMENT_ADMISSION_DIGEST_DOMAIN_V1"),
+            ("src/evidence/admit.rs", "PLACEMENT_ADMISSION_DIGEST_DOMAIN_V2"),
+            (
+                "src/hosted_remote/v2/store.rs",
+                "HOSTED_STATE_AUTHORITY_SCHEMA_V1",
+            ),
             ("src/hosted_remote/protocol.rs", "HOSTED_PROTOCOL_V1"),
             ("src/hosted_remote/v2/protocol.rs", "HOSTED_PROTOCOL_V2"),
             ("src/information/mod.rs", "INFORMATION_SCHEMA_V1"),

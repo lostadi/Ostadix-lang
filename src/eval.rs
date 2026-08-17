@@ -363,7 +363,7 @@ pub struct Evaluator {
 
     /// Digest-bound pre-execution decision that authorized the most recent
     /// graph run (or was compiled for the serial differential oracle).
-    last_execution_admission: Option<crate::evidence::ExecutionAdmissionV5>,
+    last_execution_admission: Option<crate::evidence::ExecutionAdmissionV6>,
 
     /// The hypergraph schedule built from the most recent lowered OIR program.
     /// This is the compiled foothold for the graph executor: current runtime
@@ -518,23 +518,134 @@ impl PlacementFragmentBindingsV1 {
     }
 }
 
+/// Current package-0.3 placement coordinates. V2 is freshly derived from
+/// Admission V6 and the placement-admission V2 digest domain; it is never
+/// constructed from or compared as equivalent to V1.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlacementFragmentBindingsV2 {
+    source_sha256: String,
+    canonical_backend: String,
+    plan_node: PlanNodeId,
+    operation_oir: crate::resource_identity::ArtifactId,
+    requirement_footprint: crate::placement::RequirementFootprintV1,
+    requirement_footprint_sha256: crate::placement::SemanticDigestV1,
+    placement_admission: crate::placement::SemanticDigestV1,
+    task_attempt: crate::placement::TaskAttemptIdV1,
+    backend_implementation: crate::placement::BackendImplementationIdV1,
+    backend_implementation_sha256: crate::placement::SemanticDigestV1,
+    backend_launch_generation: crate::placement::SemanticDigestV1,
+    environment: EnvironmentRefV2,
+    sandbox_permissions: Vec<BackendAuthority>,
+    sandbox_policy_sha256: crate::placement::SemanticDigestV1,
+}
+
+impl PlacementFragmentBindingsV2 {
+    pub fn source_sha256(&self) -> &str {
+        &self.source_sha256
+    }
+
+    pub fn canonical_backend(&self) -> &str {
+        &self.canonical_backend
+    }
+
+    pub fn plan_node(&self) -> PlanNodeId {
+        self.plan_node
+    }
+
+    pub fn operation_oir(&self) -> &crate::resource_identity::ArtifactId {
+        &self.operation_oir
+    }
+
+    pub fn requirement_footprint(&self) -> &crate::placement::RequirementFootprintV1 {
+        &self.requirement_footprint
+    }
+
+    pub fn requirement_footprint_sha256(&self) -> &crate::placement::SemanticDigestV1 {
+        &self.requirement_footprint_sha256
+    }
+
+    pub fn placement_admission(&self) -> &crate::placement::SemanticDigestV1 {
+        &self.placement_admission
+    }
+
+    pub fn admission(&self) -> &crate::placement::SemanticDigestV1 {
+        self.placement_admission()
+    }
+
+    pub fn task_attempt(&self) -> &crate::placement::TaskAttemptIdV1 {
+        &self.task_attempt
+    }
+
+    pub fn backend_implementation(&self) -> &crate::placement::BackendImplementationIdV1 {
+        &self.backend_implementation
+    }
+
+    pub fn backend_implementation_sha256(&self) -> &crate::placement::SemanticDigestV1 {
+        &self.backend_implementation_sha256
+    }
+
+    pub fn realization_pipeline(&self) -> &crate::placement::SemanticDigestV1 {
+        self.backend_implementation.realization_pipeline()
+    }
+
+    pub fn backend_launch_generation(&self) -> &crate::placement::SemanticDigestV1 {
+        &self.backend_launch_generation
+    }
+
+    pub fn environment(&self) -> EnvironmentRefV2 {
+        self.environment
+    }
+
+    pub fn sandbox_permissions(&self) -> &[BackendAuthority] {
+        &self.sandbox_permissions
+    }
+
+    pub fn sandbox_policy_sha256(&self) -> &crate::placement::SemanticDigestV1 {
+        &self.sandbox_policy_sha256
+    }
+}
+
 /// Non-cloneable, process-local execution authority prepared from one exact
-/// source fragment.  There is intentionally no public constructor and no
-/// mutable access to its lowered/admitted components.
+/// source fragment under the archival V1/V5 contract. Package 0.3 retains its
+/// binding vocabulary for inspection only: there is no public constructor and
+/// current execution accepts only [`PreparedPlacementFragmentV2`].
+///
+/// ```compile_fail
+/// use std::collections::HashMap;
+/// use o_lang::eval::{Evaluator, PreparedPlacementFragmentV1};
+/// use o_lang::value::OValue;
+///
+/// fn cannot_execute_archival_fragment(
+///     evaluator: &mut Evaluator,
+///     fragment: PreparedPlacementFragmentV1,
+///     scope: &mut HashMap<String, OValue>,
+/// ) {
+///     evaluator.execute_prepared_placement_fragment(fragment, scope).unwrap();
+/// }
+/// ```
 pub struct PreparedPlacementFragmentV1 {
-    program: OIrProgram,
-    plan: ExecutionPlan,
-    admission: crate::evidence::PreparedAdmissionPartsV1,
-    hgraph_schedule: crate::hgraph::Schedule,
     bindings: PlacementFragmentBindingsV1,
-    /// Process-local evaluator instance fence. This private bearer never
-    /// enters canonical placement records or leaves the non-serializable
-    /// handle.
-    evaluator_instance_binding: String,
 }
 
 impl PreparedPlacementFragmentV1 {
     pub fn bindings(&self) -> &PlacementFragmentBindingsV1 {
+        &self.bindings
+    }
+}
+
+/// Current non-cloneable placement execution authority. Its V6 admission and
+/// V2 bindings cannot be reconstructed from an archival V1 fragment.
+pub struct PreparedPlacementFragmentV2 {
+    program: OIrProgram,
+    plan: ExecutionPlan,
+    admission: crate::evidence::PreparedAdmissionPartsV2,
+    hgraph_schedule: crate::hgraph::Schedule,
+    bindings: PlacementFragmentBindingsV2,
+    evaluator_instance_binding: String,
+}
+
+impl PreparedPlacementFragmentV2 {
+    pub fn bindings(&self) -> &PlacementFragmentBindingsV2 {
         &self.bindings
     }
 }
@@ -769,7 +880,7 @@ impl Evaluator {
     }
 
     /// Evidence-bound admission compiled before the most recent execution.
-    pub fn last_execution_admission(&self) -> Option<&crate::evidence::ExecutionAdmissionV5> {
+    pub fn last_execution_admission(&self) -> Option<&crate::evidence::ExecutionAdmissionV6> {
         self.last_execution_admission.as_ref()
     }
 
@@ -1978,7 +2089,7 @@ impl Evaluator {
         &mut self,
         source_utf8: &str,
         task_attempt: crate::placement::TaskAttemptIdV1,
-    ) -> Result<PreparedPlacementFragmentV1> {
+    ) -> Result<PreparedPlacementFragmentV2> {
         use crate::placement::CanonicalPlacementRecordV1;
 
         let executable_source = strip_prepared_source_shebang(source_utf8);
@@ -2095,7 +2206,7 @@ impl Evaluator {
             .map_err(anyhow::Error::msg)
             .context("placement-fragment ready schedule is not executable")?;
 
-        let bindings = PlacementFragmentBindingsV1 {
+        let bindings = PlacementFragmentBindingsV2 {
             source_sha256: crate::evidence::source_sha256(source_utf8.as_bytes()),
             canonical_backend: backend.canonical,
             plan_node: exec_node,
@@ -2112,7 +2223,7 @@ impl Evaluator {
             sandbox_policy_sha256,
         };
         let admission = admitted.into_prepared_parts();
-        Ok(PreparedPlacementFragmentV1 {
+        Ok(PreparedPlacementFragmentV2 {
             program,
             plan,
             admission,
@@ -2129,7 +2240,7 @@ impl Evaluator {
     /// immediately before dispatch.
     pub fn execute_prepared_placement_fragment(
         &mut self,
-        prepared: PreparedPlacementFragmentV1,
+        prepared: PreparedPlacementFragmentV2,
         scope: &mut HashMap<String, OValue>,
     ) -> Result<OValue> {
         // GraphEvalFrame normally copies the entire caller scope into every
@@ -2144,7 +2255,7 @@ impl Evaluator {
                 "prepared placement fragment cannot consume a nonempty coordinator scope until that scope is canonically packaged and digest-bound"
             );
         }
-        let PreparedPlacementFragmentV1 {
+        let PreparedPlacementFragmentV2 {
             program,
             plan,
             admission,
@@ -2191,7 +2302,7 @@ impl Evaluator {
     /// backend may already have performed.
     pub fn execute_prepared_placement_fragment_until(
         &mut self,
-        prepared: PreparedPlacementFragmentV1,
+        prepared: PreparedPlacementFragmentV2,
         scope: &mut HashMap<String, OValue>,
         deadline: Instant,
     ) -> Result<OValue> {
