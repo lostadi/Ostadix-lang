@@ -12,8 +12,13 @@ pub use crate::backend_morphism::{
 };
 pub use crate::eval::Evaluator;
 pub use crate::evidence::{
-    AdmittedExecution, ExecutionIntentV1, ADMISSION_SCHEMA_V5, EVIDENCE_SCHEMA_V5,
-    EXECUTION_INTENT_SCHEMA_V1,
+    admit_execution_v6, analyze_execution_v6, evidence_bundle_sha256_v6, graph_sha256_v2,
+    AdmittedExecution, AdmittedExecutionV6, AdmittedOperationV2, EvidenceBundleV6,
+    ExecutionAdmissionV6, ExecutionIntentV1, NodeEvidenceV2, ScheduleWhyViewV2, TypeContractV2,
+    ADMISSION_SCHEMA_V5, ADMISSION_SCHEMA_V6, ANALYZER_ID_V6, EVIDENCE_BUNDLE_DIGEST_DOMAIN_V6,
+    EVIDENCE_SCHEMA_V5, EVIDENCE_SCHEMA_V6, EXECUTION_ADMISSION_DIGEST_DOMAIN_V6,
+    EXECUTION_INTENT_SCHEMA_V1, PLACEMENT_ADMISSION_DIGEST_DOMAIN_V2, SCHEDULE_WHY_SCHEMA_V2,
+    SOLVED_EXECUTABLE_HGRAPH_DIGEST_DOMAIN_V2,
 };
 pub use crate::execution_contract::Policy;
 pub use crate::hosted_remote::v2::{
@@ -43,5 +48,27 @@ mod tests {
         let canonical: crate::execution_contract::Policy = super::Policy::Lazy;
         let compatibility: crate::eval::Policy = canonical;
         let _: super::Policy = compatibility;
+    }
+
+    #[test]
+    fn explicit_v6_facade_is_additive_and_current_constants_remain_v5() {
+        assert_eq!(super::ADMISSION_SCHEMA_V5, "oexec.admission/v5");
+        assert_eq!(super::EVIDENCE_SCHEMA_V5, "oexec.evidence/v5");
+        assert_eq!(super::ADMISSION_SCHEMA_V6, "oexec.admission/v6");
+        assert_eq!(super::EVIDENCE_SCHEMA_V6, "oexec.evidence/v6");
+        assert_eq!(super::SCHEDULE_WHY_SCHEMA_V2, "oexec.admission-why/v2");
+        assert_eq!(
+            super::SOLVED_EXECUTABLE_HGRAPH_DIGEST_DOMAIN_V2,
+            "ostadix-solved-executable-hgraph/v2"
+        );
+        assert_eq!(
+            TypeId::of::<super::EvidenceBundleV6>(),
+            TypeId::of::<crate::evidence::EvidenceBundleV6>()
+        );
+        assert_eq!(
+            TypeId::of::<super::AdmittedExecutionV6<'static>>(),
+            TypeId::of::<crate::evidence::AdmittedExecutionV6<'static>>()
+        );
+        let _: fn(&crate::hgraph::HGraph) -> String = super::graph_sha256_v2;
     }
 }
