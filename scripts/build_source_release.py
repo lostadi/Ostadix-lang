@@ -229,6 +229,7 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "docs/HOSTED_WORLD_REFERENCE_PROFILE.md",
         "docs/CI_POSTURE.md",
         "docs/INFORMATION_KERNEL_V1.md",
+        "docs/releases/v0.3.0.md",
         "docs/O_MACHINE_CONTRACT.md",
         "docs/OSTADIX_BOOT.md",
         "docs/OSTADIX_WORLD.md",
