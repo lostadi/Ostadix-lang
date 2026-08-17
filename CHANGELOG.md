@@ -26,6 +26,12 @@ Package SemVer is only one of the independent coordinates documented in
 - Durable Hosted V2 state roots carry an exact package-0.3 execution-authority
   marker. Pre-0.3 roots, V1 prepared fragments, and V1 placement-admission
   digests are rejected by current execution rather than migrated or relabeled.
+- Experimental Information Bridge V1 adds eight explicit, bounded,
+  authority-free native metadata projections plus a lock-free existing-root
+  reader, `o-info head`, and fixed local MCP head inspection. HGraph/Evidence
+  metadata digests intentionally omit source/value/runtime identity; raw
+  registry and Hosted locators/tokens are domain-projected equality oracles,
+  not confidentiality primitives.
 
 ### Changed
 
@@ -37,6 +43,9 @@ Package SemVer is only one of the independent coordinates documented in
   the three profiled crossings remain shadow-only and do not change
   `BackendInterface`, HGraph solving, graph hashing, evidence/admission schemas,
   or execution behavior.
+- `ParsedDocumentV1.nodes` is private before the 0.3 tag. Use `nodes()` or
+  `into_nodes()`; parsed-document equality now also binds parser-captured exact
+  source SHA-256 and length. The stable `ostadix-api` facade remains unchanged.
 
 ## [0.2.0] - 2026-08-16
 

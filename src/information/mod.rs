@@ -43,7 +43,7 @@ pub use model::{
 };
 pub use projection::{ProjectionDirectionV1, ProjectionReceiptV1};
 pub use root::{InformationRevisionV1, InformationSnapshotV1};
-pub use store::{InformationObjectKindV1, InformationStoreV1};
+pub use store::{InformationObjectKindV1, InformationStoreReaderV1, InformationStoreV1};
 
 pub const INFORMATION_SCHEMA_V1: &str = "ostadix.information/v1";
 pub const MAX_T0_CANONICAL_BYTES: usize = 4 * 1024;

@@ -21,6 +21,20 @@
 - The hosted process protocol uses a 4-byte big-endian length prefix followed
   by canonical CBOR encoding in `src/wire.rs`; maps are sorted by encoded key
   length and bytes before transmission.
+- The experimental Information V1 bridge implements exactly eight typed,
+  bounded, read-only native metadata projections. Tests cover real fixtures,
+  pinned canonical/T2 vectors, exact source provenance, caller-public scalar
+  preflight, semantic/canonical decoder rejection, admitted-HGraph denial,
+  intentional HGraph/Evidence metadata collisions, raw locator/token absence,
+  and the lack of native reverse/authority edges. Its metadata digests are
+  deliberately lossy and are not native identity, confidentiality, freshness,
+  trust, continuity, admission, or authority. `InformationStoreReaderV1` and
+  fixed MCP `o_information_inspect` provide bounded existing-root head
+  inspection without directory/lock creation, mode repair, head mutation,
+  cloud, or network access. The tested no-mutation surface covers entries,
+  content, inode, mode, and mtime, not atime or concurrent hostile ancestor
+  replacement. The stable `ostadix-api` facade and generated AOT runtime do not
+  expose this bridge.
 - The repository contains three hosted implementations: the Rust authoritative
   runtime (`src/`), the C17 interpreter and AOT `olangc` (`c_cpp/Makefile` and
   `c_cpp/CMakeLists.txt`, both using C17), and the Python reference edition

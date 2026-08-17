@@ -1,6 +1,7 @@
 use crate::environment::{EnvironmentRefV2, EPHEMERAL_ENV_ID};
 use crate::syntax_dialect::SyntaxDialect;
 use anyhow::{bail, Result};
+use sha2::{Digest, Sha256};
 
 /// Languages whose bodies are SEQUENCED (children are O-level statements)
 /// rather than SPLICED (children are raw source text for a target backend).
@@ -88,17 +89,42 @@ impl SourceSpanV1 {
 /// `plan_origins()[index]` corresponds to the OIR node returned at the same
 /// index by `OIrProgram::flatten_for_plan`. Bodies owned by `quote` are
 /// intentionally absent because they are captured syntax, not executable plan
-/// nodes. A caller associates this parser-relative map with its own source path
-/// and/or source digest; neither is inferred here.
+/// nodes. The parser captures the exact source digest and length, but a caller
+/// associates this parser-relative map with any external source path.
+///
+/// Parsed nodes are read-only after construction:
+///
+/// ```compile_fail
+/// fn mutate(document: &mut o_lang::parser::ParsedDocumentV1) {
+///     document.nodes.clear();
+/// }
+/// ```
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParsedDocumentV1 {
-    pub nodes: Vec<ONode>,
+    nodes: Vec<ONode>,
     plan_origins: Vec<SourceSpanV1>,
+    source_sha256: [u8; 32],
+    source_len: usize,
 }
 
 impl ParsedDocumentV1 {
+    /// The unchanged syntax nodes parsed from the source document.
+    pub fn nodes(&self) -> &[ONode] {
+        &self.nodes
+    }
+
     pub fn plan_origins(&self) -> &[SourceSpanV1] {
         &self.plan_origins
+    }
+
+    /// Parser-computed identity of the exact UTF-8 bytes from which this
+    /// document and its origin sidecar were produced.
+    pub fn source_sha256(&self) -> &[u8; 32] {
+        &self.source_sha256
+    }
+
+    pub fn source_len(&self) -> usize {
+        self.source_len
     }
 
     pub fn origin_for_plan_index(&self, plan_index: usize) -> Option<&SourceSpanV1> {
@@ -181,6 +207,8 @@ impl<'a> Parser<'a> {
         Ok(ParsedDocumentV1 {
             nodes,
             plan_origins,
+            source_sha256: Sha256::digest(self.source.as_bytes()).into(),
+            source_len: self.source.len(),
         })
     }
 
@@ -1117,9 +1145,9 @@ mod tests {
         let ordinary = Parser::new(source, &backends).parse().unwrap();
         let sourced = Parser::new(source, &backends).parse_with_origins().unwrap();
 
-        assert_eq!(sourced.nodes, ordinary);
+        assert_eq!(sourced.nodes(), ordinary);
         let ordinary_oir = crate::ir::OIrProgram::lower(&ordinary);
-        let sourced_oir = crate::ir::OIrProgram::lower(&sourced.nodes);
+        let sourced_oir = crate::ir::OIrProgram::lower(sourced.nodes());
         assert_eq!(sourced_oir, ordinary_oir);
         assert_eq!(sourced_oir.to_text(), ordinary_oir.to_text());
         assert_eq!(
@@ -1133,7 +1161,7 @@ mod tests {
         let source = "quote^(python^($hidden)_python)_quote\npython^($visible)_python";
         let backends = make_backends(&["python", "quote"]);
         let sourced = Parser::new(source, &backends).parse_with_origins().unwrap();
-        let program = crate::ir::OIrProgram::lower(&sourced.nodes);
+        let program = crate::ir::OIrProgram::lower(sourced.nodes());
         let plan = program.plan();
 
         let slices = sourced
