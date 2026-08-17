@@ -11,7 +11,7 @@ excluded_directories = ["src/bin"]
 
 # This token fragment is compiled into backend_catalog.rs with include!(). It
 # is scanned under that owning root but is not counted as a standalone module
-# file in the 148-file production-module inventory.
+# file in the 149-file production-module inventory.
 [[compiled_fragment]]
 path = "src/backend_catalog.inc.rs"
 owner = "backend_catalog"
