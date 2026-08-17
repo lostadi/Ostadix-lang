@@ -1844,6 +1844,14 @@ ocore_enter_user:
 //   RAX number; RDI,RSI,RDX,R10,R8,R9 arguments 0..5.
 // The O-core dispatcher is an ordinary SysV function:
 //   RDI number; RSI,RDX,RCX,R8,R9 arguments 0..4; stack argument 5.
+.macro OCORE_PROJECT_ASYNC_USER_RFLAGS frame
+  // An interrupt may split a user CMP/TEST from its SETcc/Jcc consumer. Keep
+  // the ordinary arithmetic status across that asynchronous boundary while
+  // clearing user-controlled return hazards. Bit 1 and IF are canonical.
+  and qword ptr [\frame + 152], 0x8d5
+  or qword ptr [\frame + 152], 0x202
+.endm
+
 .type ocore_syscall_entry, @function
 ocore_syscall_entry:
   swapgs
@@ -1880,6 +1888,19 @@ ocore_syscall_entry:
   mov qword ptr [rsp + 160], rax
   mov qword ptr [rsp + 168], 0x1b
 
+  // Mode 0 uses R11 as the hardware receipt for the caller's pre-entry
+  // RFLAGS. Bind that focused proof to the live IA32_FMASK result without
+  // charging every syscall in the other capacity-sensitive kernel modes.
+#if OCORE_PROBE_MODE == 0
+  test qword ptr [rsp + 32], 0x4000
+  jz .syscall_entry_flags_validated
+  pushfq
+  pop rax
+  test rax, 0x4000
+  jnz .fatal_exception
+.syscall_entry_flags_validated:
+#endif
+
   mov rax, qword ptr [rsp + 48]
   mov rdi, qword ptr [rsp + 112]
   mov rsi, qword ptr [rsp + 64]
@@ -1907,10 +1928,10 @@ ocore_syscall_entry:
   test rax, rax
   jz .invalid_user_return_saved
 
-  // Restore only the architectural reserved bit and IF. This clears IOPL,
-  // NT, VM, TF, DF, AC, and every other user-controlled return hazard.
+  // Restore only the architectural reserved bit and IF in the authoritative
+  // IRET frame. R11 remains the hardware-captured, caller-clobbered entry
+  // receipt; exposing the caller's own flags there grants no return authority.
   mov qword ptr [rsp + 152], 0x202
-  mov qword ptr [rsp + 32], 0x202
   mov rax, qword ptr [rsp + 136]
   mov qword ptr [rsp + 96], rax
   jmp .restore_syscall_frame
@@ -1918,7 +1939,6 @@ ocore_syscall_entry:
 .schedule_from_syscall:
   mov qword ptr [rsp + 112], 0
   mov qword ptr [rsp + 152], 0x202
-  mov qword ptr [rsp + 32], 0x202
   mov rax, qword ptr [rsp + 136]
   mov qword ptr [rsp + 96], rax
   mov rdi, rsp
@@ -1932,9 +1952,9 @@ ocore_syscall_entry:
   test rax, rax
   jz .fatal_exception
   // The scheduler may select a different TCB whose frame was saved by IRQ0.
-  // Sanitize that exact frame just as the timer-return path does below; the
-  // caller frame sanitized above is no longer the frame IRETQ will consume.
-  mov qword ptr [rbx + 152], 0x202
+  // Project that exact asynchronous frame just as the timer-return path does
+  // below; the caller frame sanitized above is no longer consumed by IRETQ.
+  OCORE_PROJECT_ASYNC_USER_RFLAGS rbx
   mov rsp, rbx
 
 .restore_syscall_frame:
@@ -2018,10 +2038,9 @@ ocore_timer_interrupt_entry:
   jz .timer_scheduler_complete
   mov rbx, rax
 
-  // Validate and sanitize every selected CPL3 frame, including a different
-  // TCB returned by the scheduler. A hostile user RFLAGS value interrupted by
-  // IRQ0 must not survive merely because this return uses IRETQ rather than
-  // the SYSCALL return path.
+  // Validate and project every selected CPL3 frame, including a different TCB
+  // returned by the scheduler. Arithmetic status survives arbitrary IRQ0
+  // boundaries; privilege-sensitive and control hazards do not.
   mov rax, qword ptr [rbx + 144]
   test al, 3
   jz .timer_frame_validated
@@ -2030,7 +2049,7 @@ ocore_timer_interrupt_entry:
   call kernel_validate_user_return
   test rax, rax
   jz .fatal_exception
-  mov qword ptr [rbx + 152], 0x202
+  OCORE_PROJECT_ASYNC_USER_RFLAGS rbx
 .timer_frame_validated:
   mov rsp, rbx
 
@@ -2218,7 +2237,7 @@ ocore_exception_common:
   call kernel_validate_user_return
   test rax, rax
   jz .fatal_exception
-  mov qword ptr [rbx + 152], 0x202
+  OCORE_PROJECT_ASYNC_USER_RFLAGS rbx
 .scheduled_exception_frame_validated:
   mov rsp, rbx
   mov rax, qword ptr [rsp + 144]
