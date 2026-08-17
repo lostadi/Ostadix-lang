@@ -29,7 +29,9 @@ def write_minimal_tree(root: Path) -> None:
         "src/syntax_dialect.rs",
         "src/ir.rs",
         "src/backend_catalog.rs",
+        "src/execution_contract.rs",
         "src/effects.rs",
+        "src/value.rs",
         "src/dispatch_model.rs",
         "src/placement/mod.rs",
         "src/placement/projection.rs",
@@ -54,6 +56,7 @@ def write_minimal_tree(root: Path) -> None:
         "src/evidence/fact.rs",
         "src/evidence/intent.rs",
         "src/evidence/profile.rs",
+        "src/world/grounding.rs",
     ):
         path = root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -88,11 +91,23 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("canonical backend catalog", result.stderr)
 
+    def test_ir_cannot_depend_on_its_execution_contract_projection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/ir.rs").write_text(
+                "use crate::execution_contract::Policy;\n", encoding="utf-8"
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("execution-contract", result.stderr)
+
     def test_canonical_catalog_rejects_every_frozen_higher_layer(self) -> None:
         for module in (
             "backend",
             "eval",
             "evidence",
+            "execution_contract",
             "executor",
             "hgraph",
             "ir",
@@ -126,6 +141,174 @@ class ArchitectureBoundaryTests(unittest.TestCase):
             (root / "src/backend_catalog.rs").write_text(
                 "".join(f"use crate::{module}::Boundary;\n" for module in allowed),
                 encoding="utf-8",
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_execution_contract_rejects_every_frozen_higher_layer(self) -> None:
+        for module in (
+            "api",
+            "backend",
+            "backend_morphism",
+            "backend_state",
+            "canonical_cbor",
+            "capability",
+            "dispatch_model",
+            "environment",
+            "eval",
+            "eval_core",
+            "evidence",
+            "executor",
+            "hgraph",
+            "hosted_remote",
+            "information",
+            "kernel_world",
+            "live_system",
+            "nix_ops",
+            "nixos_ops",
+            "ocore",
+            "parser",
+            "placement",
+            "placement_protocol",
+            "process",
+            "project",
+            "registry",
+            "resource_identity",
+            "runtime_exec",
+            "scheduler",
+            "shims",
+            "syntax_dialect",
+            "version",
+            "wire",
+            "world",
+        ):
+            with self.subTest(module=module):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    write_minimal_tree(root)
+                    (root / "src/execution_contract.rs").write_text(
+                        f"use crate::{module}::Boundary;\n", encoding="utf-8"
+                    )
+                    result = run_checker(root)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("canonical execution contract", result.stderr)
+
+    def test_execution_contract_forbidden_roots_cannot_be_obscured(self) -> None:
+        cases = (
+            ("use crate::process::Boundary;\n", "crate::process"),
+            ("use crate::{process::Boundary};\n", "crate::{process::...}"),
+            ("use crate :: process :: Boundary;\n", "crate::process"),
+            (
+                "fn boundary() { let _ = crate::process::Boundary; }\n",
+                "crate::process",
+            ),
+        )
+        for source, expected in cases:
+            with self.subTest(source=source):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    write_minimal_tree(root)
+                    (root / "src/execution_contract.rs").write_text(
+                        source, encoding="utf-8"
+                    )
+                    result = run_checker(root)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(f"forbidden dependency `{expected}`", result.stderr)
+
+    def test_execution_contract_allowlist_rejects_novel_roots_in_every_form(self) -> None:
+        cases = (
+            ("use crate::future_high_layer::Boundary;\n", "crate::future_high_layer"),
+            (
+                "use crate::{future_high_layer::Boundary};\n",
+                "crate::{future_high_layer::...}",
+            ),
+            (
+                "use crate :: future_high_layer :: Boundary;\n",
+                "crate::future_high_layer",
+            ),
+        )
+        for source, expected in cases:
+            with self.subTest(source=source):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    write_minimal_tree(root)
+                    (root / "src/execution_contract.rs").write_text(
+                        source, encoding="utf-8"
+                    )
+                    result = run_checker(root)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(f"forbidden dependency `{expected}`", result.stderr)
+
+    def test_rules_without_allowlists_remain_deny_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/parser.rs").write_text(
+                "use crate::future_low_layer::Boundary;\n", encoding="utf-8"
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_execution_contract_accepts_only_its_frozen_lower_seams(self) -> None:
+        allowed = ("backend_catalog", "effects", "ir", "value")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/execution_contract.rs").write_text(
+                "".join(f"use crate::{module}::Boundary;\n" for module in allowed),
+                encoding="utf-8",
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_execution_contract_lower_seams_cannot_form_reverse_cycles(self) -> None:
+        for relative in (
+            "src/parser.rs",
+            "src/syntax_dialect.rs",
+            "src/effects.rs",
+            "src/value.rs",
+            "src/placement/protocol/target.rs",
+        ):
+            with self.subTest(relative=relative):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    write_minimal_tree(root)
+                    (root / relative).write_text(
+                        "use crate::execution_contract::Policy;\n", encoding="utf-8"
+                    )
+                    result = run_checker(root)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(
+                    "forbidden dependency `crate::execution_contract`", result.stderr
+                )
+
+    def test_evidence_and_world_cannot_reenter_evaluator_for_contract_types(self) -> None:
+        for relative in (
+            "src/evidence/admit.rs",
+            "src/evidence/analyze.rs",
+            "src/evidence/intent.rs",
+            "src/world/grounding.rs",
+        ):
+            with self.subTest(relative=relative):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    write_minimal_tree(root)
+                    (root / relative).write_text(
+                        "use crate::eval::Policy;\n", encoding="utf-8"
+                    )
+                    result = run_checker(root)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("canonical execution contract", result.stderr)
+
+    def test_evidence_and_world_accept_canonical_execution_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/evidence/analyze.rs").write_text(
+                "use crate::execution_contract::Policy;\n", encoding="utf-8"
+            )
+            (root / "src/world/grounding.rs").write_text(
+                "use crate::execution_contract::BlockOptions;\n", encoding="utf-8"
             )
             result = run_checker(root)
         self.assertEqual(result.returncode, 0, result.stderr)

@@ -210,7 +210,7 @@ pub(crate) fn validate_canonical_solved_graph(
         );
     }
     let flat = program.flatten_for_plan();
-    crate::eval::validate_execution_metadata(&flat)
+    crate::execution_contract::validate_execution_metadata(&flat)
         .context("analysis rejected invalid OIR execution metadata")?;
     graph
         .validate_execution_source(program, plan)

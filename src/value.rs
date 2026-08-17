@@ -16,7 +16,6 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
-use std::str::FromStr;
 
 use anyhow::{bail, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
@@ -27,7 +26,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 mod bigint_json {
-    use super::*;
+    use std::{fmt, result::Result, str::FromStr};
+
+    use num_bigint::BigInt;
     use serde::de::{self, Visitor};
 
     pub fn serialize<S>(value: &BigInt, serializer: S) -> Result<S::Ok, S::Error>
