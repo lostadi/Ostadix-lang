@@ -21,8 +21,8 @@ authorized, that an information projection is fresh, or that a World is live.
 | Execution intent | `oexec.execution-intent/v1` | `src/evidence/intent.rs` `EXECUTION_INTENT_SCHEMA_V1` | Stable, authority-free identity of exact source and analyzed semantics. |
 | Evidence | `oexec.evidence/v5` | `src/evidence/fact.rs` `EVIDENCE_SCHEMA_V5` | Pre-execution evidence vocabulary; evidence is not admission. |
 | Admission | `oexec.admission/v5` | `src/evidence/fact.rs` `ADMISSION_SCHEMA_V5` | Live process-local admitted-execution contract. |
-| Backend catalog | `ostadix.backend-catalog/v4` | `src/backend_catalog.inc.rs` `current_schema` | Canonical backend specification and implementation-identity projection. |
-| Backend morphism | `ostadix.backend-morphism/v1` | `src/backend_morphism.rs` `BACKEND_MORPHISM_SCHEMA_V1` | Experimental shadow-only crossing profiles; this coordinate is not part of catalog V4, evidence, admission, placement, or dispatch. |
+| Backend catalog | `ostadix.backend-catalog/v5` | `src/backend_catalog.inc.rs` `current_schema` | Canonical backend specification and implementation-identity projection. V5 extends frozen V4 identity with one explicit optional bounded morphism-profile label per backend. |
+| Backend morphism | `ostadix.backend-morphism/v1` | `src/backend_morphism.rs` `BACKEND_MORPHISM_SCHEMA_V1` | Experimental shadow-only crossing kernel. Catalog V5 binds which profile applies, but does not enforce its assessment through evidence, admission, placement, or dispatch. |
 | Hosted transport | `ostadix.hosted-transport/v1`, `ostadix.hosted-transport/v2` | `src/hosted_remote/protocol.rs` `HOSTED_PROTOCOL_V1`; `src/hosted_remote/v2/protocol.rs` `HOSTED_PROTOCOL_V2` | Frozen single-operation V1 and opt-in durable-session V2 wire contracts. |
 | Placement milestone | Hosted Placement V6 | `docs/HOSTED_PLACEMENT_V6.md` | A placement/evidence milestone name, not a source-level schema constant and not an automatic upgrade from Admission V5. |
 | World wire family | V1 | `src/world/protocol.rs` `WORLD_SCHEMA_V1`; codec constants under `src/world/` | Offline World record, identity, value, and receipt codecs. These coordinates do not establish a live World. |
@@ -86,12 +86,19 @@ commits to them.
 6. Information-kernel schemas version logical facts, roots, deltas, loss
    contracts, and receipts. They do not version a storage engine and do not
    mint or replace evidence, admission, placement, or World authority.
-7. Backend-morphism V1 is an inspection-only profile family. Enforcing it
-   requires an explicit backend-catalog/evidence version rollover; it cannot
-   silently strengthen or narrow catalog V4.
+7. Backend-morphism V1 remains an inspection-only profile family. Catalog V5
+   binds the selected optional profile, but enforcing its assessment requires an
+   explicit graph/evidence version rollover; it cannot silently strengthen or
+   narrow V5 semantics.
 8. The `o_lang::api` façade is the intended embedding surface. Historical
    top-level modules remain available during the 0.2 compatibility period but
    are not all promised as stable external contracts.
+
+Execution Intent V1 continues to bind the solved graph V1 identity and the
+process's current backend-catalog projection. The V5 catalog rollover therefore
+changes that catalog binding without changing the graph algorithm or schema.
+Archival V4 whole/per-specification helpers remain available for inspection but
+never authorize a current V5 placement.
 
 ## Changing a coordinate
 
