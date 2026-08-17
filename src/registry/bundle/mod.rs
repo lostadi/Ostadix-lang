@@ -12,7 +12,7 @@ use std::sync::{LazyLock, OnceLock};
 use num_bigint::BigInt;
 use sha2::{Digest, Sha256};
 
-use crate::placement::protocol::{
+use crate::placement_protocol::{
     BackendImplementationIdV1, BackendStateSupportV2, CurrentBackendCatalogV1,
     PlacementValidationError, SemanticDigestV1, SnapshotCompatibilityV2,
 };

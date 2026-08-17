@@ -32,12 +32,20 @@ def write_minimal_tree(root: Path) -> None:
         "src/dispatch_model.rs",
         "src/placement/mod.rs",
         "src/placement/projection.rs",
+        "src/placement/protocol/candidate.rs",
+        "src/placement/protocol/catalog.rs",
+        "src/placement/protocol/digest.rs",
+        "src/placement/protocol/error.rs",
         "src/placement/protocol/mod.rs",
         "src/placement/protocol/records.rs",
+        "src/placement/protocol/requirement.rs",
         "src/placement/protocol/state.rs",
         "src/placement/protocol/target.rs",
         "src/placement/protocol/warrant.rs",
         "src/registry/bundle/mod.rs",
+        "src/registry/model.rs",
+        "src/registry/placement_compat.rs",
+        "src/registry/store.rs",
         "src/eval.rs",
         "src/runtime_exec.rs",
         "src/evidence/admit.rs",
@@ -455,8 +463,8 @@ class ArchitectureBoundaryTests(unittest.TestCase):
             ("src/eval.rs", "use super::world::ArtifactId;\n", "super::world"),
             (
                 "src/placement/protocol/target.rs",
-                "use super::super::super::world::ArtifactId;\n",
-                "super::super::super::world",
+                "use super::super::world::ArtifactId;\n",
+                "super::super::world",
             ),
         )
         for relative, source, expected in cases:
@@ -474,8 +482,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
             root = Path(directory)
             write_minimal_tree(root)
             (root / "src/placement/protocol/target.rs").write_text(
-                "use super::world::ArtifactId;\n"
-                "use super::super::world::OtherArtifactId;\n",
+                "use super::digest::validate_token;\n",
                 encoding="utf-8",
             )
             result = run_checker(root)
@@ -486,12 +493,12 @@ class ArchitectureBoundaryTests(unittest.TestCase):
             root = Path(directory)
             write_minimal_tree(root)
             (root / "src/placement/protocol/target.rs").write_text(
-                "use super::super::super::super::world::ArtifactId;\n",
+                "use super::super::super::world::ArtifactId;\n",
                 encoding="utf-8",
             )
             result = run_checker(root)
         self.assertEqual(result.returncode, 1)
-        self.assertIn("exceeds file module depth 3", result.stderr)
+        self.assertIn("exceeds file module depth 2", result.stderr)
 
     def test_inline_module_super_path_fails_closed_as_ambiguous(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -580,6 +587,80 @@ class ArchitectureBoundaryTests(unittest.TestCase):
             result = run_checker(root)
         self.assertEqual(result.returncode, 1)
         self.assertIn("resource_identity", result.stderr)
+
+    def test_protocol_cannot_reenter_any_forbidden_higher_layer(self) -> None:
+        cases = (
+            ("backend", "use crate :: { backend :: Boundary };\n"),
+            ("dispatch_model", "use crate::dispatch_model::Boundary;\n"),
+            ("effects", "use crate::effects::Boundary;\n"),
+            ("eval", "use crate::eval::Boundary;\n"),
+            ("evidence", "use crate::evidence::Boundary;\n"),
+            ("executor", "use crate::executor::Boundary;\n"),
+            ("hgraph", "use crate::hgraph::Boundary;\n"),
+            ("hosted_remote", "use crate::hosted_remote::Boundary;\n"),
+            ("ir", "use crate::ir::Boundary;\n"),
+            ("placement", "use crate::placement::Boundary;\n"),
+            ("project", "use crate::project::Boundary;\n"),
+            ("registry", "use crate::registry::Boundary;\n"),
+            ("runtime_exec", "use crate::runtime_exec::Boundary;\n"),
+            ("value", "use crate::value::Boundary;\n"),
+            ("world", "use crate::world::Boundary;\n"),
+        )
+        for module, source in cases:
+            with self.subTest(module=module):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    write_minimal_tree(root)
+                    (root / "src/placement/protocol/catalog.rs").write_text(
+                        source, encoding="utf-8"
+                    )
+                    result = run_checker(root)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("canonical placement protocol", result.stderr)
+
+    def test_protocol_can_depend_on_shared_resource_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/placement/protocol/catalog.rs").write_text(
+                "use crate::resource_identity::ArtifactId;\n", encoding="utf-8"
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_registry_cannot_import_public_placement_facade(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/registry/model.rs").write_text(
+                "use crate::placement::NodeProfileV1;\n", encoding="utf-8"
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("canonical placement_protocol", result.stderr)
+
+    def test_registry_can_import_canonical_placement_protocol(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/registry/model.rs").write_text(
+                "use crate::placement_protocol::NodeProfileV1;\n", encoding="utf-8"
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_ir_cannot_import_any_placement_projection(self) -> None:
+        for module in ("placement", "placement_protocol"):
+            with self.subTest(module=module):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    write_minimal_tree(root)
+                    (root / "src/ir.rs").write_text(
+                        f"use crate::{module}::SemanticDigestV1;\n", encoding="utf-8"
+                    )
+                    result = run_checker(root)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("HGraph or placement projections", result.stderr)
 
 
 if __name__ == "__main__":
