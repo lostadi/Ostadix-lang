@@ -8,10 +8,10 @@ use num_traits::ToPrimitive;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::backend_morphism::{shadow_assess_backend_morphism_v1, BackendMorphismAssessmentV1};
-use crate::ir::{
+use crate::backend_catalog::{
     BackendRegistry, BackendValueCapabilities, IntegerExactness, RichNumberPreservation,
 };
+use crate::backend_morphism::{shadow_assess_backend_morphism_v1, BackendMorphismAssessmentV1};
 use crate::value::{AnnotationKind, Fidelity, FidelityAssessmentV2, ONumber, OValue};
 
 use super::{

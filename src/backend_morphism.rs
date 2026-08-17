@@ -12,7 +12,7 @@ use num_bigint::BigInt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::registry::bundle::BackendRegistry;
+use crate::backend_catalog::BackendRegistry;
 use crate::value::{AnnotationKind, FidelityAssessmentV2, FloatFormat, ONumber, OText, OValue};
 
 pub const BACKEND_MORPHISM_SCHEMA_V1: &str = "ostadix.backend-morphism/v1";

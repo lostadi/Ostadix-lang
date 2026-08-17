@@ -8,12 +8,12 @@ use anyhow::{bail, Context, Result};
 use thiserror::Error;
 
 use crate::backend::state::{BackendStateTierV1, EvaluatorStateSnapshotV1};
+use crate::backend_catalog::BackendRegistry;
 use crate::environment::EnvironmentRefV2;
 use crate::eval::{
     Evaluator, PreparedPlacementDeadlineExpiredV1, PreparedPlacementFragmentV1,
     PreparedPlacementRefusalV1,
 };
-use crate::ir::BackendRegistry;
 use crate::placement::{
     ActorGenerationIdV1, BackendStateSupportV2, CanonicalPlacementRecordV1, GenerationV1,
     SemanticDigestV1, SnapshotCompatibilityV2, StateQuotaLimitsV2, StateReservationV2,
