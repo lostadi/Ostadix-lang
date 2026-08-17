@@ -103,6 +103,12 @@ RULES = (
         "the canonical backend catalog must remain below backend realization, IR, analysis, execution, scheduling, registry storage, public placement projections, and World",
     ),
     Rule(
+        ("src/backend_state.rs",),
+        ("backend", "process"),
+        "the canonical backend-state protocol may depend directly only on environment, value, and wire, never backend or process realizations",
+        allowed_modules=("environment", "value", "wire"),
+    ),
+    Rule(
         ("src/execution_contract.rs",),
         (
             "api",
@@ -150,8 +156,13 @@ RULES = (
     ),
     Rule(
         ("src/value.rs",),
-        ("eval_core", "execution_contract"),
-        "the runtime value vocabulary must remain below the execution contract and graph-evaluation core",
+        ("backend_state", "eval_core", "execution_contract"),
+        "the runtime value vocabulary must remain below backend state, the execution contract, and graph-evaluation core",
+    ),
+    Rule(
+        ("src/environment.rs", "src/wire.rs"),
+        ("backend_state",),
+        "backend-state dependencies must remain below the canonical backend-state protocol",
     ),
     Rule(
         (
@@ -202,6 +213,11 @@ RULES = (
         EXECUTOR_RUNTIME_PATHS,
         ("eval", "registry"),
         "the graph executor must consume eval_core and canonical catalogs rather than evaluator or registry realizations",
+    ),
+    Rule(
+        ("src/process.rs",),
+        ("backend",),
+        "process management must consume the canonical backend-state protocol without importing the backend realization facade",
     ),
     Rule(
         PLACEMENT_PROTOCOL_PATHS,
