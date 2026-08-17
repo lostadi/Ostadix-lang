@@ -32,15 +32,15 @@ HGRAPH_BENCHMARK = ROOT / "scripts" / "benchmark_hgraph_hosted.sh"
 CLI_TEST = ROOT / "tests" / "test_cli.sh"
 
 SCHEDULE_EXPLANATION_STRUCT_FIELDS = {
-    "ScheduleExplanationV1": ("schema", "admission", "realizability", "prediction"),
-    "ScheduleExplanationAdmissionV1": (
+    "ScheduleExplanationV2": ("schema", "admission", "realizability", "prediction"),
+    "ScheduleExplanationAdmissionV2": (
         "schema",
         "analyzer",
         "runtime_snapshot_kind",
         "base_policy",
         "bindings",
     ),
-    "ScheduleExplanationBindingsV1": (
+    "ScheduleExplanationBindingsV2": (
         "lowered_oir_sha256",
         "plan_sha256",
         "analyzed_graph_sha256",
@@ -85,6 +85,20 @@ SCHEDULE_EXPLANATION_STRUCT_FIELDS = {
         "layers",
     ),
     "SchedulePredictionLayerV1": ("index", "operations"),
+}
+
+ARCHIVAL_SCHEDULE_EXPLANATION_STRUCT_FIELDS = {
+    "ScheduleExplanationV1": ("schema", "admission", "realizability", "prediction"),
+    "ScheduleExplanationAdmissionV1": (
+        "schema",
+        "analyzer",
+        "runtime_snapshot_kind",
+        "base_policy",
+        "bindings",
+    ),
+    "ScheduleExplanationBindingsV1": SCHEDULE_EXPLANATION_STRUCT_FIELDS[
+        "ScheduleExplanationBindingsV2"
+    ],
 }
 
 
@@ -249,7 +263,7 @@ def catalog_schema() -> str:
 
 def schedule_explanation_schema() -> str:
     match = re.search(
-        r'pub const SCHEDULE_EXPLANATION_SCHEMA_V1:\s*&str\s*=\s*"([^"]+)"',
+        r'pub const SCHEDULE_EXPLANATION_SCHEMA_V2:\s*&str\s*=\s*"([^"]+)"',
         EVIDENCE_ADMISSION.read_text(encoding="utf-8"),
     )
     if match is None:
@@ -269,16 +283,19 @@ def rust_public_struct_fields(source: str, name: str) -> tuple[str, ...]:
 
 def validate_schedule_explanation_contract() -> None:
     source = EVIDENCE_ADMISSION.read_text(encoding="utf-8")
-    for name, expected in SCHEDULE_EXPLANATION_STRUCT_FIELDS.items():
+    for name, expected in {
+        **ARCHIVAL_SCHEDULE_EXPLANATION_STRUCT_FIELDS,
+        **SCHEDULE_EXPLANATION_STRUCT_FIELDS,
+    }.items():
         actual = rust_public_struct_fields(source, name)
         if actual != expected:
             raise ContractError(
-                f"{name} fields differ from the schedule-explanation v1 contract: "
+                f"{name} fields differ from its schedule-explanation contract: "
                 f"expected={list(expected)!r}, actual={list(actual)!r}"
             )
 
     schema = schedule_explanation_schema()
-    if schema != "oexec.schedule-explanation/v1":
+    if schema != "oexec.schedule-explanation/v2":
         raise ContractError(f"unsupported schedule-explanation schema: {schema}")
     benchmark = HGRAPH_BENCHMARK.read_text(encoding="utf-8")
     if benchmark.count("--format json") != 1:
@@ -303,7 +320,7 @@ def validate_schedule_explanation_contract() -> None:
         "admission-sha256=[0-9a-f]{64}"
     )
     if legacy_binding not in cli_test:
-        raise ContractError("CLI tests do not retain the canonical V5 text binding")
+        raise ContractError("CLI tests do not retain the canonical V6 text binding")
 
 
 def validate_manifest_versions() -> None:

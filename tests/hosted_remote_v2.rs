@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use o_lang::eval::{Evaluator, PlacementFragmentBindingsV1};
+use o_lang::eval::{Evaluator, PlacementFragmentBindingsV2};
 use o_lang::hosted_remote::v2::{
     build_local_dev_placement_proof_v2, open_capability_commitment_v2, validate_hosted_response_v2,
     DenyAllPlacementAuthorizerV2, DurableSessionStoreV2, HostedCommandBindingV2,
@@ -159,6 +159,7 @@ fn lease(
         purpose,
         operation_sha256,
         operation,
+        None,
         TEST_EVIDENCE_VALIDITY_MS,
     )
 }
@@ -178,6 +179,7 @@ fn lease_with_validity(
     purpose: PlacementPurposeV2,
     operation_sha256: Option<String>,
     operation: &PreparedOperationV2,
+    placement_admission_override: Option<SemanticDigestV1>,
     validity_ms: u64,
 ) -> (SignedPlacementLeaseV2, TargetDescriptorV1) {
     let bindings = prepare_bindings(operation);
@@ -272,7 +274,7 @@ fn lease_with_validity(
             bindings.operation_oir().clone(),
             footprint_digest,
             discharge_digest,
-            bindings.placement_admission().clone(),
+            placement_admission_override.unwrap_or_else(|| bindings.placement_admission().clone()),
             bindings.task_attempt().clone(),
             bindings.backend_implementation_sha256().clone(),
             bindings.realization_pipeline().clone(),
@@ -329,7 +331,7 @@ fn lease_with_validity(
     )
 }
 
-fn prepare_bindings(operation: &PreparedOperationV2) -> PlacementFragmentBindingsV1 {
+fn prepare_bindings(operation: &PreparedOperationV2) -> PlacementFragmentBindingsV2 {
     let mut evaluator = Evaluator::new(Path::new(env!("CARGO_MANIFEST_DIR")).join("backends"))
         .with_registered_backends(BackendRegistry::global().registered_backend_tags())
         .with_runtime_executable(Path::new(env!("CARGO_BIN_EXE_O")).to_path_buf());
@@ -341,7 +343,7 @@ fn prepare_bindings(operation: &PreparedOperationV2) -> PlacementFragmentBinding
 }
 
 fn actor_for(
-    bindings: &PlacementFragmentBindingsV1,
+    bindings: &PlacementFragmentBindingsV2,
     target: &TargetDescriptorV1,
     generation: u64,
 ) -> ActorGenerationIdV1 {
@@ -454,6 +456,7 @@ fn open_session_with_reservation_and_validity(
         PlacementPurposeV2::OpenSession,
         None,
         &proof_operation,
+        None,
         validity_ms,
     );
     let capability = open_capability(&state_session, request_id);
@@ -1814,6 +1817,7 @@ fn expired_self_minted_execute_placement_does_not_consume_sequence_or_lease_nonc
         PlacementPurposeV2::Execute,
         Some(prepared.sha256().unwrap()),
         &prepared,
+        None,
         1,
     )
     .0;
@@ -1862,6 +1866,83 @@ fn expired_self_minted_execute_placement_does_not_consume_sequence_or_lease_nonc
         &opened.capability,
         &prepared.operation_id,
     );
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn signed_archival_v1_placement_admission_is_rejected_before_dispatch() {
+    let directory = tempfile::tempdir().unwrap();
+    let state_root = directory.path().join("state");
+    let node_signer = HostedNodeSignerV2::generate().unwrap();
+    let placement_signer = PlacementLeaseSignerV2::generate().unwrap();
+    let state_quotas = quotas(8);
+    let principal = principal_digest('8');
+    let runtime = runtime(
+        &state_root,
+        node_signer,
+        &placement_signer,
+        state_quotas.clone(),
+    );
+    let opened = open_session(
+        &runtime,
+        &placement_signer,
+        &principal,
+        "open-archival-placement",
+        SessionStateTierV2::Stateless,
+        state_quotas.clone(),
+    );
+    let prepared = operation("archival-placement", opened.tier);
+    let request_id = "execute-archival-placement";
+    let archival_v1 = SemanticDigestV1::hash_bytes(
+        "ostadix/placement-admission/v1",
+        b"archival-v1-authority-cannot-be-uplifted",
+    );
+    let signed = lease_with_validity(
+        &placement_signer,
+        &principal,
+        opened.state_session.clone(),
+        opened.tier,
+        state_quotas,
+        opened.reservation.clone(),
+        Some(&opened.target),
+        None,
+        request_id,
+        1,
+        PlacementPurposeV2::Execute,
+        Some(prepared.sha256().unwrap()),
+        &prepared,
+        Some(archival_v1),
+        TEST_EVIDENCE_VALIDITY_MS,
+    )
+    .0;
+
+    let response = runtime.handle_request(
+        &principal,
+        HostedRequestV2::SubmitOperation {
+            protocol: HOSTED_PROTOCOL_V2.to_owned(),
+            request: SubmitOperationRequestV2 {
+                credentials: opened.capability.clone().into(),
+                client_request_id: request_id.to_owned(),
+                client_sequence: 1,
+                placement_lease: signed,
+                operation: prepared,
+            },
+        },
+    );
+    let HostedResponseV2::Error { error } = response else {
+        panic!("archival V1 placement admission reached dispatch: {response:?}")
+    };
+    assert_eq!(error.code, "placement-denied");
+    assert!(
+        error
+            .message
+            .contains("canonical execution placement lease validation failed"),
+        "{}",
+        error.message
+    );
+    let unchanged = current_session_view(&runtime, &principal, &opened.capability);
+    assert_eq!(unchanged.next_client_sequence, 1);
+    assert!(unchanged.operations.is_empty());
     runtime.shutdown().unwrap();
 }
 

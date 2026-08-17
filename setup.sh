@@ -852,7 +852,7 @@ install_ubuntu_vm_tools() {
 build_rust() {
   echo ">>> Building Rust edition (--release)..."
   clean_rust_release_binaries
-  local cargo_args=(build --release --locked)
+  local cargo_args=(build --release --locked --package o-lang)
   if $FULL; then
     cargo_args+=(--features notebook)
   fi
@@ -1601,7 +1601,7 @@ echo
 echo "Quick starts:"
 echo "  o examples/hello.O                    # Rust (if wrapper installed)"
 echo "  o-c examples/hello.O                  # C edition"
-echo "  cargo run -- examples/hello.O"
+echo "  cargo run --package o-lang -- examples/hello.O"
 echo "  ./c_cpp/O examples/hello.O ./backends"
 echo "  ./c_cpp/olangc examples/hello.O -o /tmp/h && /tmp/h"
 echo "  python3 -m o_lang examples/hello.O"

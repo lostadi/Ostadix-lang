@@ -90,7 +90,7 @@ if ! grep -Fq 'const SYS_LINUX_MINIMAL_COMPLETE: u64 = 22;' "$DAEMON_SOURCE" \
   exit 1
 fi
 
-cargo build --quiet --manifest-path "$ROOT/Cargo.toml" --bin ocorec
+cargo build --quiet --manifest-path "$ROOT/Cargo.toml" --package o-lang --bin ocorec
 OCOREC="$ROOT/target/debug/ocorec"
 LLD="$(find_lld)"
 
