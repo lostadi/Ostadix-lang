@@ -8,15 +8,13 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 
+use crate::backend_catalog::{BackendAdapterKind, BackendRegistry, BACKEND_CATALOG_SCHEMA_V1};
 use crate::dispatch_model;
 use crate::effects::{EffectConfidence, EffectSummary, Fallibility, ResourceKey};
 use crate::hgraph::{
     HEdgeKind, HGraph, HNodeKind, MemOrder, OcoreOpKind, OpKind, PortRole, ValueState,
 };
-use crate::ir::{
-    BackendAdapterKind, BackendRegistry, ExecutionPlan, InvokeMode, OIrProgram, PlanNodeKind,
-    BACKEND_CATALOG_SCHEMA_V1,
-};
+use crate::ir::{ExecutionPlan, InvokeMode, OIrProgram, PlanNodeKind};
 use crate::runtime_exec::{
     capture_execution_manifest, capture_execution_manifest_with_current_executable,
     inspection_executable_manifest, ExecutableLeaseSet, ExecutableManifestV1,

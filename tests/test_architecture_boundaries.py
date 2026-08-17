@@ -28,6 +28,7 @@ def write_minimal_tree(root: Path) -> None:
         "src/parser.rs",
         "src/syntax_dialect.rs",
         "src/ir.rs",
+        "src/backend_catalog.rs",
         "src/effects.rs",
         "src/dispatch_model.rs",
         "src/placement/mod.rs",
@@ -75,6 +76,59 @@ class ArchitectureBoundaryTests(unittest.TestCase):
             result = run_checker(root)
         self.assertEqual(result.returncode, 1)
         self.assertIn("narrow dialect projection", result.stderr)
+
+    def test_ir_cannot_reenter_catalog_through_registry_facade(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/ir.rs").write_text(
+                "use crate::registry::bundle::BackendRegistry;\n", encoding="utf-8"
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("canonical backend catalog", result.stderr)
+
+    def test_canonical_catalog_rejects_every_frozen_higher_layer(self) -> None:
+        for module in (
+            "backend",
+            "eval",
+            "evidence",
+            "executor",
+            "hgraph",
+            "ir",
+            "placement",
+            "registry",
+            "runtime_exec",
+            "scheduler",
+            "world",
+        ):
+            with self.subTest(module=module):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    write_minimal_tree(root)
+                    (root / "src/backend_catalog.rs").write_text(
+                        f"use crate::{module}::Boundary;\n", encoding="utf-8"
+                    )
+                    result = run_checker(root)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("canonical backend catalog must remain below", result.stderr)
+
+    def test_canonical_catalog_accepts_only_its_frozen_lower_seams(self) -> None:
+        allowed = (
+            "value",
+            "syntax_dialect",
+            "resource_identity",
+            "placement_protocol",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/backend_catalog.rs").write_text(
+                "".join(f"use crate::{module}::Boundary;\n" for module in allowed),
+                encoding="utf-8",
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_unit_test_import_does_not_define_production_geometry(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
