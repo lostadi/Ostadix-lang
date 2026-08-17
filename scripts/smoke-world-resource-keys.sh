@@ -41,7 +41,7 @@ mark() {
 
 resource_tests="$work_dir/world-resource-keys-tests.log"
 run_logged "$resource_tests" env CARGO_TERM_COLOR=never \
-    cargo test --locked --test world_resource_keys
+    cargo test --locked --package o-lang --test world_resource_keys
 require_test_count "$resource_tests" 5
 require_test "$resource_tests" roadmap_vocabulary_has_one_typed_classification_and_stable_display
 require_test "$resource_tests" device_and_accelerator_views_share_the_generic_resource_dependency
@@ -54,7 +54,7 @@ mark 'World ResourceKey source-forgery rejection: PASS'
 
 hgraph_test="$work_dir/world-resource-keys-hgraph.log"
 hgraph_name='hgraph::from_oir::world_resource_key_tests::world_resource_keys_share_the_generic_hgraph_state_chain'
-run_logged "$hgraph_test" env CARGO_TERM_COLOR=never cargo test --locked --lib \
+run_logged "$hgraph_test" env CARGO_TERM_COLOR=never cargo test --locked --package o-lang --lib \
     hgraph::from_oir::world_resource_key_tests::world_resource_keys_share_the_generic_hgraph_state_chain \
     -- --exact
 require_test_count "$hgraph_test" 1
@@ -63,14 +63,14 @@ mark 'World ResourceKey HGraph state-transition corpus: PASS'
 
 grounding_test="$work_dir/world-resource-keys-grounding.log"
 grounding_name='world::grounding::tests::governed_resource_keys_project_into_governed_and_ambient_fields'
-run_logged "$grounding_test" env CARGO_TERM_COLOR=never cargo test --locked --lib \
+run_logged "$grounding_test" env CARGO_TERM_COLOR=never cargo test --locked --package o-lang --lib \
     world::grounding::tests::governed_resource_keys_project_into_governed_and_ambient_fields \
     -- --exact
 require_test_count "$grounding_test" 1
 require_test "$grounding_test" "$grounding_name"
 mark 'World ResourceKey governed/ambient grounding projection: PASS'
 
-run cargo build --locked --bin olangc
+run cargo build --locked --package o-lang --bin olangc
 cli_log="$work_dir/world-resource-keys-cli.log"
 run_logged "$cli_log" "$ROOT/target/debug/olangc" \
     "$ROOT/examples/hello.O" \

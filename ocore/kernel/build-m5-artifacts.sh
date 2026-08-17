@@ -32,7 +32,7 @@ find_lld() {
   return 1
 }
 
-cargo build --quiet --manifest-path "$ROOT/Cargo.toml" --bin ocorec
+cargo build --quiet --manifest-path "$ROOT/Cargo.toml" --package o-lang --bin ocorec
 OCOREC="$ROOT/target/debug/ocorec"
 LLD="$(find_lld)"
 

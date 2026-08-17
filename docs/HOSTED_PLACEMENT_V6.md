@@ -31,23 +31,27 @@ cancelled-effect rollback, or an exactly-once external-effect guarantee.
 
 Three deliberately separate names occur here:
 
-- **Execution Admission V5** remains the supported current local execution
-  contract and the default for uppercase `O`, the evaluator/coordinator, and
-  existing MCP execution tools.
-- **Explicit local Evidence/Admission V6** means `oexec.evidence/v6` and
-  `oexec.admission/v6`. It preserves typed `FidelityAssessmentV2` through Graph
-  V2 and provides an inspection-only Why V2 view. The current coordinator does
-  not accept `AdmittedExecutionV6`, and there is no prepared-admission or
-  placement-fragment conversion.
+- **Current local Evidence/Admission V6** means `oexec.evidence/v6` and
+  `oexec.admission/v6`. Package 0.3 uses it through Graph V2 for uppercase `O`,
+  the evaluator/coordinator, CLI, and MCP execution. It preserves typed
+  `FidelityAssessmentV2`, exposes Schedule Explanation/Why V2, and freshly
+  prepares `PreparedPlacementFragmentV2` for the hosted path.
+- **Archival local coordinates** are Graph V1, Evidence/Admission V5, Schedule
+  Explanation/Why V1, and `PreparedPlacementFragmentV1`. They remain explicit
+  inspection and compatibility-verification surfaces only and are never
+  uplifted, relabeled, authorized, or executed as package-0.3 V2/V6 authority.
+  Execution Intent V1 remains bound to the frozen Graph V1 identity, but a
+  matching intent still requires fresh Graph V2/V6 analysis and admission
+  before dispatch.
 - **Hosted Placement V6** is this document's placement milestone. It adds
   descriptor-based placement records plus frozen direct transport V1 and
   opt-in durable transport V2, exposed by `o-node` and `octl`. Its “V6” is not
   the `oexec.admission/v6` schema coordinate.
 
 None is silently upgraded or translated into another, and none is World
-admission. A generated executable embeds its runtime sources; today its
-production execution path remains V5 even though the explicit local V6 symbols
-are source-complete in that generated runtime.
+admission. A generated executable embeds its runtime sources, including the
+current Graph V2/Evidence and Admission V6 execution path and its V2 placement
+fragment boundary.
 
 ## Backend catalog V5 hard rollover
 
@@ -212,7 +216,7 @@ an explicit numeric environment and accept its locality/serialization
 constraint. Sequential `LANG[*]` syntax and fresh-per-occurrence semantics are
 supported by the Rust runtime, the Python reference, and the C17 edition.
 
-The current V5 scheduler's `ActorResourceId` remains the canonical backend name
+The current scheduler's `ActorResourceId` remains the canonical backend name
 plus persistent numeric environment. Its process registry separately adds the
 sandbox policy and admitted launch generation. Durable hosted V2 does not
 reinterpret that smaller key as remote identity: it uses
@@ -512,7 +516,7 @@ The placement lease binds:
 - exact hosted command plus open/existing state and actor-generation binding.
 
 Before execute authorization, the node parses, lowers, solves, and admits the
-submitted bytes into a non-cloneable `PreparedPlacementFragmentV1`. It accepts
+submitted bytes into a non-cloneable `PreparedPlacementFragmentV2`. It accepts
 one non-whitespace semantic root whose only executable node is exactly one shim
 `Exec`; structural text may be a child. A second `Exec`, non-shim execution, `Load`, `Store`, `Call`,
 `Request`, `Group`, `Schedule`, text-only source, or a nonempty coordinator
@@ -528,8 +532,11 @@ runtime consumes that same handle and rechecks retained executable authority
 immediately before dispatch; it does not parse, solve, discover, or admit a
 second program. Its portable placement-admission digest excludes ambient world,
 PID, paths, and other process-local runtime facts so the authority and node can
-derive the same semantic coordinate. The complete V5 admission retains those
-local freshness facts and is still checked at dispatch. The session's target, exact requirement footprint, backend,
+derive the same semantic coordinate. The complete V6 admission retains those
+local freshness facts and is still checked at dispatch.
+`PreparedPlacementFragmentV1` remains an archival inspection type and cannot be
+converted, authorized, or executed by the package-0.3 path. The session's
+target, exact requirement footprint, backend,
 realization, logical environment, trust policy, and compute reservation are
 fixed at open and cannot drift on a later execute. Open has no physical actor
 generation. A stateful first execute carries `None` for the not-yet-established
@@ -583,12 +590,19 @@ control reserve keeps authorization and completion reachable at the hard total
 state boundary. Missing, replaced, or corrupt archives fail startup closed.
 
 Cooperating server and offline-admin processes retain an exclusive advisory
-lock on the persistent state-root marker for their complete lifetime. This is
-process coordination under the host account, not protection from a hostile
-same-UID process that can mutate the state directory. On Unix, state directories
-are mode 0700 and files mode 0600; trusted inputs reject symlinks and non-regular
-files, and file plus parent-directory updates are synchronized. A new session
-and its first journal frame are published by one staged-directory rename.
+lock on the persistent state-root lock file for their complete lifetime. Every
+root containing durable state must also carry the exact package-0.3
+`.execution-authority-v1` marker for Graph V2, Evidence/Admission V6, and
+placement-admission V2. A root with durable sessions or an authority journal
+but no exact marker, or with a different authority coordinate, is rejected
+without mutation; archival journals are never uplifted, resumed, relabeled, or
+executed. A root without existing durable sessions or an authority journal may
+be initialized with the marker. This is process coordination under the host
+account, not protection from a hostile same-UID process that can mutate the
+state directory. On Unix, state directories are mode 0700 and files mode 0600;
+trusted inputs reject symlinks and non-regular files, and file plus
+parent-directory updates are synchronized. A new session and its first journal
+frame are published by one staged-directory rename.
 Immutable operation and checkpoint blobs are written and fsynced in a private
 same-filesystem staging directory, then installed through atomic no-clobber
 publication; an exact existing canonical blob is idempotent and conflicting or

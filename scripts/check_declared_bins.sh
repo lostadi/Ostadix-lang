@@ -18,7 +18,7 @@ cleanup() {
 trap cleanup EXIT
 
 cargo metadata --no-deps --format-version 1 >"$metadata_file"
-cargo check --bins --all-features --message-format=json-render-diagnostics >"$messages_file"
+cargo check --package o-lang --bins --all-features --message-format=json-render-diagnostics >"$messages_file"
 
 python3 - "$metadata_file" "$messages_file" "$repo_root/Cargo.toml" <<'PY'
 import json
@@ -71,5 +71,5 @@ if missing:
     )
 
 print(f"declared Cargo binaries ({len(declared)}): {', '.join(declared)}")
-print("cargo check --bins reported every declared binary: PASS")
+print("cargo check --package o-lang --bins reported every declared binary: PASS")
 PY

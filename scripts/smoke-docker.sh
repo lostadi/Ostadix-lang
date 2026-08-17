@@ -63,6 +63,32 @@ printf 'Docker minimal image build: PASS\n'
     '
 printf 'Docker minimal runtime profile: PASS\n'
 
+version_output="$("$docker_bin" run --rm "$image" --version)"
+require_exact "O package version" "O 0.3.0" "$version_output"
+printf 'Docker O 0.3.0 package coordinate: PASS\n'
+
+version_json="$work_dir/version.json"
+"$docker_bin" run --rm "$image" version --json >"$version_json"
+python3 - "$version_json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+report = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+expected = {
+    "package_version": "0.3.0",
+    "evidence_schema": "oexec.evidence/v6",
+    "admission_schema": "oexec.admission/v6",
+    "evidence_analyzer": "ostadix-oir-evidence-compiler/v6",
+    "execution_intent_schema": "oexec.execution-intent/v1",
+    "backend_catalog_schema": "ostadix.backend-catalog/v5",
+}
+for key, value in expected.items():
+    if report.get(key) != value:
+        raise SystemExit(f"Docker version report {key} expected {value!r}, got {report.get(key)!r}")
+PY
+printf 'Docker current V6 and archival Intent V1 coordinates: PASS\n'
+
 hello_output="$(
     "$docker_bin" run --rm \
         --mount "type=bind,src=$repo_root,dst=/work,readonly" \

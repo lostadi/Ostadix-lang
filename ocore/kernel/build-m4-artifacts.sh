@@ -44,7 +44,7 @@ find_objdump() {
   return 1
 }
 
-cargo build --manifest-path "$ROOT/Cargo.toml" --bin ocorec
+cargo build --manifest-path "$ROOT/Cargo.toml" --package o-lang --bin ocorec
 OCOREC="$ROOT/target/debug/ocorec"
 LLD="$(find_lld)"
 OBJDUMP="$(find_objdump)"
