@@ -7,7 +7,7 @@ use serde::Serialize;
 
 use crate::backend_catalog::BACKEND_CATALOG_CURRENT_SCHEMA;
 use crate::evidence::{
-    ADMISSION_SCHEMA_V5, ANALYZER_ID_V5, EVIDENCE_SCHEMA_V5, EXECUTION_INTENT_SCHEMA_V1,
+    ADMISSION_SCHEMA_V6, ANALYZER_ID_V6, EVIDENCE_SCHEMA_V6, EXECUTION_INTENT_SCHEMA_V1,
 };
 use crate::hosted_remote::v2::HOSTED_PROTOCOL_V2;
 use crate::hosted_remote::{HOSTED_PROTOCOL_V1, HOSTED_TLS_ALPN_V1, HOSTED_TLS_ALPN_V2};
@@ -49,9 +49,9 @@ impl OstadixVersionReportV1 {
             package_version: env!("CARGO_PKG_VERSION"),
             minimum_rust_version: env!("CARGO_PKG_RUST_VERSION"),
             release_rust_toolchain: release_rust_toolchain(),
-            admission_schema: ADMISSION_SCHEMA_V5,
-            evidence_schema: EVIDENCE_SCHEMA_V5,
-            evidence_analyzer: ANALYZER_ID_V5,
+            admission_schema: ADMISSION_SCHEMA_V6,
+            evidence_schema: EVIDENCE_SCHEMA_V6,
+            evidence_analyzer: ANALYZER_ID_V6,
             execution_intent_schema: EXECUTION_INTENT_SCHEMA_V1,
             backend_catalog_schema: BACKEND_CATALOG_CURRENT_SCHEMA,
             hosted_transport_protocols: [HOSTED_PROTOCOL_V1, HOSTED_PROTOCOL_V2],
@@ -91,7 +91,7 @@ mod tests {
     fn report_keeps_independent_version_axes_explicit() {
         let report = OstadixVersionReportV1::current();
         assert_eq!(report.schema, VERSION_REPORT_SCHEMA_V1);
-        assert_eq!(report.package_version, "0.2.0");
+        assert_eq!(report.package_version, "0.3.0");
         assert_eq!(report.minimum_rust_version, "1.93.1");
         assert_eq!(report.release_rust_toolchain, "1.97.1");
         assert_ne!(report.admission_schema, report.execution_intent_schema);
