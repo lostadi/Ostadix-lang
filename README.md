@@ -126,6 +126,7 @@ Choose the next path according to what you want to inspect:
 |---|---|
 | Typed-parenthesis hosted language and OValue crossing | Supported core |
 | OIR, ExecutionPlan, HGraph, V5 evidence/admission, local executor | Supported core under hardening |
+| Explicit Graph V2 / Evidence and Admission V6 / Why V2 | Experimental inspection-only API; not current dispatch or placement |
 | Information Kernel V1 and backend-morphism V1 | Experimental local shadow surfaces; non-authorizing |
 | Hosted V2 durable sessions and direct-node placement | Experimental integration with dedicated lifecycle and recovery tests |
 | Project lifting, route execution, and live supervision | Experimental integration |
@@ -139,14 +140,16 @@ distributed guarantees are narrower than the supported hosted core. See
 
 ## Hosted Placement V6
 
-Ostadix-lang has two current admission contracts. V5 remains the supported
-legacy-local contract used by the uppercase `O` compatibility CLI and the
-existing MCP execution tools. Hosted Placement V6 adds a transport-independent
-descriptor, requirement, warrant, capacity, and lease core. Its direct-node V1
-compatibility path executes one fresh source document; its opt-in V2 path
-combines a locally prepared single-shim fragment with the complete signed
-placement proof and a durable, explicitly closed session. Neither an admission
-nor a transport version is silently translated into another.
+V5 remains the supported current local admission contract used by uppercase
+`O`, the evaluator/coordinator, and existing MCP execution tools. The additive
+local `oexec.evidence/v6` and `oexec.admission/v6` APIs preserve typed fidelity
+through Graph V2 and expose Why V2, but they do not dispatch or create a hosted
+placement fragment. Hosted Placement V6 is a separate milestone name: it adds
+a transport-independent descriptor, requirement, warrant, capacity, and lease
+core. Its direct-node V1 compatibility path executes one fresh source document;
+its opt-in V2 path combines a locally prepared single-shim fragment with the
+complete signed placement proof and a durable, explicitly closed session. None
+of these coordinates is silently translated into another.
 
 Admission version and backend-catalog generation are separate version axes.
 `O version --json` reports the independent coordinates compiled into the
@@ -161,9 +164,11 @@ relabeling or silent V4-to-V5 uplift. V4 remains the archival generation that
 added each backend's state-support tier and snapshot-compatibility identity.
 V5 extends that frozen projection with one explicit optional bounded
 backend-morphism profile: Python, JavaScript, and Rust are profiled, while the
-other 27 canonical backends explicitly are not. This changes catalog identity,
-not `BackendInterface`, HGraph facts, graph hashing, evidence/admission schemas,
-or execution behavior. Rebuild the runtime and MCP server, then regenerate
+other 27 canonical backends explicitly are not. The Catalog V5 rollover itself
+changes catalog identity, not `BackendInterface`, current Graph V1 facts and
+hashing, current V5 evidence/admission schemas, or execution behavior. The
+separate explicit Graph V2/Evidence V6 path does not enforce those morphism
+profiles. Rebuild the runtime and MCP server, then regenerate
 short-lived profiles and all derived placement evidence after this rollover. The
 exact boundary and regeneration sequence are in [Hosted Placement
 V6](docs/HOSTED_PLACEMENT_V6.md#backend-catalog-v5-hard-rollover).
