@@ -25,9 +25,9 @@ use super::fact::{
     BackendArtifactStateV1, BackendArtifactV1, CapabilityDispositionV1, CostEstimateV1,
     DispatchAdapterV1, DispatchContractV1, DispatchLaneV1, DispatchSemanticsV1, EffectContractV1,
     EvidenceBindingsV2, EvidenceBundleV5, EvidenceBundleV6, EvidenceProvenance, FailureClassV1,
-    FailureContractV1, NodeEvidence, NodeEvidenceV2, PlacementContractV1, ResourceDemandContractV1,
-    RuntimeBindingV1, RuntimeSnapshotKindV1, TypeContractV1, TypeContractV2, ANALYZER_ID_V5,
-    ANALYZER_ID_V6, EVIDENCE_SCHEMA_V5, EVIDENCE_SCHEMA_V6,
+    FailureContractV1, NodeEvidenceV1, NodeEvidenceV2, PlacementContractV1,
+    ResourceDemandContractV1, RuntimeBindingV1, RuntimeSnapshotKindV1, TypeContractV1,
+    TypeContractV2, ANALYZER_ID_V5, ANALYZER_ID_V6, EVIDENCE_SCHEMA_V5, EVIDENCE_SCHEMA_V6,
 };
 
 pub const SOLVED_EXECUTABLE_HGRAPH_DIGEST_DOMAIN_V1: &str = "ostadix-solved-executable-hgraph/v1";
@@ -542,7 +542,7 @@ pub fn analyze_execution_v5(
         let (capability_disposition, capability_provenance) =
             capability_contract(&plan.nodes[info.plan_node.0].kind);
 
-        nodes.push(NodeEvidence {
+        nodes.push(NodeEvidenceV1 {
             plan_node: info.plan_node,
             type_contract: TypeContractV1 {
                 constraints_solved: true,
@@ -621,19 +621,20 @@ pub fn analyze_execution_v5(
     })
 }
 
-/// Current analyzer compatibility surface. It remains byte-for-byte V5 until
-/// the package/current API rollover.
+/// Current analyzer surface. Package 0.3 binds the complete typed fidelity
+/// assessment through Graph V2 and Evidence V6.
 pub fn analyze_execution(
     program: &OIrProgram,
     plan: &ExecutionPlan,
     graph: &HGraph,
     runtime: RuntimeBindingV1,
-) -> Result<EvidenceBundleV5> {
-    analyze_execution_v5(program, plan, graph, runtime)
+) -> Result<EvidenceBundleV6> {
+    analyze_execution_v6(program, plan, graph, runtime)
 }
 
 /// Produce explicit Evidence V6 with the complete typed fidelity assessment.
-/// This is additive and does not replace the current V5 analyzer.
+/// Package 0.3 also routes the unversioned current analyzer here; V5 remains
+/// an explicit archival inspection path.
 pub fn analyze_execution_v6(
     program: &OIrProgram,
     plan: &ExecutionPlan,
@@ -968,11 +969,10 @@ fn encode_fidelity_assessment_v2(
     }
 }
 
-/// Current solved-graph identity. Existing callers remain on the frozen V1
-/// algorithm; the explicit V2 seam does not retarget this compatibility path.
+/// Current solved-graph identity for package 0.3.
 #[cfg(test)]
 pub(crate) fn graph_sha256(graph: &HGraph) -> String {
-    graph_sha256_v1(graph)
+    graph_sha256_v2(graph)
 }
 
 pub fn evidence_bundle_sha256_v5(bundle: &EvidenceBundleV5) -> String {
@@ -1636,7 +1636,7 @@ mod tests {
     }
 
     #[test]
-    fn solved_graph_sha256_v1_is_pinned_and_current_alias_is_identical() {
+    fn solved_graph_sha256_v1_is_pinned_and_current_alias_is_v2() {
         let program = program_for_backend("python", 1);
         let mut graph = crate::hgraph::from_oir::build_program(&program);
         crate::hgraph::solve::solve_types(&mut graph).unwrap();
@@ -1646,7 +1646,8 @@ mod tests {
             v1,
             "103d5d2f3f260407b74c7887ce4a9b9d8bfdbf208d5d86bdc5a3bf8f592bbd92"
         );
-        assert_eq!(graph_sha256(&graph), v1);
+        assert_eq!(graph_sha256(&graph), graph_sha256_v2(&graph));
+        assert_ne!(graph_sha256(&graph), v1);
     }
 
     #[test]
@@ -1738,7 +1739,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_v6_is_typed_while_current_analyzer_remains_v5() {
+    fn current_analyzer_is_v6_while_explicit_v5_remains_archival() {
         let program = program_for_backend("python", 1);
         let plan = program.plan();
         let mut graph = program.hgraph();
@@ -1746,20 +1747,21 @@ mod tests {
         let runtime = runtime_binding_from_adapter_bytes(
             &plan,
             &[],
-            &[("explicit-v6-test", "typed-current-v5")],
+            &[("explicit-v6-test", "typed-current-v6")],
         );
 
         let current = analyze_execution(&program, &plan, &graph, runtime.clone()).unwrap();
         let explicit_v5 = analyze_execution_v5(&program, &plan, &graph, runtime.clone()).unwrap();
         let v6 = analyze_execution_v6(&program, &plan, &graph, runtime).unwrap();
 
-        assert_eq!(current, explicit_v5);
-        assert_eq!(current.schema(), EVIDENCE_SCHEMA_V5);
-        assert_eq!(current.analyzer(), ANALYZER_ID_V5);
+        assert_eq!(current, v6);
+        assert_ne!(current.bindings(), explicit_v5.bindings());
+        assert_eq!(explicit_v5.schema(), EVIDENCE_SCHEMA_V5);
+        assert_eq!(explicit_v5.analyzer(), ANALYZER_ID_V5);
         assert_eq!(v6.schema(), EVIDENCE_SCHEMA_V6);
         assert_eq!(v6.analyzer(), ANALYZER_ID_V6);
         assert_eq!(
-            current.bindings().analyzed_graph_sha256,
+            explicit_v5.bindings().analyzed_graph_sha256,
             graph_sha256_v1(&graph)
         );
         assert_eq!(v6.bindings().analyzed_graph_sha256, graph_sha256_v2(&graph));

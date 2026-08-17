@@ -78,10 +78,60 @@ FIXTURE_EVIDENCE_GATE_COUNT = (
 )
 FIXTURE_CARGO = f"""\
 [package]
-name = "release-fixture"
+name = "o-lang"
 version = "0.1.0"
+edition = "2021"
+rust-version = "1.93.1"
 repository = "{release.ROOT_REPOSITORY}"
+authors = ["Lee Daghlar Ostadi"]
 license = "{release.ROOT_LICENSE_SPDX}"
+
+[workspace]
+members = [".", "crates/ostadix-api"]
+default-members = [".", "crates/ostadix-api"]
+exclude = ["fuzz", "mcp/ostadix_lang_mcp_server"]
+resolver = "2"
+"""
+FIXTURE_API_CARGO = f"""\
+[package]
+name = "ostadix-api"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.93.1"
+description = "Fixture stable embedding facade"
+repository = "{release.ROOT_REPOSITORY}"
+authors = ["Lee Daghlar Ostadi"]
+license = "{release.ROOT_LICENSE_SPDX}"
+publish = true
+
+[dependencies]
+o-lang = {{ path = "../..", version = "=0.1.0" }}
+"""
+FIXTURE_API_SOURCE = """\
+use o_lang::api::Parser;
+use o_lang::eval::Evaluator;
+use o_lang::ir::BackendRegistry;
+pub use o_lang::api::{
+    BackendAuthority, BigInt, CapabilityKind, DecimalSpecial, FloatFormat,
+    FloatSpecial, GraphNode, GroupMode, NativeBoundary, NativeCodecSafety,
+    NativeIdentity, NodeId, OBytes, OKeyword, ONative, ONumber, OSymbol, OText,
+    OValue, RehydratePolicy, RequestKind, RuntimeBoundary, SeqKind, SetKind,
+    SnapshotKind,
+};
+pub enum RuntimeStage { Parse, Evaluate }
+pub struct RuntimeError;
+pub struct Runtime { evaluator: Evaluator }
+impl Runtime {
+    pub fn evaluate(&mut self, _source: &str) {}
+}
+"""
+FIXTURE_API_TEST = """\
+#[test]
+fn complete_ovalue_payload_vocabulary_is_nameable_from_the_facade() {}
+#[test]
+fn runtime_owns_success_parse_failure_and_evaluate_failure_stages() {}
+#[test]
+fn facade_source_has_no_glob_or_public_evaluator_reexport() {}
 """
 FIXTURE_CITATION = f"""\
 cff-version: 1.2.0
@@ -337,6 +387,124 @@ class RootReleaseMetadataValidationTests(unittest.TestCase):
                     release._validate_root_release_metadata(files)
 
 
+class WorkspaceFacadeReleaseValidationTests(unittest.TestCase):
+    @staticmethod
+    def fixture_files() -> dict[str, bytes]:
+        return {
+            "Cargo.toml": FIXTURE_CARGO.encode(),
+            "src/api.rs": b"pub use num_bigint::BigInt;\n",
+            "crates/ostadix-api/Cargo.toml": FIXTURE_API_CARGO.encode(),
+            "crates/ostadix-api/src/lib.rs": FIXTURE_API_SOURCE.encode(),
+            "crates/ostadix-api/tests/public_surface.rs": FIXTURE_API_TEST.encode(),
+        }
+
+    def test_live_workspace_facade_is_structurally_closed(self) -> None:
+        files = {
+            path: (PROJECT_ROOT / path).read_bytes()
+            for path in {"Cargo.toml", "src/api.rs", *release.OSTADIX_API_RELEASE_PATHS}
+        }
+        release._validate_workspace_facade_release_surface(files)
+
+    def test_workspace_dependency_and_surface_drift_fail_closed(self) -> None:
+        mutations = {
+            "members": (
+                "Cargo.toml",
+                FIXTURE_CARGO.replace(
+                    'members = [".", "crates/ostadix-api"]',
+                    'members = ["."]',
+                    1,
+                ),
+                r"workspace\.members",
+            ),
+            "default members": (
+                "Cargo.toml",
+                FIXTURE_CARGO.replace(
+                    'default-members = [".", "crates/ostadix-api"]',
+                    'default-members = ["."]',
+                    1,
+                ),
+                r"workspace\.default-members",
+            ),
+            "excludes": (
+                "Cargo.toml",
+                FIXTURE_CARGO.replace(
+                    'exclude = ["fuzz", "mcp/ostadix_lang_mcp_server"]',
+                    'exclude = ["fuzz"]',
+                    1,
+                ),
+                r"workspace\.exclude",
+            ),
+            "resolver": (
+                "Cargo.toml",
+                FIXTURE_CARGO.replace('resolver = "2"', 'resolver = "1"', 1),
+                r"workspace\.resolver",
+            ),
+            "reverse dependency": (
+                "Cargo.toml",
+                FIXTURE_CARGO
+                + '\n[dev-dependencies]\nostadix-api = { path = "crates/ostadix-api" }\n',
+                r"must not depend on ostadix-api",
+            ),
+            "facade version": (
+                "crates/ostadix-api/Cargo.toml",
+                FIXTURE_API_CARGO.replace('version = "0.1.0"', 'version = "9.9.9"', 1),
+                r"package\.version",
+            ),
+            "dependency coordinate": (
+                "crates/ostadix-api/Cargo.toml",
+                FIXTURE_API_CARGO.replace('version = "=0.1.0"', 'version = "0.1"'),
+                r"o-lang dependency",
+            ),
+            "not publishable": (
+                "crates/ostadix-api/Cargo.toml",
+                FIXTURE_API_CARGO.replace("publish = true", "publish = false"),
+                r"package\.publish",
+            ),
+            "glob": (
+                "crates/ostadix-api/src/lib.rs",
+                FIXTURE_API_SOURCE + "\npub use o_lang::api::*;\n",
+                r"must not contain a glob reexport",
+            ),
+            "evaluator leakage": (
+                "crates/ostadix-api/src/lib.rs",
+                FIXTURE_API_SOURCE + "\npub use o_lang::eval::Evaluator;\n",
+                r"must not expose Evaluator",
+            ),
+            "registry leakage": (
+                "crates/ostadix-api/src/lib.rs",
+                FIXTURE_API_SOURCE + "\npub use o_lang::ir::BackendRegistry;\n",
+                r"must not expose BackendRegistry",
+            ),
+            "parser seam": (
+                "crates/ostadix-api/src/lib.rs",
+                FIXTURE_API_SOURCE.replace("use o_lang::api::Parser;\n", ""),
+                r"stable Parser facade",
+            ),
+            "registry seam": (
+                "crates/ostadix-api/src/lib.rs",
+                FIXTURE_API_SOURCE.replace("use o_lang::ir::BackendRegistry;\n", ""),
+                r"canonical BackendRegistry path",
+            ),
+            "payload closure": (
+                "crates/ostadix-api/src/lib.rs",
+                FIXTURE_API_SOURCE.replace("    SnapshotKind,\n", ""),
+                r"payload closure differs",
+            ),
+        }
+        for label, (path, replacement, message) in mutations.items():
+            with self.subTest(label=label):
+                files = self.fixture_files()
+                files[path] = replacement.encode()
+                with self.assertRaisesRegex(release.ReleaseError, message):
+                    release._validate_workspace_facade_release_surface(files)
+
+    def test_facade_release_allowlist_is_exact_not_directory_wide(self) -> None:
+        for path in release.OSTADIX_API_RELEASE_PATHS:
+            self.assertTrue(release.is_allowed_release_path(path))
+        self.assertFalse(release.is_allowed_release_path("crates/private/Cargo.toml"))
+        self.assertFalse(release.is_allowed_release_path("crates/ostadix-api/notes.txt"))
+
+
 class SourceReleaseTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -399,6 +567,9 @@ class SourceReleaseTests(unittest.TestCase):
             "CONTRIBUTING.md": "# Contributing\n",
             "Cargo.lock": "# fixture root lock\n",
             "Cargo.toml": FIXTURE_CARGO,
+            "crates/ostadix-api/Cargo.toml": FIXTURE_API_CARGO,
+            "crates/ostadix-api/src/lib.rs": FIXTURE_API_SOURCE,
+            "crates/ostadix-api/tests/public_surface.rs": FIXTURE_API_TEST,
             "Dockerfile": "FROM scratch\n",
             "LICENSE": FIXTURE_LICENSE,
             "README.md": fixture_readme(),
@@ -480,6 +651,7 @@ class SourceReleaseTests(unittest.TestCase):
             "mcp/ostadix_lang_mcp_server/Cargo.toml": (
                 "[package]\n"
                 'name = "ostadix-mcp-server"\n'
+                'version = "0.1.0"\n'
                 'license = "LGPL-2.1-only"\n'
                 "publish = false\n\n"
                 "[[bin]]\n"
@@ -587,7 +759,7 @@ class SourceReleaseTests(unittest.TestCase):
             "scripts/world_alpha_evidence.py": "#!/usr/bin/env python3\n",
             "src/backend_catalog.rs": "// fixture canonical backend catalog implementation\n",
             "src/backend_catalog.inc.rs": "// fixture canonical backend catalog data\n",
-            "src/api.rs": "// fixture curated public API\n",
+            "src/api.rs": "pub use num_bigint::BigInt;\n",
             "src/backend.rs": "// fixture backend runtime\n",
             "src/backend_morphism.rs": "// fixture shadow backend morphism kernel\n",
             "src/backend_state.rs": "// fixture versioned backend state protocol\n",
@@ -912,6 +1084,9 @@ class SourceReleaseTests(unittest.TestCase):
                 "CONTRIBUTING.md",
                 "Cargo.lock",
                 "Cargo.toml",
+                "crates/ostadix-api/Cargo.toml",
+                "crates/ostadix-api/src/lib.rs",
+                "crates/ostadix-api/tests/public_surface.rs",
                 "Dockerfile",
                 "LICENSE",
                 "README.md",

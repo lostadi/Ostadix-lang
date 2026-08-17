@@ -11,7 +11,7 @@ use crate::backend_catalog::BackendRegistry;
 use crate::backend_state::{BackendStateTierV1, EvaluatorStateSnapshotV1};
 use crate::environment::EnvironmentRefV2;
 use crate::eval::{
-    Evaluator, PreparedPlacementDeadlineExpiredV1, PreparedPlacementFragmentV1,
+    Evaluator, PreparedPlacementDeadlineExpiredV1, PreparedPlacementFragmentV2,
     PreparedPlacementRefusalV1,
 };
 use crate::placement::{
@@ -500,14 +500,14 @@ struct ClientCommitV2 {
 enum ActorCommandV2 {
     Prepare {
         operation: PreparedOperationV2,
-        reply: mpsc::Sender<std::result::Result<PreparedPlacementFragmentV1, String>>,
+        reply: mpsc::Sender<std::result::Result<PreparedPlacementFragmentV2, String>>,
     },
     Execute {
         operation: PreparedOperationV2,
         // Prepared fragments retain a complete admitted graph/runtime bundle.
         // Keep the command envelope small because it also carries tiny
         // lifecycle variants through the same channel.
-        prepared: Box<PreparedPlacementFragmentV1>,
+        prepared: Box<PreparedPlacementFragmentV2>,
         actor_generation: Option<ActorGenerationIdV1>,
     },
     /// Force a staged immutable checkpoint through the backend RestoreV1
@@ -4482,7 +4482,7 @@ fn execute_operation(
     evaluator: &mut Evaluator,
     scope: &mut HashMap<String, OValue>,
     operation: &PreparedOperationV2,
-    prepared: PreparedPlacementFragmentV1,
+    prepared: PreparedPlacementFragmentV2,
 ) -> ExecutionDispositionV2 {
     let now = match unix_time_ms() {
         Ok(now) => now,

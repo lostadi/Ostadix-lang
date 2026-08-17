@@ -57,7 +57,7 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-msrv-${{ hashFiles('Cargo.lock') }}
       - name: Check every target at the supported floor
-        run: cargo +1.93.1 check --locked --all-targets --all-features
+        run: cargo +1.93.1 check --locked --workspace --all-targets --all-features
       - name: Check isolated MCP at the supported floor
         run: cargo +1.93.1 check --locked --manifest-path mcp/ostadix_lang_mcp_server/Cargo.toml
 
@@ -83,11 +83,11 @@ jobs:
       - name: Check formatting
         run: cargo +1.97.1 fmt --all -- --check
       - name: Clippy all targets and features
-        run: cargo +1.97.1 clippy --locked --all-targets --all-features -- -D warnings
+        run: cargo +1.97.1 clippy --locked --workspace --all-targets --all-features -- -D warnings
       - name: Build Rust API documentation with warnings denied
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo +1.97.1 doc --locked --all-features --no-deps
+        run: cargo +1.97.1 doc --locked --workspace --all-features --no-deps
       - name: Verify every declared binary target
         run: bash scripts/check_declared_bins.sh
       - name: Check parser fuzz target
@@ -120,11 +120,11 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-tests-${{ hashFiles('Cargo.lock') }}
       - name: Run broad Rust test suite
-        run: cargo +1.97.1 test --locked --all-targets --all-features --no-fail-fast
+        run: cargo +1.97.1 test --locked --workspace --all-targets --all-features --no-fail-fast
       - name: Run deterministic parser properties
-        run: cargo +1.97.1 test --locked --test parser_proptest
+        run: cargo +1.97.1 test --locked --package o-lang --test parser_proptest
       - name: Verify byte-reproducible O-core objects
-        run: cargo +1.97.1 test --locked --lib ocore::driver::tests::ocore_object_is_byte_reproducible_across_source_directories -- --exact
+        run: cargo +1.97.1 test --locked --package o-lang --lib ocore::driver::tests::ocore_object_is_byte_reproducible_across_source_directories -- --exact
       - name: Run manifest-selected Rust example semantics
         run: O_BIN="$PWD/target/debug/O" ./test_o_lang_examples.sh
 
@@ -155,7 +155,7 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-hosted-${{ hashFiles('Cargo.lock') }}
       - name: Build hosted targets
-        run: cargo +1.97.1 build --locked --all-targets --all-features
+        run: cargo +1.97.1 build --locked --workspace --all-targets --all-features
       - name: Run fast autonomous worker lifecycle gates
         timeout-minutes: 3
         env:
@@ -173,24 +173,24 @@ jobs:
             autonomous_worker_nested_hosted_callback_inherits_deadline \
             autonomous_nonresponsive_backend_fails_within_configured_bound
           do
-            cargo +1.97.1 test --locked --test autonomous_hosted_parallel "$test_name" -- --exact --nocapture --test-threads=1
+            cargo +1.97.1 test --locked --package o-lang --test autonomous_hosted_parallel "$test_name" -- --exact --nocapture --test-threads=1
           done
       - name: Prove descendant quiescence
         timeout-minutes: 2
         env:
           O_LIFECYCLE_TRACE: ${{ runner.temp }}/ostadix-lifecycle/backend-descendant.log
-        run: cargo +1.97.1 test --locked --test autonomous_hosted_parallel autonomous_lingering_same_group_descendant_fails_and_group_becomes_quiescent -- --exact --nocapture --test-threads=1
+        run: cargo +1.97.1 test --locked --package o-lang --test autonomous_hosted_parallel autonomous_lingering_same_group_descendant_fails_and_group_becomes_quiescent -- --exact --nocapture --test-threads=1
       - name: Run production backend-proxy lifecycle gate
         timeout-minutes: 2
         env:
           O_LIFECYCLE_TRACE: ${{ runner.temp }}/ostadix-lifecycle/backend-proxy.log
-        run: cargo +1.97.1 test --locked --test autonomous_hosted_parallel production_python_backend_proxy_shutdown_reaps_shim -- --exact --nocapture --test-threads=1
+        run: cargo +1.97.1 test --locked --package o-lang --test autonomous_hosted_parallel production_python_backend_proxy_shutdown_reaps_shim -- --exact --nocapture --test-threads=1
       - name: Run hosted transport and session tests
         run: |
-          cargo +1.97.1 test --locked --test hosted_remote_cli
-          cargo +1.97.1 test --locked --test hosted_remote_v2
-          cargo +1.97.1 test --locked --test placement_v6
-          cargo +1.97.1 test --locked --test registry_v1
+          cargo +1.97.1 test --locked --package o-lang --test hosted_remote_cli
+          cargo +1.97.1 test --locked --package o-lang --test hosted_remote_v2
+          cargo +1.97.1 test --locked --package o-lang --test placement_v6
+          cargo +1.97.1 test --locked --package o-lang --test registry_v1
       - name: Run hosted semantic smokes
         run: |
           O_RELEASE_BIN="$PWD/target/debug/O" OLANGC_RELEASE_BIN="$PWD/target/debug/olangc" \
@@ -257,7 +257,7 @@ jobs:
           components: clippy
       - name: Build and validate MCP
         run: |
-          cargo +1.97.1 build --release --locked --bin O --bin olangc
+          cargo +1.97.1 build --release --locked --package o-lang --bin O --bin olangc
           cargo +1.97.1 test --locked --manifest-path mcp/ostadix_lang_mcp_server/Cargo.toml
           python3 -m unittest -v tests.test_mcp_smoke
           cargo +1.97.1 clippy --locked --manifest-path mcp/ostadix_lang_mcp_server/Cargo.toml -- -D warnings

@@ -1,0 +1,13 @@
+[package]
+name = "ostadix-api"
+version = "0.3.0"
+edition = "2021"
+rust-version = "1.93.1"
+description = "Stable embedding facade for the Ostadix-lang runtime"
+repository = "https://github.com/lostadi/Ostadix-lang"
+authors = ["Lee Daghlar Ostadi"]
+license = "LGPL-2.1-only"
+publish = true
+
+[dependencies]
+o-lang = { path = "../..", version = "=0.3.0" }

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 
 use crate::backend_catalog::BackendRegistry;
-use crate::eval::PlacementFragmentBindingsV1;
+use crate::eval::PlacementFragmentBindingsV2;
 use crate::placement::{
     ActorGenerationIdV1, CandidateDecisionV1, CanonicalPlacementRecordV1, CurrentBackendCatalogV1,
     EnvironmentRequirementV1, GenerationV1, LeaseExpectationV2, LeaseStateBindingV2,
@@ -35,7 +35,7 @@ pub struct PlacementAuthorizationContextV2 {
     pub state_reservation: StateReservationV2,
     pub current_actor_generation: Option<ActorGenerationIdV1>,
     pub next_actor_generation: GenerationV1,
-    pub prepared_fragment: Option<PlacementFragmentBindingsV1>,
+    pub prepared_fragment: Option<PlacementFragmentBindingsV2>,
     pub expected_session_identity: Option<HostedPlacementIdentityV2>,
     pub now_unix_ms: u64,
 }

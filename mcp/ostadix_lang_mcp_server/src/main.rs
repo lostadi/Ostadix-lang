@@ -1556,7 +1556,7 @@ impl OstadixMcp {
     }
 
     #[tool(
-        description = "Consume a one-use o_analyze_intent handle and ask O to recompute the same stable intent before fresh V5 admission and dispatch"
+        description = "Consume a one-use o_analyze_intent handle and ask O to recompute the same stable Intent V1 before fresh V6 admission and dispatch"
     )]
     async fn o_execute_intent(
         &self,

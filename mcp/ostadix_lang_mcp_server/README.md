@@ -13,7 +13,7 @@ resolve an **absolute** `O_BACKENDS_DIR`, so relative `backends` and bare
 | `o_doctor` | Existence checks + shim inventory + complete runtime report + a18re `search/o-run` |
 | `o_smoke` | `O examples/hello.O <absolute-backends>` — expect `2` |
 | `o_analyze_intent` | Nonexecutingly compute a stable execution intent and return a bounded, expiring, one-use opaque handle |
-| `o_execute_intent` | Consume that handle and require `O` to recompute the same source and execution-intent digests before fresh V5 admission and dispatch |
+| `o_execute_intent` | Consume that handle and require `O` to recompute the same source and execution-intent digests before fresh Graph V2/Evidence and Admission V6 dispatch |
 | `o_run` | Direct, ungated compatibility execution of any `.O` with absolute backends; relative input resolves once against `cwd` or the repository root, while an absolute path with no `cwd` runs from its parent directory |
 | `o_olangc` | `olangc` with `--shim-dir`; relative input/output resolves against the repository root |
 | `o_search_run` | Run `~/a18re/search/<name>.O` with correct env |
@@ -59,7 +59,8 @@ after 120 seconds by default, may request 1 through 900 seconds, and is consumed
 execution. Reuse, expiration, a different canonical program/cwd/root/backends,
 or a changed source fails closed. `o_execute_intent` supplies the analyzed
 source and stable-intent digests to `O`; `O` recomputes them and then constructs
-a fresh V5 `AdmittedExecution`, which remains the sole dispatch authority.
+a fresh Graph V2/V6 `AdmittedExecution`, which remains the sole dispatch
+authority.
 
 This protocol is a local **same-intent gate**, not authorization, a capability,
 a retained admission object, proof of runtime health, or a capacity lease.
@@ -67,18 +68,28 @@ a retained admission object, proof of runtime health, or a capacity lease.
 crate does not link the root runtime and does not add a worker, scheduler lane,
 or persistent `O` process.
 
-Admission V5 and Hosted Placement V6 are dual current contracts. This MCP
-surface remains deliberately local and V5 by default: it does not discover a
-federated registry, enroll a node, request a placement lease, or turn a stable
-intent handle into V6 authority. The current direct-node surface is the
-separately authenticated `octl node ...` client and `o-node` service documented
-in [`docs/HOSTED_PLACEMENT_V6.md`](../../docs/HOSTED_PLACEMENT_V6.md). No MCP
-tool wraps frozen one-operation V1, durable session V2, placement-authority
-issuance or the co-located development mint, explicit closed-session GC, or the
-separate local `o-registry` snapshot store. In particular, no MCP tool holds a
-session bearer, submits `PlacementLeaseV2`, or consumes a V2 signed journal
-receipt. A future placement-aware MCP adapter must select V6 explicitly rather
-than silently upgrading a V5 handle.
+Package 0.3 MCP execution remains deliberately local and uses fresh Graph V2
+with `oexec.evidence/v6` and `oexec.admission/v6`; current CLI/API inspection
+exposes Schedule Explanation/Why V2. Graph V1, Evidence/Admission V5, Schedule
+Explanation/Why V1, and `PreparedPlacementFragmentV1` remain explicit archival
+inspection surfaces only. The MCP never uplifts, relabels, authorizes, or
+dispatches them as current V2/V6 authority. Execution Intent V1 stays bound to
+the frozen Graph V1 identity, but a matching handle carries no authority and
+forces fresh Graph V2/V6 admission before dispatch.
+
+Hosted Placement V6 is a separate milestone. Its current preparation boundary
+is `PreparedPlacementFragmentV2`; the authenticated direct-node surface is the
+`octl node ...` client and `o-node` service documented in
+[`docs/HOSTED_PLACEMENT_V6.md`](../../docs/HOSTED_PLACEMENT_V6.md). This MCP
+does not discover a federated registry, enroll a node, request a placement
+lease, or turn a stable intent handle into placement authority. No MCP tool
+wraps frozen one-operation V1, durable session V2, placement-authority issuance
+or the co-located development mint, explicit closed-session GC, or the separate
+local `o-registry` snapshot store. In particular, no MCP tool holds a session
+bearer, submits `PlacementLeaseV2`, consumes a V2 signed journal receipt, or
+opens or upgrades a durable state root; `o-node` rejects durable state without
+the exact package-0.3 execution-authority marker, while a fresh empty root may
+be initialized with that marker.
 
 The checked-in `.mcp.json` contains no shell expressions. When explicit
 environment paths are absent, the server recognizes the repository from its

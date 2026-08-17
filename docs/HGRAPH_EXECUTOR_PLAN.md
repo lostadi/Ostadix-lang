@@ -6,7 +6,7 @@ executor used by the differential conformance suite.
 
 ```text
 .O -> OIR -> validated ExecutionPlan -> draft HGraph -> type/fidelity solve
-   -> EvidenceBundleV5 -> admission compiler -> AdmittedExecution
+   -> EvidenceBundleV6 -> admission compiler -> AdmittedExecutionV6
    -> Coordinator
 ```
 
@@ -18,10 +18,11 @@ constructor are private to the digest-checking admission path. The evaluator
 also compiles this admission when `O_EXECUTOR=serial` selects the differential
 oracle, so changing the executor does not bypass pre-execution checking.
 
-`EvidenceBundleV5` is a pre-execution certificate bundle. For each executable
+`EvidenceBundleV6` is the current pre-execution certificate bundle. For each executable
 operation it records type, effect-footprint, dispatch, capability-policy,
 placement, failure-policy, and resource-demand contracts, plus a separate soft
-cost estimate and the provenance of every fact. Only enforced,
+cost estimate, the complete typed `FidelityAssessmentV2`, and the provenance of
+every fact. Only enforced,
 compiler-verified, or trusted-adapter evidence can establish a closed effect
 footprint. A user declaration can add conservative constraints but cannot
 erase unknown hosted effects. Historical observations and costs can inform a
@@ -32,7 +33,7 @@ forged execution metadata.
 
 The bundle binds canonical lowered OIR, the validated plan, the solved analyzed
 graph, analyzer identity, the canonical backend-catalog specifications
-referenced by the plan, consumed legacy Python shim artifacts, the V5
+referenced by the plan, consumed legacy Python shim artifacts, the current
 direct-executable manifest, execution environment, and a descriptive ambient
 `HostWorld` snapshot. Execution selects plan-used direct launchers once,
 preserves absolute invocation paths, opens and hashes each canonical target
@@ -44,7 +45,7 @@ non-probing and reports no runtime readiness. The catalog projection establishes
 specification identity only; it does not establish health, authorization,
 capacity, or readiness. The bundle deliberately labels the
 first digest `lowered-oir-sha256`: evaluator APIs can receive an existing
-`OIrProgram`, so V5 does not claim an original source-byte digest. Admission
+`OIrProgram`, so V6 does not claim an original source-byte digest. Admission
 rejects mismatched bindings, attaches seven pre-materialized
 `AdmissionEvidence` nodes to every executable edge, validates the resulting
 graph, and freezes it. Immediately before running, both the coordinator and
@@ -71,18 +72,23 @@ separate Request/project admission authorities. Consumed legacy Python support
 files and adapter-owned tools are bound without restricting user-created
 subprocesses. A Nix command lease is captured only when an uncached Nix Request
 is actually performed and is shared only by Nix members; lazy, cached, and
-independent non-Nix members remain executable without Nix. V5 also does not
+independent non-Nix members remain executable without Nix. V6 also does not
 bind caller initial-scope shape/values, a frozen child environment, opaque
 state/generation inside an already-live actor, or a placement lease.
-In V5, actor identity is only a serialization identity; all persistent hosted work
-remains unknown, coordinator-lane, and conservatively attached to `HostWorld`.
+In current V6 admission, actor identity is only a serialization identity; all
+persistent hosted work remains unknown, coordinator-lane, and conservatively
+attached to `HostWorld`.
+
+Graph V1, `EvidenceBundleV5`, and `AdmittedExecutionV5` remain explicit
+archival inspection APIs. They are not converted or relabeled, and neither the
+coordinator nor evaluator accepts them as current execution authority.
 
 `olangc FILE --target ir --explain-schedule` exercises this solve, analysis,
 and admission path without dispatch. It prints exact digest bindings,
 per-operation provenance, blockers, retained source-sequence reasons, and
 static legal waves. Its admission report identifies the runtime snapshot as
 `inspection-only`; it is not interchangeable with the evaluator's execution
-snapshot. The inspection surface is ordinary-OIR-only in V5.
+snapshot. The inspection surface is ordinary-OIR-only in current V6.
 
 `olangc FILE.O --target ir --why P3` projects the same evidence-bound admission
 onto one plan operation and its immediate dependency neighborhood; repository
@@ -98,7 +104,8 @@ invalidation across edits.
 This admission is distinct from an observation or receipt. `RuntimeGraphV1`
 and `ExecutionReceiptV1` describe completed execution and carry no scheduling
 authority; a prior receipt cannot authorize a new run. Project HGraphs and the
-buffered Request scheduler also remain separate execution islands in V5.
+buffered Request scheduler also remain separate execution islands under the
+current V6 admission contract.
 
 Project inputs have a distinct logical-planning and opt-in hosted execution
 surface:
@@ -380,7 +387,7 @@ only literal text, already-settled Store children, and recursively trusted
 renderers; and the explicit non-strict hosted contract described above. On the
 coordinator thread, preparation freezes the relevant scope or already-
 materialized splice inputs into immutable owned `PreparedTask` envelopes.
-Evidence schema V5 binds each
+Evidence schema V6 binds each
 operation to exactly one adapter ID: `o-scope-load/v1`,
 `trusted-inline-renderer/v1`, `autonomous-ephemeral-shim/v1`, or
 `coordinator/v1`. Dispatch evidence also records `strict-equivalent` or
@@ -436,7 +443,7 @@ to one terminal trace event, and does not disguise the failure as `NodeFailed`.
 An unwind-capable build gives a caught worker panic the same treatment. The
 release profile uses `panic = "abort"`, so
 a release worker panic terminates the process before in-process recovery or
-terminal trace completion; V5 does not claim otherwise.
+terminal trace completion; V6 does not claim otherwise.
 
 After each accepted success, the coordinator materializes the value,
 completion, and written successor-state outputs. On a selected failure, it emits
