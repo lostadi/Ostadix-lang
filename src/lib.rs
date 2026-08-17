@@ -17,6 +17,7 @@ mod dispatch_model;
 pub mod effects;
 pub mod environment;
 pub mod eval;
+pub(crate) mod eval_core;
 pub mod evidence;
 pub mod execution_contract;
 pub mod executor;
