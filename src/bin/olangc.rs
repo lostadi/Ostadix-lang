@@ -3226,6 +3226,13 @@ use ostadix_generated_serde::placement::SemanticDigestV1;
 use ostadix_generated_serde::placement::protocol::SemanticDigestV1 as NestedSemanticDigestV1;
 use ostadix_generated_serde::execution_contract::Policy as CanonicalPolicy;
 use ostadix_generated_serde::eval::Policy as CompatibilityPolicy;
+use ostadix_generated_serde::evidence::{
+    admit_execution_v6, analyze_execution, analyze_execution_v6, graph_sha256_v1,
+    graph_sha256_v2, runtime_binding_from_adapter_bytes, ADMISSION_SCHEMA_V6,
+    EVIDENCE_SCHEMA_V5, EVIDENCE_SCHEMA_V6, PLACEMENT_ADMISSION_DIGEST_DOMAIN_V2,
+    SCHEDULE_WHY_SCHEMA_V2, SOLVED_EXECUTABLE_HGRAPH_DIGEST_DOMAIN_V2,
+};
+use ostadix_generated_serde::ir::{OIr, OIrProgram};
 use ostadix_generated_serde::registry::bundle::{
     BackendMorphismProfileV1, BackendRegistry, IntegerExactness,
     BACKEND_CATALOG_CURRENT_SCHEMA, BACKEND_CATALOG_SCHEMA_V4, BACKEND_CATALOG_SCHEMA_V5,
@@ -3292,6 +3299,49 @@ fn execution_policy_is_one_type_in_generated_aot_runtime() {
     assert_eq!(canonical.name(), "autonomous");
     assert_eq!(CanonicalPolicy::from_name(canonical.name()), Some(canonical));
 }
+
+#[test]
+fn explicit_evidence_v6_symbols_admit_a_real_generated_runtime_fixture() {
+    let program = OIrProgram {
+        nodes: vec![OIr::Load("generated-runtime-input".to_string())],
+    };
+    let plan = program.plan();
+    let mut graph = program.hgraph_for_plan(&plan).unwrap();
+    ostadix_generated_serde::hgraph::solve::solve_types(&mut graph).unwrap();
+    let runtime = runtime_binding_from_adapter_bytes(
+        &plan,
+        &[],
+        &[("generated-runtime-v6", "explicit")],
+    );
+
+    let current = analyze_execution(&program, &plan, &graph, runtime.clone()).unwrap();
+    assert_eq!(current.schema(), EVIDENCE_SCHEMA_V5);
+    let v6 = analyze_execution_v6(&program, &plan, &graph, runtime.clone()).unwrap();
+    assert_eq!(v6.schema(), EVIDENCE_SCHEMA_V6);
+    assert_eq!(v6.bindings().analyzed_graph_sha256, graph_sha256_v2(&graph));
+    assert_ne!(graph_sha256_v1(&graph), graph_sha256_v2(&graph));
+
+    let admitted = admit_execution_v6(
+        &program,
+        &plan,
+        graph,
+        CanonicalPolicy::Eager,
+        runtime,
+        v6,
+    )
+    .unwrap();
+    assert_eq!(admitted.admission().schema(), ADMISSION_SCHEMA_V6);
+    assert_eq!(
+        SOLVED_EXECUTABLE_HGRAPH_DIGEST_DOMAIN_V2,
+        "ostadix-solved-executable-hgraph/v2"
+    );
+    assert_eq!(
+        PLACEMENT_ADMISSION_DIGEST_DOMAIN_V2,
+        "ostadix/placement-admission/v2"
+    );
+    let target = admitted.admission().operations()[0].plan_node;
+    assert_eq!(admitted.schedule_why(target).unwrap().schema, SCHEDULE_WHY_SCHEMA_V2);
+}
 "#,
         )
         .unwrap();
@@ -3300,6 +3350,9 @@ fn execution_policy_is_one_type_in_generated_aot_runtime() {
         let output = Command::new(cargo)
             .args(["check", "--offline", "--locked", "--color", "never"])
             .env("CARGO_TARGET_DIR", build_dir.path().join("target"))
+            .env("CARGO_INCREMENTAL", "0")
+            .env("CARGO_PROFILE_DEV_DEBUG", "0")
+            .env("CARGO_PROFILE_TEST_DEBUG", "0")
             .current_dir(build_dir.path())
             .output()
             .expect("Cargo must be available to check the generated project");
@@ -3322,6 +3375,9 @@ fn execution_policy_is_one_type_in_generated_aot_runtime() {
                 "generated_runtime_closure",
             ])
             .env("CARGO_TARGET_DIR", build_dir.path().join("target"))
+            .env("CARGO_INCREMENTAL", "0")
+            .env("CARGO_PROFILE_DEV_DEBUG", "0")
+            .env("CARGO_PROFILE_TEST_DEBUG", "0")
             .current_dir(build_dir.path())
             .output()
             .expect("Cargo must be available to exercise the generated project closure");

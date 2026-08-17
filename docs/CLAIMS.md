@@ -180,11 +180,15 @@
   capability, runtime-health result, retained admission, or authorization; `O`
   still constructs and rechecks a fresh process-local V5 admission, and direct
   `o_run` remains an explicitly ungated compatibility surface.
-- Admission V5 remains the supported legacy-local contract. Hosted Placement
-  V6 is an additive placement-aware contract; neither version is silently
-  upgraded or translated into the other. Existing MCP execution tools remain
-  local V5 surfaces. The direct V6 channel is exposed separately through
-  `o-node` and `octl node ...`; it does not upgrade a V5 handle.
+- Admission V5 remains the supported current local execution contract. The
+  explicit `analyze_execution_v6`/`admit_execution_v6` API preserves typed
+  `FidelityAssessmentV2` through Graph V2 and exposes Why V2, but it is
+  inspection-only: current coordinator/evaluator/CLI/MCP paths accept only V5,
+  and no V5 bundle is converted to V6.
+- Hosted Placement V6 is a separate placement milestone, not the local
+  `oexec.admission/v6` coordinate. Its direct-node channel is exposed through
+  `o-node` and `octl node ...`; it does not upgrade a V5 handle or consume an
+  `AdmittedExecutionV6` as a placement fragment.
 - The V6 placement core models a `RequirementFootprintV1` over operation
   capability, value, effect, environment, and resource constraints and compares
   it with a full `TargetDescriptorV1`. Eligibility never factors through an ISA
@@ -206,7 +210,8 @@
   policy, and compute reservation under one signed envelope; the node
   re-evaluates candidate eligibility against its current catalog and exact
   locally prepared fragment before accepting execution authority.
-- Admission V5/V6 and backend-catalog generation are independent version axes.
+- Local admission schema, Hosted Placement V6, and backend-catalog generation
+  are independent version axes.
   The current authorizing catalog is `ostadix.backend-catalog/v5`, and its
   schema string participates in the whole-catalog and per-specification hash
   domains. `NodeProfileV1::validate_at` invokes
