@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -52,6 +53,7 @@ class LocalCiPostureTests(unittest.TestCase):
 
         # Dependabot coverage includes these independent Cargo roots.
         for relative in (
+            "crates/ostadix-api/Cargo.toml",
             "fuzz/Cargo.toml",
             "mcp/ostadix_lang_mcp_server/Cargo.toml",
         ):
@@ -203,6 +205,62 @@ class LocalCiPostureTests(unittest.TestCase):
             and record["status"] == "finding"
         ]
         self.assertTrue(any("cargo at /fuzz" in record["message"] for record in findings))
+
+    def test_root_dependabot_entry_covers_declared_workspace_member(self) -> None:
+        self.assertEqual(
+            posture._manifest_directories(ROOT)
+            & {
+                ("cargo", "/"),
+                ("cargo", "/crates/ostadix-api"),
+                ("cargo", "/fuzz"),
+                ("cargo", "/mcp/ostadix_lang_mcp_server"),
+            },
+            {
+                ("cargo", "/"),
+                ("cargo", "/fuzz"),
+                ("cargo", "/mcp/ostadix_lang_mcp_server"),
+            },
+        )
+
+    def test_malformed_workspace_members_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = Path(temporary)
+            self.copy_baseline_fixture(fixture)
+            manifest = fixture / "Cargo.toml"
+            text = manifest.read_text(encoding="utf-8")
+            text = text.replace(
+                'members = [".", "crates/ostadix-api"]',
+                'members = "crates/ostadix-api"',
+                1,
+            )
+            manifest.write_text(text, encoding="utf-8")
+
+            report = posture.audit_repository(fixture)
+
+        findings = [
+            record
+            for record in report.ordered_checks()
+            if record["id"] == "baseline.dependabot.coverage"
+            and record["status"] == "finding"
+        ]
+        self.assertTrue(
+            any("cargo at /crates/ostadix-api" in record["message"] for record in findings)
+        )
+
+    def test_excluded_cargo_roots_remain_independent(self) -> None:
+        covered = posture._root_workspace_member_manifests(ROOT)
+        self.assertIsNotNone(covered)
+        assert covered is not None
+        self.assertNotIn(ROOT / "fuzz/Cargo.toml", covered)
+        self.assertNotIn(
+            ROOT / "mcp/ostadix_lang_mcp_server/Cargo.toml", covered
+        )
+        for relative in (
+            "fuzz/Cargo.toml",
+            "mcp/ostadix_lang_mcp_server/Cargo.toml",
+        ):
+            manifest = tomllib.loads((ROOT / relative).read_text(encoding="utf-8"))
+            self.assertEqual(manifest["workspace"]["members"], ["."])
 
     def test_full_profile_returns_two_when_tools_or_policy_are_missing(self) -> None:
         report = posture.audit_repository(

@@ -1,6 +1,6 @@
 [package]
 name        = "o-lang"
-version     = "0.2.0"
+version     = "0.3.0"
 edition     = "2021"
 rust-version = "1.93.1"
 description = "Ostadix-lang (O-lang): recursive evaluator composition for whole-program polyglot execution"
@@ -10,6 +10,12 @@ license     = "LGPL-2.1-only"
 # `cargo run` and the test_o_lang_examples.sh smoke suite invoke the
 # interpreter; default-run pins that so they don't have to spell --bin O.
 default-run = "O"
+
+[workspace]
+members = [".", "crates/ostadix-api"]
+default-members = [".", "crates/ostadix-api"]
+exclude = ["fuzz", "mcp/ostadix_lang_mcp_server"]
+resolver = "2"
 
 [[bin]]
 name = "O"

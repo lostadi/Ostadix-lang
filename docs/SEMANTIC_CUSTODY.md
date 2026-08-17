@@ -68,11 +68,12 @@ V1 is shadow-only. Catalog V5 hashes the explicit optional profile assignment
 and resolves it through canonical backend names and aliases; archival V4
 identity remains unchanged. The profile is not a `BackendInterface` field and
 does not itself authorize evidence, admission, placement, or dispatch. Existing
-current-catalog projections bind the V5 digest without adding a new evidence
-field. The explicit Graph V2/Evidence V6 API separately preserves the complete
-typed solver assessment in its hashes and Why V2 view, but does not enforce the
-catalog profile and is not accepted by the current coordinator. Current V5 uses
-the frozen Graph V1 projection; there is no conversion from V5 to V6. The
+current-catalog projections bind the Catalog V5 digest without adding a new
+evidence field. Package 0.3's current Graph V2/Evidence V6 path preserves the
+complete typed solver assessment in its hashes and Why V2 view and is accepted
+by the coordinator, but still does not enforce the catalog profile. Graph
+V1/Evidence and Admission V5 remain archival; there is no conversion from V5
+to V6. The
 shadow result can therefore expose differences such as the compatibility
 solver's optimistic container classification without reducing current
 execution capacity.

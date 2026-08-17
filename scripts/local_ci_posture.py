@@ -544,6 +544,8 @@ def _dependabot_updates(text: str) -> list[tuple[str, str]]:
 
 def _manifest_directories(root: Path) -> set[tuple[str, str]]:
     expected: set[tuple[str, str]] = set()
+    cargo_manifests = set(_repository_files(root, "Cargo.toml"))
+    workspace_manifests = _root_workspace_member_manifests(root)
     for current, directories, files in os.walk(root):
         current_path = Path(current)
         # A developer may keep an ignored comparison checkout below the real
@@ -559,12 +561,82 @@ def _manifest_directories(root: Path) -> set[tuple[str, str]]:
         relative = current_path.relative_to(root)
         dependabot_directory = "/" if relative == Path(".") else f"/{relative.as_posix()}"
         if "Cargo.toml" in files:
-            expected.add(("cargo", dependabot_directory))
+            manifest = current_path / "Cargo.toml"
+            if workspace_manifests is None or manifest not in workspace_manifests:
+                expected.add(("cargo", dependabot_directory))
         if "Dockerfile" in files:
             expected.add(("docker", dependabot_directory))
     if _workflow_paths(root):
         expected.add(("github-actions", "/"))
+    if workspace_manifests and cargo_manifests & workspace_manifests:
+        expected.add(("cargo", "/"))
     return expected
+
+
+def _root_workspace_member_manifests(root: Path) -> set[Path] | None:
+    """Return manifests covered by the root Cargo workspace.
+
+    ``None`` is deliberately fail-closed: malformed workspace declarations make
+    every discovered manifest require its own Dependabot entry rather than
+    silently treating an unproved member as covered by ``/``.
+    """
+
+    root_manifest = root / "Cargo.toml"
+    if not root_manifest.is_file():
+        return set()
+    try:
+        cargo = tomllib.loads(root_manifest.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError):
+        return None
+    workspace = cargo.get("workspace")
+    if workspace is None:
+        return {root_manifest}
+    if not isinstance(workspace, dict):
+        return None
+    members = workspace.get("members")
+    excludes = workspace.get("exclude", [])
+    if (
+        not isinstance(members, list)
+        or not members
+        or any(not isinstance(item, str) or not item for item in members)
+        or not isinstance(excludes, list)
+        or any(not isinstance(item, str) or not item for item in excludes)
+    ):
+        return None
+
+    def expand(patterns: list[str]) -> set[Path] | None:
+        manifests: set[Path] = set()
+        for pattern in patterns:
+            pure = Path(pattern)
+            if pure.is_absolute() or ".." in pure.parts:
+                return None
+            matches = [root] if pattern == "." else sorted(root.glob(pattern))
+            if not matches:
+                return None
+            for match in matches:
+                manifest = match if match.name == "Cargo.toml" else match / "Cargo.toml"
+                if manifest.is_file():
+                    manifests.add(manifest)
+        return manifests
+
+    covered = expand(members)
+    excluded = expand(excludes) if excludes else set()
+    if covered is None or excluded is None:
+        return None
+    covered.add(root_manifest)
+    return covered - excluded
+
+
+def _independent_cargo_manifests(root: Path) -> list[Path]:
+    manifests = _repository_files(root, "Cargo.toml")
+    covered = _root_workspace_member_manifests(root)
+    if covered is None:
+        return manifests
+    return [
+        manifest
+        for manifest in manifests
+        if manifest == root / "Cargo.toml" or manifest not in covered
+    ]
 
 
 def _repository_files(root: Path, basename: str) -> list[Path]:
@@ -822,7 +894,7 @@ def _full_commands(
         and deny_config.is_file()
         and cargo_deny_root is not None
     ):
-        for manifest in _repository_files(root, "Cargo.toml"):
+        for manifest in _independent_cargo_manifests(root):
             commands.append(
                 (
                     "cargo-deny",
