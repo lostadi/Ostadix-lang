@@ -36,8 +36,11 @@ use sha2::{Digest, Sha256};
 use crate::hgraph::{ExecutableOp, HNodeKind, NodeId, ReadyInputPolicy, ReadySchedule, ValueState};
 use crate::ir::PlanNodeId;
 
+use super::deployment::DEPLOYMENT_PLAN_SCHEMA_V1;
+use super::logical::LOGICAL_HGRAPH_SCHEMA_V1;
 use super::model::{
-    Artifact, ArtifactCaptureStatus, OExecutionResult, RouteFailureContinuation, RoutePolicy,
+    Artifact, ArtifactCaptureFailure, ArtifactCaptureStatus, OExecutionResult,
+    RouteFailureContinuation, RoutePolicy,
 };
 use super::plan::{ProjectDependency, ProjectHGraph, ProjectPlanOperation};
 
@@ -150,19 +153,17 @@ impl ProjectAttemptTraceHeader {
         validate_metadata_sha256(&self.bundle_digest, "bundle digest")?;
         validate_label(&self.target, "selection target")?;
         validate_label(&self.policy, "route policy")?;
-        if self.logical_graph_schema != super::logical::LOGICAL_HGRAPH_SCHEMA_V1 {
+        if self.logical_graph_schema != LOGICAL_HGRAPH_SCHEMA_V1 {
             return Err(ProjectTraceError::InvalidMetadata(format!(
                 "logical graph schema must be {}, got {}",
-                super::logical::LOGICAL_HGRAPH_SCHEMA_V1,
-                self.logical_graph_schema
+                LOGICAL_HGRAPH_SCHEMA_V1, self.logical_graph_schema
             )));
         }
         validate_metadata_sha256(&self.logical_graph_digest, "logical graph digest")?;
-        if self.deployment_plan_schema != super::deployment::DEPLOYMENT_PLAN_SCHEMA_V1 {
+        if self.deployment_plan_schema != DEPLOYMENT_PLAN_SCHEMA_V1 {
             return Err(ProjectTraceError::InvalidMetadata(format!(
                 "deployment plan schema must be {}, got {}",
-                super::deployment::DEPLOYMENT_PLAN_SCHEMA_V1,
-                self.deployment_plan_schema
+                DEPLOYMENT_PLAN_SCHEMA_V1, self.deployment_plan_schema
             )));
         }
         validate_metadata_sha256(&self.deployment_plan_digest, "deployment plan digest")?;
@@ -778,7 +779,7 @@ impl ProjectAttemptEvent {
                         ArtifactCaptureStatus::Incomplete { failure }
                             if matches!(
                                 failure.as_ref(),
-                                super::model::ArtifactCaptureFailure::NotAttempted { reason }
+                                ArtifactCaptureFailure::NotAttempted { reason }
                                     if reason == "route_guard_skipped"
                             )
                     ) {
@@ -912,7 +913,7 @@ impl ProjectAttemptTrace {
                 "failed to digest trusted logical HGraph for deployment replay: {error}"
             ))
         })?;
-        if deployment.logical_hgraph_schema != super::logical::LOGICAL_HGRAPH_SCHEMA_V1
+        if deployment.logical_hgraph_schema != LOGICAL_HGRAPH_SCHEMA_V1
             || deployment.logical_hgraph != logical_digest
         {
             return Err(ProjectTraceError::InvalidMetadata(
@@ -1529,7 +1530,7 @@ fn validate_project_header(
             )));
         }
     }
-    if header.logical_graph_schema != super::logical::LOGICAL_HGRAPH_SCHEMA_V1 {
+    if header.logical_graph_schema != LOGICAL_HGRAPH_SCHEMA_V1 {
         return Err(ProjectTraceError::InvalidMetadata(
             "trace logical graph schema differs from LogicalHGraphV1".to_string(),
         ));
@@ -1540,7 +1541,7 @@ fn validate_project_header(
             "trace logical graph digest differs from the trusted Project HGraph".to_string(),
         ));
     }
-    if header.deployment_plan_schema != super::deployment::DEPLOYMENT_PLAN_SCHEMA_V1 {
+    if header.deployment_plan_schema != DEPLOYMENT_PLAN_SCHEMA_V1 {
         return Err(ProjectTraceError::InvalidMetadata(
             "trace deployment plan schema differs from DeploymentPlanV1".to_string(),
         ));
