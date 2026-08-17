@@ -6,7 +6,8 @@ does not by itself qualify that system release. OSTADIX Alpha additionally
 requires G13 and the evidence bound by the qualification registry below.
 
 This checklist is grounded in the current repository state: `Cargo.toml` version
-`0.2.0`, `CITATION.cff` version `0.2.0`, the README citation example, the CI
+`0.3.0`, `CITATION.cff` version `0.3.0`, the publishable
+`crates/ostadix-api` facade, the README citation example, the CI
 workflow in `.github/workflows/ci.yml`, and the active release-claim guard in
 `scripts/check_release_claims.sh`. The source-release builder and its tests
 also reject disagreement among the root LGPL-2.1-only license text, Cargo
@@ -29,28 +30,29 @@ dependency explicitly; local runs must make them discoverable on `PATH` (or use
 the documented linker override).
 
 ```bash
-cargo fmt -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo build --all-targets --all-features --verbose
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo build --workspace --all-targets --all-features --verbose
 bash scripts/check_declared_bins.sh
-cargo test --all-targets --all-features --verbose
+cargo test --workspace --all-targets --all-features --verbose
+cargo test --package ostadix-api
 bash scripts/smoke-hosted-live-reference.sh
 bash scripts/smoke-world-resource-keys.sh
 bash scripts/smoke-project-hgraph.sh
 bash scripts/smoke-project-hgraph-exec.sh
-cargo test --test parser_proptest
-cargo test --lib ocore::driver::tests::ocore_object_is_byte_reproducible_across_source_directories -- --exact
+cargo test --package o-lang --test parser_proptest
+cargo test --package o-lang --lib ocore::driver::tests::ocore_object_is_byte_reproducible_across_source_directories -- --exact
 cargo check --manifest-path fuzz/Cargo.toml
-cargo build --release --locked --bin O --bin olangc
+cargo build --release --locked --package o-lang --bin O --bin olangc
 cargo test --locked --manifest-path mcp/ostadix_lang_mcp_server/Cargo.toml
 cargo clippy --locked --manifest-path mcp/ostadix_lang_mcp_server/Cargo.toml -- -D warnings
 cargo build --release --locked --manifest-path mcp/ostadix_lang_mcp_server/Cargo.toml
 python3 scripts/smoke_ostadix_mcp.py
 python3 scripts/release_evidence.py validate
-cargo test --test world_identity_wire
+cargo test --package o-lang --test world_identity_wire
 ./ocore/kernel/smoke-world-identity-qemu.sh
 ./ocore/kernel/smoke-world-value-qemu.sh
-cargo test --test world_receipt
+cargo test --package o-lang --test world_receipt
 ./ocore/kernel/smoke-world-receipt-qemu.sh
 ./ocore/kernel/smoke-world-project-runtime-qemu.sh
 python3 scripts/world_alpha_evidence.py
@@ -281,10 +283,10 @@ bytes from the resolved Git commit, not from local build products:
 
 ```bash
 python3 scripts/build_source_release.py \
-  --ref v0.2.0 \
-  --output dist/Ostadix-lang-source-v0.2.0.zip
+  --ref v0.3.0 \
+  --output dist/Ostadix-lang-source-v0.3.0.zip
 python3 scripts/build_source_release.py \
-  --verify dist/Ostadix-lang-source-v0.2.0.zip
+  --verify dist/Ostadix-lang-source-v0.3.0.zip
 ```
 
 The ZIP is deterministic for one commit and prefix. It contains a canonical
@@ -317,19 +319,35 @@ and runs `scripts/smoke_ostadix_mcp.py` against the real transport.
 Before tagging, verify all public version references agree:
 
 - `Cargo.toml` `[package].version`.
+- `crates/ostadix-api/Cargo.toml` package version and exact `=VERSION`
+  dependency on the root `o-lang` package.
+- The root, fuzz, and isolated MCP lockfile entries for repository-owned
+  packages.
+- `mcp/ostadix_lang_mcp_server/Cargo.toml` and its isolated lockfile.
+- `o_lang/__init__.py` `__version__`.
 - `CITATION.cff` `version`.
-- The Git tag name, for example `v0.2.0`.
+- The Git tag name, for example `v0.3.0`.
 - The README citation example in `README.md` under "How to cite".
 - `Cargo.toml` and `CITATION.cff` both declare `LGPL-2.1-only`, matching the root
   `LICENSE`; the attribution-only `NOTICE` does not grant an alternate license.
 
-For v0.2.0 these all point at `0.2.0`; do not tag while
+For v0.3.0 these all point at `0.3.0`; do not tag while
 any one of them disagrees.
+
+## Registry publication order
+
+The facade intentionally has one exact dependency on the root package. When
+publishing to crates.io, first publish and verify `o-lang 0.3.0`, then publish
+`ostadix-api 0.3.0`. A local path makes workspace development atomic, while the
+exact version makes the registry dependency deterministic. Never publish the
+facade first, relax the exact version to work around registry propagation, or
+add a reverse root dependency on `ostadix-api`. The isolated MCP package remains
+`publish = false` and is built from its own lockfile.
 
 ## Git tag and GitHub release
 
 1. Choose the exact commit that passed the pre-tag validation above.
-2. Create an annotated version tag, for example `git tag -a v0.2.0 -m "Ostadix-lang v0.2.0"`.
+2. Create an annotated version tag, for example `git tag -a v0.3.0 -m "Ostadix-lang v0.3.0"`.
 3. Push the tag only after verifying it points to the intended commit.
 4. Draft a GitHub release for that tag.
 5. Build and verify the allowlisted source ZIP from that tag. Attach that ZIP,
@@ -348,7 +366,7 @@ upload that ZIP as a workflow artifact. Use the successful tag run's
 The existing DOI `10.5281/zenodo.21544345` identifies the preprint/package
 record. It is not an archive of a tagged Ostadix-lang source release and must
 remain the `preferred-citation` DOI. The steps below mint a separate DOI for a
-tagged v0.2.0 source snapshot:
+tagged v0.3.0 source snapshot:
 
 1. Enable the repository in Zenodo's GitHub integration.
 2. Confirm Zenodo sees `lostadi/Ostadix-lang` and is authorized to archive releases.
@@ -372,12 +390,13 @@ After DOI minting:
 
 1. Fill the top-level `doi` field in `CITATION.cff` with the separate tagged
    source-release DOI; do not replace the existing `preferred-citation` DOI.
-2. Keep `date-released` set to the actual v0.2.0 publication date,
-   `2026-08-16`; do not replace it with the later DOI-minting date.
+2. Set `date-released` to the actual v0.3.0 publication date; do not reuse the
+   archived v0.2.0 date or replace it with a later DOI-minting date.
 3. Update the README citation section to cite the DOI-bearing archived release.
 4. Use a follow-up metadata commit and a subsequent release as appropriate for
-   repository policy. Never move or recreate the archival `v0.2.0` tag after
-   publication; preserve a clear public trail from source tag to DOI.
+   repository policy. Never move or recreate either archival `v0.2.0` or
+   `v0.3.0` tags after publication; preserve a clear public trail from source
+   tag to DOI.
 
 ## Generated artifacts must not be published
 

@@ -9,14 +9,29 @@ Package SemVer is only one of the independent coordinates documented in
 
 ### Added
 
+- A two-member Cargo workspace retains the root `o-lang` package and adds the
+  publishable `ostadix-api` crate: an owned explicit-shim `Runtime`, facade-owned
+  parse/evaluate errors, and the complete public `OValue` payload vocabulary.
+- Source-release, Dependabot, Docker, CI, and lock-projection contracts now
+  distinguish the workspace facade from the independently locked fuzz and MCP
+  roots.
 - Explicit, source-additive Graph V2, Evidence/Admission V6, placement-admission
   V2 digest, and Why V2 APIs preserve complete typed fidelity assessments.
-  Current unversioned APIs, coordinator/evaluator/CLI/MCP behavior, and
-  Execution Intent V1 remain V5/Graph V1; there is no silent V5-to-V6 uplift or
-  hosted placement-fragment conversion.
+  Package 0.3 atomically makes those coordinates current for unversioned APIs,
+  coordinator/evaluator/CLI/MCP execution, and new placement fragments.
+  Execution Intent V1 remains bound to Graph V1 plus Catalog V5, while explicit
+  Admission V5, Graph V1, Why V1, and prepared-fragment V1 surfaces are
+  archival inspection APIs only: there is no silent V5-to-V6 uplift or hosted
+  placement-fragment conversion.
+- Durable Hosted V2 state roots carry an exact package-0.3 execution-authority
+  marker. Pre-0.3 roots, V1 prepared fragments, and V1 placement-admission
+  digests are rejected by current execution rather than migrated or relabeled.
 
 ### Changed
 
+- Root and MCP package coordinates advance to `0.3.0`; generated-runtime stays
+  frozen at `0.1.0`. Publication, when separately authorized, must publish
+  `o-lang` before its exact-version `ostadix-api` dependent.
 - Backend catalog V5 now binds the explicit optional BackendMorphism V1 profile
   assignment for all 30 canonical backends. Archival V4 hashes remain frozen;
   the three profiled crossings remain shadow-only and do not change
@@ -69,9 +84,10 @@ Release notes: [docs/releases/v0.2.0.md](docs/releases/v0.2.0.md).
 
 ### Release boundary
 
-The current `0.2.0` value in `Cargo.toml` is a package coordinate. Its presence
-here or in source does not itself assert a tag, publication, production
-readiness, hardware result, remote placement result, or live-World result.
+The `0.2.0` value recorded for this historical release is a package coordinate.
+Its presence here or in archived source does not itself assert a tag,
+publication, production readiness, hardware results, remote placement results,
+or a live World.
 Release entries must be dated and linked to the exact released commit or tag
 when a release is cut.
 

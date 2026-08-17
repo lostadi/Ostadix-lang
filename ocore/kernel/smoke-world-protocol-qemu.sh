@@ -19,7 +19,7 @@ fi
 
 # Admit the native convergence marker only after the independent Rust oracle
 # passes and QEMU emits the exact pinned corpus.
-cargo test --quiet --manifest-path "$ROOT/Cargo.toml" --test world_protocol
+cargo test --quiet --manifest-path "$ROOT/Cargo.toml" --package o-lang --test world_protocol
 OCORE_PROBE_MODE=28 OCORE_BUILD_DIR="$BUILD_DIR" \
   "$ROOT/ocore/kernel/build.sh" >/dev/null
 
