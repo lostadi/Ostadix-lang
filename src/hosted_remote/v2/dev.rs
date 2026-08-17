@@ -50,7 +50,7 @@ pub fn validate_local_dev_session_tier_v2(
     bindings: &PlacementFragmentBindingsV1,
     tier: SessionStateTierV2,
 ) -> Result<()> {
-    let support = crate::ir::BackendRegistry::global()
+    let support = crate::backend_catalog::BackendRegistry::global()
         .state_support_for(bindings.canonical_backend())
         .context("prepared backend is absent from the current state-support catalog")?;
     tier.validate_backend_support(support)?;
@@ -260,7 +260,7 @@ pub fn build_local_dev_placement_proof_v2(
     let eligibility = match candidate.evaluate_with_catalog(
         UnixMillisV1::new(config.now_unix_ms),
         &SelfAttestedDevelopmentAuthenticator,
-        crate::ir::BackendRegistry::global(),
+        crate::backend_catalog::BackendRegistry::global(),
     ) {
         CandidateDecisionV1::Eligible { proof } => proof,
         CandidateDecisionV1::Ineligible { rejections } => {
@@ -353,8 +353,8 @@ impl RecordAuthenticatorV1 for SelfAttestedDevelopmentAuthenticator {
 mod tests {
     use std::path::Path;
 
+    use crate::backend_catalog::BackendRegistry;
     use crate::eval::Evaluator;
-    use crate::ir::BackendRegistry;
     use crate::placement::{TaskAttemptIdV1, WarrantAssertionV1};
 
     use super::*;

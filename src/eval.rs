@@ -32,15 +32,17 @@ use crate::backend::state::{
     ensure_evaluator_snapshot_bound, sandbox_policy_sha256, EvaluatorActorCheckpointV1,
     EvaluatorStateSnapshotV1,
 };
+use crate::backend_catalog::{
+    BackendAdapterKind, BackendInterface, BackendRegistry, ExecutionMode, SpliceRenderer,
+};
 use crate::capability::{fresh_bearer_identity, BackendAuthorityBroker, BackendSandboxPolicy};
 use crate::effects::EffectDeclaration;
 use crate::environment::EnvironmentRefV2;
 #[cfg(test)]
 use crate::ir::lower_node;
 use crate::ir::{
-    reconstruct_source as reconstruct_ir_source, BackendAdapterKind, BackendInterface,
-    BackendRegistry, ExecutionMode, ExecutionPlan, InvokeMode, OIr, OIrProgram, PlanEdgeKind,
-    PlanNodeId, PlanNodeKind, SpliceRenderer,
+    reconstruct_source as reconstruct_ir_source, ExecutionPlan, InvokeMode, OIr, OIrProgram,
+    PlanEdgeKind, PlanNodeId, PlanNodeKind,
 };
 use crate::nix_ops;
 use crate::nixos_ops;
@@ -3631,7 +3633,7 @@ fn prepared_backend_implementation(
             Some(&expected_specification),
             adapter_artifact,
             executable_set,
-            crate::registry::bundle::LOCAL_BACKEND_PROTOCOL_ABI_V1,
+            crate::backend_catalog::LOCAL_BACKEND_PROTOCOL_ABI_V1,
         )
         .map_err(Into::into)
 }
