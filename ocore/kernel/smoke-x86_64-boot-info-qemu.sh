@@ -4,11 +4,14 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SMOKE_ROOT="${OSTADIX_BOOT_INFO_SMOKE_ROOT:-$ROOT/target/ostadix-boot-info-smoke}"
 QEMU_BIN="${OCORE_QEMU_BIN:-qemu-system-x86_64}"
-TIMEOUT="${OSTADIX_BOOT_INFO_TIMEOUT_SECONDS:-10}"
+HANDOFF_TIMEOUT="${OSTADIX_BOOT_INFO_TIMEOUT_SECONDS:-10}"
+MODE0_COMPLETION_TIMEOUT="${OSTADIX_BOOT_INFO_MODE0_COMPLETION_TIMEOUT_SECONDS:-12}"
 FIRST="$SMOKE_ROOT/first.img"
 SECOND="$SMOKE_ROOT/second.img"
 MODE0="$SMOKE_ROOT/challenged-mode0.img"
 MODE0_TRANSCRIPT="$SMOKE_ROOT/challenged-mode0.serial"
+MODE0_STDERR="$SMOKE_ROOT/challenged-mode0.stderr"
+MODE0_DIAGNOSTIC="$SMOKE_ROOT/challenged-mode0-diagnostic.json"
 
 if [[ $# -ne 0 ]]; then
   echo "usage: smoke-x86_64-boot-info-qemu.sh" >&2
@@ -61,7 +64,7 @@ python3 - \
   "$QEMU_BIN" \
   "$OSTADIX_OVMF_CODE" \
   "$FIRST" \
-  "$TIMEOUT" \
+  "$HANDOFF_TIMEOUT" \
   "$OSTADIX_BOOT_CHALLENGE" \
   "$SOURCE_COMMIT" <<'PY'
 import hashlib
@@ -179,93 +182,18 @@ OCORE_MEDIA_KERNEL_BUILD_DIR="$SMOKE_ROOT/kernel-mode0" \
   "$ROOT/ocore/kernel/build-x86_64-uefi-media.sh" "$MODE0" \
   >"$SMOKE_ROOT/mode0-build.txt"
 
-python3 - \
-  "$QEMU_BIN" \
-  "$OSTADIX_OVMF_CODE" \
-  "$MODE0" \
-  "$TIMEOUT" \
-  "$OSTADIX_BOOT_CHALLENGE" \
-  "$SOURCE_COMMIT" \
-  "$MODE0_TRANSCRIPT" <<'PY'
-import hashlib
-from pathlib import Path
-import subprocess
-import sys
-
-qemu, firmware, media, timeout_text, challenge, source_commit, transcript = sys.argv[1:]
-command = [
-    qemu,
-    "-accel", "tcg",
-    "-machine", "q35",
-    "-m", "128M",
-    "-drive", f"if=pflash,unit=0,format=raw,readonly=on,file={firmware}",
-    "-drive", f"if=none,id=ostadix,format=raw,readonly=on,file={media}",
-    "-device", "virtio-blk-pci,drive=ostadix",
-    "-nodefaults",
-    "-nic", "none",
-    "-display", "none",
-    "-serial", "stdio",
-    "-monitor", "none",
-    "-no-reboot",
-    "-no-shutdown",
-]
-try:
-    result = subprocess.run(
-        command,
-        capture_output=True,
-        timeout=float(timeout_text),
-        check=False,
-    )
-    timed_out = False
-    stdout = result.stdout
-    stderr = result.stderr
-except subprocess.TimeoutExpired as error:
-    timed_out = True
-    stdout = error.stdout or b""
-    stderr = error.stderr or b""
-output = stdout.decode("utf-8", "replace")
-diagnostic = stderr.decode("utf-8", "replace")
-required = [
-    "BootInfoV1: source pointer and temporary aperture released\n",
-    "BootInfoV1: Multiboot2 normalized\n",
-    "page protections: W^X online\n",
-    "page allocator: online\n",
-    "BootInfoV1: firmware allocator window admitted\n",
-    f"OSTADIX boot challenge: {challenge}\n",
-    f"OSTADIX source commit: {source_commit}\n",
-    "CPL3 native[0]: online\n",
-    "timer CPL3 return: online\n",
-    "CPL3 heartbeat: online\n",
-]
-missing = [marker for marker in required if marker not in output]
-positions = [output.find(marker) for marker in required]
-if positions != sorted(positions):
-    missing.append("challenged mode-0 causal marker order")
-if "BootInfoV1: rejected" in output or "BootInfoV1 rejection code:" in output:
-    missing.append("no BootInfo rejection marker")
-if output.count(f"OSTADIX boot challenge: {challenge}\n") != 1:
-    missing.append("exactly one mode-0 challenge echo")
-if output.count(f"OSTADIX source commit: {source_commit}\n") != 1:
-    missing.append("exactly one mode-0 source-commit echo")
-if output.count(
-    "BootInfoV1: source pointer and temporary aperture released\n"
-) != 1:
-    missing.append("exactly one mode-0 source-pointer/aperture release assertion")
-if missing or not timed_out:
-    print(
-        f"challenged mode-0 QEMU smoke failed; missing={missing!r} "
-        f"timed_out={timed_out}",
-        file=sys.stderr,
-    )
-    print("stdout:", output, file=sys.stderr)
-    print("stderr:", diagnostic, file=sys.stderr)
-    raise SystemExit(1)
-image_digest = hashlib.sha256(Path(media).read_bytes()).hexdigest()
-Path(transcript).write_bytes(stdout)
-print(output, end="")
-print(f"OSTADIX challenged mode-0 media SHA-256 {image_digest}")
-print("OSTADIX challenged mode-0 CPL3 lifecycle: PASS")
-PY
+python3 "$ROOT/scripts/ostadix_boot_info_qemu.py" \
+  --qemu "$QEMU_BIN" \
+  --firmware "$OSTADIX_OVMF_CODE" \
+  --media "$MODE0" \
+  --kernel "$SMOKE_ROOT/kernel-mode0/kernel.elf" \
+  --challenge "$OSTADIX_BOOT_CHALLENGE" \
+  --source-commit "$SOURCE_COMMIT" \
+  --completion-timeout-seconds "$MODE0_COMPLETION_TIMEOUT" \
+  --post-lifecycle-seconds 1.0 \
+  --transcript "$MODE0_TRANSCRIPT" \
+  --stderr "$MODE0_STDERR" \
+  --diagnostic "$MODE0_DIAGNOSTIC"
 
 # Exercise the exact transcript grammar shared with authority-free physical
 # observations. This is explicitly a QEMU-context check, not physical proof.
