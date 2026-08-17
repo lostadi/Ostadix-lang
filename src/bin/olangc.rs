@@ -116,8 +116,9 @@ const RUNTIME_EFFECTS_RS: &str = include_str!("../effects.rs");
 const RUNTIME_RUNTIME_EXEC_RS: &str = include_str!("../runtime_exec.rs");
 
 // placement protocol + compiled catalog — the canonical identity, state,
-// quota, and backend-capability vocabulary consumed by ir.rs. Generated
-// runtimes receive the same source rather than a reduced compatibility stub.
+// quota, and backend-capability vocabulary. Generated runtimes load the
+// physical protocol tree once as `placement_protocol`; `placement` remains the
+// public flat/nested compatibility projection over that same module identity.
 const RUNTIME_PLACEMENT_SOURCES: &[(&str, &str)] = &[
     ("mod.rs", include_str!("../placement/mod.rs")),
     ("projection.rs", include_str!("../placement/projection.rs")),
@@ -2079,6 +2080,8 @@ pub mod environment;
 pub mod backend;
 pub mod backend_morphism;
 pub mod parser;
+#[path = \"placement/protocol/mod.rs\"]
+pub(crate) mod placement_protocol;
 pub mod placement;
 pub mod registry;
 pub mod ir;
@@ -2861,6 +2864,8 @@ mod tests {
         assert!(lib_rs.contains("pub mod effects;"));
         assert!(lib_rs.contains("pub mod environment;"));
         assert!(lib_rs.contains("pub mod backend_morphism;"));
+        assert!(lib_rs.contains("#[path = \"placement/protocol/mod.rs\"]"));
+        assert!(lib_rs.contains("pub(crate) mod placement_protocol;"));
         assert!(lib_rs.contains("pub mod placement;"));
         assert!(lib_rs.contains("pub mod registry;"));
         assert!(lib_rs.contains("pub mod evidence;"));
@@ -2961,6 +2966,10 @@ mod tests {
             RUNTIME_REGISTRY_PLACEMENT_COMPAT_RS,
             "generated runtimes must receive catalog/placement integration verbatim"
         );
+        let placement_facade = fs::read_to_string(src_dir.join("placement/mod.rs")).unwrap();
+        assert!(!placement_facade.contains("pub mod protocol;"));
+        assert!(placement_facade.contains("pub mod protocol {"));
+        assert!(placement_facade.contains("pub use crate::placement_protocol::*;"));
         for &(relative_path, embedded) in RUNTIME_PLACEMENT_SOURCES {
             assert_eq!(
                 fs::read_to_string(src_dir.join("placement").join(relative_path)).unwrap(),
@@ -3164,6 +3173,7 @@ mod tests {
     empty_checkpoint, validate_empty_restore,
 };
 use ostadix_generated_serde::placement::SemanticDigestV1;
+use ostadix_generated_serde::placement::protocol::SemanticDigestV1 as NestedSemanticDigestV1;
 use ostadix_generated_serde::registry::bundle::{
     BackendRegistry, IntegerExactness, BACKEND_CATALOG_CURRENT_SCHEMA,
     BACKEND_CATALOG_SCHEMA_V4,
@@ -3186,6 +3196,17 @@ fn catalog_placement_and_checkpoint_sources_are_live() {
     let checkpoint = empty_checkpoint("rust", runtime.as_sha256()).unwrap();
     checkpoint.validate().unwrap();
     validate_empty_restore("rust", runtime.as_sha256(), &checkpoint).unwrap();
+}
+
+#[test]
+fn flat_and_nested_placement_paths_share_one_type_identity() {
+    let nested = NestedSemanticDigestV1::hash_bytes(
+        "ostadix/generated-runtime-placement-alias/v1",
+        b"one-canonical-module",
+    );
+    let flat: SemanticDigestV1 = nested;
+    let nested_again: NestedSemanticDigestV1 = flat;
+    assert_eq!(nested_again.as_sha256().len(), 64);
 }
 
 #[test]
