@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
-use crate::placement::NodeProfileV1;
+use crate::placement_protocol::NodeProfileV1;
 
 use super::{
     append_profile_to_store, canonical_registry_bytes, create_registry_root, merge_registry_store,

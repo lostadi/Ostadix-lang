@@ -1,7 +1,6 @@
 use crate::environment::EnvironmentRefV2;
 use crate::ir::{ExecutionMode, ExecutionPlan, OIrProgram, PlanNodeId, PlanNodeKind};
-
-use super::{
+use crate::placement_protocol::{
     CapabilityAtomV1, CapabilityKeyV1, EffectRequirementV1, EnvironmentRequirementV1,
     PlacementValidationError, RequirementAtomV1, RequirementFootprintV1, ResourceKindV1,
     SemanticDigestV1,
