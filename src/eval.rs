@@ -36,8 +36,11 @@ use crate::backend_catalog::{
     BackendAdapterKind, BackendInterface, BackendRegistry, ExecutionMode, SpliceRenderer,
 };
 use crate::capability::{fresh_bearer_identity, BackendAuthorityBroker, BackendSandboxPolicy};
-use crate::effects::EffectDeclaration;
 use crate::environment::EnvironmentRefV2;
+pub use crate::execution_contract::Policy;
+use crate::execution_contract::{
+    is_o_identifier, validate_execution_metadata, BlockEvalPolicy, BlockOptions,
+};
 #[cfg(test)]
 use crate::ir::lower_node;
 use crate::ir::{
@@ -164,49 +167,6 @@ fn exec_nix_kind(
              group dispatch (Eval requests are always executed serially)"
         ),
     }
-}
-
-// ═════════════════════════════════════════════════════════════════════════════
-// Policy — WHEN does a Request execute?
-//
-// The "when" axis of the two-axis framing (the other is "who decides", which
-// is the Executor). Step-3 ships Eager (default) and Lazy (scoped via lazy^).
-// Autonomous is a placeholder for STEP4 — goal-driven scheduling, where the
-// scheduler decides what to execute (and possibly speculatively pre-executes)
-// based on goals carried alongside requests.
-// ═════════════════════════════════════════════════════════════════════════════
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Policy {
-    /// Requests are auto-resolved (executed) at let-binding boundaries and
-    /// at the top level. The user sees Derivations/StorePaths, never raw
-    /// Requests. This is the default policy in eval_document.
-    Eager,
-
-    /// Requests pass through let-bindings as values. The user must explicitly
-    /// call `now(req)` to perform a request. Entered via the `lazy^(...)_lazy`
-    /// block — Policy::Lazy is in effect for the body of that block only,
-    /// then restored to the surrounding policy on exit.
-    Lazy,
-
-    /// STEP-4: scheduler-directed buffered execution.
-    ///
-    /// Under Autonomous, non-Eval Requests are buffered as they're constructed
-    /// instead of being executed immediately. At force points (exit of an
-    /// `autonomous(expr)` block, explicit `now(req)`, document end), the
-    /// AutonomousScheduler flushes the buffer: it collects the full transitive
-    /// closure of all buffered requests, builds a dependency DAG, and dispatches
-    /// independent requests as concurrent threads (up to `parallelism` at a
-    /// time). Results are stored in a two-level cache (L1 memory + L2 disk).
-    ///
-    /// `RequestKind::Eval` is excluded from buffering — Eval needs the
-    /// ProcessRegistry (which is !Send) and is executed eagerly even under
-    /// this policy. Full Eval parallelism is a STEP5 goal.
-    ///
-    /// Activated via the `autonomous(expr)` built-in function, which evaluates
-    /// `expr` under this policy, flushes the buffer on exit, and returns the
-    /// resolved result.
-    Autonomous,
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -704,84 +664,6 @@ impl GraphEvalFrame {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BlockEvalPolicy {
-    Lazy,
-    Defer,
-}
-
-#[derive(Debug, Default)]
-pub(crate) struct BlockOptions {
-    policy: Option<BlockEvalPolicy>,
-    capability_binding: Option<String>,
-    permissions: Vec<BackendAuthority>,
-}
-
-fn is_o_identifier(name: &str) -> bool {
-    name.as_bytes()
-        .first()
-        .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-}
-
-impl BlockOptions {
-    pub(crate) fn parse(attr: Option<&str>, lang: &str) -> Result<Self> {
-        let mut options = Self::default();
-        let mut seen = HashSet::new();
-        EffectDeclaration::parse(attr)
-            .map_err(anyhow::Error::msg)
-            .with_context(|| format!("invalid effect declaration on {lang}^"))?;
-        for entry in attr.into_iter().flat_map(|attr| attr.split(',')) {
-            let entry = entry.trim();
-            if !seen.insert(entry.to_string()) {
-                bail!("duplicate block attribute `{{{entry}}}` on {lang}^");
-            }
-            match entry {
-                "lazy" => {
-                    if options.policy.replace(BlockEvalPolicy::Lazy).is_some() {
-                        bail!("a block cannot combine `lazy` and `defer`");
-                    }
-                }
-                "defer" => {
-                    if options.policy.replace(BlockEvalPolicy::Defer).is_some() {
-                        bail!("a block cannot combine `lazy` and `defer`");
-                    }
-                }
-                _ if entry.starts_with("cap=") => {
-                    let name = entry.trim_start_matches("cap=");
-                    if !is_o_identifier(name) {
-                        bail!("backend capability binding `{name}` is not an O identifier");
-                    }
-                    if options.capability_binding.replace(name.into()).is_some() {
-                        bail!("a block must name exactly one backend capability binding");
-                    }
-                }
-                _ if EffectDeclaration::recognizes_entry(entry) => {}
-                _ => {
-                    let permission = BackendAuthority::parse(entry).ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "unknown block attribute `{{{entry}}}` on {lang}^. Known attributes: lazy, defer, cap=name, fs_read, fs_write, network, process, effects=pure|unknown, reads=..., writes=..., serial=host"
-                        )
-                    })?;
-                    options.permissions.push(permission);
-                }
-            }
-        }
-        options.permissions.sort();
-        Ok(options)
-    }
-
-    pub(crate) fn capability_binding(&self) -> Option<&str> {
-        self.capability_binding.as_deref()
-    }
-
-    pub(crate) fn permissions(&self) -> &[BackendAuthority] {
-        &self.permissions
-    }
-}
-
 /// Resolve the execution engine without reading process-global state. Keeping
 /// this decision pure makes the graph-by-default contract directly testable;
 /// the caller is responsible only for decoding the environment variable.
@@ -1007,11 +889,7 @@ impl Evaluator {
         let mut registered = self.registered_backends.iter().cloned().collect::<Vec<_>>();
         registered.sort();
         let registered = registered.join(",");
-        let policy = match self.policy {
-            Policy::Eager => "eager",
-            Policy::Lazy => "lazy",
-            Policy::Autonomous => "autonomous",
-        };
+        let policy = self.policy.name();
         admitted.verify_runtime_context(
             &self.shim_dir,
             &[
@@ -1062,11 +940,7 @@ impl Evaluator {
         let mut registered = self.registered_backends.iter().cloned().collect::<Vec<_>>();
         registered.sort();
         let registered = registered.join(",");
-        let policy = match self.policy {
-            Policy::Eager => "eager",
-            Policy::Lazy => "lazy",
-            Policy::Autonomous => "autonomous",
-        };
+        let policy = self.policy.name();
         let context = [
             ("policy", policy),
             ("registered-backends", registered.as_str()),
@@ -1337,7 +1211,7 @@ impl Evaluator {
         if permissions.is_empty() {
             return Ok(None);
         }
-        if let Some(binding) = options.capability_binding.as_deref() {
+        if let Some(binding) = options.capability_binding() {
             if let Some(capability) = scope.get(binding) {
                 if let Ok(identity) =
                     self.backend_authorities
@@ -1366,7 +1240,7 @@ impl Evaluator {
         backend: &BackendInterface,
         options: &BlockOptions,
     ) -> BackendSandboxPolicy {
-        self.backend_sandbox_policy_from_permissions(backend, &options.permissions)
+        self.backend_sandbox_policy_from_permissions(backend, options.permissions())
     }
 
     fn backend_sandbox_policy_from_permissions(
@@ -2963,7 +2837,7 @@ impl Evaluator {
 
         let mut buf = String::new();
         let mut deps: Vec<OValue> = Vec::new();
-        let constructs_thunk = backend.canonical == "nix_expr" || options.policy.is_some();
+        let constructs_thunk = backend.canonical == "nix_expr" || options.policy().is_some();
         let mut local_scope = frame.exec_scope(node_id, plan)?;
 
         for (child_id, child) in &planned_body {
@@ -2988,7 +2862,7 @@ impl Evaluator {
             }
         }
 
-        if let Some(policy) = options.policy {
+        if let Some(policy) = options.policy() {
             let cacheable = policy == BlockEvalPolicy::Lazy;
             let thunk = OValue::thunk(buf, deps);
             return Ok(OValue::request(
@@ -3653,130 +3527,6 @@ fn unique_admitted_sha256<'a>(
             "backend `{backend}` has multiple conflicting {label} digests in its retained admission"
         ),
     }
-}
-
-/// Validate the execution metadata embedded in lowered OIR before evidence is
-/// issued. This is intentionally evaluator-independent: admission must reject
-/// a forged backend interface or invocation contract instead of merely binding
-/// the invalid metadata to a digest and deferring rejection until dispatch.
-pub(crate) fn validate_execution_metadata(flat: &[&OIr]) -> Result<()> {
-    for node in flat {
-        match node {
-            OIr::Invoke {
-                fn_name,
-                mode,
-                args,
-            } => {
-                let canonical_mode = InvokeMode::for_name(fn_name);
-                if *mode != canonical_mode {
-                    bail!(
-                        "OIR invocation `{fn_name}` uses mode {}, but canonical lowering requires {}",
-                        mode.label(),
-                        canonical_mode.label()
-                    );
-                }
-                match mode {
-                    InvokeMode::Lazy => {
-                        if args.len() != 1 {
-                            bail!("lazy(expr) takes exactly 1 argument, got {}", args.len());
-                        }
-                    }
-                    InvokeMode::Autonomous => {
-                        if args.len() != 1 {
-                            bail!(
-                                "autonomous(expr) takes exactly 1 argument, got {}",
-                                args.len()
-                            );
-                        }
-                    }
-                    InvokeMode::Group(_) => {
-                        if args.is_empty() {
-                            bail!("{}(...) takes at least 1 argument, got 0", fn_name);
-                        }
-                    }
-                    InvokeMode::Eager => {}
-                }
-            }
-            OIr::Exec {
-                lang,
-                attr,
-                backend,
-                ..
-            } => validate_exec_metadata(lang, attr.as_deref(), backend)?,
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
-fn validate_exec_metadata(
-    lang: &str,
-    attr: Option<&str>,
-    backend: &BackendInterface,
-) -> Result<()> {
-    let registered_backend = BackendRegistry::global().interface_for(lang);
-    if backend != &registered_backend {
-        bail!(
-            "OIR backend interface for `{lang}` does not match the registered execution and authority policy"
-        );
-    }
-
-    if backend.execution == ExecutionMode::InlineAst && backend.canonical == "quote" {
-        if attr.is_some() {
-            bail!("attributes are not valid on the structural `quote` backend");
-        }
-        return Ok(());
-    }
-
-    if backend.execution == ExecutionMode::InlineAst && backend.canonical == "O" {
-        if attr.is_some() {
-            bail!("attributes are not valid on the structural `O` backend");
-        }
-        return Ok(());
-    }
-
-    if backend.execution == ExecutionMode::InlineAst {
-        bail!(
-            "OIR backend `{}` declares inline_ast execution without an executor",
-            backend.canonical
-        );
-    }
-
-    let options = BlockOptions::parse(attr, lang)?;
-    if let Some(policy) = options.policy {
-        match policy {
-            BlockEvalPolicy::Lazy => {
-                if lang == "nix_expr" {
-                    bail!(
-                        "`nix_expr{{lazy}}^` is redundant — nix_expr^ already \
-                         captures its expression lazily. Use bare nix_expr^ for \
-                         a captured Nix expression, or nix{{defer}}^ for a \
-                         non-cacheable deferred raw Nix evaluation."
-                    );
-                }
-                if !backend.pure {
-                    bail!(
-                        "`{lang}{{lazy}}^` is invalid because {lang} is not a \
-                         pure backend; caching a thunk that re-runs with side \
-                         effects would be unsound. Use `{lang}{{defer}}^` instead \
-                         — it captures the same thunk but never caches and \
-                         always re-runs on force.",
-                        lang = lang
-                    );
-                }
-            }
-            BlockEvalPolicy::Defer => {
-                if lang == "nix_expr" {
-                    bail!(
-                        "`nix_expr{{defer}}^` is redundant — nix_expr^ is already \
-                         lazy. If you want a non-cacheable deferred Nix eval, \
-                         write nix{{defer}}^."
-                    );
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Pair direct OIR children with the identities and order selected by the
@@ -6667,8 +6417,8 @@ mod tests {
     #[test]
     fn block_capability_binding_accepts_valid_o_identifier() {
         let options = BlockOptions::parse(Some("cap=_runner2,process"), "python").unwrap();
-        assert_eq!(options.capability_binding.as_deref(), Some("_runner2"));
-        assert_eq!(options.permissions, vec![BackendAuthority::Process]);
+        assert_eq!(options.capability_binding(), Some("_runner2"));
+        assert_eq!(options.permissions(), &[BackendAuthority::Process]);
     }
 
     /// {lazy} on an impure backend (python) is rejected at evaluation with a

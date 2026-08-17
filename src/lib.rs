@@ -18,6 +18,7 @@ pub mod effects;
 pub mod environment;
 pub mod eval;
 pub mod evidence;
+pub mod execution_contract;
 pub mod executor;
 pub mod hgraph;
 pub mod hosted_remote;

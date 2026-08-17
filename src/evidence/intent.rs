@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::eval::Policy;
+use crate::execution_contract::Policy;
 use crate::hgraph::HGraph;
 use crate::ir::{ExecutionPlan, OIrProgram};
 
@@ -74,7 +74,7 @@ impl ExecutionIntentV1 {
             backend_catalog_projection_sha256: backend_catalog_projection_sha256(plan),
             analyzer_id: EXECUTION_INTENT_ANALYZER_ID_V1.to_string(),
             analyzer_sha256: sha256_bytes(EXECUTION_INTENT_ANALYZER_ID_V1.as_bytes()),
-            base_policy: policy_name(base_policy).to_string(),
+            base_policy: base_policy.name().to_string(),
             execution_intent_sha256: String::new(),
         };
         intent.execution_intent_sha256 = intent.recompute_sha256();
@@ -115,7 +115,7 @@ impl ExecutionIntentV1 {
         if self.analyzer_sha256 != sha256_bytes(self.analyzer_id.as_bytes()) {
             bail!("execution intent analyzer identity digest does not match its analyzer ID");
         }
-        if !matches!(self.base_policy.as_str(), "eager" | "lazy" | "autonomous") {
+        if Policy::from_name(&self.base_policy).is_none() {
             bail!(
                 "execution intent names unsupported base policy `{}`",
                 self.base_policy
@@ -177,14 +177,6 @@ impl ExecutionIntentV1 {
 
 pub fn source_sha256(source: &[u8]) -> String {
     sha256_bytes(source)
-}
-
-fn policy_name(policy: Policy) -> &'static str {
-    match policy {
-        Policy::Eager => "eager",
-        Policy::Lazy => "lazy",
-        Policy::Autonomous => "autonomous",
-    }
 }
 
 fn validate_sha256(label: &str, digest: &str) -> Result<()> {
