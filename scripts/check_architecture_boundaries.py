@@ -25,6 +25,28 @@ class Rule:
     reason: str
 
 
+PLACEMENT_PROTOCOL_PATHS = (
+    "src/placement/protocol/candidate.rs",
+    "src/placement/protocol/catalog.rs",
+    "src/placement/protocol/digest.rs",
+    "src/placement/protocol/error.rs",
+    "src/placement/protocol/mod.rs",
+    "src/placement/protocol/records.rs",
+    "src/placement/protocol/requirement.rs",
+    "src/placement/protocol/state.rs",
+    "src/placement/protocol/target.rs",
+    "src/placement/protocol/warrant.rs",
+)
+
+# `src/lib.rs` loads this physical tree once through
+# `#[path = "placement/protocol/mod.rs"] mod placement_protocol;`. Relative
+# `super` paths must therefore be resolved from that declared module root, not
+# from the compatibility facade implied by the on-disk directory names.
+EXPLICIT_PATH_MODULE_ROOTS = (
+    (("src", "placement", "protocol"), ("placement_protocol",)),
+)
+
+
 RULES = (
     Rule(
         ("src/parser.rs",),
@@ -38,8 +60,8 @@ RULES = (
     ),
     Rule(
         ("src/ir.rs",),
-        ("hgraph",),
-        "IR must not depend on its HGraph projection",
+        ("hgraph", "placement", "placement_protocol"),
+        "IR must not depend on its HGraph or placement projections",
     ),
     Rule(
         ("src/effects.rs",),
@@ -63,13 +85,43 @@ RULES = (
         "the shared dispatch model must remain independent of HGraph and executor consumers",
     ),
     Rule(
+        PLACEMENT_PROTOCOL_PATHS,
+        (
+            "backend",
+            "dispatch_model",
+            "effects",
+            "eval",
+            "evidence",
+            "executor",
+            "hgraph",
+            "hosted_remote",
+            "ir",
+            "placement",
+            "project",
+            "registry",
+            "runtime_exec",
+            "value",
+            "world",
+        ),
+        "the canonical placement protocol may depend on resource_identity but not backend, analysis, runtime, facade, registry, project, value, or World layers",
+    ),
+    Rule(
         (
             "src/placement/mod.rs",
             "src/placement/projection.rs",
-            "src/placement/protocol/mod.rs",
         ),
         ("registry",),
-        "placement protocol and projection must remain registry-independent",
+        "the public placement projection must remain registry-independent",
+    ),
+    Rule(
+        (
+            "src/registry/bundle/mod.rs",
+            "src/registry/model.rs",
+            "src/registry/placement_compat.rs",
+            "src/registry/store.rs",
+        ),
+        ("placement",),
+        "registry must bind the canonical placement_protocol module, not its public compatibility facade",
     ),
     Rule(
         (
@@ -521,21 +573,37 @@ class PathViolation:
 
 
 def _file_module_path(relative: str) -> tuple[str, ...]:
-    """Derive the library-module path established by a conventional Rust file path."""
+    """Derive the declared library-module path for one governed Rust file."""
 
     parts = Path(relative).parts
     if len(parts) < 2 or parts[0] != "src" or not parts[-1].endswith(".rs"):
         raise ValueError(f"`{relative}` is not a conventional Rust source path beneath src/")
     if len(parts) > 2 and parts[1] == "bin":
         raise ValueError(f"`{relative}` is a binary-crate path, not a library-module path")
-    if parts[-1] in {"lib.rs", "main.rs"}:
+
+    explicit_root: tuple[str, ...] | None = None
+    explicit_suffix: tuple[str, ...] = ()
+    for source_prefix, module_root in EXPLICIT_PATH_MODULE_ROOTS:
+        if parts[: len(source_prefix)] == source_prefix:
+            explicit_root = module_root
+            explicit_suffix = parts[len(source_prefix) :]
+            break
+
+    if explicit_root is not None:
+        if not explicit_suffix:
+            raise ValueError(f"`{relative}` resolves to an explicit module directory, not a file")
+        if explicit_suffix[-1] == "mod.rs":
+            modules = (*explicit_root, *explicit_suffix[:-1])
+        else:
+            modules = (*explicit_root, *explicit_suffix[:-1], explicit_suffix[-1][:-3])
+    elif parts[-1] in {"lib.rs", "main.rs"}:
         modules: tuple[str, ...] = ()
     elif parts[-1] == "mod.rs":
         modules = tuple(parts[1:-1])
     else:
         modules = (*parts[1:-1], parts[-1][:-3])
     if any(not IDENTIFIER_RE.fullmatch(module) for module in modules):
-        raise ValueError(f"`{relative}` requires a nonstandard #[path] module mapping")
+        raise ValueError(f"`{relative}` has an invalid declared module path")
     return modules
 
 
