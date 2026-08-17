@@ -25,7 +25,7 @@ use crate::capability::BackendSandboxPolicy;
 use crate::dispatch_model::renderer_inputs_statically_preparable;
 pub use crate::dispatch_model::TaskKind;
 pub(crate) use crate::dispatch_model::{adapter_matches, effect_contract_worker_safe};
-use crate::eval::{render_with, GraphEvalFrame};
+use crate::eval_core::{render_with, GraphEvalFrame};
 use crate::evidence::DispatchAdapterV1;
 use crate::ir::{ExecutionPlan, OIr, PlanNodeId, PlanNodeKind};
 use crate::process::run_ephemeral_with_eval_callback;
@@ -621,7 +621,7 @@ impl PreparedTask for ParallelTask {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::eval::ExecutionTrace;
+    use crate::eval_core::ExecutionTrace;
     use crate::execution_contract::Policy;
     use crate::executor::pool::WorkerPool;
     use crate::executor::task::{TaskOutcome, TaskSubmission, TaskToken};
