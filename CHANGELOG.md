@@ -7,6 +7,14 @@ Package SemVer is only one of the independent coordinates documented in
 
 ## [Unreleased]
 
+### Added
+
+- Explicit, source-additive Graph V2, Evidence/Admission V6, placement-admission
+  V2 digest, and Why V2 APIs preserve complete typed fidelity assessments.
+  Current unversioned APIs, coordinator/evaluator/CLI/MCP behavior, and
+  Execution Intent V1 remain V5/Graph V1; there is no silent V5-to-V6 uplift or
+  hosted placement-fragment conversion.
+
 ### Changed
 
 - Backend catalog V5 now binds the explicit optional BackendMorphism V1 profile
