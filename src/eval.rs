@@ -27,14 +27,14 @@ use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 
-use crate::backend::state::{
-    ensure_evaluator_snapshot_bound, sandbox_policy_sha256, EvaluatorActorCheckpointV1,
-    EvaluatorStateSnapshotV1,
-};
 #[cfg(test)]
 use crate::backend_catalog::SpliceRenderer;
 use crate::backend_catalog::{
     BackendAdapterKind, BackendInterface, BackendRegistry, ExecutionMode,
+};
+use crate::backend_state::{
+    ensure_evaluator_snapshot_bound, sandbox_policy_sha256, EvaluatorActorCheckpointV1,
+    EvaluatorStateSnapshotV1,
 };
 use crate::capability::{fresh_bearer_identity, BackendAuthorityBroker, BackendSandboxPolicy};
 use crate::environment::EnvironmentRefV2;
@@ -3935,7 +3935,7 @@ mod tests {
         assert_eq!(snapshot.actors.len(), 1);
         assert_eq!(
             snapshot.actors[0].checkpoint.tier,
-            crate::backend::state::BackendStateTierV1::Stateless
+            crate::backend_state::BackendStateTierV1::Stateless
         );
         assert_eq!(
             snapshot.actors[0].checkpoint.payload,
