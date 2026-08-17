@@ -7,24 +7,24 @@
 # delegate to (for example rustc, Node.js, Ruby, a JDK, or C/C++ compilers).
 #
 # Build:
-#   docker build -t o-lang:0.2.0 .
+#   docker build -t o-lang:0.3.0 .
 #
 # Run a .O program from the host:
 #   docker run --rm --mount type=bind,src="$PWD",dst=/work,readonly \
-#       o-lang:0.2.0 examples/hello.O
+#       o-lang:0.3.0 examples/hello.O
 #
 # Literal-link the checked-in Python-only fixture and run it immediately:
 #   docker run --rm \
 #       --mount type=bind,src="$PWD/examples/docker_literal",dst=/work,readonly \
-#       --entrypoint o-link o-lang:0.2.0 . -o /tmp/app.O
+#       --entrypoint o-link o-lang:0.3.0 . -o /tmp/app.O
 # Safe, nonexecuting lift of the actual repository root:
 #   mkdir -p target/docker
 #   docker run --rm --mount type=bind,src="$PWD",dst=/work,readonly \
-#       --entrypoint o-link o-lang:0.2.0 --project . --stdout \
+#       --entrypoint o-link o-lang:0.3.0 --project . --stdout \
 #       > target/docker/project.O
 #
 # Drop into an interactive REPL:
-#   docker run --rm -it o-lang:0.2.0 --repl
+#   docker run --rm -it o-lang:0.3.0 --repl
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Stage 1: build ───────────────────────────────────────────────────────────
@@ -38,12 +38,13 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates/ostadix-api ./crates/ostadix-api
 COPY src ./src
 COPY backends ./backends
 
 # olangc embeds the runtime sources, Cargo.lock, and shim scripts at compile
 # time (include_str!/include_bytes!), so everything above must be present.
-RUN cargo build --release --locked --bin O --bin olangc --bin o-link
+RUN cargo build --release --locked --package o-lang --bin O --bin olangc --bin o-link
 
 # ── Stage 2: runtime ─────────────────────────────────────────────────────────
 FROM debian:bookworm-slim

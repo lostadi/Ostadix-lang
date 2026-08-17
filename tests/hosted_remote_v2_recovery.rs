@@ -12,7 +12,7 @@ use o_lang::backend::state::{
     EvaluatorStateSnapshotV1,
 };
 use o_lang::backend_state as canonical_backend_state;
-use o_lang::eval::{Evaluator, PlacementFragmentBindingsV1};
+use o_lang::eval::{Evaluator, PlacementFragmentBindingsV2};
 use o_lang::hosted_remote::v2::{
     build_local_dev_placement_proof_v2, open_capability_commitment_v2, ActorHealthV2,
     AuthorizedPlacementV2, DenyAllPlacementAuthorizerV2, DurableSessionStoreV2,
@@ -169,7 +169,7 @@ fn prepared_open_operation(request_id: &str) -> PreparedOperationV2 {
     .unwrap()
 }
 
-fn prepare_bindings(operation: &PreparedOperationV2) -> PlacementFragmentBindingsV1 {
+fn prepare_bindings(operation: &PreparedOperationV2) -> PlacementFragmentBindingsV2 {
     let mut evaluator = Evaluator::new(Path::new(env!("CARGO_MANIFEST_DIR")).join("backends"))
         .with_registered_backends(BackendRegistry::global().registered_backend_tags())
         .with_runtime_executable(Path::new(env!("CARGO_BIN_EXE_O")).to_path_buf());

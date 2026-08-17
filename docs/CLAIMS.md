@@ -178,17 +178,22 @@
   a bounded, expiring, one-use opaque handle and require `O` to recompute that
   same intent before dispatch. This is a local same-intent gate, not a
   capability, runtime-health result, retained admission, or authorization; `O`
-  still constructs and rechecks a fresh process-local V5 admission, and direct
-  `o_run` remains an explicitly ungated compatibility surface.
-- Admission V5 remains the supported current local execution contract. The
-  explicit `analyze_execution_v6`/`admit_execution_v6` API preserves typed
-  `FidelityAssessmentV2` through Graph V2 and exposes Why V2, but it is
-  inspection-only: current coordinator/evaluator/CLI/MCP paths accept only V5,
-  and no V5 bundle is converted to V6.
+  still freshly analyzes Graph V2 and constructs and rechecks a process-local
+  V6 admission, and direct `o_run` remains an explicitly ungated compatibility
+  surface.
+- Package 0.3's supported current local execution contract is Graph V2 with
+  `oexec.evidence/v6` and `oexec.admission/v6`. The coordinator, evaluator,
+  CLI, and MCP execution paths accept fresh `AdmittedExecutionV6` authority and
+  expose Schedule Explanation/Why V2. Graph V1, Evidence/Admission V5, and
+  Schedule Explanation/Why V1 remain explicit archival inspection and
+  compatibility-verification surfaces only; they are never uplifted,
+  relabeled, authorized, or dispatched as V2/V6 authority.
 - Hosted Placement V6 is a separate placement milestone, not the local
   `oexec.admission/v6` coordinate. Its direct-node channel is exposed through
-  `o-node` and `octl node ...`; it does not upgrade a V5 handle or consume an
-  `AdmittedExecutionV6` as a placement fragment.
+  `o-node` and `octl node ...`; it freshly prepares a
+  `PreparedPlacementFragmentV2` from local Graph V2/V6 authority. It does not
+  treat an `AdmittedExecutionV6` as portable authority or upgrade an archival
+  V5 admission or `PreparedPlacementFragmentV1` into an executable fragment.
 - The V6 placement core models a `RequirementFootprintV1` over operation
   capability, value, effect, environment, and resource constraints and compares
   it with a full `TargetDescriptorV1`. Eligibility never factors through an ISA
@@ -258,7 +263,7 @@
   `HostWorld` state chain. Persistent environments also use typed actor-state
   chains. The implementation does not claim exact effect inference from
   arbitrary Python, Bash, JavaScript, Rust, or other hosted source.
-- The current V5 scheduler's `ActorResourceId` remains the canonical backend
+- The current scheduler's `ActorResourceId` remains the canonical backend
   name plus persistent numeric environment; the process registry additionally
   keys sandbox and admitted launch generation. Hosted V2 does not substitute
   that smaller local scheduling key. It uses `ActorGenerationIdV1` as its
@@ -303,8 +308,9 @@
   The embedding `o-node` process is not treated as the O backend proxy: doctor
   and serve resolve a native `ostadix-evaluator`/sibling O or an explicit
   `--runtime-binary`, reject script dispatchers, and bind that exact executable
-  into each operation's retained V5 executable manifest. Doctor's native-image
-  check is a format preflight, not an ABI or backend-protocol probe; the
+  into each operation's retained executable manifest admitted under V6.
+  Doctor's native-image check is a format preflight, not an ABI or
+  backend-protocol probe; the
   default/sibling O path is exercised end-to-end, while an arbitrary explicit
   image proves protocol compatibility only on an admitted hosted-backend
   launch. Registry
@@ -333,7 +339,7 @@
   multi-key chain, discovery, or scheduler-selected placement.
 - Before V2 execution authorization, the node parses, lowers, solves, admits,
   and seals the exact submitted source as one non-cloneable
-  `PreparedPlacementFragmentV1`. The admissible shape has one non-whitespace
+  `PreparedPlacementFragmentV2`. The admissible shape has one non-whitespace
   semantic root and exactly one shim `Exec`; text children are allowed, while a second `Exec`, `Load`,
   `Store`, `Call`, `Request`, `Group`, `Schedule`, text-only input, a nonempty
   coordinator scope, or recursive `O.eval` authority is refused. The execution
@@ -353,8 +359,10 @@
   session lifetime: every execute separately binds exact source-derived OIR,
   task attempt, portable placement admission, deadline, operation, and one-use
   lease, permitting multiple commands only while those fixed coordinates remain
-  equal. The full V5 admission still binds process-local runtime freshness and
+  equal. The full V6 admission still binds process-local runtime freshness and
   is rechecked at dispatch; it is not used as a cross-process proof coordinate.
+  `PreparedPlacementFragmentV1` remains available for archival inspection only
+  and is never accepted, converted, or executed by the package-0.3 path.
 - V2 session access requires both the authenticated TLS client-certificate
   leaf fingerprint fixed at open and a separate random 256-bit bearer. The
   client creates and fsyncs its mode-0600 capability file before network send,
@@ -401,6 +409,12 @@
   cannot be reconciled to exact durable bytes, the store returns
   `store-reopen-required` and refuses mutations plus current-head views until a
   fresh open revalidates the journals.
+- Every root containing durable Hosted V2 state must carry the exact
+  package-0.3 `.execution-authority-v1` marker for Graph V2, Evidence/Admission
+  V6, and placement-admission V2. A durable root with no marker or a different
+  authority coordinate is rejected without mutation; archival journals are
+  never uplifted, resumed, relabeled, or executed. A root without existing
+  durable sessions or an authority journal may be initialized with the marker.
 - `Status` and `Actors` responses verify a node-signed receipt for the exact
   session journal head and correlate it to the requested session. Their
   projected convenience fields are carried over authenticated mTLS but are not
@@ -1109,11 +1123,11 @@
   intent digests with `O --require-source-sha256` and
   `--require-execution-intent-sha256` makes graph execution recompute and
   compare that projection before dispatch; a match still proceeds through a
-  fresh process-local V5 `AdmittedExecution`. The stable intent deliberately
-  excludes runtime discovery, backend artifacts, environment and PID state,
-  capacity, authority, and live admission, so it is sameness evidence rather
-  than a capability or reusable admission token. The gate adds no work to an
-  ordinary `O` invocation when its two flags are absent.
+  fresh Graph V2 analysis and process-local V6 `AdmittedExecution`. The stable
+  intent deliberately excludes runtime discovery, backend artifacts,
+  environment and PID state, capacity, authority, and live admission, so it is
+  sameness evidence rather than a capability or reusable admission token. The
+  gate adds no work to an ordinary `O` invocation when its two flags are absent.
 - Ordinary source sequence is preserved by completion dependencies unless an
   explicit concurrent group or the narrow verified-inline rule removes it.
 - Full N-language communication soundness is not established; native OValue

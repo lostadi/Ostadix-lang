@@ -30,7 +30,7 @@ if (( PROBE_MODE == 33 || PROBE_MODE == 34 )) && (( BOOT_INFO_ENABLED != 1 )); t
 fi
 mkdir -p "$BUILD_DIR"
 
-cargo build --manifest-path "$ROOT/Cargo.toml" --bin ocorec
+cargo build --manifest-path "$ROOT/Cargo.toml" --package o-lang --bin ocorec
 
 M4_IMAGE_DEFINE='-DOCORE_M4_IMAGE_PATH=""'
 M5_IMAGE_DEFINE='-DOCORE_M5_IMAGE_PATH=""'
@@ -159,7 +159,7 @@ if (( PROBE_MODE == 31 )); then
 fi
 
 if (( PROBE_MODE == 20 || PROBE_MODE == 21 || PROBE_MODE == 22 || PROBE_MODE == 23 )); then
-  cargo build --quiet --manifest-path "$ROOT/Cargo.toml" \
+  cargo build --quiet --manifest-path "$ROOT/Cargo.toml" --package o-lang \
     --bin ocore-kernel-world-record
   RECORD_BUILD_DIR="$BUILD_DIR/kernel-world-record"
   mkdir -p "$RECORD_BUILD_DIR"

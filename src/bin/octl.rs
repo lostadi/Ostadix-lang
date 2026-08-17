@@ -10,7 +10,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
-use o_lang::eval::{Evaluator, PlacementFragmentBindingsV1};
+use o_lang::eval::{Evaluator, PlacementFragmentBindingsV2};
 use o_lang::hosted_remote::v2::{
     build_local_dev_placement_proof_v2, hosted_v2_client_failure_disposition,
     open_capability_commitment_v2, read_node_public_key_v2, read_placement_signing_key_v2,
@@ -1413,7 +1413,7 @@ fn authority_dev_mint_recover(args: AuthorityDevMintRecoverArgs) -> Result<()> {
 fn prepare_local_dev_bindings(
     runtime: &LocalDevRuntimeArgs,
     operation: &PreparedOperationV2,
-) -> Result<PlacementFragmentBindingsV1> {
+) -> Result<PlacementFragmentBindingsV2> {
     if !runtime.shim_dir.is_dir() {
         bail!(
             "--shim-dir `{}` is not a directory",

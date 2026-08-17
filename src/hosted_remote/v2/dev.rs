@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 
 use anyhow::{bail, Context, Result};
 
-use crate::eval::PlacementFragmentBindingsV1;
+use crate::eval::PlacementFragmentBindingsV2;
 use crate::placement::{
     ActorGenerationIdV1, CandidateDecisionV1, CanonicalPlacementRecordV1, CapabilityAtomV1,
     CapabilityKeyV1, CapacityObservationV1, DischargedRequirementV1, EndiannessV1,
@@ -47,7 +47,7 @@ pub struct LocalDevPlacementProofV2 {
 }
 
 pub fn validate_local_dev_session_tier_v2(
-    bindings: &PlacementFragmentBindingsV1,
+    bindings: &PlacementFragmentBindingsV2,
     tier: SessionStateTierV2,
 ) -> Result<()> {
     let support = crate::backend_catalog::BackendRegistry::global()
@@ -68,7 +68,7 @@ pub fn validate_local_dev_session_tier_v2(
 }
 
 pub fn local_dev_actor_generation_v2(
-    bindings: &PlacementFragmentBindingsV1,
+    bindings: &PlacementFragmentBindingsV2,
     target: &TargetDescriptorV1,
     generation: GenerationV1,
 ) -> Result<ActorGenerationIdV1> {
@@ -99,7 +99,7 @@ pub fn local_dev_actor_generation_v2(
 /// logical environment already present in the footprint; they never claim a
 /// physical actor identity that only the execution node can establish.
 pub fn build_local_dev_placement_proof_v2(
-    bindings: &PlacementFragmentBindingsV1,
+    bindings: &PlacementFragmentBindingsV2,
     issuer_key: SemanticDigestV1,
     config: LocalDevPlacementConfigV2,
     established_target: Option<&TargetDescriptorV1>,
@@ -274,7 +274,7 @@ pub fn build_local_dev_placement_proof_v2(
 }
 
 fn local_target_descriptor(
-    bindings: &PlacementFragmentBindingsV1,
+    bindings: &PlacementFragmentBindingsV2,
     requirements: &std::collections::BTreeSet<RequirementAtomV1>,
     config: &LocalDevPlacementConfigV2,
 ) -> Result<TargetDescriptorV1> {
