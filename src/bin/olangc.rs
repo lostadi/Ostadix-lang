@@ -1679,7 +1679,7 @@ fn inspect_ir_with_origins(
         .parse_with_origins()
         .context("failed to parse .O source with source origins")?;
     let origins = parsed.plan_origins().to_vec();
-    let program = OIrProgram::lower(&parsed.nodes);
+    let program = OIrProgram::lower(parsed.nodes());
     let plan = program.plan();
     let graph = program
         .hgraph_for_plan(&plan)
@@ -2908,6 +2908,10 @@ mod tests {
         assert!(lib_rs.contains("mod canonical_cbor;"));
         assert!(lib_rs.contains("mod dispatch_model;"));
         assert!(lib_rs.contains("pub mod syntax_dialect;"));
+        assert!(!lib_rs.contains("mod information;"));
+        assert!(!lib_rs.contains("mod information_bridge;"));
+        assert!(!src_dir.join("information").exists());
+        assert!(!src_dir.join("information_bridge").exists());
 
         for path in [
             "backend_catalog.rs",
@@ -3206,6 +3210,11 @@ mod tests {
         let build_dir = tempfile::tempdir().unwrap();
         let src_dir = build_dir.path().join("src");
         write_project_sources(&src_dir).unwrap();
+        let lib_rs = generate_lib_rs(true);
+        assert!(!lib_rs.contains("mod information;"));
+        assert!(!lib_rs.contains("mod information_bridge;"));
+        assert!(!src_dir.join("information").exists());
+        assert!(!src_dir.join("information_bridge").exists());
         for &(relative_path, embedded) in RUNTIME_PROJECT_SOURCES {
             let emitted = fs::read_to_string(src_dir.join("project").join(relative_path))
                 .unwrap_or_else(|error| panic!("missing generated {relative_path}: {error}"));

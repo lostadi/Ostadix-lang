@@ -487,4 +487,8 @@ impl EvidenceBundleV6 {
     pub fn nodes(&self) -> &[NodeEvidenceV2] {
         &self.nodes
     }
+
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
 }
