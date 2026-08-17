@@ -5,10 +5,11 @@ use std::process::{Command, Output};
 
 use o_lang::information::{
     AcquisitionModalityV1, EntityDescriptorV1, InformationAtomV1, InformationDeltaPackV1,
-    InformationDeltaV1, InformationPackSignerV1, InformationRevisionV1, InformationSnapshotV1,
-    OfflinePackPolicyV1, PackedInformationObjectV1, ParticipantV1, PayloadRefV1, PublicScalarV1,
-    ScopeV1,
+    InformationDeltaV1, InformationObjectKindV1, InformationPackSignerV1, InformationRevisionV1,
+    InformationSnapshotV1, InformationStoreReaderV1, OfflinePackPolicyV1,
+    PackedInformationObjectV1, ParticipantV1, PayloadRefV1, PublicScalarV1, ScopeV1,
 };
+use sha2::Digest;
 
 fn run(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_o-info"))
@@ -383,6 +384,136 @@ fn private_key_reads_are_bounded_after_open() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("65536 byte local limit"));
     assert!(!root.path().join("fact.cbor").exists());
+}
+
+#[test]
+fn head_inspection_is_existing_root_only_and_preserves_store_metadata_and_bytes() {
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    success(&["init", "--state", state.to_str().unwrap()]);
+    fs::remove_file(state.join("store.lock")).unwrap();
+    let before = snapshot_tree(&state);
+
+    let inspected = success(&["head", "--state", state.to_str().unwrap()]);
+    assert!(inspected.contains("facts=0"));
+    assert_eq!(snapshot_tree(&state), before);
+    assert!(!state.join("store.lock").exists());
+
+    let missing = root.path().join("missing-state");
+    let output = run(&["head", "--state", missing.to_str().unwrap()]);
+    assert!(!output.status.success());
+    assert!(!missing.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn readonly_reader_rejects_incomplete_or_nonprivate_roots_without_repair() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let root = tempfile::tempdir().unwrap();
+    let incomplete = root.path().join("incomplete");
+    fs::create_dir(&incomplete).unwrap();
+    fs::set_permissions(&incomplete, fs::Permissions::from_mode(0o700)).unwrap();
+    let output = run(&["head", "--state", incomplete.to_str().unwrap()]);
+    assert!(!output.status.success());
+    assert!(!incomplete.join("objects").exists());
+    assert!(!incomplete.join("heads").exists());
+    assert!(!incomplete.join("store.lock").exists());
+
+    let nonprivate = root.path().join("nonprivate");
+    fs::create_dir(&nonprivate).unwrap();
+    fs::set_permissions(&nonprivate, fs::Permissions::from_mode(0o755)).unwrap();
+    let before_mode = fs::metadata(&nonprivate).unwrap().mode();
+    let output = run(&["head", "--state", nonprivate.to_str().unwrap()]);
+    assert!(!output.status.success());
+    assert_eq!(fs::metadata(&nonprivate).unwrap().mode(), before_mode);
+    assert!(!nonprivate.join("objects").exists());
+    assert!(!nonprivate.join("heads").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn readonly_reader_rejects_symlinked_object_kind_directory() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    success(&["init", "--state", state.to_str().unwrap()]);
+    let external = root.path().join("external-revisions");
+    fs::create_dir(&external).unwrap();
+    fs::set_permissions(&external, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let revision_directory = state.join("objects/revision");
+    fs::remove_dir_all(&revision_directory).unwrap();
+    symlink(&external, &revision_directory).unwrap();
+
+    let reader = InformationStoreReaderV1::open_existing(&state).unwrap();
+    let error = reader
+        .get(InformationObjectKindV1::Revision, &"00".repeat(32))
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("symlink") || error.to_string().contains("symbolic link"),
+        "unexpected reader error: {error}"
+    );
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TreeEntry {
+    relative: String,
+    directory: bool,
+    len: u64,
+    sha256: Option<String>,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    mode: u32,
+    #[cfg(unix)]
+    modified_seconds: i64,
+    #[cfg(unix)]
+    modified_nanoseconds: i64,
+}
+
+fn snapshot_tree(root: &Path) -> Vec<TreeEntry> {
+    fn visit(root: &Path, current: &Path, entries: &mut Vec<TreeEntry>) {
+        let mut children = fs::read_dir(current)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        children.sort();
+        for path in children {
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            let directory = metadata.is_dir();
+            let sha256 = metadata
+                .is_file()
+                .then(|| hex::encode(sha2::Sha256::digest(fs::read(&path).unwrap())));
+            #[cfg(unix)]
+            use std::os::unix::fs::MetadataExt;
+            entries.push(TreeEntry {
+                relative: path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                directory,
+                len: metadata.len(),
+                sha256,
+                #[cfg(unix)]
+                inode: metadata.ino(),
+                #[cfg(unix)]
+                mode: metadata.mode(),
+                #[cfg(unix)]
+                modified_seconds: metadata.mtime(),
+                #[cfg(unix)]
+                modified_nanoseconds: metadata.mtime_nsec(),
+            });
+            if directory {
+                visit(root, &path, entries);
+            }
+        }
+    }
+    let mut entries = Vec::new();
+    visit(root, root, &mut entries);
+    entries
 }
 
 fn write_trust(path: &Path, signer: &InformationPackSignerV1) {

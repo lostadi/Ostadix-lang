@@ -23,7 +23,7 @@ use std::process::Stdio;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
 const INTENT_SCHEMA_V1: &str = "oexec.execution-intent/v1";
@@ -31,6 +31,14 @@ const DEFAULT_INTENT_TTL_SECS: u64 = 120;
 const MAX_INTENT_TTL_SECS: u64 = 900;
 const MAX_INTENT_OPERATION_TIMEOUT_SECS: u64 = 900;
 const MAX_LIVE_INTENTS: usize = 64;
+const MAX_INFORMATION_STATE_PATH_BYTES: usize = 4096;
+const MAX_INFORMATION_HEAD_NAME_BYTES: usize = 128;
+const MAX_INFORMATION_INSPECTION_STDOUT_BYTES: usize = 256 * 1024;
+const MAX_INFORMATION_INSPECTION_STDERR_BYTES: usize = 16 * 1024;
+const DEFAULT_INFORMATION_INSPECTION_TIMEOUT_SECS: u64 = 10;
+const MAX_INFORMATION_INSPECTION_TIMEOUT_SECS: u64 = 30;
+const INFORMATION_NON_AUTHORITY_NOTICE: &str =
+    "information presence and signatures grant no execution authority";
 
 #[derive(Clone)]
 struct OstadixMcp {
@@ -326,6 +334,28 @@ fn resolve_olangc(root: &Path) -> PathBuf {
         return release;
     }
     which::which("olangc").unwrap_or_else(|_| PathBuf::from("olangc"))
+}
+
+fn resolve_o_info(root: &Path) -> Result<PathBuf, String> {
+    let candidate = root.join("target/release/o-info");
+    let metadata = std::fs::symlink_metadata(&candidate).map_err(|_| {
+        format!(
+            "local o-info is not built at the fixed repository path {}",
+            candidate.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err("fixed repository o-info path must not be a symlink".to_string());
+    }
+    if !metadata.is_file() {
+        return Err(format!(
+            "local o-info is not built at the fixed repository path {}",
+            candidate.display()
+        ));
+    }
+    candidate
+        .canonicalize()
+        .map_err(|error| format!("resolve local o-info {}: {error}", candidate.display()))
 }
 
 const RUNTIME_PATH_MODE_ENV: &str = "OSTADIX_RUNTIME_PATH_MODE";
@@ -1146,6 +1176,171 @@ async fn run_cmd(
     Ok((code, stdout, stderr))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InformationInspectRunError {
+    Spawn,
+    Timeout,
+    StdoutLimit,
+    StderrLimit,
+    Io,
+    InvalidUtf8,
+}
+
+impl InformationInspectRunError {
+    fn public_message(self) -> &'static str {
+        match self {
+            Self::Spawn => "could not start the fixed local o-info inspector",
+            Self::Timeout => "local o-info read-only inspection timed out",
+            Self::StdoutLimit => "local o-info exceeded the stdout inspection bound",
+            Self::StderrLimit => "local o-info exceeded the stderr inspection bound",
+            Self::Io => "local o-info inspection failed while collecting bounded output",
+            Self::InvalidUtf8 => "local o-info returned non-UTF-8 inspection output",
+        }
+    }
+}
+
+async fn read_information_pipe_bounded<R: AsyncRead + Unpin>(
+    reader: R,
+    maximum: usize,
+) -> Result<Vec<u8>, ()> {
+    let limit = u64::try_from(maximum)
+        .map_err(|_| ())?
+        .checked_add(1)
+        .ok_or(())?;
+    let mut bytes = Vec::with_capacity(maximum.min(16 * 1024));
+    reader
+        .take(limit)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|_| ())?;
+    if bytes.len() > maximum {
+        Err(())
+    } else {
+        Ok(bytes)
+    }
+}
+
+async fn terminate_information_child(
+    child: &mut tokio::process::Child,
+    #[cfg(unix)] process_group_id: Option<u32>,
+) {
+    #[cfg(unix)]
+    if let Some(pid) = process_group_id {
+        if let Ok(group_id) = i32::try_from(pid) {
+            // SAFETY: this inspector child is placed in a fresh process group.
+            unsafe {
+                libc::kill(-group_id, libc::SIGKILL);
+            }
+        }
+    }
+    if !matches!(child.try_wait(), Ok(Some(_))) {
+        let _ = child.kill().await;
+    }
+    let _ = child.wait().await;
+}
+
+async fn run_information_inspect_bounded(
+    program: &Path,
+    args: &[&str],
+    cwd: &Path,
+    timeout_secs: u64,
+) -> Result<(i32, String, String), InformationInspectRunError> {
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .current_dir(cwd)
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command
+        .spawn()
+        .map_err(|_| InformationInspectRunError::Spawn)?;
+    let stdout = child.stdout.take().ok_or(InformationInspectRunError::Io)?;
+    let stderr = child.stderr.take().ok_or(InformationInspectRunError::Io)?;
+    #[cfg(unix)]
+    let process_group_id = child.id();
+
+    let mut stdout_task = tokio::spawn(read_information_pipe_bounded(
+        stdout,
+        MAX_INFORMATION_INSPECTION_STDOUT_BYTES,
+    ));
+    let mut stderr_task = tokio::spawn(read_information_pipe_bounded(
+        stderr,
+        MAX_INFORMATION_INSPECTION_STDERR_BYTES,
+    ));
+    let timeout = tokio::time::sleep(Duration::from_secs(timeout_secs));
+    tokio::pin!(timeout);
+    let mut status = None;
+    let mut stdout_bytes = None;
+    let mut stderr_bytes = None;
+
+    while status.is_none() || stdout_bytes.is_none() || stderr_bytes.is_none() {
+        tokio::select! {
+            waited = child.wait(), if status.is_none() => {
+                match waited {
+                    Ok(value) => status = Some(value),
+                    Err(_) => {
+                        terminate_information_child(&mut child, #[cfg(unix)] process_group_id).await;
+                        stdout_task.abort();
+                        stderr_task.abort();
+                        return Err(InformationInspectRunError::Io);
+                    }
+                }
+            }
+            read = &mut stdout_task, if stdout_bytes.is_none() => {
+                match read {
+                    Ok(Ok(bytes)) => stdout_bytes = Some(bytes),
+                    Ok(Err(())) => {
+                        terminate_information_child(&mut child, #[cfg(unix)] process_group_id).await;
+                        stderr_task.abort();
+                        return Err(InformationInspectRunError::StdoutLimit);
+                    }
+                    Err(_) => {
+                        terminate_information_child(&mut child, #[cfg(unix)] process_group_id).await;
+                        stderr_task.abort();
+                        return Err(InformationInspectRunError::Io);
+                    }
+                }
+            }
+            read = &mut stderr_task, if stderr_bytes.is_none() => {
+                match read {
+                    Ok(Ok(bytes)) => stderr_bytes = Some(bytes),
+                    Ok(Err(())) => {
+                        terminate_information_child(&mut child, #[cfg(unix)] process_group_id).await;
+                        stdout_task.abort();
+                        return Err(InformationInspectRunError::StderrLimit);
+                    }
+                    Err(_) => {
+                        terminate_information_child(&mut child, #[cfg(unix)] process_group_id).await;
+                        stdout_task.abort();
+                        return Err(InformationInspectRunError::Io);
+                    }
+                }
+            }
+            _ = &mut timeout => {
+                terminate_information_child(&mut child, #[cfg(unix)] process_group_id).await;
+                stdout_task.abort();
+                stderr_task.abort();
+                return Err(InformationInspectRunError::Timeout);
+            }
+        }
+    }
+
+    let code = status
+        .expect("inspection status completed")
+        .code()
+        .unwrap_or(-1);
+    let stdout = String::from_utf8(stdout_bytes.expect("inspection stdout completed"))
+        .map_err(|_| InformationInspectRunError::InvalidUtf8)?;
+    let stderr = String::from_utf8(stderr_bytes.expect("inspection stderr completed"))
+        .map_err(|_| InformationInspectRunError::InvalidUtf8)?;
+    Ok((code, stdout, stderr))
+}
+
 fn resolve_directory(base: &Path, requested: Option<&str>, label: &str) -> Result<PathBuf, String> {
     let candidate = requested
         .map(PathBuf::from)
@@ -1166,6 +1361,26 @@ fn resolve_directory(base: &Path, requested: Option<&str>, label: &str) -> Resul
     candidate
         .canonicalize()
         .map_err(|error| format!("resolve {label} {}: {error}", candidate.display()))
+}
+
+fn resolve_information_state(root: &Path, requested: &str) -> Result<PathBuf, String> {
+    let requested = PathBuf::from(requested);
+    let candidate = if requested.is_absolute() {
+        requested
+    } else {
+        root.join(requested)
+    };
+    let metadata = std::fs::symlink_metadata(&candidate)
+        .map_err(|_| "information state is not an existing directory".to_string())?;
+    if metadata.file_type().is_symlink() {
+        return Err("information state root must not be a symlink".to_string());
+    }
+    if !metadata.is_dir() {
+        return Err("information state is not an existing directory".to_string());
+    }
+    candidate
+        .canonicalize()
+        .map_err(|_| "could not resolve information state directory".to_string())
 }
 
 fn resolve_file(base: &Path, requested: &str, label: &str) -> Result<PathBuf, String> {
@@ -1329,6 +1544,120 @@ struct SearchRunArgs {
     timeout_secs: Option<u64>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct InformationInspectArgs {
+    #[schemars(
+        description = "Existing local Information V1 state directory (absolute or relative to O_LANG_ROOT; maximum 4096 UTF-8 bytes)"
+    )]
+    state: String,
+    #[serde(default)]
+    #[schemars(
+        description = "Fixed local head name (default main; maximum 128 ASCII token bytes)"
+    )]
+    head: Option<String>,
+    #[serde(default)]
+    #[schemars(description = "Read-only inspection timeout seconds (default 10; maximum 30)")]
+    timeout_secs: Option<u64>,
+}
+
+fn validate_information_head_name(name: &str) -> Result<(), String> {
+    if name.len() > MAX_INFORMATION_HEAD_NAME_BYTES
+        || name.is_empty()
+        || name == "."
+        || name == ".."
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+    {
+        return Err("invalid bounded information head name".to_string());
+    }
+    Ok(())
+}
+
+fn lowercase_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn sanitize_information_head_output(stdout: &str, expected_head: &str) -> Result<String, String> {
+    let mut lines = stdout.lines();
+    let summary = lines
+        .next()
+        .ok_or_else(|| "o-info head returned no summary".to_string())?;
+    let prefix = "head state=";
+    let summary = summary
+        .strip_prefix(prefix)
+        .ok_or_else(|| "o-info head returned an unexpected summary prefix".to_string())?;
+    let marker = format!(" name={expected_head} revision=");
+    let marker_at = summary
+        .rfind(&marker)
+        .ok_or_else(|| "o-info head returned an unexpected head name".to_string())?;
+    let state = &summary[..marker_at];
+    if state.is_empty() || state.chars().any(char::is_control) {
+        return Err("o-info head returned an invalid state token".to_string());
+    }
+    let remainder = &summary[marker_at + marker.len()..];
+
+    let mut sanitized = format!("head={expected_head}\n");
+    let expected_fact_count;
+    if remainder == "none" {
+        sanitized.push_str("revision=none\nfacts=0\n");
+        expected_fact_count = 0_usize;
+    } else {
+        let (revision, rest) = remainder
+            .split_once(" snapshot=")
+            .ok_or_else(|| "o-info head omitted snapshot identity".to_string())?;
+        let (snapshot, facts) = rest
+            .split_once(" facts=")
+            .ok_or_else(|| "o-info head omitted fact count".to_string())?;
+        if !lowercase_sha256(revision) || !lowercase_sha256(snapshot) {
+            return Err("o-info head returned a malformed object identity".to_string());
+        }
+        expected_fact_count = facts
+            .parse::<usize>()
+            .map_err(|_| "o-info head returned a malformed fact count".to_string())?;
+        sanitized.push_str(&format!(
+            "revision={revision}\nsnapshot={snapshot}\nfacts={expected_fact_count}\n"
+        ));
+    }
+
+    let mut facts = BTreeSet::new();
+    let mut authority_seen = false;
+    for line in lines {
+        if line == format!("authority={INFORMATION_NON_AUTHORITY_NOTICE}") {
+            if authority_seen {
+                return Err("o-info head repeated its authority notice".to_string());
+            }
+            authority_seen = true;
+            continue;
+        }
+        if authority_seen {
+            return Err("o-info head emitted content after its authority notice".to_string());
+        }
+        let fact = line
+            .strip_prefix("fact=")
+            .ok_or_else(|| "o-info head returned an unexpected output key".to_string())?;
+        if !lowercase_sha256(fact) || !facts.insert(fact.to_string()) {
+            return Err("o-info head returned a malformed or duplicate fact identity".to_string());
+        }
+    }
+    if !authority_seen || facts.len() != expected_fact_count {
+        return Err("o-info head fact count or authority notice mismatch".to_string());
+    }
+    for fact in facts {
+        sanitized.push_str(&format!("fact={fact}\n"));
+    }
+    sanitized.push_str(&format!(
+        "authority={INFORMATION_NON_AUTHORITY_NOTICE}\nsource=local-o-info-read-only\n"
+    ));
+    if sanitized.len() > MAX_INFORMATION_INSPECTION_STDOUT_BYTES {
+        return Err("sanitized information inspection exceeds its output bound".to_string());
+    }
+    Ok(sanitized)
+}
+
 #[tool_router]
 impl OstadixMcp {
     #[tool(
@@ -1366,6 +1695,74 @@ impl OstadixMcp {
     ) -> Result<CallToolResult, McpError> {
         let root = resolve_lang_root();
         text_ok(discover_runtimes(&self.runtime_search, &root).to_text())
+    }
+
+    #[tool(
+        description = "Inspect exactly one existing local Information V1 head through the fixed read-only o-info path; no cloud, network, mutation, dispatch, or arbitrary subcommands"
+    )]
+    async fn o_information_inspect(
+        &self,
+        Parameters(args): Parameters<InformationInspectArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        if args.state.len() > MAX_INFORMATION_STATE_PATH_BYTES
+            || args.state.is_empty()
+            || args.state.chars().any(char::is_control)
+        {
+            return text_err("invalid bounded information state path");
+        }
+        let head = args.head.as_deref().unwrap_or("main");
+        if let Err(error) = validate_information_head_name(head) {
+            return text_err(error);
+        }
+        let timeout = args
+            .timeout_secs
+            .unwrap_or(DEFAULT_INFORMATION_INSPECTION_TIMEOUT_SECS);
+        if timeout == 0 || timeout > MAX_INFORMATION_INSPECTION_TIMEOUT_SECS {
+            return text_err(format!(
+                "information inspection timeout must be between 1 and {MAX_INFORMATION_INSPECTION_TIMEOUT_SECS} seconds"
+            ));
+        }
+
+        let root = resolve_lang_root();
+        let state = match resolve_information_state(&root, &args.state) {
+            Ok(state) => state,
+            Err(error) => return text_err(error),
+        };
+        let o_info = match resolve_o_info(&root) {
+            Ok(path) => path,
+            Err(error) => return text_err(error),
+        };
+        let state_text = match state.to_str() {
+            Some(path) => path.to_string(),
+            None => return text_err("resolved information state path is not UTF-8"),
+        };
+        match run_information_inspect_bounded(
+            &o_info,
+            &["head", "--state", &state_text, "--head", head],
+            &root,
+            timeout,
+        )
+        .await
+        {
+            Ok((code, stdout, stderr)) => {
+                if stdout.len() > MAX_INFORMATION_INSPECTION_STDOUT_BYTES
+                    || stderr.len() > MAX_INFORMATION_INSPECTION_STDERR_BYTES
+                {
+                    return text_err("local o-info exceeded the MCP inspection output bound");
+                }
+                if code != 0 {
+                    return text_err("local o-info read-only inspection rejected the state/head");
+                }
+                if !stderr.is_empty() {
+                    return text_err("local o-info emitted unexpected stderr during inspection");
+                }
+                match sanitize_information_head_output(&stdout, head) {
+                    Ok(output) => text_ok(output),
+                    Err(error) => text_err(error),
+                }
+            }
+            Err(error) => text_err(error.public_message()),
+        }
     }
 
     #[tool(
@@ -1816,6 +2213,7 @@ impl ServerHandler for OstadixMcp {
             instructions: Some(
                 "Ostadix-lang / O-lang MCP (Rust). Use o_env/o_runtimes/o_doctor first. \
 Use o_analyze_intent then o_execute_intent for a one-use same-intent gate; o_run remains direct ungated compatibility execution. \
+Use o_information_inspect only for bounded descriptive reads of an existing local Information V1 head; it grants no authority. \
 Always run .O programs through an MCP O tool so backends is absolute. \
 Never pass the literal string O_BACKENDS_DIR; never put $VAR inside .O sources (O splices $IDENT)."
                     .into(),
@@ -1854,12 +2252,14 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     use super::{
         catalog_backends_for, discover_runtimes, is_lang_root, parse_execution_intent,
-        random_intent_handle, resolve_directory, resolve_file, resolve_run_target, run_cmd,
+        random_intent_handle, resolve_directory, resolve_file, resolve_information_state,
+        resolve_o_info, resolve_run_target, run_cmd, run_information_inspect_bounded,
         runtime_search_path_with_mode, runtime_search_path_with_mode_and_manager_environment,
-        validate_intent_target, EmptyArgs, IntentLease, IntentReservation, IntentStore, OstadixMcp,
-        RuntimePathMode, RuntimeSearchPath, CATALOG_BACKEND_RUNTIMES, CATALOG_LEGACY_SCHEMA_V3,
-        CATALOG_LEGACY_SCHEMA_V4, CATALOG_RUNTIME_REQUIREMENTS, CATALOG_SCHEMA, INTENT_SCHEMA_V1,
-        MAX_LIVE_INTENTS,
+        sanitize_information_head_output, validate_information_head_name, validate_intent_target,
+        EmptyArgs, InformationInspectRunError, IntentLease, IntentReservation, IntentStore,
+        OstadixMcp, RuntimePathMode, RuntimeSearchPath, CATALOG_BACKEND_RUNTIMES,
+        CATALOG_LEGACY_SCHEMA_V3, CATALOG_LEGACY_SCHEMA_V4, CATALOG_RUNTIME_REQUIREMENTS,
+        CATALOG_SCHEMA, INTENT_SCHEMA_V1, MAX_LIVE_INTENTS,
     };
     use std::collections::BTreeSet;
     use std::ffi::OsStr;
@@ -2374,6 +2774,128 @@ mod tests {
         ))
         .expect_err("malformed digest must fail closed");
         assert!(malformed.contains("malformed execution-intent digest"));
+    }
+
+    #[test]
+    fn information_head_output_is_strictly_parsed_and_state_path_is_not_returned() {
+        let revision = "a".repeat(64);
+        let snapshot = "b".repeat(64);
+        let fact = "c".repeat(64);
+        let raw = format!(
+            "head state=/private/location with spaces name=main revision={revision} snapshot={snapshot} facts=1\nfact={fact}\nauthority=information presence and signatures grant no execution authority\n"
+        );
+        let sanitized = sanitize_information_head_output(&raw, "main").unwrap();
+        assert!(!sanitized.contains("/private/location"));
+        assert!(sanitized.contains(&format!("revision={revision}")));
+        assert!(sanitized.contains(&format!("fact={fact}")));
+        assert!(sanitized.contains("source=local-o-info-read-only"));
+
+        let duplicate = format!(
+            "head state=/state name=main revision={revision} snapshot={snapshot} facts=2\nfact={fact}\nfact={fact}\nauthority=information presence and signatures grant no execution authority\n"
+        );
+        assert!(sanitize_information_head_output(&duplicate, "main").is_err());
+        let unexpected = format!(
+            "head state=/state name=main revision={revision} snapshot={snapshot} facts=0\ncapability=forged\nauthority=information presence and signatures grant no execution authority\n"
+        );
+        assert!(sanitize_information_head_output(&unexpected, "main").is_err());
+    }
+
+    #[test]
+    fn information_head_arguments_are_fixed_bounded_tokens() {
+        assert!(validate_information_head_name("main").is_ok());
+        assert!(validate_information_head_name("../main").is_err());
+        assert!(validate_information_head_name("main\nforged").is_err());
+        assert!(validate_information_head_name(&"x".repeat(129)).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn information_state_resolution_rejects_symlink_and_missing_roots_without_creation() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new();
+        let state = fixture.0.join("state");
+        fs::create_dir(&state).unwrap();
+        let link = fixture.0.join("state-link");
+        symlink(&state, &link).unwrap();
+        assert!(resolve_information_state(&fixture.0, link.to_str().unwrap()).is_err());
+
+        let missing = fixture.0.join("missing-state");
+        assert!(resolve_information_state(&fixture.0, missing.to_str().unwrap()).is_err());
+        assert!(!missing.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fixed_information_inspector_binary_rejects_final_component_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new();
+        let release = fixture.0.join("target/release");
+        fs::create_dir_all(&release).unwrap();
+        symlink("/bin/sh", release.join("o-info")).unwrap();
+        let error = resolve_o_info(&fixture.0).unwrap_err();
+        assert!(error.contains("must not be a symlink"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn information_inspector_kills_oversized_stdout_and_stderr() {
+        let cwd = PathBuf::from("/");
+        let stdout_error =
+            run_information_inspect_bounded(PathBuf::from("/usr/bin/yes").as_path(), &[], &cwd, 5)
+                .await
+                .expect_err("unbounded stdout must be killed at the inspection cap");
+        assert_eq!(stdout_error, InformationInspectRunError::StdoutLimit);
+
+        let stderr_error = run_information_inspect_bounded(
+            PathBuf::from("/bin/sh").as_path(),
+            &["-c", "while :; do printf x >&2; done"],
+            &cwd,
+            5,
+        )
+        .await
+        .expect_err("unbounded stderr must be killed at the inspection cap");
+        assert_eq!(stderr_error, InformationInspectRunError::StderrLimit);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn information_inspector_timeout_kills_descendants() {
+        let fixture = Fixture::new();
+        let sentinel = fixture.0.join("late-information-inspector-write");
+        let command = format!(
+            "(/bin/sleep 2; printf late > '{}') & wait",
+            sentinel.display()
+        );
+        let error = run_information_inspect_bounded(
+            PathBuf::from("/bin/sh").as_path(),
+            &["-c", &command],
+            &fixture.0,
+            1,
+        )
+        .await
+        .expect_err("information inspector must time out");
+        assert_eq!(error, InformationInspectRunError::Timeout);
+        tokio::time::sleep(Duration::from_millis(1_250)).await;
+        assert!(!sentinel.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn information_inspector_clears_the_inherited_environment() {
+        let result = run_information_inspect_bounded(
+            PathBuf::from("/bin/sh").as_path(),
+            &[
+                "-c",
+                "if [ -z \"${HOME+x}\" ]; then printf cleared; else printf inherited; fi",
+            ],
+            PathBuf::from("/").as_path(),
+            5,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, (0, "cleared".to_string(), String::new()));
     }
 
     #[test]
