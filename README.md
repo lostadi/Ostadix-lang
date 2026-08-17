@@ -556,6 +556,15 @@ base-plus-addition revision. Otherwise it retains the verified pack under
 Neither a signature nor head membership grants execution authority. See
 [Information Kernel V1](docs/INFORMATION_KERNEL_V1.md) for the exact boundary.
 
+Package 0.3 also exposes eight explicit `o_lang::information_bridge` metadata
+projections for parsed documents, caller-public scalars, unadmitted HGraphs,
+Evidence V6, verified registry/World inputs, logical project graphs, and
+self-signature-consistent Hosted journals. They are bounded, lossy, and
+non-authorizing; there is no generic native serializer or reverse conversion.
+`o info head` uses a separate existing-root reader that creates no lock or
+directory and performs no head update. The advanced root API exports these
+records; stable `ostadix-api` and generated AOT projects do not.
+
 This hosted profile is not a World, Governor, G1/G10, physical-machine,
 exactly-once, global-effect-isolation, project-migration, cancellation, or mid-
 operation-migration claim. Its complete contract, trust rules, user commands,
@@ -603,6 +612,7 @@ reconstructing executable and backend paths by hand.
 | `o_run` | Runs one local `.O` file directly with an explicit working directory and timeout; this remains an ungated compatibility path. |
 | `o_olangc` | Runs `olangc` with the resolved shim directory; supports `ir`, `dot`, `script`, and `wasm`, or the default target. |
 | `o_search_run` | Runs a named search program from an external `a18re` work tree when that optional tree is present. |
+| `o_information_inspect` | Runs fixed local `o-info head` against one existing non-symlink state root with bounded input, output, and timeout; returns sanitized object IDs/count only, never the state path, raw stderr, cloud/network access, logical/content/inode/mode/mtime mutation, or authority. Atime is untested. |
 
 The normal setup builds this separate, lockfile-pinned Rust crate and, unless
 wrappers are disabled, copies the executable to
@@ -612,11 +622,11 @@ wrappers are disabled, copies the executable to
 ./setup.sh --minimal --yes
 ```
 
-For a build without the rest of setup, build the two Ostadix commands used by
+For a build without the rest of setup, build the three Ostadix commands used by
 the server and then the server itself:
 
 ```bash
-cargo build --release --bin O --bin olangc
+cargo build --release --locked --package o-lang --bin O --bin olangc --bin o-info
 cargo build --release --locked \
   --manifest-path mcp/ostadix_lang_mcp_server/Cargo.toml
 ```
@@ -629,8 +639,10 @@ own lockfile, rejects Clippy warnings, and exercises initialization, exact tool
 and object-schema discovery, `o_env`, `o_runtimes`, and `o_smoke` over the real
 stdio transport with `scripts/smoke_ostadix_mcp.py`. The smoke launches the
 server with a system-only `PATH`, then calls `o_run` with both forms of relative
-path and calls `o_olangc`; transport discovery alone therefore cannot mask a
-broken runtime-path recovery or execution tool. Use `./setup.sh --no-mcp` when
+path, calls `o_olangc`, and inspects a temporary local Information V1 head
+without mutating its entries/content/inode/mode/mtime; transport discovery
+alone therefore cannot mask a broken runtime-path recovery, execution tool, or
+inspection boundary. Use `./setup.sh --no-mcp` when
 the MCP server is not wanted. The deterministic source release includes `mcp/`,
 `.mcp.json`, and the smoke client, and its link/schema/metadata verifier rejects
 an incomplete MCP release surface without executing archive payloads. The
@@ -673,6 +685,7 @@ o_runtimes {}
 o_smoke {}
 o_run {"path":"/absolute/path/to/Ostadix-lang/examples/hello.O"}
 o_olangc {"path":"/absolute/path/to/Ostadix-lang/examples/hello.O","target":"ir"}
+o_information_inspect {"state":"/absolute/path/to/existing-information-state","head":"main"}
 ```
 
 These are MCP tool names and argument objects, not shell commands. `o_smoke`
