@@ -579,7 +579,9 @@ pub(crate) fn evidence_bindings(
     }
 }
 
-pub(crate) fn graph_sha256(graph: &HGraph) -> String {
+/// Archival byte identity of the solved executable HGraph used by V5
+/// evidence and admission. This algorithm and its domain are frozen as V1.
+pub(crate) fn graph_sha256_v1(graph: &HGraph) -> String {
     let mut hash = CanonicalHasher::new("ostadix-solved-executable-hgraph/v1");
     for id in graph.node_ids() {
         let node = &graph.nodes[&id];
@@ -708,6 +710,12 @@ pub(crate) fn graph_sha256(graph: &HGraph) -> String {
         hash.u64(node.0);
     }
     hash.finish()
+}
+
+/// Current solved-graph identity. Keep existing callers on the frozen V1
+/// algorithm until a future version is introduced through an explicit seam.
+pub(crate) fn graph_sha256(graph: &HGraph) -> String {
+    graph_sha256_v1(graph)
 }
 
 pub(crate) fn evidence_bundle_sha256(bundle: &EvidenceBundleV5) -> String {
@@ -1302,6 +1310,20 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn solved_graph_sha256_v1_is_pinned_and_current_alias_is_identical() {
+        let program = program_for_backend("python", 1);
+        let mut graph = crate::hgraph::from_oir::build_program(&program);
+        crate::hgraph::solve::solve_types(&mut graph).unwrap();
+        let v1 = graph_sha256_v1(&graph);
+
+        assert_eq!(
+            v1,
+            "103d5d2f3f260407b74c7887ce4a9b9d8bfdbf208d5d86bdc5a3bf8f592bbd92"
+        );
+        assert_eq!(graph_sha256(&graph), v1);
     }
 
     #[test]

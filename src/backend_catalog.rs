@@ -734,9 +734,10 @@ pub(crate) fn hash_backend_spec_v4(
     spec: &BackendSpec,
     requirement: &RuntimeRequirementSpec,
 ) {
-    // V4 is the exact V3 projection extended by one explicit state-support
-    // field. Keeping the shared prefix makes the rollover auditable while the
-    // distinct schema domain prevents cross-version authorization.
+    // Archival V4 is the exact V3 projection extended by one explicit
+    // state-support field. Keeping the shared prefix makes the rollover
+    // auditable while the distinct schema domain prevents cross-version
+    // authorization. Its field order and encoding are compatibility-frozen.
     hash_backend_spec_v3(hash, spec, requirement);
     hash_state_support(hash, &spec.state_support);
 }
@@ -871,13 +872,13 @@ impl BackendRegistry {
             .clone()
     }
 
-    /// Deterministic SHA-256 of the complete current ordered catalog.
-    pub fn catalog_sha256(&self) -> String {
-        static CURRENT_DIGEST: OnceLock<String> = OnceLock::new();
-        CURRENT_DIGEST
+    /// Deterministic SHA-256 of the complete ordered archival V4 catalog.
+    pub fn catalog_sha256_v4(&self) -> String {
+        static V4_DIGEST: OnceLock<String> = OnceLock::new();
+        V4_DIGEST
             .get_or_init(|| {
                 let mut hash = Sha256::new();
-                catalog_hash_field(&mut hash, BACKEND_CATALOG_CURRENT_SCHEMA.as_bytes());
+                catalog_hash_field(&mut hash, BACKEND_CATALOG_SCHEMA_V4.as_bytes());
                 catalog_hash_count(&mut hash, RUNTIME_REQUIREMENT_SPECS.len());
                 for requirement in RUNTIME_REQUIREMENT_SPECS {
                     hash_runtime_requirement(&mut hash, requirement);
@@ -891,6 +892,12 @@ impl BackendRegistry {
             .clone()
     }
 
+    /// Deterministic SHA-256 of the complete current ordered catalog.
+    /// Current V4 behavior remains an alias of its explicit archival helper.
+    pub fn catalog_sha256(&self) -> String {
+        self.catalog_sha256_v4()
+    }
+
     /// Deterministic SHA-256 of one canonical backend specification and its
     /// referenced runtime requirements. Aliases resolve to the same digest.
     pub fn specification_sha256_v3(&self, lang: &str) -> Option<String> {
@@ -901,14 +908,20 @@ impl BackendRegistry {
         Some(finish_catalog_hash(hash))
     }
 
-    /// Deterministic SHA-256 of one current canonical backend specification.
-    /// Aliases resolve to the same exact implementation identity.
-    pub fn specification_sha256(&self, lang: &str) -> Option<String> {
+    /// Deterministic SHA-256 of one archival V4 canonical backend
+    /// specification. Aliases resolve to the same exact identity.
+    pub fn specification_sha256_v4(&self, lang: &str) -> Option<String> {
         let spec = self.get(lang)?;
         let mut hash = Sha256::new();
-        catalog_hash_field(&mut hash, BACKEND_CATALOG_CURRENT_SCHEMA.as_bytes());
+        catalog_hash_field(&mut hash, BACKEND_CATALOG_SCHEMA_V4.as_bytes());
         hash_backend_spec_v4(&mut hash, spec, self.runtime_requirements_for(spec.name));
         Some(finish_catalog_hash(hash))
+    }
+
+    /// Deterministic SHA-256 of one current canonical backend specification.
+    /// Current V4 behavior remains an alias of its explicit archival helper.
+    pub fn specification_sha256(&self, lang: &str) -> Option<String> {
+        self.specification_sha256_v4(lang)
     }
 
     /// Build the exact implementation identity shared by local publication
@@ -1126,6 +1139,12 @@ impl CurrentBackendCatalogV1 for BackendRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const CATALOG_V4_WHOLE_SHA256: &str =
+        "abbe7201cd985baaa9c8da81a09791830a2cceb5697b514fea942852c25e10ea";
+    const CATALOG_V4_SOURCE_SHA256: &str =
+        "6d4e19cdf737982a5cfaf7d802c716e08ef5fc1e031465379a8a20348e08687a";
+    const CATALOG_V4_SOURCE_BYTES: usize = 14_568;
 
     const CATALOG_V3_SPEC_GOLDENS: &[(&str, &str)] = &[
         (
@@ -1420,9 +1439,9 @@ mod tests {
             (
                 "v4",
                 "4f7d503dff73525b5d7f9c5b6a2f51c856bfe2e1",
-                "abbe7201cd985baaa9c8da81a09791830a2cceb5697b514fea942852c25e10ea",
-                "6d4e19cdf737982a5cfaf7d802c716e08ef5fc1e031465379a8a20348e08687a",
-                14_568,
+                CATALOG_V4_WHOLE_SHA256,
+                CATALOG_V4_SOURCE_SHA256,
+                CATALOG_V4_SOURCE_BYTES,
             ),
         ];
         let mut whole = BTreeSet::new();
@@ -1441,6 +1460,7 @@ mod tests {
 
         let registry = BackendRegistry::global();
         assert_eq!(registry.catalog_sha256_v3(), coordinates[2].2);
+        assert_eq!(registry.catalog_sha256_v4(), CATALOG_V4_WHOLE_SHA256);
         assert_eq!(registry.catalog_sha256(), coordinates[3].2);
         let current_source = include_bytes!("backend_catalog.inc.rs");
         assert_eq!(current_source.len(), coordinates[3].4);
@@ -1470,16 +1490,20 @@ mod tests {
                 Some(*v3_digest)
             );
             assert_eq!(
-                registry.specification_sha256(v4_name).as_deref(),
+                registry.specification_sha256_v4(v4_name).as_deref(),
                 Some(*v4_digest)
+            );
+            assert_eq!(
+                registry.specification_sha256(v4_name),
+                registry.specification_sha256_v4(v4_name)
             );
             assert_ne!(v3_digest, v4_digest);
             assert!(!registry.contains_specification_sha256(v3_digest));
             assert!(registry.contains_specification_sha256(v4_digest));
         }
         assert_eq!(
-            registry.specification_sha256("py"),
-            registry.specification_sha256("python")
+            registry.specification_sha256_v4("py"),
+            registry.specification_sha256_v4("python")
         );
         assert_eq!(
             registry.specification_sha256_v3("py"),
@@ -1946,8 +1970,10 @@ mod tests {
         assert_eq!(catalog.len(), 64);
         assert!(catalog.bytes().all(|byte| byte.is_ascii_hexdigit()));
         assert_eq!(catalog, registry.catalog_sha256());
+        assert_eq!(catalog, registry.catalog_sha256_v4());
 
         let python = registry.specification_sha256("python").unwrap();
+        assert_eq!(python, registry.specification_sha256_v4("python").unwrap());
         assert_eq!(python, registry.specification_sha256("py").unwrap());
         assert_ne!(python, registry.specification_sha256("bash").unwrap());
         assert_eq!(python.len(), 64);
@@ -2184,8 +2210,17 @@ mod tests {
             digest_for(BACKEND_CATALOG_SCHEMA_V3, &weakened, hash_backend_spec_v3),
             "archival V3 identity predates state support"
         );
+        let direct_v4 = digest_for(BACKEND_CATALOG_SCHEMA_V4, python, hash_backend_spec_v4);
+        assert_eq!(
+            direct_v4,
+            CATALOG_V4_SPEC_GOLDENS
+                .iter()
+                .find_map(|(name, digest)| (*name == "python").then_some(*digest))
+                .unwrap(),
+            "the internal V4 hash helper must retain the published Python anchor"
+        );
         assert_ne!(
-            digest_for(BACKEND_CATALOG_SCHEMA_V4, python, hash_backend_spec_v4),
+            direct_v4,
             digest_for(BACKEND_CATALOG_SCHEMA_V4, &weakened, hash_backend_spec_v4),
             "current V4 identity must bind state support"
         );

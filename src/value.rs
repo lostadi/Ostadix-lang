@@ -260,7 +260,7 @@ enum FidelityAssessmentDeserializeV2 {
     Lossless,
     Structural {
         #[serde(default)]
-        definite: BTreeSet<AnnotationKind>,
+        definite: Option<BTreeSet<AnnotationKind>>,
         possible: BTreeSet<AnnotationKind>,
     },
     NativeCapsule,
@@ -436,7 +436,8 @@ impl<'de> Deserialize<'de> for FidelityAssessmentV2 {
         match wire {
             FidelityAssessmentDeserializeV2::Lossless => Ok(Self::Lossless),
             FidelityAssessmentDeserializeV2::Structural { definite, possible } => {
-                Self::structural(definite, possible).map_err(serde::de::Error::custom)
+                Self::structural(definite.unwrap_or_default(), possible)
+                    .map_err(serde::de::Error::custom)
             }
             FidelityAssessmentDeserializeV2::NativeCapsule => Ok(Self::NativeCapsule),
             FidelityAssessmentDeserializeV2::Unsupported => Ok(Self::Unsupported),
@@ -3831,6 +3832,39 @@ mod tests {
         let invalid = r#"{"kind":"structural","definite":[{"kind":"numeric_precision"}],"possible":[{"kind":"type_tag"}]}"#;
         let error = serde_json::from_str::<FidelityAssessmentV2>(invalid).unwrap_err();
         assert!(error.to_string().contains("subset"), "{error}");
+    }
+
+    #[test]
+    fn fidelity_v2_structural_definite_compatibility_normalizes_canonically() {
+        let expected = FidelityAssessmentV2::structural([], [AnnotationKind::TypeTag]).unwrap();
+        let canonical = r#"{"kind":"structural","definite":null,"possible":[{"kind":"type_tag"}]}"#;
+        let compatible = [
+            r#"{"kind":"structural","possible":[{"kind":"type_tag"}]}"#,
+            r#"{"kind":"structural","definite":null,"possible":[{"kind":"type_tag"}]}"#,
+            r#"{"kind":"structural","definite":[],"possible":[{"kind":"type_tag"}]}"#,
+        ];
+
+        for wire in compatible {
+            let decoded = serde_json::from_str::<FidelityAssessmentV2>(wire).unwrap();
+            assert_eq!(decoded, expected, "wire={wire}");
+            assert_eq!(serde_json::to_string(&decoded).unwrap(), canonical);
+        }
+    }
+
+    #[test]
+    fn fidelity_v2_empty_structural_bounds_decode_as_canonical_lossless() {
+        for wire in [
+            r#"{"kind":"structural","possible":[]}"#,
+            r#"{"kind":"structural","definite":null,"possible":[]}"#,
+            r#"{"kind":"structural","definite":[],"possible":[]}"#,
+        ] {
+            let decoded = serde_json::from_str::<FidelityAssessmentV2>(wire).unwrap();
+            assert_eq!(decoded, FidelityAssessmentV2::Lossless, "wire={wire}");
+            assert_eq!(
+                serde_json::to_string(&decoded).unwrap(),
+                r#"{"kind":"lossless"}"#
+            );
+        }
     }
 
     #[test]
