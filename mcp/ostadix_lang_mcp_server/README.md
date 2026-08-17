@@ -17,10 +17,13 @@ resolve an **absolute** `O_BACKENDS_DIR`, so relative `backends` and bare
 | `o_run` | Direct, ungated compatibility execution of any `.O` with absolute backends; relative input resolves once against `cwd` or the repository root, while an absolute path with no `cwd` runs from its parent directory |
 | `o_olangc` | `olangc` with `--shim-dir`; relative input/output resolves against the repository root |
 | `o_search_run` | Run `~/a18re/search/<name>.O` with correct env |
+| `o_information_inspect` | Fixed, bounded `o-info head` inspection of one existing local Information V1 root; returns sanitized IDs/count, no state path or authority, and makes no logical/content/inode/mode/mtime change (atime untested) |
 
 ## Build / install
 
 ```bash
+cd ~/Ostadix-lang
+cargo build --release --locked --package o-lang --bin O --bin olangc --bin o-info
 cd ~/Ostadix-lang/mcp/ostadix_lang_mcp_server
 cargo build --release --locked
 cp -f target/release/ostadix-mcp ~/.local/bin/ostadix-mcp
@@ -36,11 +39,33 @@ python3 scripts/smoke_ostadix_mcp.py
 ```
 
 The last command performs a real MCP initialize/list/call exchange and requires
-the root release `O` and `olangc` binaries. Under a deliberately system-only
+the root release `O`, `olangc`, and `o-info` binaries. Under a deliberately system-only
 `PATH`, it validates every tool's object schema, calls `o_runtimes`, `o_smoke`,
-both supported relative-path forms of `o_run`, and relative-path `o_olangc`.
+both supported relative-path forms of `o_run`, relative-path `o_olangc`, and
+fixed local Information V1 head inspection with a no-mutation tree comparison.
 The client drains stdout/stderr concurrently and retains out-of-order JSON-RPC
 replies by id.
+
+## Read-only Information inspection
+
+`o_information_inspect` accepts only an existing, non-symlink Information V1
+state root, one bounded head token, and a timeout. It resolves only the fixed
+repository `target/release/o-info` binary and rejects a symlink at that final
+component. The dedicated runner clears the inherited environment, captures
+stdout and stderr concurrently through hard byte limits, kills and reaps the
+process group on Unix (the direct child elsewhere) on overflow or timeout,
+rejects non-UTF-8/control/unexpected or duplicate output, and never returns raw
+stderr or the state path. It invokes
+only `o-info head --state ... --head ...`; no generic arguments, shell, cloud,
+or network surface is exposed.
+
+The root runtime remains an independent child: the MCP crate does not link
+`o-lang` or write Information logical state. `o-info head` uses
+`InformationStoreReaderV1`, which creates no directory/lock, repairs no mode,
+and updates no head. The sanitized result is descriptive metadata only.
+Information presence, a verified pack, World `signature_validated`, and Hosted
+self-signature consistency grant no execution authority, freshness, signer
+trust, or journal continuity.
 
 ## Same-intent execution gate
 

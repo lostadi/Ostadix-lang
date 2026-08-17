@@ -377,6 +377,7 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "src/information/projection.rs",
         "src/information/root.rs",
         "src/information/store.rs",
+        "src/information_bridge/mod.rs",
         "src/ir.rs",
         "src/lib.rs",
         "src/main.rs",
@@ -469,6 +470,7 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "tests/hosted_remote_cli.rs",
         "tests/hosted_remote_v2.rs",
         "tests/o_info_cli.rs",
+        "tests/information_bridge_v1.rs",
         "tests/placement_v6.rs",
         "tests/registry_v1.rs",
         "tests/project_hgraph.rs",
@@ -1642,6 +1644,32 @@ def _validate_workspace_facade_release_surface(files: dict[str, bytes]) -> None:
         r"pub\s+(?:use|type)\s+[^;]*\bBackendRegistry\b", source, re.DOTALL
     ):
         raise ReleaseError(f"{facade_source_path} must not expose BackendRegistry")
+    forbidden_bridge_symbols = (
+        "information_bridge",
+        "ParsedDocumentV1",
+        "ParsedDocumentInformationV1",
+        "PublicValueInformationV1",
+        "HGraphInformationV1",
+        "EvidenceInformationV1",
+        "RegistryProfileInformationV1",
+        "WorldReceiptInformationV1",
+        "ProjectGraphInformationV1",
+        "HostedJournalInformationV1",
+        "InformationBridgeErrorV1",
+        "project_parsed_document_v1",
+        "project_public_value_v1",
+        "project_hgraph_v1",
+        "project_evidence_v6",
+        "project_registry_profile_v1",
+        "project_world_receipt_v1",
+        "project_logical_hgraph_v1",
+        "project_hosted_journal_v2",
+    )
+    for symbol in forbidden_bridge_symbols:
+        if symbol in source:
+            raise ReleaseError(
+                f"{facade_source_path} must not expose experimental Information bridge symbol {symbol}"
+            )
     for declaration in (
         "pub struct Runtime",
         "pub struct RuntimeError",
