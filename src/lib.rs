@@ -9,6 +9,7 @@
 
 pub mod api;
 pub mod backend;
+pub(crate) mod backend_catalog;
 pub mod backend_morphism;
 mod canonical_cbor;
 mod capability;

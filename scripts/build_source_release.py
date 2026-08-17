@@ -326,6 +326,7 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "src/backend.rs",
         "src/backend_morphism.rs",
         "src/api.rs",
+        "src/backend_catalog.rs",
         "src/backend_catalog.inc.rs",
         "src/backend_state.rs",
         "src/canonical_cbor.rs",
