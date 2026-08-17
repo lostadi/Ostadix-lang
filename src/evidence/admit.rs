@@ -7,7 +7,8 @@ use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use crate::effects::{EffectSummary, ResourceKey};
+use crate::backend_catalog::ExecutionMode;
+use crate::effects::{EffectSummary, Fallibility, ResourceKey};
 use crate::execution_contract::Policy;
 use crate::hgraph::{AdmissionFactKind, EdgeId, HGraph, HNodeKind, NodeId, ReadySchedule};
 use crate::ir::{ExecutionPlan, OIrProgram, PlanEdgeKind, PlanNodeId, PlanNodeKind};
@@ -19,9 +20,10 @@ use super::analyze::{
     oir_sha256,
 };
 use super::fact::{
-    BackendArtifactV1, DispatchAdapterV1, DispatchLaneV1, DispatchSemanticsV1, EvidenceBindingsV2,
-    EvidenceBundleV5, NodeEvidence, PlacementContractV1, RuntimeBindingV1, RuntimeSnapshotKindV1,
-    ADMISSION_SCHEMA_V5, ANALYZER_ID_V5, EVIDENCE_SCHEMA_V5,
+    BackendArtifactStateV1, BackendArtifactV1, DispatchAdapterV1, DispatchLaneV1,
+    DispatchSemanticsV1, EvidenceBindingsV2, EvidenceBundleV5, FailureClassV1, NodeEvidence,
+    PlacementContractV1, RuntimeBindingV1, RuntimeSnapshotKindV1, ADMISSION_SCHEMA_V5,
+    ANALYZER_ID_V5, EVIDENCE_SCHEMA_V5,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -523,7 +525,7 @@ impl ExecutionAdmissionV5 {
                 artifact.state.name(),
                 artifact.state.sha256().unwrap_or("none"),
                 match &artifact.state {
-                    crate::evidence::BackendArtifactStateV1::Unreadable { error_kind } => {
+                    BackendArtifactStateV1::Unreadable { error_kind } => {
                         format!(" error-kind={error_kind}")
                     }
                     _ => String::new(),
@@ -1473,11 +1475,11 @@ fn validate_node_evidence(
                 || !((strict_semantics
                     && (summary.is_verified_pure_infallible()
                         || evidence.failure_contract.class
-                            == crate::evidence::FailureClassV1::MayFailNoExternalEffects))
+                            == FailureClassV1::MayFailNoExternalEffects))
                     || (explicitly_autonomous_shim
                         && autonomous_semantics
                         && evidence.failure_contract.class
-                            == crate::evidence::FailureClassV1::MayFailUnorderedExternalEffects))
+                            == FailureClassV1::MayFailUnorderedExternalEffects))
             {
                 bail!(
                     "operation {} has an unsafe worker dispatch claim",
@@ -1518,9 +1520,7 @@ fn explain_hosted_task_layers(
         .nodes
         .iter()
         .filter_map(|node| match &node.kind {
-            PlanNodeKind::Exec { backend, .. }
-                if backend.execution == crate::backend_catalog::ExecutionMode::Shim =>
-            {
+            PlanNodeKind::Exec { backend, .. } if backend.execution == ExecutionMode::Shim => {
                 Some(node.id)
             }
             _ => None,
@@ -1772,8 +1772,8 @@ fn sequence_reason(
         || right.unknown
         || !left.writes.is_empty()
         || !right.writes.is_empty()
-        || !matches!(left.fallibility, crate::effects::Fallibility::Infallible)
-        || !matches!(right.fallibility, crate::effects::Fallibility::Infallible)
+        || !matches!(left.fallibility, Fallibility::Infallible)
+        || !matches!(right.fallibility, Fallibility::Infallible)
     {
         return SequenceRetentionReasonV1::StrictFailStopUnproven;
     }
@@ -1789,7 +1789,7 @@ fn inside_left_to_right_region(plan: &ExecutionPlan, node: PlanNodeId) -> bool {
             matches!(
                 kind,
                 PlanNodeKind::Exec { backend, .. }
-                    if backend.execution == crate::backend_catalog::ExecutionMode::InlineAst
+                    if backend.execution == ExecutionMode::InlineAst
                         && backend.canonical == "O"
             )
         })

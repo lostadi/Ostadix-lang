@@ -213,6 +213,7 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "README.md",
         "SECURITY.md",
         "boot-and-test.sh",
+        "ci/architecture-roots.toml",
         "ci/required-jobs.toml",
         "ci/test-suites.toml",
         "rust-toolchain.toml",
