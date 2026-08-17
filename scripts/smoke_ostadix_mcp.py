@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -23,12 +24,32 @@ EXPECTED_TOOLS = {
     "o_doctor",
     "o_env",
     "o_execute_intent",
+    "o_information_inspect",
     "o_olangc",
     "o_run",
     "o_runtimes",
     "o_search_run",
     "o_smoke",
 }
+
+
+def _snapshot_tree(root: Path) -> tuple[tuple[Any, ...], ...]:
+    entries: list[tuple[Any, ...]] = []
+    for path in sorted(root.rglob("*")):
+        metadata = path.lstat()
+        digest = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+        entries.append(
+            (
+                path.relative_to(root).as_posix(),
+                path.is_dir(),
+                metadata.st_ino,
+                metadata.st_mode,
+                metadata.st_size,
+                metadata.st_mtime_ns,
+                digest,
+            )
+        )
+    return tuple(entries)
 
 
 class SmokeError(RuntimeError):
@@ -188,6 +209,27 @@ def run_smoke(root: Path, binary: Path, timeout: float) -> None:
     intent_fixture = tempfile.TemporaryDirectory(
         prefix=".mcp-intent-smoke-", dir=root
     )
+    information_fixture = tempfile.TemporaryDirectory(
+        prefix=".mcp-information-smoke-", dir=root
+    )
+    information_state = Path(information_fixture.name) / "state"
+    o_info = root / "target/release/o-info"
+    if not o_info.is_file():
+        raise SmokeError(f"fixed local o-info binary is missing: {o_info}")
+    initialized_information = subprocess.run(
+        [os.fspath(o_info), "init", "--state", os.fspath(information_state)],
+        cwd=root,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if initialized_information.returncode != 0:
+        raise SmokeError(
+            "could not initialize MCP information smoke state: "
+            + initialized_information.stderr.decode("utf-8", "replace")
+        )
+    information_before = _snapshot_tree(information_state)
     intent_program = Path(intent_fixture.name) / "intent.O"
     intent_marker = Path(intent_fixture.name) / "executed.marker"
 
@@ -606,6 +648,66 @@ def run_smoke(root: Path, binary: Path, timeout: float) -> None:
             raise SmokeError(
                 f"mismatched intent attempt did not consume its handle:\n{mismatch_replay_text}"
             )
+
+        _send(
+            process,
+            {
+                "jsonrpc": "2.0",
+                "id": 18,
+                "method": "tools/call",
+                "params": {
+                    "name": "o_information_inspect",
+                    "arguments": {
+                        "state": os.fspath(information_state),
+                        "head": "main",
+                        "timeout_secs": 10,
+                    },
+                },
+            },
+        )
+        information_result = responses.response(18, timeout)
+        information_text = _content_text(information_result)
+        if information_result.get("isError") is True:
+            raise SmokeError(
+                f"o_information_inspect failed on initialized local state:\n{information_text}"
+            )
+        required_information = {
+            "head=main",
+            "facts=0",
+            "authority=information presence and signatures grant no execution authority",
+            "source=local-o-info-read-only",
+        }
+        if not all(marker in information_text for marker in required_information):
+            raise SmokeError(
+                f"o_information_inspect omitted bounded records:\n{information_text}"
+            )
+        if os.fspath(information_state) in information_text or "state=" in information_text:
+            raise SmokeError(
+                f"o_information_inspect leaked its request-local state path:\n{information_text}"
+            )
+        if _snapshot_tree(information_state) != information_before:
+            raise SmokeError("o_information_inspect mutated the local information store")
+
+        _send(
+            process,
+            {
+                "jsonrpc": "2.0",
+                "id": 19,
+                "method": "tools/call",
+                "params": {
+                    "name": "o_information_inspect",
+                    "arguments": {
+                        "state": os.fspath(information_state),
+                        "head": "../main",
+                    },
+                },
+            },
+        )
+        invalid_information = responses.response(19, timeout)
+        if invalid_information.get("isError") is not True:
+            raise SmokeError("o_information_inspect accepted a non-token head name")
+        if _snapshot_tree(information_state) != information_before:
+            raise SmokeError("rejected information inspection mutated the local store")
     finally:
         if process.stdin is not None:
             try:
@@ -623,6 +725,7 @@ def run_smoke(root: Path, binary: Path, timeout: float) -> None:
         stderr = stderr_capture.read().decode("utf-8", "replace")
         stderr_capture.close()
         intent_fixture.cleanup()
+        information_fixture.cleanup()
         if process.returncode != 0:
             raise SmokeError(
                 f"ostadix-mcp exited {process.returncode}; stderr:\n{stderr}"
