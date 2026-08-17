@@ -75,10 +75,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use o_lang::eval::{Evaluator, Policy};
+use o_lang::eval::Evaluator;
 use o_lang::evidence::{
     admit_execution, analyze_execution, runtime_binding_from_adapter_bytes, ExecutionIntentV1,
 };
+use o_lang::execution_contract::Policy;
 use o_lang::ir::{OIrProgram, PlanNodeId};
 use o_lang::parser::Parser;
 use o_lang::shims::read_shims;
@@ -101,6 +102,7 @@ const RUNTIME_PARSER_RS: &str = include_str!("../parser.rs");
 const RUNTIME_IR_RS: &str = include_str!("../ir.rs");
 const RUNTIME_BACKEND_CATALOG_MODULE_RS: &str = include_str!("../backend_catalog.rs");
 const RUNTIME_BACKEND_CATALOG_DATA_RS: &str = include_str!("../backend_catalog.inc.rs");
+const RUNTIME_EXECUTION_CONTRACT_RS: &str = include_str!("../execution_contract.rs");
 const RUNTIME_EVAL_RS: &str = include_str!("../eval.rs");
 const RUNTIME_PROCESS_RS: &str = include_str!("../process.rs");
 const RUNTIME_BACKEND_RS: &str = include_str!("../backend.rs");
@@ -1233,6 +1235,10 @@ fn write_runtime_sources(src_dir: &Path) -> Result<()> {
         src_dir.join("backend_catalog.inc.rs"),
         RUNTIME_BACKEND_CATALOG_DATA_RS,
     )?;
+    fs::write(
+        src_dir.join("execution_contract.rs"),
+        RUNTIME_EXECUTION_CONTRACT_RS,
+    )?;
     fs::write(src_dir.join("eval.rs"), RUNTIME_EVAL_RS)?;
     fs::write(src_dir.join("process.rs"), RUNTIME_PROCESS_RS)?;
     fs::write(src_dir.join("backend.rs"), RUNTIME_BACKEND_RS)?;
@@ -2092,6 +2098,7 @@ pub mod placement;
 pub mod registry;
 pub mod ir;
 pub mod effects;
+pub mod execution_contract;
 pub mod evidence;
 pub mod hgraph;
 pub mod executor;
@@ -2868,6 +2875,7 @@ mod tests {
 
         let lib_rs = fs::read_to_string(src_dir.join("lib.rs")).unwrap();
         assert!(lib_rs.contains("pub mod effects;"));
+        assert!(lib_rs.contains("pub mod execution_contract;"));
         assert!(lib_rs.contains("pub mod environment;"));
         assert!(lib_rs.contains("pub(crate) mod backend_catalog;"));
         assert!(lib_rs.contains("pub mod backend_morphism;"));
@@ -2895,6 +2903,7 @@ mod tests {
             "syntax_dialect.rs",
             "environment.rs",
             "effects.rs",
+            "execution_contract.rs",
             "runtime_exec.rs",
             "placement/mod.rs",
             "placement/projection.rs",
@@ -2994,6 +3003,11 @@ mod tests {
             fs::read_to_string(src_dir.join("effects.rs")).unwrap(),
             RUNTIME_EFFECTS_RS,
             "generated runtimes must receive the shared semantic effect model verbatim"
+        );
+        assert_eq!(
+            fs::read_to_string(src_dir.join("execution_contract.rs")).unwrap(),
+            RUNTIME_EXECUTION_CONTRACT_RS,
+            "generated runtimes must receive the canonical execution contract verbatim"
         );
         assert_eq!(
             fs::read_to_string(src_dir.join("dispatch_model.rs")).unwrap(),
@@ -3187,6 +3201,8 @@ mod tests {
 };
 use ostadix_generated_serde::placement::SemanticDigestV1;
 use ostadix_generated_serde::placement::protocol::SemanticDigestV1 as NestedSemanticDigestV1;
+use ostadix_generated_serde::execution_contract::Policy as CanonicalPolicy;
+use ostadix_generated_serde::eval::Policy as CompatibilityPolicy;
 use ostadix_generated_serde::registry::bundle::{
     BackendRegistry, IntegerExactness, BACKEND_CATALOG_CURRENT_SCHEMA,
     BACKEND_CATALOG_SCHEMA_V4,
@@ -3231,6 +3247,14 @@ fn world_artifact_id_is_the_shared_identity_in_generated_aot_runtime() {
 
     assert_eq!(shared_again, shared);
     assert_eq!(through_world_identity_module, shared);
+}
+
+#[test]
+fn execution_policy_is_one_type_in_generated_aot_runtime() {
+    let compatibility: CompatibilityPolicy = CanonicalPolicy::Autonomous;
+    let canonical: CanonicalPolicy = compatibility;
+    assert_eq!(canonical.name(), "autonomous");
+    assert_eq!(CanonicalPolicy::from_name(canonical.name()), Some(canonical));
 }
 "#,
         )
