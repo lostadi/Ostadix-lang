@@ -152,16 +152,21 @@ Admission version and backend-catalog generation are separate version axes.
 `O version --json` reports the independent coordinates compiled into the
 interpreter; [VERSIONING.md](docs/VERSIONING.md) defines their compatibility
 rules.
-The current authorizing catalog is `ostadix.backend-catalog/v4`; its schema is
+The current authorizing catalog is `ostadix.backend-catalog/v5`; its schema is
 part of both the whole-catalog digest and every backend-specification digest.
-A placement profile that advertises any V3 backend identity remains decodable
+A placement profile that advertises any V4 or older backend identity remains decodable
 and independently auditable, but fails current profile validation before it can
 authorize candidate selection or warrant discharge. There is no digest
-relabeling or silent V3-to-V4 uplift. V4 additionally binds each backend's
-state-support tier and snapshot-compatibility identity. Rebuild the runtime and
-MCP server, then regenerate short-lived profiles and all derived placement
-evidence after this rollover. The exact boundary and regeneration sequence are in
-[Hosted Placement V6](docs/HOSTED_PLACEMENT_V6.md#backend-catalog-v4-hard-rollover).
+relabeling or silent V4-to-V5 uplift. V4 remains the archival generation that
+added each backend's state-support tier and snapshot-compatibility identity.
+V5 extends that frozen projection with one explicit optional bounded
+backend-morphism profile: Python, JavaScript, and Rust are profiled, while the
+other 27 canonical backends explicitly are not. This changes catalog identity,
+not `BackendInterface`, HGraph facts, graph hashing, evidence/admission schemas,
+or execution behavior. Rebuild the runtime and MCP server, then regenerate
+short-lived profiles and all derived placement evidence after this rollover. The
+exact boundary and regeneration sequence are in [Hosted Placement
+V6](docs/HOSTED_PLACEMENT_V6.md#backend-catalog-v5-hard-rollover).
 
 Current implementation identity also uses the path-independent
 `ostadix/backend-executable-set/v2` projection and
