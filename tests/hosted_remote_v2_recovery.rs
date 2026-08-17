@@ -11,6 +11,7 @@ use o_lang::backend::state::{
     sandbox_policy_sha256, BackendCheckpointV1, BackendStateTierV1, EvaluatorActorCheckpointV1,
     EvaluatorStateSnapshotV1,
 };
+use o_lang::backend_state as canonical_backend_state;
 use o_lang::eval::{Evaluator, PlacementFragmentBindingsV1};
 use o_lang::hosted_remote::v2::{
     build_local_dev_placement_proof_v2, open_capability_commitment_v2, ActorHealthV2,
@@ -43,6 +44,18 @@ const NODE_ID: &str = "node-v2-recovery-test";
 const CLOSE_HEADROOM: u64 = 64 * 1024;
 const ACTOR_FENCE_HEADROOM: u64 = 64 * 1024;
 const AUTHORITY_CONTROL_HEADROOM: u64 = 16 * 1024;
+
+#[test]
+fn backend_state_root_and_legacy_paths_share_one_type_identity() {
+    let canonical = canonical_backend_state::BackendStateTierV1::SemanticSnapshot;
+    let legacy: BackendStateTierV1 = canonical;
+    let canonical_again: canonical_backend_state::BackendStateTierV1 = legacy;
+
+    assert_eq!(
+        canonical_again,
+        canonical_backend_state::BackendStateTierV1::SemanticSnapshot
+    );
+}
 
 fn digest(label: &str) -> SemanticDigestV1 {
     SemanticDigestV1::hash_bytes("ostadix/hosted-v2-recovery-test/v1", label.as_bytes())

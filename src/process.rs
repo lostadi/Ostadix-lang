@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
-use crate::backend::state::{
+use crate::backend_state::{
     ensure_evaluator_snapshot_bound, sandbox_policy_sha256, BackendCheckpointV1,
     BackendRestoreReceiptV1, BackendStateCapabilitiesV1, BackendStateTierV1, BackendWireCommandV2,
     BackendWireResponseV2, EvaluatorActorCheckpointV1, EvaluatorStateSnapshotV1,
@@ -938,7 +938,7 @@ impl BackendProcess {
         match self.recv_response_timeout(backend_operation_timeout())? {
             BackendWireResponseV2::CheckpointV1 { checkpoint } => {
                 checkpoint.validate()?;
-                crate::backend::state::ensure_checkpoint_bound(&checkpoint, max_bytes)?;
+                crate::backend_state::ensure_checkpoint_bound(&checkpoint, max_bytes)?;
                 Ok(checkpoint)
             }
             BackendWireResponseV2::StatePinRequiredV1 { reason } => {

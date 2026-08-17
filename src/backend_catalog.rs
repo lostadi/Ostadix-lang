@@ -2137,7 +2137,7 @@ mod tests {
         );
         let expected_sql_codec = crate::placement::SemanticDigestV1::hash_bytes(
             "ostadix/backend-state-codec-name/v2",
-            crate::backend::state::SQL_CLI_CODEC_V1.as_bytes(),
+            crate::backend_state::SQL_CLI_CODEC_V1.as_bytes(),
         );
         assert_eq!(
             registry.state_support_for("sql"),
