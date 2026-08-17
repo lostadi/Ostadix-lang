@@ -339,6 +339,7 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "src/evidence/profile.rs",
         "src/effects.rs",
         "src/eval.rs",
+        "src/execution_contract.rs",
         "src/hosted_remote/client.rs",
         "src/hosted_remote/mod.rs",
         "src/hosted_remote/node.rs",

@@ -23,6 +23,7 @@ class Rule:
     paths: tuple[str, ...]
     forbidden_modules: tuple[str, ...]
     reason: str
+    allowed_modules: tuple[str, ...] | None = None
 
 
 PLACEMENT_PROTOCOL_PATHS = (
@@ -50,18 +51,18 @@ EXPLICIT_PATH_MODULE_ROOTS = (
 RULES = (
     Rule(
         ("src/parser.rs",),
-        ("ir", "registry"),
-        "syntax must depend only on its narrow dialect projection, not IR or the executable registry",
+        ("execution_contract", "ir", "registry"),
+        "syntax must depend only on its narrow dialect projection, not the execution contract, IR, or the executable registry",
     ),
     Rule(
         ("src/syntax_dialect.rs",),
-        ("ir", "registry", "runtime_exec"),
+        ("execution_contract", "ir", "registry", "runtime_exec"),
         "the syntax-dialect contract must remain a capability-free model boundary",
     ),
     Rule(
         ("src/ir.rs",),
-        ("hgraph", "placement", "placement_protocol", "registry"),
-        "IR must not depend on its HGraph or placement projections and must depend directly on the canonical backend catalog rather than registry compatibility projections",
+        ("execution_contract", "hgraph", "placement", "placement_protocol", "registry"),
+        "IR must not depend on its execution-contract projection, its HGraph or placement projections, and must depend directly on the canonical backend catalog rather than registry compatibility projections",
     ),
     Rule(
         ("src/backend_catalog.rs",),
@@ -69,6 +70,7 @@ RULES = (
             "backend",
             "eval",
             "evidence",
+            "execution_contract",
             "executor",
             "hgraph",
             "ir",
@@ -81,9 +83,55 @@ RULES = (
         "the canonical backend catalog must remain below backend realization, IR, analysis, execution, scheduling, registry storage, public placement projections, and World",
     ),
     Rule(
+        ("src/execution_contract.rs",),
+        (
+            "api",
+            "backend",
+            "backend_morphism",
+            "backend_state",
+            "canonical_cbor",
+            "capability",
+            "dispatch_model",
+            "environment",
+            "eval",
+            "eval_core",
+            "evidence",
+            "executor",
+            "hgraph",
+            "hosted_remote",
+            "information",
+            "kernel_world",
+            "live_system",
+            "nix_ops",
+            "nixos_ops",
+            "ocore",
+            "parser",
+            "placement",
+            "placement_protocol",
+            "process",
+            "project",
+            "registry",
+            "resource_identity",
+            "runtime_exec",
+            "scheduler",
+            "shims",
+            "syntax_dialect",
+            "version",
+            "wire",
+            "world",
+        ),
+        "the canonical execution contract may depend directly only on backend_catalog, effects, ir, and value",
+        allowed_modules=("backend_catalog", "effects", "ir", "value"),
+    ),
+    Rule(
         ("src/effects.rs",),
-        ("world",),
-        "the effect vocabulary must depend on shared identities, not World",
+        ("execution_contract", "world"),
+        "the effect vocabulary must remain below the execution contract and depend on shared identities, not World",
+    ),
+    Rule(
+        ("src/value.rs",),
+        ("execution_contract",),
+        "the runtime value vocabulary must remain below the execution contract",
     ),
     Rule(
         (
@@ -93,8 +141,13 @@ RULES = (
             "src/evidence/intent.rs",
             "src/evidence/profile.rs",
         ),
-        ("executor",),
-        "evidence must bind a dispatch model rather than import its executor",
+        ("eval", "executor"),
+        "evidence must bind the canonical execution contract and dispatch model rather than import evaluator or executor realizations",
+    ),
+    Rule(
+        ("src/world/grounding.rs",),
+        ("eval",),
+        "World grounding must consume the canonical execution contract rather than evaluator realization internals",
     ),
     Rule(
         ("src/dispatch_model.rs",),
@@ -109,6 +162,7 @@ RULES = (
             "effects",
             "eval",
             "evidence",
+            "execution_contract",
             "executor",
             "hgraph",
             "hosted_remote",
@@ -940,7 +994,12 @@ def findings(root: Path) -> list[str]:
                     f"{relative}:{line}: {violation.message}; governed architecture surfaces require explicit root paths"
                 )
             for dependency in dependencies:
-                if dependency.module not in rule.forbidden_modules:
+                explicitly_forbidden = dependency.module in rule.forbidden_modules
+                outside_allowlist = (
+                    rule.allowed_modules is not None
+                    and dependency.module not in rule.allowed_modules
+                )
+                if not explicitly_forbidden and not outside_allowlist:
                     continue
                 line = source.count("\n", 0, dependency.offset) + 1
                 failures.append(

@@ -597,6 +597,7 @@ class SourceReleaseTests(unittest.TestCase):
             "src/evidence/profile.rs": "// fixture non-authoritative cost profiles\n",
             "src/effects.rs": "// fixture governed effect vocabulary\n",
             "src/eval.rs": "// fixture evaluator state bridge\n",
+            "src/execution_contract.rs": "// fixture canonical execution contract\n",
             "src/runtime_exec.rs": "// fixture direct-launch executable authority\n",
             "src/syntax_dialect.rs": "// fixture parser syntax dialect\n",
             "src/bin/o-info.rs": "// fixture local information CLI\n",
@@ -1042,6 +1043,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "src/evidence/profile.rs",
                 "src/effects.rs",
                 "src/eval.rs",
+                "src/execution_contract.rs",
                 "src/runtime_exec.rs",
                 "src/syntax_dialect.rs",
                 "src/bin/o-info.rs",
@@ -1643,6 +1645,7 @@ class SourceReleaseTests(unittest.TestCase):
             "src/backend_state.rs",
             "src/backend_catalog.rs",
             "src/eval.rs",
+            "src/execution_contract.rs",
             "docs/HOSTED_PLACEMENT_V6.md",
             "setup.sh",
             "src/bin/o-node.rs",
@@ -1977,6 +1980,7 @@ class SourceReleaseTests(unittest.TestCase):
             "src/evidence/profile.rs",
             "src/backend_catalog.rs",
             "src/backend_catalog.inc.rs",
+            "src/execution_contract.rs",
             "src/runtime_exec.rs",
         )
         self._git("commit", "-q", "-m", "remove evidence-bound admission surface")
@@ -1988,6 +1992,7 @@ class SourceReleaseTests(unittest.TestCase):
             r"src/evidence/admit\.rs.*"
             r"src/evidence/analyze\.rs.*src/evidence/fact\.rs.*"
             r"src/evidence/intent\.rs.*src/evidence/mod\.rs.*src/evidence/profile\.rs.*"
+            r"src/execution_contract\.rs.*"
             r"src/runtime_exec\.rs",
         ):
             self._build("missing-evidence-bound-admission.zip")

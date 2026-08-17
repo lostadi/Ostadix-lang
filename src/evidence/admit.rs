@@ -8,7 +8,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::effects::{EffectSummary, ResourceKey};
-use crate::eval::Policy;
+use crate::execution_contract::Policy;
 use crate::hgraph::{AdmissionFactKind, EdgeId, HGraph, HNodeKind, NodeId, ReadySchedule};
 use crate::ir::{ExecutionPlan, OIrProgram, PlanEdgeKind, PlanNodeId, PlanNodeKind};
 use crate::placement::SemanticDigestV1;
@@ -387,7 +387,7 @@ impl ExecutionAdmissionV5 {
                 schema: self.schema,
                 analyzer: self.analyzer,
                 runtime_snapshot_kind: self.runtime_snapshot_kind.name(),
-                base_policy: policy_name(self.base_policy),
+                base_policy: self.base_policy.name(),
                 bindings: ScheduleExplanationBindingsV1 {
                     lowered_oir_sha256: self.bindings.oir_sha256.clone(),
                     plan_sha256: self.bindings.plan_sha256.clone(),
@@ -1327,11 +1327,7 @@ pub fn admit_execution<'a>(
         placement_admission_digest(&expected_bindings, &admitted_graph_sha256, base_policy);
     let admission_sha256 = digest_fields(
         "ostadix-execution-admission/v5",
-        &[
-            &evidence_sha256,
-            &admitted_graph_sha256,
-            policy_name(base_policy),
-        ],
+        &[&evidence_sha256, &admitted_graph_sha256, base_policy.name()],
     );
 
     let admission = ExecutionAdmissionV5 {
@@ -1375,7 +1371,7 @@ fn placement_admission_digest(
             &bindings.analyzed_graph_sha256,
             admitted_graph_sha256,
             &bindings.backend_catalog_projection_sha256,
-            policy_name(base_policy),
+            base_policy.name(),
         ],
     );
     SemanticDigestV1::from_sha256(digest)
@@ -1797,14 +1793,6 @@ fn inside_left_to_right_region(plan: &ExecutionPlan, node: PlanNodeId) -> bool {
                         && backend.canonical == "O"
             )
         })
-}
-
-fn policy_name(policy: Policy) -> &'static str {
-    match policy {
-        Policy::Eager => "eager",
-        Policy::Lazy => "lazy",
-        Policy::Autonomous => "autonomous",
-    }
 }
 
 fn resources_text(resources: &[ResourceKey]) -> String {
