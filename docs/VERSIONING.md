@@ -30,6 +30,7 @@ authorized, that an information projection is fresh, or that a World is live.
 | Placement milestone | Hosted Placement V6 | `docs/HOSTED_PLACEMENT_V6.md` | A placement/evidence milestone name, not a source-level schema constant and not an automatic conversion from archival Admission V5. |
 | World wire family | V1 | `src/world/protocol.rs` `WORLD_SCHEMA_V1`; codec constants under `src/world/` | Offline World record, identity, value, and receipt codecs. These coordinates do not establish a live World. |
 | Information kernel family | V1 | `INFORMATION_SCHEMA_V1` and record constants under `src/information/` | Authority-free, immutable information identities, deltas, projections, and receipts. Each record validates its own exact schema. |
+| Information native bridge | V1 | `INFORMATION_BRIDGE_SCHEMA_V1` and record constants under `src/information_bridge/mod.rs` | Eight explicit, lossy, authority-free native metadata projections. This leaf family is independent of native record versions and does not replace their identities. |
 
 “V6” in Hosted Placement V6 names the placement milestone and placement-evidence
 model; it is not a promise that every schema or transport is numerically version
@@ -112,6 +113,34 @@ records retain their own coordinates:
 independently labeled wire schema. Changing its serialized meaning therefore
 requires advancing the containing receipt coordinate.
 
+### Information-bridge V1 coordinates
+
+The bridge family is `ostadix.information-bridge/v1` with media type
+`application/cbor`. Its eight exact record coordinates are:
+
+| Record | Coordinate |
+|---|---|
+| Parsed document | `ostadix.info-bridge-parsed-document/v1` |
+| Caller-public scalar | `ostadix.info-bridge-public-value/v1` |
+| HGraph metadata | `ostadix.info-bridge-hgraph/v1` |
+| Evidence metadata | `ostadix.info-bridge-evidence/v1` |
+| Registry profile metadata | `ostadix.info-bridge-registry-profile/v1` |
+| World receipt metadata | `ostadix.info-bridge-world-receipt/v1` |
+| Project graph metadata | `ostadix.info-bridge-project-graph/v1` |
+| Hosted journal metadata | `ostadix.info-bridge-hosted-journal/v1` |
+
+HGraph and Evidence use separate
+`HGRAPH_METADATA_PROJECTION_DIGEST_DOMAIN_V1` and
+`EVIDENCE_METADATA_PROJECTION_DIGEST_DOMAIN_V1` domains over only their
+exported allowlists. Registry node, Hosted session, and Hosted entry/link
+identities use their separate bridge domains. These are lossy projection or
+equality coordinates, not the Graph V2/Evidence V6/native journal identities,
+privacy primitives, or authority. The package version report remains unchanged:
+these experimental source constants are authoritative, and adding a report
+field would require a separately versioned report-schema change. The advanced
+root `o_lang::api` exports the bridge; stable `ostadix-api` and generated AOT
+do not.
+
 These V1 records describe canonical, provenance-bearing facts and certified
 projections. A matching root or receipt is not execution authority, placement
 admission, runtime availability, freshness beyond its declared preconditions,
@@ -171,6 +200,10 @@ never authorize a current Catalog V5-backed placement V2.
   compile both default members.
 - The new publishable `ostadix-api = 0.3.0` facade depends exactly on
   `o-lang = 0.3.0`, so releases publish the root crate before the facade.
+- `ParsedDocumentV1.nodes` is now private before the 0.3 tag. Use `nodes()` for
+  borrowed access or `into_nodes()` for owned extraction. Its derived equality
+  also includes parser-captured source SHA-256 and length. The stable
+  `ostadix-api` facade did not expose this type and remains source-unchanged.
 
 ## Changing a coordinate
 
