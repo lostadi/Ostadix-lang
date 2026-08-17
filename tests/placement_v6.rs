@@ -16,7 +16,8 @@ use o_lang::placement::{
     WarrantTierV1,
 };
 use o_lang::registry::bundle::{
-    LOCAL_BACKEND_PROTOCOL_ABI_V1, LOCAL_REALIZATION_DIGEST_DOMAIN_V1, LOCAL_REALIZATION_SCHEMA_V1,
+    BACKEND_CATALOG_SCHEMA_V5, LOCAL_BACKEND_PROTOCOL_ABI_V1, LOCAL_REALIZATION_DIGEST_DOMAIN_V1,
+    LOCAL_REALIZATION_SCHEMA_V1,
 };
 use o_lang::world::ArtifactId;
 
@@ -186,9 +187,18 @@ fn placement_v1_canonical_bytes_and_digests_are_pinned() {
 
 #[test]
 fn noncurrent_catalog_profiles_remain_inspectable_but_cannot_authorize() {
-    let obsolete_specification = digest(250);
-    assert!(!BackendRegistry::global()
-        .contains_specification_sha256(obsolete_specification.as_sha256()));
+    let registry = BackendRegistry::global();
+    let obsolete_specification = SemanticDigestV1::from_sha256(
+        registry
+            .specification_sha256_v4("python")
+            .expect("archival Python V4 specification"),
+    )
+    .unwrap();
+    assert_eq!(
+        obsolete_specification.as_sha256(),
+        "0802014cbcadb8e7302ccf4f542d0b08eb5ccb05d41caffdac359e392145dcbf"
+    );
+    assert!(!registry.contains_specification_sha256(obsolete_specification.as_sha256()));
     let descriptor = target(
         "legacy-node",
         "legacy catalog node",
@@ -217,7 +227,7 @@ fn noncurrent_catalog_profiles_remain_inspectable_but_cannot_authorize() {
             specification,
             current_schema,
         }) if specification == obsolete_specification.as_sha256()
-            && current_schema == "ostadix.backend-catalog/v4"
+            && current_schema == BACKEND_CATALOG_SCHEMA_V5
     ));
 }
 
@@ -242,15 +252,15 @@ fn current_catalog_state_support_is_exact_and_alias_stable() {
         })
     ));
 
-    let legacy_python = SemanticDigestV1::from_sha256(
+    let legacy_python_v4 = SemanticDigestV1::from_sha256(
         registry
-            .specification_sha256_v3("python")
-            .expect("archival Python V3 identity"),
+            .specification_sha256_v4("python")
+            .expect("archival Python V4 identity"),
     )
     .unwrap();
-    assert!(!registry.contains_current_specification(&legacy_python));
+    assert!(!registry.contains_current_specification(&legacy_python_v4));
     assert_eq!(
-        registry.state_support_for_current_specification(&legacy_python),
+        registry.state_support_for_current_specification(&legacy_python_v4),
         None
     );
 }
@@ -303,7 +313,7 @@ fn current_catalog_rejects_legacy_realization_with_a_current_specification() {
             realization_pipeline,
             current_schema,
         }) if realization_pipeline == legacy_pipeline.as_sha256()
-            && current_schema == "ostadix.backend-catalog/v4"
+            && current_schema == BACKEND_CATALOG_SCHEMA_V5
     ));
 }
 

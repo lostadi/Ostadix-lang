@@ -3227,19 +3227,24 @@ use ostadix_generated_serde::placement::protocol::SemanticDigestV1 as NestedSema
 use ostadix_generated_serde::execution_contract::Policy as CanonicalPolicy;
 use ostadix_generated_serde::eval::Policy as CompatibilityPolicy;
 use ostadix_generated_serde::registry::bundle::{
-    BackendRegistry, IntegerExactness, BACKEND_CATALOG_CURRENT_SCHEMA,
-    BACKEND_CATALOG_SCHEMA_V4,
+    BackendMorphismProfileV1, BackendRegistry, IntegerExactness,
+    BACKEND_CATALOG_CURRENT_SCHEMA, BACKEND_CATALOG_SCHEMA_V4, BACKEND_CATALOG_SCHEMA_V5,
 };
 use ostadix_generated_serde::{resource_identity, world};
 
 #[test]
 fn catalog_placement_and_checkpoint_sources_are_live() {
-    assert_eq!(BACKEND_CATALOG_CURRENT_SCHEMA, BACKEND_CATALOG_SCHEMA_V4);
+    assert_eq!(BACKEND_CATALOG_CURRENT_SCHEMA, BACKEND_CATALOG_SCHEMA_V5);
+    assert_eq!(BACKEND_CATALOG_SCHEMA_V4, "ostadix.backend-catalog/v4");
     let rust = BackendRegistry::global().interface_for("rust");
     assert!(matches!(
         rust.value_capabilities.integer_exactness,
         IntegerExactness::TwosComplementBits(63)
     ));
+    assert_eq!(
+        BackendRegistry::global().morphism_profile_for("rust"),
+        Some(BackendMorphismProfileV1::RustSourceConstantStdout)
+    );
 
     let runtime = SemanticDigestV1::hash_bytes(
         "ostadix/generated-runtime-closure-test/v1",
