@@ -7,6 +7,14 @@ Package SemVer is only one of the independent coordinates documented in
 
 ## [Unreleased]
 
+### Changed
+
+- Backend catalog V5 now binds the explicit optional BackendMorphism V1 profile
+  assignment for all 30 canonical backends. Archival V4 hashes remain frozen;
+  the three profiled crossings remain shadow-only and do not change
+  `BackendInterface`, HGraph solving, graph hashing, evidence/admission schemas,
+  or execution behavior.
+
 ## [0.2.0] - 2026-08-16
 
 Release notes: [docs/releases/v0.2.0.md](docs/releases/v0.2.0.md).
