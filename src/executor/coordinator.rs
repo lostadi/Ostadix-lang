@@ -19,8 +19,9 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{bail, Result};
 
 use crate::effects::EffectSummary;
-use crate::eval::{derive_policy_contexts, Evaluator, ExecutionTrace, GraphEvalFrame, Policy};
+use crate::eval::{derive_policy_contexts, Evaluator, ExecutionTrace, GraphEvalFrame};
 use crate::evidence::{AdmittedExecution, DispatchAdapterV1, DispatchLaneV1, FailureClassV1};
+use crate::execution_contract::Policy;
 use crate::hgraph::{schedule::ReadySchedule, NodeId, ValueState};
 use crate::ir::{ExecutionPlan, OIr, OIrProgram, PlanNodeId, PlanNodeKind};
 use crate::value::OValue;
