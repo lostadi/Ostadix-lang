@@ -1660,7 +1660,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_v1_through_v4_archive_coordinates_are_explicit_and_v5_source_is_current() {
+    fn catalog_v1_through_v5_archive_coordinates_are_explicit_and_v5_source_is_current() {
         let coordinates = [
             (
                 "v1",
@@ -1690,6 +1690,13 @@ mod tests {
                 CATALOG_V4_SOURCE_SHA256,
                 CATALOG_V4_SOURCE_BYTES,
             ),
+            (
+                "v5",
+                "f6f830c475fe582c61d5c6ffd8fef29008c6ac34",
+                CATALOG_V5_WHOLE_SHA256,
+                CATALOG_V5_SOURCE_SHA256,
+                CATALOG_V5_SOURCE_BYTES,
+            ),
         ];
         let mut whole = BTreeSet::new();
         let mut source = BTreeSet::new();
@@ -1707,15 +1714,15 @@ mod tests {
 
         let registry = BackendRegistry::global();
         assert_eq!(registry.catalog_sha256_v3(), coordinates[2].2);
-        assert_eq!(registry.catalog_sha256_v4(), CATALOG_V4_WHOLE_SHA256);
-        assert_eq!(registry.catalog_sha256_v5(), CATALOG_V5_WHOLE_SHA256);
-        assert_eq!(registry.catalog_sha256(), CATALOG_V5_WHOLE_SHA256);
+        assert_eq!(registry.catalog_sha256_v4(), coordinates[3].2);
+        assert_eq!(registry.catalog_sha256_v5(), coordinates[4].2);
+        assert_eq!(registry.catalog_sha256(), coordinates[4].2);
         assert_ne!(registry.catalog_sha256(), coordinates[3].2);
         let current_source = include_bytes!("backend_catalog.inc.rs");
-        assert_eq!(current_source.len(), CATALOG_V5_SOURCE_BYTES);
+        assert_eq!(current_source.len(), coordinates[4].4);
         assert_eq!(
             hex::encode(Sha256::digest(current_source)),
-            CATALOG_V5_SOURCE_SHA256
+            coordinates[4].3
         );
     }
 
