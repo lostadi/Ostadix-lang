@@ -598,6 +598,7 @@ class SourceReleaseTests(unittest.TestCase):
             "docs/CLAIMS.md": "fixture claims\n",
             "docs/CI_POSTURE.md": "fixture local CI posture contract\n",
             "docs/INFORMATION_KERNEL_V1.md": "fixture information kernel contract\n",
+            "docs/releases/v0.3.0.md": "# Ostadix-lang v0.3.0 fixture\n",
             "docs/HOSTED_LIVE_REFERENCE.md": "fixture hosted reference\n",
             "docs/HOSTED_PLACEMENT_V6.md": "fixture hosted placement contract\n",
             "docs/KERNEL_WORLD_CONTRACT.md": "fixture kernel World contract\n",
@@ -1108,6 +1109,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "docs/CLAIMS.md",
                 "docs/CI_POSTURE.md",
                 "docs/INFORMATION_KERNEL_V1.md",
+                "docs/releases/v0.3.0.md",
                 "docs/HOSTED_LIVE_REFERENCE.md",
                 "docs/HOSTED_PLACEMENT_V6.md",
                 "docs/HOSTED_WORLD_REFERENCE_PROFILE.md",
@@ -1823,6 +1825,7 @@ class SourceReleaseTests(unittest.TestCase):
             "CHANGELOG.md",
             "CODE_OF_CONDUCT.md",
             "CONTRIBUTING.md",
+            "docs/releases/v0.3.0.md",
             "SECURITY.md",
             "tests/test_governance_surfaces.py",
         )

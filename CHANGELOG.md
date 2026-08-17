@@ -7,6 +7,10 @@ Package SemVer is only one of the independent coordinates documented in
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-17
+
+Release notes: [docs/releases/v0.3.0.md](docs/releases/v0.3.0.md).
+
 ### Added
 
 - A two-member Cargo workspace retains the root `o-lang` package and adds the
@@ -32,6 +36,12 @@ Package SemVer is only one of the independent coordinates documented in
   metadata digests intentionally omit source/value/runtime identity; raw
   registry and Hosted locators/tokens are domain-projected equality oracles,
   not confidentiality primitives.
+- A manifest-governed production-library root DAG now closes source geometry,
+  compiled fragments, physical overrides, facade projections, allowed edges,
+  layer descent, and multi-root cycles under fail-closed CI validation.
+- O-core personality smoke failures now capture bounded QMP scheduler, thread,
+  frame, and RPC state only after the failure verdict is frozen; successful
+  runs remain byte- and behavior-compatible with the prior guest artifacts.
 
 ### Changed
 
@@ -46,6 +56,29 @@ Package SemVer is only one of the independent coordinates documented in
 - `ParsedDocumentV1.nodes` is private before the 0.3 tag. Use `nodes()` or
   `into_nodes()`; parsed-document equality now also binds parser-captured exact
   source SHA-256 and length. The stable `ostadix-api` facade remains unchanged.
+- Canonical placement, backend catalog/state, execution-contract, and graph
+  evaluation seams remove wrong-way module dependencies without changing the
+  corresponding execution semantics or archived identity formulas.
+
+### Fixed
+
+- O-core x86-64 asynchronous user-frame returns preserve arithmetic status
+  flags while clearing hazardous control flags, and the mode-0 proof binds the
+  syscall FMASK entry behavior without charging capacity-tight probe modes.
+- The hosted durable-state lock explicitly unlocks its final file descriptor
+  before drop; a duplicated-descriptor regression proves immediate reopen after
+  the final store clone is released.
+- Mode-25 crash monitoring preserves the armed lifecycle state across the
+  crash transition, and ArtifactId ownership no longer depends on the World
+  facade.
+
+### Release boundary
+
+The v0.3.0 tag identifies an advanced systems-research release, not OSTADIX
+Alpha qualification or a production-readiness claim. The exact included
+claims, explicit nonclaims, independent version coordinates, and source-asset
+verification procedure are recorded in
+[docs/releases/v0.3.0.md](docs/releases/v0.3.0.md).
 
 ## [0.2.0] - 2026-08-16
 
@@ -100,5 +133,6 @@ or a live World.
 Release entries must be dated and linked to the exact released commit or tag
 when a release is cut.
 
-[Unreleased]: https://github.com/lostadi/Ostadix-lang/compare/v0.2.0...HEAD
-[0.2.0]: https://github.com/lostadi/Ostadix-lang/releases/tag/v0.2.0
+[Unreleased]: https://github.com/lostadi/Ostadix-lang/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/lostadi/Ostadix-lang/tree/v0.3.0
+[0.2.0]: https://github.com/lostadi/Ostadix-lang/tree/v0.2.0
