@@ -28,8 +28,11 @@ def write_minimal_tree(root: Path) -> None:
         "src/parser.rs",
         "src/syntax_dialect.rs",
         "src/ir.rs",
+        "src/backend.rs",
         "src/backend_catalog.rs",
+        "src/backend_state.rs",
         "src/capability.rs",
+        "src/environment.rs",
         "src/execution_contract.rs",
         "src/eval_core.rs",
         "src/effects.rs",
@@ -62,6 +65,8 @@ def write_minimal_tree(root: Path) -> None:
         "src/executor/task.rs",
         "src/executor/trace.rs",
         "src/runtime_exec.rs",
+        "src/process.rs",
+        "src/wire.rs",
         "src/evidence/admit.rs",
         "src/evidence/analyze.rs",
         "src/evidence/fact.rs",
@@ -154,6 +159,100 @@ class ArchitectureBoundaryTests(unittest.TestCase):
             (root / "src/backend_catalog.rs").write_text(
                 "".join(f"use crate::{module}::Boundary;\n" for module in allowed),
                 encoding="utf-8",
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_backend_state_is_compiled_once_with_a_legacy_alias(self) -> None:
+        lib_source = (ROOT / "src/lib.rs").read_text(encoding="utf-8")
+        backend_source = (ROOT / "src/backend.rs").read_text(encoding="utf-8")
+
+        self.assertEqual(lib_source.count("pub mod backend_state;"), 1)
+        self.assertIn("pub use crate::backend_state as state;", backend_source)
+        self.assertNotIn('#[path = "backend_state.rs"]', backend_source)
+
+    def test_backend_state_cannot_reenter_backend_or_process_realizations(self) -> None:
+        for module in ("backend", "process"):
+            with self.subTest(module=module):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    write_minimal_tree(root)
+                    (root / "src/backend_state.rs").write_text(
+                        f"use crate::{module}::Boundary;\n", encoding="utf-8"
+                    )
+                    result = run_checker(root)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("canonical backend-state protocol", result.stderr)
+
+    def test_backend_state_allowlist_rejects_novel_roots_in_every_form(self) -> None:
+        cases = (
+            ("use crate::future_state_owner::Boundary;\n", "crate::future_state_owner"),
+            (
+                "use crate::{future_state_owner::Boundary};\n",
+                "crate::{future_state_owner::...}",
+            ),
+            (
+                "use crate :: future_state_owner :: Boundary;\n",
+                "crate::future_state_owner",
+            ),
+        )
+        for source, expected in cases:
+            with self.subTest(source=source):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    write_minimal_tree(root)
+                    (root / "src/backend_state.rs").write_text(
+                        source, encoding="utf-8"
+                    )
+                    result = run_checker(root)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(f"forbidden dependency `{expected}`", result.stderr)
+
+    def test_backend_state_accepts_exactly_its_three_lower_roots(self) -> None:
+        allowed = ("environment", "value", "wire")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/backend_state.rs").write_text(
+                "".join(f"use crate::{module}::Boundary;\n" for module in allowed),
+                encoding="utf-8",
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_backend_state_lower_dependencies_predeny_reverse_edges(self) -> None:
+        for relative in ("src/environment.rs", "src/value.rs", "src/wire.rs"):
+            with self.subTest(relative=relative):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    write_minimal_tree(root)
+                    (root / relative).write_text(
+                        "use crate::backend_state::BackendStateTierV1;\n",
+                        encoding="utf-8",
+                    )
+                    result = run_checker(root)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(
+                    "forbidden dependency `crate::backend_state`", result.stderr
+                )
+
+    def test_process_cannot_import_backend_realization_facade(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/process.rs").write_text(
+                "use crate::backend::RustBackend;\n", encoding="utf-8"
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("canonical backend-state protocol", result.stderr)
+
+    def test_process_can_import_canonical_backend_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/process.rs").write_text(
+                "use crate::backend_state::BackendStateTierV1;\n", encoding="utf-8"
             )
             result = run_checker(root)
         self.assertEqual(result.returncode, 0, result.stderr)

@@ -13,7 +13,7 @@ use anyhow::{bail, Context, Result};
 use fs2::FileExt;
 use thiserror::Error;
 
-use crate::backend::state::EvaluatorStateSnapshotV1;
+use crate::backend_state::EvaluatorStateSnapshotV1;
 
 use sha2::{Digest, Sha256};
 
@@ -2919,10 +2919,10 @@ fn tree_bytes(path: &Path) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::state::{
+    use crate::backend_catalog::BackendRegistry;
+    use crate::backend_state::{
         BackendCheckpointV1, BackendStateTierV1, EvaluatorActorCheckpointV1,
     };
-    use crate::backend_catalog::BackendRegistry;
     use crate::hosted_remote::v2::{HostedPlacementIdentityV2, SessionStateTierV2};
     use crate::placement::{
         CanonicalPlacementRecordV1, GenerationV1, PlacementReservationV1, SemanticDigestV1,
