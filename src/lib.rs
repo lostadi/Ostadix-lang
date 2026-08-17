@@ -11,6 +11,7 @@ pub mod api;
 pub mod backend;
 pub(crate) mod backend_catalog;
 pub mod backend_morphism;
+pub mod backend_state;
 mod canonical_cbor;
 mod capability;
 mod dispatch_model;
