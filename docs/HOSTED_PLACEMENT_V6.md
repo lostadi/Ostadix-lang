@@ -27,36 +27,48 @@ It does not grant Governor authority, World membership, WorldFS access, native
 O-core authority, scheduler-selected placement, global effect isolation,
 cancelled-effect rollback, or an exactly-once external-effect guarantee.
 
-## Admission versions
+## Admission coordinates and the Hosted Placement V6 milestone
 
-Admission V5 and Hosted Placement V6 are dual current contracts:
+Three deliberately separate names occur here:
 
-- **V5** remains the supported legacy-local execution contract and the default
-  for the uppercase `O` compatibility CLI and existing MCP execution tools.
-- **V6** adds descriptor-based placement records plus frozen direct transport
-  V1 and opt-in durable transport V2. They are exposed by `o-node` and `octl`;
-  neither is an implicit mode of uppercase `O`, `o-link`, or the MCP tools.
+- **Execution Admission V5** remains the supported current local execution
+  contract and the default for uppercase `O`, the evaluator/coordinator, and
+  existing MCP execution tools.
+- **Explicit local Evidence/Admission V6** means `oexec.evidence/v6` and
+  `oexec.admission/v6`. It preserves typed `FidelityAssessmentV2` through Graph
+  V2 and provides an inspection-only Why V2 view. The current coordinator does
+  not accept `AdmittedExecutionV6`, and there is no prepared-admission or
+  placement-fragment conversion.
+- **Hosted Placement V6** is this document's placement milestone. It adds
+  descriptor-based placement records plus frozen direct transport V1 and
+  opt-in durable transport V2, exposed by `o-node` and `octl`. Its “V6” is not
+  the `oexec.admission/v6` schema coordinate.
 
-A V5 record is never silently upgraded to V6, and a V6 record is never treated
-as World admission. A generated executable embeds the admission version it was
-built against.
+None is silently upgraded or translated into another, and none is World
+admission. A generated executable embeds its runtime sources; today its
+production execution path remains V5 even though the explicit local V6 symbols
+are source-complete in that generated runtime.
 
 ## Backend catalog V5 hard rollover
 
-Admission V5/V6 and backend-catalog V3/V4/V5 describe different things. The
-admission version selects an execution/placement contract. The catalog schema
-selects the hash domain for backend metadata. The current authorizing catalog
-schema is `ostadix.backend-catalog/v5`. Archival V4 added the backend-state
-support tier and snapshot-compatibility identity. V5 preserves that exact hash
-prefix and appends one self-identifying optional BackendMorphism V1 profile:
+Execution-admission coordinates, the Hosted Placement V6 milestone, and
+backend-catalog V3/V4/V5 describe different things. An execution-admission
+schema selects a local evidence contract; the placement milestone selects its
+own records and transports. The catalog schema selects the hash domain for
+backend metadata. The current authorizing catalog schema is
+`ostadix.backend-catalog/v5`. Archival V4 added the backend-state support tier
+and snapshot-compatibility identity. V5 preserves that exact hash prefix and
+appends one self-identifying optional BackendMorphism V1 profile:
 Python, JavaScript, and Rust have named profiles and the other 27 canonical
 backends explicitly have none.
 
-The profile label is catalog data, not direct crossing authority. It is not
-projected into `BackendInterface`, does not rewrite production
-`BackendCrossing` fidelity, does not change solved-graph hashing or the
-evidence/admission schemas, and does not alter dispatch. The existing current
-catalog projection naturally binds the V5 digest.
+The profile label is catalog data, not direct crossing authority. The Catalog
+V5 rollover itself is not projected into `BackendInterface`, does not rewrite
+production `BackendCrossing` fidelity, does not change solved-graph hashing or
+evidence/admission schemas, and does not alter dispatch. Separately, the
+explicit local Graph V2/Evidence V6 API binds the complete solver assessment;
+it does not enforce the catalog morphism profile. Both V5 and V6 evidence paths
+bind the existing current Catalog V5 projection.
 
 The schema string participates in the digest of the complete ordered catalog
 and in every canonical backend-specification digest. Moving from V4 to V5 thus

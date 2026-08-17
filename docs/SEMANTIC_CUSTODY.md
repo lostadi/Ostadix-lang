@@ -66,14 +66,16 @@ profiles remain executable but acquire no V1 morphism claim.
 
 V1 is shadow-only. Catalog V5 hashes the explicit optional profile assignment
 and resolves it through canonical backend names and aliases; archival V4
-identity remains unchanged. The profile is not a `BackendInterface` field, does
-not alter existing solver facts or graph hashing, and does not itself authorize
-evidence, admission, placement, or dispatch. Existing current-catalog
-projections bind the V5 digest without adding a new evidence field. The explicit
-shadow result exposes differences such as the compatibility solver's optimistic
-container classification without reducing current execution capacity. A future
-enforcing integration requires a separately reviewed graph/evidence schema
-rollover rather than silently changing V5 meaning.
+identity remains unchanged. The profile is not a `BackendInterface` field and
+does not itself authorize evidence, admission, placement, or dispatch. Existing
+current-catalog projections bind the V5 digest without adding a new evidence
+field. The explicit Graph V2/Evidence V6 API separately preserves the complete
+typed solver assessment in its hashes and Why V2 view, but does not enforce the
+catalog profile and is not accepted by the current coordinator. Current V5 uses
+the frozen Graph V1 projection; there is no conversion from V5 to V6. The
+shadow result can therefore expose differences such as the compatibility
+solver's optimistic container classification without reducing current
+execution capacity.
 
 ## Executable artifact
 

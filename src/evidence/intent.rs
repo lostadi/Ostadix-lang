@@ -7,8 +7,8 @@ use crate::hgraph::HGraph;
 use crate::ir::{ExecutionPlan, OIrProgram};
 
 use super::analyze::{
-    backend_catalog_projection_sha256, digest_fields, graph_sha256, oir_sha256,
-    validate_canonical_solved_graph,
+    backend_catalog_projection_sha256, digest_fields, graph_sha256_v1, oir_sha256,
+    validate_canonical_solved_graph_v1,
 };
 pub const EXECUTION_INTENT_SCHEMA_V1: &str = "oexec.execution-intent/v1";
 const EXECUTION_INTENT_DIGEST_DOMAIN_V1: &str = "ostadix-execution-intent/v1";
@@ -62,7 +62,7 @@ impl ExecutionIntentV1 {
         base_policy: Policy,
     ) -> Result<Self> {
         validate_sha256("source", source_sha256)?;
-        validate_canonical_solved_graph(program, plan, graph)
+        validate_canonical_solved_graph_v1(program, plan, graph)
             .context("execution intent rejected noncanonical static execution input")?;
 
         let mut intent = Self {
@@ -70,7 +70,7 @@ impl ExecutionIntentV1 {
             source_sha256: source_sha256.to_string(),
             oir_sha256: oir_sha256(program),
             plan_sha256: sha256_bytes(plan.to_text().as_bytes()),
-            analyzed_graph_sha256: graph_sha256(graph),
+            analyzed_graph_sha256: graph_sha256_v1(graph),
             backend_catalog_projection_sha256: backend_catalog_projection_sha256(plan),
             analyzer_id: EXECUTION_INTENT_ANALYZER_ID_V1.to_string(),
             analyzer_sha256: sha256_bytes(EXECUTION_INTENT_ANALYZER_ID_V1.as_bytes()),
