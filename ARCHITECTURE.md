@@ -106,8 +106,8 @@ entrypoints, conventional binary directory, and declared compiled fragments.
 Facades bind an unconditionally public owner and exact public alias or glob
 projection. The checker then rejects undeclared roots and edges, retains
 the narrow semantic rules above, and runs Tarjan's algorithm over the observed
-root graph. The frozen baseline contains 148 production library module files,
-39 roots, 163 cross-root edges, and zero multi-root strongly connected
+root graph. The frozen baseline contains 149 production library module files,
+40 roots, 174 cross-root edges, and zero multi-root strongly connected
 components. The separately scanned include fragment has no cross-root edge.
 
 That is a root-level acyclicity claim only. Dependencies and bounded strongly
