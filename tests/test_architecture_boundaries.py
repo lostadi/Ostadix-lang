@@ -5,12 +5,14 @@ from __future__ import annotations
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
 CHECKER = ROOT / "scripts" / "check_architecture_boundaries.py"
+MANIFEST = ROOT / "ci" / "architecture-roots.toml"
 
 
 def run_checker(root: Path) -> subprocess.CompletedProcess[str]:
@@ -79,12 +81,711 @@ def write_minimal_tree(root: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("pub struct Boundary;\n", encoding="utf-8")
 
+    manifest = tomllib.loads(MANIFEST.read_text(encoding="utf-8"))
+    for root_spec in manifest["root"]:
+        path = root / "src" / f"{root_spec['name']}.rs"
+        if not path.exists():
+            path.write_text("pub struct Boundary;\n", encoding="utf-8")
+
+    # The manifest validates compatibility facades as real owner-to-target
+    # edges. Keep those edges in every synthetic repository as well.
+    facade_sources = {
+        "src/backend.rs": "pub use crate::backend_state as state;\n",
+        "src/placement/mod.rs": (
+            "pub mod protocol { pub use crate::placement_protocol::*; }\n"
+        ),
+        "src/registry.rs": "pub mod bundle;\n",
+        "src/registry/bundle/mod.rs": "pub use crate::backend_catalog::*;\n",
+        "src/world/mod.rs": "pub use crate::resource_identity as identity;\n",
+    }
+    for relative, source in facade_sources.items():
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(source, encoding="utf-8")
+
+    for relative in (
+        "src/backend_catalog.inc.rs",
+        "src/lib.rs",
+        "src/main.rs",
+        "src/world/identity.rs",
+    ):
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.exists():
+            path.write_text("pub struct Boundary;\n", encoding="utf-8")
+    override_declarations = {
+        entry["module_path"][0]: (
+            entry["path"].removeprefix("src/")
+            if entry["kind"] == "file"
+            else f"{entry['path'].removeprefix('src/')}/mod.rs"
+        )
+        for entry in manifest["physical_override"]
+    }
+    crate_root_lines = []
+    for root_spec in manifest["root"]:
+        name = root_spec["name"]
+        if name in override_declarations:
+            crate_root_lines.append(f'#[path = "{override_declarations[name]}"]')
+        crate_root_lines.append(f"pub mod {name};")
+    (root / "src/lib.rs").write_text(
+        "\n".join(crate_root_lines) + "\n", encoding="utf-8"
+    )
+    fragment_owner = root / "src/backend_catalog/fragment_owner.rs"
+    fragment_owner.parent.mkdir(parents=True, exist_ok=True)
+    fragment_owner.write_text(
+        'include!("../backend_catalog.inc.rs");\n', encoding="utf-8"
+    )
+    (root / "src/bin").mkdir(parents=True, exist_ok=True)
+    (root / "Cargo.toml").write_text(
+        '[package]\nname = "architecture-fixture"\nversion = "0.0.0"\n',
+        encoding="utf-8",
+    )
+    (root / "ci").mkdir(parents=True, exist_ok=True)
+    (root / "ci/architecture-roots.toml").write_text(
+        MANIFEST.read_text(encoding="utf-8").replace(
+            'included_from = "src/backend_catalog.rs"',
+            'included_from = "src/backend_catalog/fragment_owner.rs"',
+            1,
+        ),
+        encoding="utf-8",
+    )
+
 
 class ArchitectureBoundaryTests(unittest.TestCase):
     def test_current_tree_respects_frozen_boundaries(self) -> None:
         result = run_checker(ROOT)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "architecture dependency boundaries: PASS\n")
+        self.assertEqual(
+            result.stdout,
+            "architecture dependency boundaries: PASS "
+            "(148 production files, 39 roots, 163 cross-root edges)\n",
+        )
+
+    def test_manifest_inventories_every_current_root_edge_override_and_facade(self) -> None:
+        manifest = tomllib.loads(MANIFEST.read_text(encoding="utf-8"))
+        roots = manifest["root"]
+        self.assertEqual(manifest["production"]["crate_root"], "src/lib.rs")
+        self.assertEqual(
+            manifest["compiled_fragment"],
+            [
+                {
+                    "path": "src/backend_catalog.inc.rs",
+                    "owner": "backend_catalog",
+                    "included_from": "src/backend_catalog.rs",
+                }
+            ],
+        )
+        self.assertEqual(len(roots), 39)
+        self.assertEqual(
+            sum(len(root["allowed_dependencies"]) for root in roots), 163
+        )
+        self.assertEqual(
+            {
+                (entry["path"], entry["kind"], tuple(entry["module_path"]))
+                for entry in manifest["physical_override"]
+            },
+            {
+                (
+                    "src/placement/protocol",
+                    "directory",
+                    ("placement_protocol",),
+                ),
+                ("src/world/identity.rs", "file", ("resource_identity",)),
+            },
+        )
+        self.assertEqual(
+            {(entry["path"], entry["kind"]) for entry in manifest["facade"]},
+            {
+                ("backend::state", "alias"),
+                ("placement::protocol", "inline_module"),
+                ("registry::bundle", "module"),
+                ("world::identity", "alias"),
+            },
+        )
+
+    def test_facade_manifest_path_must_match_the_public_projection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            manifest_path = root / "ci/architecture-roots.toml"
+            manifest_path.write_text(
+                manifest_path.read_text(encoding="utf-8").replace(
+                    'path = "backend::state"',
+                    'path = "backend::renamed_state"',
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "does not contain a top-level public alias", result.stderr
+        )
+
+    def test_projection_facades_require_an_exact_public_glob(self) -> None:
+        cases = (
+            (
+                "src/registry/bundle/mod.rs",
+                "pub use crate::backend_catalog as renamed;\n",
+                "facade `registry::bundle` source does not publicly project",
+            ),
+            (
+                "src/registry/bundle/mod.rs",
+                "pub use crate::backend_catalog::Boundary;\n",
+                "facade `registry::bundle` source does not publicly project",
+            ),
+            (
+                "src/placement/mod.rs",
+                "pub mod protocol { pub use crate::placement_protocol as renamed; }\n",
+                "does not contain a public inline module projecting",
+            ),
+            (
+                "src/placement/mod.rs",
+                "pub mod protocol { pub use crate::placement_protocol::Boundary; }\n",
+                "does not contain a public inline module projecting",
+            ),
+        )
+        for relative, source, expected in cases:
+            with self.subTest(relative=relative, source=source), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                write_minimal_tree(root)
+                (root / relative).write_text(source, encoding="utf-8")
+                result = run_checker(root)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn(expected, result.stderr)
+
+    def test_module_facade_source_must_be_publicly_declared_by_its_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            registry = root / "src/registry.rs"
+            registry.write_text(
+                registry.read_text(encoding="utf-8").replace(
+                    "pub mod bundle;\n", "", 1
+                ),
+                encoding="utf-8",
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "facade `registry::bundle` parent does not publicly declare external "
+            "module `bundle`",
+            result.stderr,
+        )
+
+    def test_compiled_include_fragment_cannot_hide_a_root_edge(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/backend_catalog.inc.rs").write_text(
+                "use crate::api::Boundary;\n", encoding="utf-8"
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "root edge `backend_catalog -> api` is not declared", result.stderr
+        )
+
+    def test_crate_root_cannot_compile_a_module_outside_declared_geometry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            crate_root = root / "src/lib.rs"
+            crate_root.write_text(
+                crate_root.read_text(encoding="utf-8").replace(
+                    "pub mod api;",
+                    '#[path = "../outside_root.rs"]\npub mod api;',
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "must remain normalized beneath `src`", result.stderr
+        )
+
+    def test_crate_root_cannot_hide_edges_in_an_inline_root_module(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            crate_root = root / "src/lib.rs"
+            crate_root.write_text(
+                crate_root.read_text(encoding="utf-8").replace(
+                    "pub mod parser;",
+                    "pub mod parser { use crate::ir::PlanNodeId; }",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "crate-root module `parser` must be an external semicolon declaration",
+            result.stderr,
+        )
+
+    def test_crate_root_cannot_contain_unowned_production_items(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            crate_root = root / "src/lib.rs"
+            crate_root.write_text(
+                crate_root.read_text(encoding="utf-8")
+                + "use crate::ir::PlanNodeId;\n",
+                encoding="utf-8",
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "crate root must contain only attributes and external module declarations",
+            result.stderr,
+        )
+
+    def test_crate_root_cannot_inject_a_macro_from_one_root_into_another(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            crate_root = root / "src/lib.rs"
+            crate_root.write_text(
+                crate_root.read_text(encoding="utf-8").replace(
+                    "pub mod ir;", "#[macro_use]\npub mod ir;", 1
+                ),
+                encoding="utf-8",
+            )
+            (root / "src/ir.rs").write_text(
+                "macro_rules! from_ir { () => { pub struct ExpandedFromIr; }; }\n",
+                encoding="utf-8",
+            )
+            (root / "src/parser.rs").write_text("from_ir!();\n", encoding="utf-8")
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "crate-root module attributes are forbidden except exact #[path]",
+            result.stderr,
+        )
+
+    def test_facade_owner_roots_must_be_publicly_reachable_from_the_crate(self) -> None:
+        for owner in ("backend", "placement", "registry", "world"):
+            with self.subTest(owner=owner), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                write_minimal_tree(root)
+                crate_root = root / "src/lib.rs"
+                crate_root.write_text(
+                    crate_root.read_text(encoding="utf-8").replace(
+                        f"pub mod {owner};", f"mod {owner};", 1
+                    ),
+                    encoding="utf-8",
+                )
+                result = run_checker(root)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn(
+                f"facade owner root `{owner}` must be a plain public crate-root module",
+                result.stderr,
+            )
+
+    def test_cargo_library_target_must_match_the_governed_crate_root(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            hidden = root / "hidden/lib.rs"
+            hidden.parent.mkdir(parents=True)
+            hidden.write_text(
+                "pub mod parser { use crate::ir::Boundary; }\npub mod ir {}\n",
+                encoding="utf-8",
+            )
+            cargo = root / "Cargo.toml"
+            cargo.write_text(
+                cargo.read_text(encoding="utf-8")
+                + '\n[lib]\npath = "hidden/lib.rs"\n',
+                encoding="utf-8",
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "library target `hidden/lib.rs` does not match governed crate root "
+            "`src/lib.rs`",
+            result.stderr,
+        )
+
+    def test_nested_module_cannot_escape_through_an_undeclared_path_attribute(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/parser.rs").write_text(
+                '#[path = "../outside.rs"]\nmod hidden;\n', encoding="utf-8"
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("undeclared #[path = '../outside.rs']", result.stderr)
+
+    def test_undeclared_include_macro_cannot_add_compiled_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/parser.rs").write_text(
+                'include!("parser_extra.rs");\n', encoding="utf-8"
+            )
+            (root / "src/parser_extra.rs").write_text(
+                "use crate::ir::PlanNodeId;\n", encoding="utf-8"
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "include! source `src/parser_extra.rs` is not declared", result.stderr
+        )
+
+    def test_undeclared_include_macro_delimiters_cannot_escape_source_geometry(self) -> None:
+        for invocation in (
+            'include! { "../outside.rs" }\n',
+            'include!["../outside.rs"]\n',
+        ):
+            with self.subTest(invocation=invocation), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                write_minimal_tree(root)
+                (root / "src/parser.rs").write_text(invocation, encoding="utf-8")
+                (root / "outside.rs").write_text(
+                    "use crate::ir::PlanNodeId;\n", encoding="utf-8"
+                )
+                result = run_checker(root)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn(
+                "include! source `outside.rs` is not declared", result.stderr
+            )
+
+    def test_raw_identifier_include_macro_is_still_source_inclusion(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/parser.rs").write_text(
+                'r#include!("../outside.rs");\n', encoding="utf-8"
+            )
+            (root / "outside.rs").write_text(
+                "use crate::ir::PlanNodeId;\n", encoding="utf-8"
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("include! source `outside.rs` is not declared", result.stderr)
+
+    def test_include_macro_aliases_cannot_escape_source_analysis(self) -> None:
+        for import_source in (
+            "use std::include as inc;\n",
+            "use std::{include as inc};\n",
+        ):
+            with self.subTest(import_source=import_source), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                write_minimal_tree(root)
+                (root / "src/parser.rs").write_text(
+                    import_source + 'inc!("../outside.rs");\n',
+                    encoding="utf-8",
+                )
+                (root / "outside.rs").write_text(
+                    "use crate::ir::PlanNodeId;\n", encoding="utf-8"
+                )
+                result = run_checker(root)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn(
+                "include macro reference", result.stderr
+            )
+            self.assertIn("aliases are forbidden", result.stderr)
+
+    def test_production_cfg_attr_cannot_change_module_source_geometry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/parser.rs").write_text(
+                '#[cfg_attr(all(), path = "../outside.rs")]\nmod hidden;\n',
+                encoding="utf-8",
+            )
+            (root / "outside.rs").write_text(
+                "use crate::ir::PlanNodeId;\n", encoding="utf-8"
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("undeclared #[path = '../outside.rs']", result.stderr)
+
+    def test_definitely_test_only_cfg_attr_does_not_change_production_geometry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            parser = root / "src/parser.rs"
+            parser.write_text(
+                '#[cfg_attr(test, path = "../outside.rs")]\nmod hidden;\n',
+                encoding="utf-8",
+            )
+            hidden = root / "src/parser/hidden.rs"
+            hidden.parent.mkdir(parents=True, exist_ok=True)
+            hidden.write_text("pub struct Hidden;\n", encoding="utf-8")
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_test_only_nested_reexport_cannot_certify_a_facade(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/placement/mod.rs").write_text(
+                "pub mod protocol {\n"
+                "    #[cfg(test)]\n"
+                "    pub use crate::placement_protocol::*;\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "does not contain a public inline module projecting", result.stderr
+        )
+
+    def test_cfg_attr_test_only_reexport_cannot_certify_a_facade(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/placement/mod.rs").write_text(
+                "pub mod protocol {\n"
+                "    #[cfg_attr(all(), cfg(test))]\n"
+                "    pub use crate::placement_protocol::*;\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "does not contain a public inline module projecting", result.stderr
+        )
+
+    def test_conditionally_absent_reexport_cannot_certify_a_facade(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/placement/mod.rs").write_text(
+                "pub mod protocol {\n"
+                '    #[cfg(test = "only")]\n'
+                "    pub use crate::placement_protocol::*;\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "does not contain a public inline module projecting", result.stderr
+        )
+
+    def test_nested_module_reexport_cannot_certify_its_parent_facade(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/placement/mod.rs").write_text(
+                "pub mod protocol {\n"
+                "    mod hidden {\n"
+                "        pub use crate::placement_protocol::*;\n"
+                "    }\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "does not contain a public inline module projecting", result.stderr
+        )
+
+    def test_cycle_in_previously_ungoverned_files_is_rejected_by_tarjan(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/information.rs").write_text(
+                "use crate::canonical_cbor::Boundary;\n", encoding="utf-8"
+            )
+            (root / "src/canonical_cbor.rs").write_text(
+                "use crate::information::Boundary;\n", encoding="utf-8"
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "multi-root strongly connected component detected: "
+            "canonical_cbor, information",
+            result.stderr,
+        )
+
+    def test_facade_dependency_participates_in_cycle_detection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/information.rs").write_text(
+                "use crate::world::identity::ArtifactId;\n", encoding="utf-8"
+            )
+            (root / "src/world/mod.rs").write_text(
+                "pub use crate::resource_identity as identity;\n"
+                "use crate::information::Boundary;\n",
+                encoding="utf-8",
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("root edge `information -> world`", result.stderr)
+        self.assertIn(
+            "multi-root strongly connected component detected: information, world",
+            result.stderr,
+        )
+
+    def test_novel_edge_between_known_roots_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/canonical_cbor.rs").write_text(
+                "use crate::value::OValue;\n", encoding="utf-8"
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "root edge `canonical_cbor -> value` is not declared", result.stderr
+        )
+
+    def test_new_production_root_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/future_private_model.rs").write_text(
+                "pub struct PrivateModel;\n", encoding="utf-8"
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "production path resolves to unknown root `future_private_model`",
+            result.stderr,
+        )
+
+    def test_manifest_root_without_a_production_source_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/shims.rs").unlink()
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "manifest root `shims` has no production Rust source", result.stderr
+        )
+
+    def test_manifest_cannot_exclude_an_arbitrary_compiled_module_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/parser.rs").write_text("mod hidden;\n", encoding="utf-8")
+            hidden = root / "src/parser/hidden.rs"
+            hidden.parent.mkdir(parents=True, exist_ok=True)
+            hidden.write_text(
+                "use crate::ir::PlanNodeId;\n", encoding="utf-8"
+            )
+            manifest_path = root / "ci/architecture-roots.toml"
+            manifest_path.write_text(
+                manifest_path.read_text(encoding="utf-8").replace(
+                    'excluded_files = ["src/backend_catalog.inc.rs", "src/lib.rs", "src/main.rs"]',
+                    'excluded_files = ["src/backend_catalog.inc.rs", "src/lib.rs", '
+                    '"src/main.rs", "src/parser/hidden.rs"]',
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "production.excluded_files must contain exactly", result.stderr
+        )
+        self.assertIn("unexpected src/parser/hidden.rs", result.stderr)
+
+    def test_manifest_cannot_exclude_an_arbitrary_compiled_module_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            hidden = root / "src/parser/hidden.rs"
+            hidden.parent.mkdir(parents=True, exist_ok=True)
+            hidden.write_text(
+                "use crate::ir::PlanNodeId;\n", encoding="utf-8"
+            )
+            manifest_path = root / "ci/architecture-roots.toml"
+            manifest_path.write_text(
+                manifest_path.read_text(encoding="utf-8").replace(
+                    'excluded_directories = ["src/bin"]',
+                    'excluded_directories = ["src/bin", "src/parser"]',
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "production.excluded_directories must contain exactly", result.stderr
+        )
+        self.assertIn("unexpected src/parser", result.stderr)
+
+    def test_symlinked_module_directory_cannot_escape_source_enumeration(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/parser.rs").write_text("mod hidden;\n", encoding="utf-8")
+            outside = root / "outside_parser"
+            outside.mkdir()
+            (outside / "hidden.rs").write_text(
+                "use crate::ir::PlanNodeId;\n", encoding="utf-8"
+            )
+            (root / "src/parser").symlink_to(outside, target_is_directory=True)
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "production source path `src/parser` must not be a symlink",
+            result.stderr,
+        )
+
+    def test_comments_raw_strings_and_cfg_test_are_not_root_edges(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/canonical_cbor.rs").write_text(
+                '// use crate::api::Boundary;\n'
+                'const COOKED: &str = "crate::api::Boundary";\n'
+                'const RAW: &str = r###"use crate::api::Boundary;"###;\n'
+                "#[cfg(test)]\nuse crate::api::Boundary;\n"
+                "pub struct Production;\n",
+                encoding="utf-8",
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_dependency_through_facade_remains_an_edge_to_facade_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/canonical_cbor.rs").write_text(
+                "use crate::world::identity::ArtifactId;\n", encoding="utf-8"
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "root edge `canonical_cbor -> world` is not declared", result.stderr
+        )
+        self.assertNotIn("canonical_cbor -> resource_identity", result.stderr)
+
+    def test_physical_directory_override_uses_canonical_protocol_root(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/placement/protocol/future.rs").write_text(
+                "use crate::resource_identity::Boundary;\n", encoding="utf-8"
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_physical_file_override_prevents_world_identity_misclassification(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/world/identity.rs").write_text(
+                "use crate::value::OValue;\n", encoding="utf-8"
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "root edge `resource_identity -> value` is not declared", result.stderr
+        )
+        self.assertNotIn("root edge `world -> value`", result.stderr)
 
     def test_wrong_way_production_dependency_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -351,7 +1052,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 1)
                 self.assertIn(f"forbidden dependency `{expected}`", result.stderr)
 
-    def test_rules_without_allowlists_remain_deny_only(self) -> None:
+    def test_repository_manifest_closes_rules_that_were_previously_deny_only(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
@@ -359,7 +1060,8 @@ class ArchitectureBoundaryTests(unittest.TestCase):
                 "use crate::future_low_layer::Boundary;\n", encoding="utf-8"
             )
             result = run_checker(root)
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("unknown root `future_low_layer`", result.stderr)
 
     def test_execution_contract_accepts_only_its_frozen_lower_seams(self) -> None:
         allowed = ("backend_catalog", "effects", "ir", "value")
@@ -640,6 +1342,82 @@ class ArchitectureBoundaryTests(unittest.TestCase):
             result = run_checker(root)
         self.assertEqual(result.returncode, 1)
         self.assertIn("forbidden dependency `crate::{ir::...}`", result.stderr)
+
+    def test_macro_cannot_split_a_crate_dependency_across_tokens(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/parser.rs").write_text(
+                "macro_rules! dep {\n"
+                "    ($root:tt, $module:ident) => {\n"
+                "        use $root::$module::Boundary;\n"
+                "    };\n"
+                "}\n"
+                "dep!(crate, ir);\n",
+                encoding="utf-8",
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "crate token inside a macro invocation is not analyzable",
+            result.stderr,
+        )
+
+    def test_macro_visibility_shape_cannot_exempt_a_captured_crate_root(self) -> None:
+        for invocation in ("dep!(pub(crate), ir);\n", "dep!(pub(in crate), ir);\n"):
+            with self.subTest(invocation=invocation), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                write_minimal_tree(root)
+                (root / "src/parser.rs").write_text(
+                    "macro_rules! dep {\n"
+                    "    (pub($root:tt), $module:ident) => {\n"
+                    "        pub($root) struct Local;\n"
+                    "        use $root::$module::Boundary;\n"
+                    "    };\n"
+                    "}\n"
+                    + invocation,
+                    encoding="utf-8",
+                )
+                result = run_checker(root)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn(
+                "crate token inside a macro invocation is not analyzable",
+                result.stderr,
+            )
+
+    def test_macro_invocation_cannot_retarget_an_apparently_allowed_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/parser.rs").write_text(
+                "macro_rules! dep {\n"
+                "    ($root:tt :: $visible:ident, $hidden:ident) => {\n"
+                "        use $root::$hidden::Boundary;\n"
+                "    };\n"
+                "}\n"
+                "dep!(crate::syntax_dialect, ir);\n",
+                encoding="utf-8",
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "crate token inside a macro invocation is not analyzable",
+            result.stderr,
+        )
+
+    def test_nested_super_in_grouped_use_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/placement/protocol/target.rs").write_text(
+                "use super::{super::ir::Boundary};\n", encoding="utf-8"
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "nested `super` root inside a grouped use is not analyzable",
+            result.stderr,
+        )
 
     def test_raw_identifiers_cannot_obscure_forbidden_root_modules(self) -> None:
         cases = (

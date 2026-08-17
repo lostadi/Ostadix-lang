@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::hgraph::ExecutableOp;
 use crate::ir::PlanNodeId;
 use crate::world::{
     ArtifactId, AttemptIdentity, GovernorIdentity, ResourceOwner, TaskIdentity, WorldIdentity,
@@ -290,10 +291,7 @@ impl RuntimeGraphV1 {
                     .operations
                     .get(event.plan_node.0)
                     .is_some_and(|operation| {
-                        matches!(
-                            operation.op,
-                            crate::hgraph::ExecutableOp::SelectRoute { .. }
-                        )
+                        matches!(operation.op, ExecutableOp::SelectRoute { .. })
                     })
         }) {
             return Err(invalid(
@@ -996,10 +994,7 @@ fn project_result_terminal(
                     .operations
                     .get(event.plan_node.0)
                     .is_some_and(|operation| {
-                        matches!(
-                            operation.op,
-                            crate::hgraph::ExecutableOp::SelectRoute { .. }
-                        )
+                        matches!(operation.op, ExecutableOp::SelectRoute { .. })
                     })
         })
         .ok_or_else(|| invalid("project result trace has no completed selection boundary"))?;
