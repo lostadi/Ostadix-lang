@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Reject the first frozen wrong-way Rust dependency edges.
+"""Enforce the production library's declared root dependency DAG.
 
 This is intentionally a token-aware lexical guard, not a full Rust dependency
-analyzer. It protects boundaries that have already been made explicit while a
-broader workspace extraction remains future work. Comments, literals, and
+analyzer. It enumerates every production library source, resolves explicit
+``crate`` and ``super`` paths under the repository's declared module geometry,
+and checks them against ``ci/architecture-roots.toml``. Comments, literals, and
 top-level items that are definitely disabled when ``test = false`` cannot hide
-or manufacture dependencies.
+or manufacture dependencies. Existing semantic boundary rules remain as
+narrower, human-explained constraints within that repository-wide contract.
 """
 
 from __future__ import annotations
@@ -13,9 +15,12 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import enum
+import json
 from pathlib import Path
+import posixpath
 import re
 import sys
+import tomllib
 
 
 @dataclasses.dataclass(frozen=True)
@@ -51,13 +56,7 @@ EXECUTOR_RUNTIME_PATHS = (
     "src/executor/trace.rs",
 )
 
-# `src/lib.rs` loads this physical tree once through
-# `#[path = "placement/protocol/mod.rs"] mod placement_protocol;`. Relative
-# `super` paths must therefore be resolved from that declared module root, not
-# from the compatibility facade implied by the on-disk directory names.
-EXPLICIT_PATH_MODULE_ROOTS = (
-    (("src", "placement", "protocol"), ("placement_protocol",)),
-)
+DEFAULT_MANIFEST_RELATIVE = Path("ci/architecture-roots.toml")
 
 
 RULES = (
@@ -652,28 +651,50 @@ def _disabled_item_end(tokens: list[Token], start: int, matches: dict[int, int])
     )
 
 
-def _top_level_disabled_item_ranges(
-    tokens: list[Token], matches: dict[int, int]
+def _production_disabled_item_ranges(
+    source: str, tokens: list[Token], matches: dict[int, int]
 ) -> list[tuple[int, int]]:
+    """Find definitely test-only Rust items at every analyzable module depth."""
+
     ranges: list[tuple[int, int]] = []
-    delimiters: list[str] = []
+    macro_ranges = _macro_token_ranges(source, tokens, matches)
+    analyzable_item_kinds = {
+        "const",
+        "enum",
+        "extern",
+        "extern_crate",
+        "fn",
+        "impl",
+        "macro",
+        "macro_rules",
+        "mod",
+        "static",
+        "struct",
+        "trait",
+        "type",
+        "union",
+        "use",
+    }
     index = 0
     while index < len(tokens):
         token = tokens[index]
-        if not delimiters and token.text == "#" and index + 1 < len(tokens) and tokens[index + 1].text == "[":
+        if (
+            token.text == "#"
+            and index + 1 < len(tokens)
+            and tokens[index + 1].text == "["
+            and not any(opening < index < closing for opening, closing in macro_ranges)
+        ):
             attribute_end = matches[index + 1]
-            cfg_value = _cfg_attribute_value(tokens, index, attribute_end, matches)
-            if cfg_value is CfgValue.FALSE:
+            if (
+                _attribute_definitely_disables_item(
+                    tokens, index, attribute_end, matches
+                )
+                and _item_kind(tokens, index, matches) in analyzable_item_kinds
+            ):
                 item_end = _disabled_item_end(tokens, attribute_end + 1, matches)
                 ranges.append((token.start, tokens[item_end].end))
                 index = item_end + 1
                 continue
-        if token.text in OPEN_TO_CLOSE:
-            delimiters.append(token.text)
-        elif token.text in CLOSE_TO_OPEN:
-            if not delimiters or delimiters[-1] != CLOSE_TO_OPEN[token.text]:
-                raise ValueError(f"unbalanced delimiter `{token.text}` at source offset {token.start}")
-            delimiters.pop()
         index += 1
     return ranges
 
@@ -691,7 +712,7 @@ def production_source(path: Path) -> str:
     tokens = _tokens(production)
     matches = _delimiter_matches(tokens)
     buffer = list(production)
-    for start, end in _top_level_disabled_item_ranges(tokens, matches):
+    for start, end in _production_disabled_item_ranges(production, tokens, matches):
         _mask_span(buffer, start, end)
     return "".join(buffer)
 
@@ -709,7 +730,91 @@ class PathViolation:
     message: str
 
 
-def _file_module_path(relative: str) -> tuple[str, ...]:
+@dataclasses.dataclass(frozen=True)
+class ProductionSpec:
+    source_root: str
+    crate_root: str
+    excluded_files: frozenset[str]
+    excluded_directories: tuple[str, ...]
+
+
+@dataclasses.dataclass(frozen=True)
+class PhysicalOverride:
+    path: str
+    kind: str
+    module_path: tuple[str, ...]
+
+
+@dataclasses.dataclass(frozen=True)
+class CompiledFragment:
+    path: str
+    owner: str
+    included_from: str
+
+
+@dataclasses.dataclass(frozen=True)
+class SourceInclusion:
+    source: str
+    target: str
+    offset: int
+
+
+@dataclasses.dataclass(frozen=True)
+class CrateRootDeclaration:
+    path: str | None
+    public: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class FacadeSpec:
+    path: tuple[str, ...]
+    kind: str
+    source: str
+    owner: str
+    target: str
+
+
+@dataclasses.dataclass(frozen=True)
+class RootSpec:
+    name: str
+    layer: int
+    allowed_dependencies: frozenset[str]
+
+
+@dataclasses.dataclass(frozen=True)
+class ArchitectureManifest:
+    path: str
+    production: ProductionSpec
+    compiled_fragments: tuple[CompiledFragment, ...]
+    physical_overrides: tuple[PhysicalOverride, ...]
+    facades: tuple[FacadeSpec, ...]
+    roots: dict[str, RootSpec]
+
+
+@dataclasses.dataclass(frozen=True)
+class SourceAnalysis:
+    relative: str
+    module_path: tuple[str, ...]
+    source: str
+    dependencies: tuple[Dependency, ...]
+    path_violations: tuple[PathViolation, ...]
+
+    @property
+    def root(self) -> str:
+        return self.module_path[0]
+
+
+@dataclasses.dataclass(frozen=True)
+class ArchitectureAudit:
+    failures: tuple[str, ...]
+    production_file_count: int
+    root_count: int
+    edge_count: int
+
+
+def _file_module_path(
+    relative: str, physical_overrides: tuple[PhysicalOverride, ...] = ()
+) -> tuple[str, ...]:
     """Derive the declared library-module path for one governed Rust file."""
 
     parts = Path(relative).parts
@@ -720,16 +825,25 @@ def _file_module_path(relative: str) -> tuple[str, ...]:
 
     explicit_root: tuple[str, ...] | None = None
     explicit_suffix: tuple[str, ...] = ()
-    for source_prefix, module_root in EXPLICIT_PATH_MODULE_ROOTS:
-        if parts[: len(source_prefix)] == source_prefix:
-            explicit_root = module_root
-            explicit_suffix = parts[len(source_prefix) :]
-            break
+    for override in physical_overrides:
+        source_prefix = Path(override.path).parts
+        if override.kind == "file":
+            matches_override = parts == source_prefix
+            suffix: tuple[str, ...] = ()
+        else:
+            matches_override = parts[: len(source_prefix)] == source_prefix
+            suffix = parts[len(source_prefix) :]
+        if not matches_override:
+            continue
+        if explicit_root is not None:
+            raise ValueError(f"`{relative}` matches multiple physical module overrides")
+        explicit_root = override.module_path
+        explicit_suffix = suffix
 
     if explicit_root is not None:
         if not explicit_suffix:
-            raise ValueError(f"`{relative}` resolves to an explicit module directory, not a file")
-        if explicit_suffix[-1] == "mod.rs":
+            modules = explicit_root
+        elif explicit_suffix[-1] == "mod.rs":
             modules = (*explicit_root, *explicit_suffix[:-1])
         else:
             modules = (*explicit_root, *explicit_suffix[:-1], explicit_suffix[-1][:-3])
@@ -840,6 +954,18 @@ def _macro_token_ranges(
     return ranges
 
 
+def _macro_invocation_ranges(
+    tokens: list[Token], matches: dict[int, int]
+) -> list[tuple[int, int]]:
+    return [
+        (opening, matches[opening])
+        for opening, token in enumerate(tokens)
+        if token.text in OPEN_TO_CLOSE
+        and opening > 0
+        and tokens[opening - 1].text == "!"
+    ]
+
+
 def _use_is_at_item_start(
     source: str,
     tokens: list[Token],
@@ -914,6 +1040,7 @@ def dependency_paths(
     tokens = _tokens(source)
     matches = _delimiter_matches(tokens)
     inline_modules = _inline_module_ranges(tokens, matches)
+    macro_invocations = _macro_invocation_ranges(tokens, matches)
     use_trees = _use_tree_ranges(source, tokens, matches)
     dependencies: list[Dependency] = []
     violations: list[PathViolation] = []
@@ -959,6 +1086,35 @@ def dependency_paths(
                 root_segments += 1
                 cursor += 2
         root_display = "crate" if root == "crate" else "::".join(["super"] * root_segments)
+        if any(
+            opening < index < closing
+            for opening, closing in macro_invocations
+        ):
+            violations.append(
+                PathViolation(
+                    root_offset,
+                    f"{root_display} token inside a macro invocation is not analyzable",
+                )
+            )
+            index = cursor + 1
+            continue
+        containing_use = next(
+            (
+                (use_index, semicolon)
+                for use_index, semicolon in use_trees
+                if use_index < index < semicolon
+            ),
+            None,
+        )
+        if root == "super" and containing_use is not None and index != containing_use[0] + 1:
+            violations.append(
+                PathViolation(
+                    root_offset,
+                    "nested `super` root inside a grouped use is not analyzable",
+                )
+            )
+            index = cursor + 1
+            continue
         if root == "super" and any(
             opening < index < closing for opening, closing in inline_modules
         ):
@@ -988,7 +1144,7 @@ def dependency_paths(
             index = cursor + 2
             continue
         if cursor + 1 >= len(tokens) or tokens[cursor + 1].text != "::":
-            if any(opening < index < closing for opening, closing in use_trees):
+            if containing_use is not None:
                 violations.append(
                     PathViolation(
                         root_offset,
@@ -1038,27 +1194,1283 @@ def dependency_paths(
     return dependencies, violations
 
 
-def findings(root: Path) -> list[str]:
+def _inside_brace(tokens: list[Token], matches: dict[int, int], index: int) -> bool:
+    return any(
+        token.text == "{" and opening < index < matches[opening]
+        for opening, token in enumerate(tokens)
+    )
+
+
+def _item_production_presence(
+    tokens: list[Token], matches: dict[int, int], item_keyword: int
+) -> CfgValue:
+    values: list[CfgValue] = []
+    cursor = item_keyword - 1
+    if cursor >= 0 and tokens[cursor].text == "pub":
+        cursor -= 1
+    while cursor >= 0 and tokens[cursor].text == "]":
+        opening = matches[cursor]
+        marker = opening - 1
+        if marker >= 0 and tokens[marker].text == "!":
+            marker -= 1
+        if marker < 0 or tokens[marker].text != "#":
+            break
+        values.append(
+            _attribute_production_presence(tokens, marker, cursor, matches)
+        )
+        cursor = marker - 1
+    return _cfg_all(values)
+
+
+def _has_public_use_of(
+    source: str,
+    tokens: list[Token],
+    matches: dict[int, int],
+    target: str,
+    *,
+    alias: str | None = None,
+    lower: int = 0,
+    upper: int | None = None,
+    top_level: bool = False,
+    direct_container: int | None = None,
+) -> bool:
+    upper = len(tokens) if upper is None else upper
+    for use_index, semicolon in _use_tree_ranges(source, tokens, matches):
+        if not (lower < use_index < upper) or semicolon >= upper:
+            continue
+        if use_index == 0 or not _is_keyword(source, tokens[use_index - 1], "pub"):
+            continue
+        if _item_production_presence(tokens, matches, use_index) is not CfgValue.TRUE:
+            continue
+        if top_level and _inside_brace(tokens, matches, use_index):
+            continue
+        if direct_container is not None:
+            containing_braces = [
+                opening
+                for opening, token in enumerate(tokens)
+                if token.text == "{" and opening < use_index < matches[opening]
+            ]
+            if containing_braces != [direct_container]:
+                continue
+        if use_index + 3 >= semicolon:
+            continue
+        if not (
+            _is_keyword(source, tokens[use_index + 1], "crate")
+            and tokens[use_index + 2].text == "::"
+            and tokens[use_index + 3].text == target
+        ):
+            continue
+        if alias is None:
+            if (
+                use_index + 6 == semicolon
+                and tokens[use_index + 4].text == "::"
+                and tokens[use_index + 5].text == "*"
+            ):
+                return True
+            continue
+        if (
+            use_index + 6 == semicolon
+            and _is_keyword(source, tokens[use_index + 4], "as")
+            and tokens[use_index + 5].text == alias
+        ):
+            return True
+    return False
+
+
+def _has_public_external_module(source: str, module_name: str) -> bool:
+    tokens = _tokens(source)
+    matches = _delimiter_matches(tokens)
+    for index in range(len(tokens) - 3):
+        if not (
+            _is_keyword(source, tokens[index], "pub")
+            and _is_keyword(source, tokens[index + 1], "mod")
+            and tokens[index + 2].text == module_name
+            and tokens[index + 3].text == ";"
+        ):
+            continue
+        if _inside_brace(tokens, matches, index):
+            continue
+        if _item_production_presence(tokens, matches, index + 1) is not CfgValue.TRUE:
+            continue
+        return True
+    return False
+
+
+def _facade_projection_error(
+    facade: FacadeSpec, analysis: SourceAnalysis
+) -> str | None:
+    display = "::".join(facade.path)
+    if facade.kind == "module":
+        if analysis.module_path != facade.path:
+            return (
+                f"facade `{display}` module source resolves to "
+                f"`{'::'.join(analysis.module_path)}`"
+            )
+    elif analysis.module_path != facade.path[:-1]:
+        return (
+            f"facade `{display}` source resolves to `{'::'.join(analysis.module_path)}`, "
+            f"not its declared parent `{'::'.join(facade.path[:-1])}`"
+        )
+
+    tokens = _tokens(analysis.source)
+    matches = _delimiter_matches(tokens)
+    if facade.kind == "alias":
+        if _has_public_use_of(
+            analysis.source,
+            tokens,
+            matches,
+            facade.target,
+            alias=facade.path[-1],
+            top_level=True,
+        ):
+            return None
+        return (
+            f"facade `{display}` source does not contain a top-level public alias "
+            f"of `crate::{facade.target}`"
+        )
+    if facade.kind == "module":
+        if _has_public_use_of(
+            analysis.source,
+            tokens,
+            matches,
+            facade.target,
+            top_level=True,
+        ):
+            return None
+        return (
+            f"facade `{display}` source does not publicly project "
+            f"`crate::{facade.target}`"
+        )
+
+    module_name = facade.path[-1]
+    for index in range(len(tokens) - 3):
+        if not (
+            _is_keyword(analysis.source, tokens[index], "pub")
+            and _is_keyword(analysis.source, tokens[index + 1], "mod")
+            and tokens[index + 2].text == module_name
+            and tokens[index + 3].text == "{"
+        ):
+            continue
+        opening = index + 3
+        if _inside_brace(tokens, matches, index):
+            continue
+        if _item_production_presence(tokens, matches, index + 1) is not CfgValue.TRUE:
+            continue
+        if _has_public_use_of(
+            analysis.source,
+            tokens,
+            matches,
+            facade.target,
+            lower=opening,
+            upper=matches[opening],
+            direct_container=opening,
+        ):
+            return None
+    return (
+        f"facade `{display}` source does not contain a public inline module "
+        f"projecting `crate::{facade.target}`"
+    )
+
+
+def _exact_keys(
+    table: dict[str, object], expected: frozenset[str], label: str
+) -> None:
+    missing = sorted(expected - table.keys())
+    unknown = sorted(table.keys() - expected)
+    if missing:
+        raise ValueError(f"{label} is missing field(s): {', '.join(missing)}")
+    if unknown:
+        raise ValueError(f"{label} has unknown field(s): {', '.join(unknown)}")
+
+
+def _relative_manifest_path(value: object, label: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{label} must be a non-empty relative path")
+    candidate = Path(value)
+    if (
+        candidate.is_absolute()
+        or "\\" in value
+        or any(part in {"", ".", ".."} for part in candidate.parts)
+        or candidate.as_posix() != value
+    ):
+        raise ValueError(f"{label} must be a normalized repository-relative path")
+    return value
+
+
+def _string_list(value: object, label: str) -> tuple[str, ...]:
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise ValueError(f"{label} must be an array of strings")
+    items = tuple(value)
+    if len(set(items)) != len(items):
+        raise ValueError(f"{label} must not contain duplicates")
+    return items
+
+
+def _manifest_tables(data: dict[str, object], key: str) -> list[dict[str, object]]:
+    value = data.get(key)
+    if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
+        raise ValueError(f"manifest `{key}` must be an array of tables")
+    return value
+
+
+def load_manifest(root: Path, manifest_path: Path | None = None) -> ArchitectureManifest:
+    root = root.resolve()
+    if manifest_path is None:
+        path = root / DEFAULT_MANIFEST_RELATIVE
+    else:
+        path = manifest_path if manifest_path.is_absolute() else root / manifest_path
+    try:
+        relative_manifest = path.resolve().relative_to(root.resolve()).as_posix()
+    except ValueError as error:
+        raise ValueError("architecture manifest must remain inside the repository root") from error
+    if not path.is_file():
+        raise ValueError(f"{relative_manifest}: required architecture manifest is missing")
+    try:
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as error:
+        raise ValueError(f"{relative_manifest}: could not parse manifest: {error}") from error
+
+    _exact_keys(
+        data,
+        frozenset(
+            {
+                "schema_version",
+                "production",
+                "compiled_fragment",
+                "physical_override",
+                "facade",
+                "root",
+            }
+        ),
+        "architecture manifest",
+    )
+    if data["schema_version"] != 1 or isinstance(data["schema_version"], bool):
+        raise ValueError("architecture manifest schema_version must be integer 1")
+
+    production_table = data["production"]
+    if not isinstance(production_table, dict):
+        raise ValueError("manifest `production` must be a table")
+    _exact_keys(
+        production_table,
+        frozenset(
+            {"source_root", "crate_root", "excluded_files", "excluded_directories"}
+        ),
+        "manifest `production`",
+    )
+    source_root = _relative_manifest_path(
+        production_table["source_root"], "manifest production.source_root"
+    )
+    crate_root = _relative_manifest_path(
+        production_table["crate_root"], "manifest production.crate_root"
+    )
+    if crate_root != source_root and not crate_root.startswith(f"{source_root}/"):
+        raise ValueError(f"manifest production.crate_root is outside `{source_root}`")
+    excluded_files = frozenset(
+        _relative_manifest_path(value, "manifest production.excluded_files entry")
+        for value in _string_list(
+            production_table["excluded_files"], "manifest production.excluded_files"
+        )
+    )
+    excluded_directories = tuple(
+        _relative_manifest_path(value, "manifest production.excluded_directories entry")
+        for value in _string_list(
+            production_table["excluded_directories"],
+            "manifest production.excluded_directories",
+        )
+    )
+    for excluded in (*excluded_files, *excluded_directories):
+        if excluded != source_root and not excluded.startswith(f"{source_root}/"):
+            raise ValueError(
+                f"manifest production exclusion `{excluded}` is outside `{source_root}`"
+            )
+    if crate_root not in excluded_files:
+        raise ValueError("manifest production.crate_root must be an excluded module entrypoint")
+    production = ProductionSpec(
+        source_root, crate_root, excluded_files, excluded_directories
+    )
+
+    physical_overrides: list[PhysicalOverride] = []
+    override_paths: set[str] = set()
+    for index, table in enumerate(_manifest_tables(data, "physical_override")):
+        label = f"manifest physical_override[{index}]"
+        _exact_keys(table, frozenset({"path", "kind", "module_path"}), label)
+        override_path = _relative_manifest_path(table["path"], f"{label}.path")
+        if override_path != source_root and not override_path.startswith(f"{source_root}/"):
+            raise ValueError(f"{label}.path is outside `{source_root}`")
+        if override_path in override_paths:
+            raise ValueError(f"duplicate physical override path `{override_path}`")
+        override_paths.add(override_path)
+        kind = table["kind"]
+        if kind not in {"file", "directory"}:
+            raise ValueError(f"{label}.kind must be `file` or `directory`")
+        module_path = _string_list(table["module_path"], f"{label}.module_path")
+        if not module_path or any(not IDENTIFIER_RE.fullmatch(part) for part in module_path):
+            raise ValueError(f"{label}.module_path must contain Rust identifiers")
+        physical_overrides.append(PhysicalOverride(override_path, kind, module_path))
+
+    roots: dict[str, RootSpec] = {}
+    root_tables = _manifest_tables(data, "root")
+    if not root_tables:
+        raise ValueError("architecture manifest must declare at least one root")
+    for index, table in enumerate(root_tables):
+        label = f"manifest root[{index}]"
+        _exact_keys(table, frozenset({"name", "layer", "allowed_dependencies"}), label)
+        name = table["name"]
+        if not isinstance(name, str) or not IDENTIFIER_RE.fullmatch(name):
+            raise ValueError(f"{label}.name must be a Rust identifier")
+        if name in roots:
+            raise ValueError(f"duplicate architecture root `{name}`")
+        layer = table["layer"]
+        if not isinstance(layer, int) or isinstance(layer, bool) or layer < 0:
+            raise ValueError(f"{label}.layer must be a non-negative integer")
+        allowed = _string_list(
+            table["allowed_dependencies"], f"{label}.allowed_dependencies"
+        )
+        if any(not IDENTIFIER_RE.fullmatch(dependency) for dependency in allowed):
+            raise ValueError(f"{label}.allowed_dependencies must contain Rust identifiers")
+        roots[name] = RootSpec(name, layer, frozenset(allowed))
+
+    for root_spec in roots.values():
+        for dependency in sorted(root_spec.allowed_dependencies):
+            target = roots.get(dependency)
+            if target is None:
+                raise ValueError(
+                    f"root `{root_spec.name}` allows unknown dependency root `{dependency}`"
+                )
+            if dependency == root_spec.name:
+                raise ValueError(f"root `{root_spec.name}` cannot allow itself")
+            if target.layer >= root_spec.layer:
+                raise ValueError(
+                    f"root `{root_spec.name}` layer {root_spec.layer} must be above "
+                    f"dependency `{dependency}` layer {target.layer}"
+                )
+
+    compiled_fragments: list[CompiledFragment] = []
+    fragment_paths: set[str] = set()
+    for index, table in enumerate(_manifest_tables(data, "compiled_fragment")):
+        label = f"manifest compiled_fragment[{index}]"
+        _exact_keys(table, frozenset({"path", "owner", "included_from"}), label)
+        fragment_path = _relative_manifest_path(table["path"], f"{label}.path")
+        if fragment_path in fragment_paths:
+            raise ValueError(f"duplicate compiled fragment path `{fragment_path}`")
+        fragment_paths.add(fragment_path)
+        if fragment_path not in excluded_files:
+            raise ValueError(
+                f"compiled fragment `{fragment_path}` must be excluded from standalone modules"
+            )
+        if not fragment_path.endswith(".rs") or not (root / fragment_path).is_file():
+            raise ValueError(
+                f"compiled fragment `{fragment_path}` is not an existing Rust source file"
+            )
+        owner = table["owner"]
+        if not isinstance(owner, str) or owner not in roots:
+            raise ValueError(f"{label}.owner must name a known architecture root")
+        included_from = _relative_manifest_path(
+            table["included_from"], f"{label}.included_from"
+        )
+        if included_from in excluded_files or not (root / included_from).is_file():
+            raise ValueError(
+                f"{label}.included_from must name an enumerated production source"
+            )
+        compiled_fragments.append(
+            CompiledFragment(fragment_path, owner, included_from)
+        )
+
+    expected_excluded_files = {
+        crate_root,
+        f"{source_root}/main.rs",
+        *(fragment.path for fragment in compiled_fragments),
+    }
+    if excluded_files != expected_excluded_files:
+        missing = sorted(expected_excluded_files - excluded_files)
+        unexpected = sorted(excluded_files - expected_excluded_files)
+        details: list[str] = []
+        if missing:
+            details.append(f"missing {', '.join(missing)}")
+        if unexpected:
+            details.append(f"unexpected {', '.join(unexpected)}")
+        raise ValueError(
+            "manifest production.excluded_files must contain exactly the crate "
+            "entrypoints and declared compiled fragments (" + "; ".join(details) + ")"
+        )
+    expected_excluded_directories = {f"{source_root}/bin"}
+    if set(excluded_directories) != expected_excluded_directories:
+        missing = sorted(expected_excluded_directories - set(excluded_directories))
+        unexpected = sorted(set(excluded_directories) - expected_excluded_directories)
+        details = []
+        if missing:
+            details.append(f"missing {', '.join(missing)}")
+        if unexpected:
+            details.append(f"unexpected {', '.join(unexpected)}")
+        raise ValueError(
+            "manifest production.excluded_directories must contain exactly the "
+            "conventional binary source directory (" + "; ".join(details) + ")"
+        )
+
+    facades: list[FacadeSpec] = []
+    facade_paths: set[tuple[str, ...]] = set()
+    for index, table in enumerate(_manifest_tables(data, "facade")):
+        label = f"manifest facade[{index}]"
+        _exact_keys(
+            table,
+            frozenset({"path", "kind", "source", "owner", "target"}),
+            label,
+        )
+        raw_path = table["path"]
+        if not isinstance(raw_path, str):
+            raise ValueError(f"{label}.path must be a `::`-separated module path")
+        facade_path = tuple(raw_path.split("::"))
+        if len(facade_path) < 2 or any(
+            not IDENTIFIER_RE.fullmatch(part) for part in facade_path
+        ):
+            raise ValueError(f"{label}.path must contain at least two Rust identifiers")
+        if facade_path in facade_paths:
+            raise ValueError(f"duplicate facade path `{raw_path}`")
+        facade_paths.add(facade_path)
+        kind = table["kind"]
+        if kind not in {"alias", "inline_module", "module"}:
+            raise ValueError(
+                f"{label}.kind must be `alias`, `inline_module`, or `module`"
+            )
+        source = _relative_manifest_path(table["source"], f"{label}.source")
+        owner = table["owner"]
+        target = table["target"]
+        if owner not in roots or target not in roots:
+            raise ValueError(f"{label} must name known owner and target roots")
+        if facade_path[0] != owner:
+            raise ValueError(f"{label}.owner must match the first facade path component")
+        if target not in roots[owner].allowed_dependencies:
+            raise ValueError(
+                f"facade `{raw_path}` target `{target}` is not an allowed dependency of `{owner}`"
+            )
+        facades.append(FacadeSpec(facade_path, kind, source, owner, target))
+
+    for override in physical_overrides:
+        target = root / override.path
+        exists_as_kind = target.is_file() if override.kind == "file" else target.is_dir()
+        if not exists_as_kind:
+            raise ValueError(
+                f"physical override `{override.path}` is not an existing {override.kind}"
+            )
+        if override.module_path[0] not in roots:
+            raise ValueError(
+                f"physical override `{override.path}` maps to unknown root "
+                f"`{override.module_path[0]}`"
+            )
+    for excluded in sorted(excluded_files):
+        if not (root / excluded).is_file():
+            raise ValueError(f"excluded production file `{excluded}` does not exist")
+    for excluded in excluded_directories:
+        if not (root / excluded).is_dir():
+            raise ValueError(f"excluded production directory `{excluded}` does not exist")
+
+    return ArchitectureManifest(
+        relative_manifest,
+        production,
+        tuple(compiled_fragments),
+        tuple(physical_overrides),
+        tuple(facades),
+        roots,
+    )
+
+
+def _path_attribute_value(
+    raw_source: str,
+    tokens: list[Token],
+    attribute_start: int,
+    attribute_end: int,
+) -> str | None:
+    content = attribute_start + 2
+    if content >= attribute_end or tokens[content].text != "path":
+        return None
+    if not (
+        content + 3 == attribute_end
+        and tokens[content + 1].text == "="
+        and tokens[content + 2].text == STRING_LITERAL_TOKEN
+    ):
+        raise ValueError(
+            f"malformed path attribute at source offset {tokens[attribute_start].start}"
+        )
+    literal_offset = tokens[content + 2].start
+    if raw_source[literal_offset : literal_offset + 1] != '"':
+        raise ValueError("module path attributes require ordinary string literals")
+    literal_end = _quoted_string_end(raw_source, literal_offset)
+    try:
+        value = json.loads(raw_source[literal_offset:literal_end])
+    except (TypeError, ValueError) as error:
+        raise ValueError("module path attribute is not a valid string") from error
+    if not isinstance(value, str) or not value:
+        raise ValueError("module path attribute must be a non-empty string")
+    return value
+
+
+def _crate_root_declarations(path: Path) -> dict[str, CrateRootDeclaration]:
+    raw_source = path.read_text(encoding="utf-8")
+    source = production_source(path)
+    tokens = _tokens(source)
+    matches = _delimiter_matches(tokens)
+    declarations: dict[str, CrateRootDeclaration] = {}
+    pending_path: str | None = None
+    index = 0
+    while index < len(tokens):
+        if (
+            tokens[index].text == "#"
+            and index + 1 < len(tokens)
+            and tokens[index + 1].text == "["
+        ):
+            attribute_end = matches[index + 1]
+            attribute_path = _path_attribute_value(
+                raw_source, tokens, index, attribute_end
+            )
+            if attribute_path is not None:
+                if pending_path is not None:
+                    raise ValueError("module declaration has multiple path attributes")
+                pending_path = attribute_path
+            conditional_paths = _cfg_attr_path_values(
+                raw_source, tokens, index, attribute_end, matches
+            )
+            if conditional_paths:
+                raise ValueError(
+                    "crate-root modules cannot use production-active "
+                    "cfg_attr path attributes"
+                )
+            if attribute_path is None:
+                raise ValueError(
+                    "crate-root module attributes are forbidden except exact #[path] "
+                    "physical overrides"
+                )
+            index = attribute_end + 1
+            continue
+
+        if (
+            tokens[index].text == "#"
+            and index + 2 < len(tokens)
+            and tokens[index + 1].text == "!"
+            and tokens[index + 2].text == "["
+        ):
+            raise ValueError("crate-root inner attributes are not permitted")
+
+        cursor = index
+        public = False
+        if _is_keyword(source, tokens[cursor], "pub"):
+            public = True
+            cursor += 1
+            if cursor < len(tokens) and tokens[cursor].text == "(":
+                public = False
+                cursor = matches[cursor] + 1
+        if cursor + 1 < len(tokens) and _is_keyword(source, tokens[cursor], "mod"):
+            name = tokens[cursor + 1].text
+            if not IDENTIFIER_RE.fullmatch(name):
+                raise ValueError(
+                    f"module declaration at source offset {tokens[cursor].start} "
+                    "has no analyzable identifier"
+                )
+            if name in declarations:
+                raise ValueError(f"crate root declares module `{name}` more than once")
+            declarations[name] = CrateRootDeclaration(pending_path, public)
+            pending_path = None
+            terminator = cursor + 2
+            if terminator >= len(tokens) or tokens[terminator].text != ";":
+                raise ValueError(
+                    f"crate-root module `{name}` must be an external semicolon declaration"
+                )
+            index = terminator + 1
+            continue
+
+        if pending_path is not None:
+            raise ValueError("path attribute is not attached to a module declaration")
+        raise ValueError(
+            "crate root must contain only attributes and external module declarations; "
+            f"found `{tokens[index].text}` at source offset {tokens[index].start}"
+        )
+    if pending_path is not None:
+        raise ValueError("path attribute is not attached to a module declaration")
+    return declarations
+
+
+def _declared_module_path(source_root: str, value: str) -> str:
+    candidate = Path(value)
+    if (
+        candidate.is_absolute()
+        or "\\" in value
+        or any(part in {"", ".", ".."} for part in candidate.parts)
+        or candidate.as_posix() != value
+    ):
+        raise ValueError(
+            f"crate-root module path `{value}` must remain normalized beneath `{source_root}`"
+        )
+    return f"{source_root}/{value}"
+
+
+def _ordinary_string_value(raw_source: str, token: Token, label: str) -> str:
+    if token.text != STRING_LITERAL_TOKEN or raw_source[token.start : token.start + 1] != '"':
+        raise ValueError(f"{label} requires an ordinary string literal")
+    literal_end = _quoted_string_end(raw_source, token.start)
+    try:
+        value = json.loads(raw_source[token.start:literal_end])
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{label} is not a valid string literal") from error
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{label} must be a non-empty string")
+    return value
+
+
+def _cfg_attr_payload(
+    tokens: list[Token],
+    start: int,
+    end: int,
+    matches: dict[int, int],
+) -> tuple[CfgValue, list[tuple[int, int]]]:
+    opening = start + 1
+    if (
+        opening >= end
+        or tokens[start].text != "cfg_attr"
+        or tokens[opening].text != "("
+        or matches[opening] != end - 1
+    ):
+        raise ValueError(f"malformed cfg_attr at source offset {tokens[start].start}")
+    closing = end - 1
+    value, cursor = _parse_cfg_predicate(tokens, opening + 1, closing, matches)
+    if cursor >= closing or tokens[cursor].text != ",":
+        raise ValueError(
+            f"cfg_attr at source offset {tokens[start].start} requires attributes"
+        )
+    cursor += 1
+    if cursor >= closing:
+        raise ValueError(
+            f"cfg_attr at source offset {tokens[start].start} requires attributes"
+        )
+
+    payload: list[tuple[int, int]] = []
+    while cursor < closing:
+        segment_start = cursor
+        while cursor < closing and tokens[cursor].text != ",":
+            if tokens[cursor].text in OPEN_TO_CLOSE:
+                nested_closing = matches[cursor]
+                if nested_closing >= closing:
+                    raise ValueError(
+                        f"cfg_attr payload at source offset "
+                        f"{tokens[segment_start].start} crosses its boundary"
+                    )
+                cursor = nested_closing + 1
+                continue
+            cursor += 1
+        segment_end = cursor
+        if segment_start == segment_end:
+            raise ValueError(
+                f"cfg_attr at source offset {tokens[start].start} "
+                "contains an empty attribute"
+            )
+        payload.append((segment_start, segment_end))
+        if cursor == closing:
+            break
+        cursor += 1
+        if cursor == closing:
+            break
+    return value, payload
+
+
+def _cfg_meta_value(
+    tokens: list[Token], start: int, end: int, matches: dict[int, int]
+) -> CfgValue | None:
+    if tokens[start].text != "cfg":
+        return None
+    opening = start + 1
+    if (
+        opening >= end
+        or tokens[opening].text != "("
+        or matches[opening] != end - 1
+    ):
+        raise ValueError(f"malformed cfg meta item at source offset {tokens[start].start}")
+    closing = end - 1
+    value, cursor = _parse_cfg_predicate(tokens, opening + 1, closing, matches)
+    if cursor != closing:
+        raise ValueError(
+            f"cfg meta item at source offset {tokens[start].start} "
+            "must contain exactly one predicate"
+        )
+    return value
+
+
+def _attribute_definitely_disables_item(
+    tokens: list[Token],
+    attribute_start: int,
+    attribute_end: int,
+    matches: dict[int, int],
+) -> bool:
+    if (
+        _cfg_attribute_value(tokens, attribute_start, attribute_end, matches)
+        is CfgValue.FALSE
+    ):
+        return True
+
+    content = attribute_start + 2
+    if content >= attribute_end or tokens[content].text != "cfg_attr":
+        return False
+
+    def active_cfg_is_false(start: int, end: int) -> bool:
+        predicate, payload = _cfg_attr_payload(tokens, start, end, matches)
+        if predicate is not CfgValue.TRUE:
+            return False
+        for segment_start, segment_end in payload:
+            cfg_value = _cfg_meta_value(
+                tokens, segment_start, segment_end, matches
+            )
+            if cfg_value is CfgValue.FALSE:
+                return True
+            if (
+                tokens[segment_start].text == "cfg_attr"
+                and active_cfg_is_false(segment_start, segment_end)
+            ):
+                return True
+        return False
+
+    return active_cfg_is_false(content, attribute_end)
+
+
+def _attribute_production_presence(
+    tokens: list[Token],
+    attribute_start: int,
+    attribute_end: int,
+    matches: dict[int, int],
+) -> CfgValue:
+    direct = _cfg_attribute_value(
+        tokens, attribute_start, attribute_end, matches
+    )
+    if direct is not None:
+        return direct
+
+    content = attribute_start + 2
+    if content >= attribute_end or tokens[content].text != "cfg_attr":
+        return CfgValue.TRUE
+
+    def cfg_attr_presence(start: int, end: int) -> CfgValue:
+        predicate, payload = _cfg_attr_payload(tokens, start, end, matches)
+        applied_values: list[CfgValue] = []
+        for segment_start, segment_end in payload:
+            cfg_value = _cfg_meta_value(
+                tokens, segment_start, segment_end, matches
+            )
+            if cfg_value is not None:
+                applied_values.append(cfg_value)
+            elif tokens[segment_start].text == "cfg_attr":
+                applied_values.append(
+                    cfg_attr_presence(segment_start, segment_end)
+                )
+        applied = _cfg_all(applied_values)
+        if predicate is CfgValue.FALSE or applied is CfgValue.TRUE:
+            return CfgValue.TRUE
+        if predicate is CfgValue.TRUE:
+            return applied
+        return CfgValue.UNKNOWN
+
+    return cfg_attr_presence(content, attribute_end)
+
+
+def _cfg_attr_path_values(
+    raw_source: str,
+    tokens: list[Token],
+    attribute_start: int,
+    attribute_end: int,
+    matches: dict[int, int],
+) -> list[str]:
+    """Return path attributes whose surrounding cfg_attr can be active."""
+
+    content = attribute_start + 2
+    if content >= attribute_end or tokens[content].text != "cfg_attr":
+        return []
+
+    def active_paths(start: int, end: int) -> list[str]:
+        value, payload = _cfg_attr_payload(tokens, start, end, matches)
+        if value is CfgValue.FALSE:
+            return []
+
+        values: list[str] = []
+        for segment_start, segment_end in payload:
+            if tokens[segment_start].text == "path":
+                if not (
+                    segment_start + 3 == segment_end
+                    and tokens[segment_start + 1].text == "="
+                    and tokens[segment_start + 2].text == STRING_LITERAL_TOKEN
+                ):
+                    raise ValueError(
+                        f"malformed cfg_attr path at source offset "
+                        f"{tokens[segment_start].start}"
+                    )
+                values.append(
+                    _ordinary_string_value(
+                        raw_source,
+                        tokens[segment_start + 2],
+                        "cfg_attr module path",
+                    )
+                )
+            elif tokens[segment_start].text == "cfg_attr":
+                values.extend(active_paths(segment_start, segment_end))
+        return values
+
+    return active_paths(content, attribute_end)
+
+
+def _source_inclusion_surface(
+    path: Path, relative: str, production: str
+) -> tuple[list[SourceInclusion], list[tuple[int, str]]]:
+    raw_source = path.read_text(encoding="utf-8")
+    tokens = _tokens(production)
+    matches = _delimiter_matches(tokens)
+    inclusions: list[SourceInclusion] = []
+    path_attributes: list[tuple[int, str]] = []
+    for index, token in enumerate(tokens):
+        if (
+            token.text == "#"
+            and index + 1 < len(tokens)
+            and tokens[index + 1].text == "["
+        ):
+            attribute_end = matches[index + 1]
+            value = _path_attribute_value(raw_source, tokens, index, attribute_end)
+            if value is not None:
+                path_attributes.append((token.start, value))
+            for conditional_path in _cfg_attr_path_values(
+                raw_source, tokens, index, attribute_end, matches
+            ):
+                path_attributes.append((token.start, conditional_path))
+        if token.text != "include":
+            continue
+        if not (
+            index + 2 < len(tokens)
+            and tokens[index + 1].text == "!"
+            and tokens[index + 2].text in OPEN_TO_CLOSE
+        ):
+            raise ValueError(
+                f"include macro reference at source offset {token.start} must be "
+                "a directly analyzable invocation; aliases are forbidden"
+            )
+        closing = matches[index + 2]
+        if closing != index + 4:
+            raise ValueError(
+                f"include! at source offset {token.start} must contain one literal path"
+            )
+        literal = _ordinary_string_value(
+            raw_source, tokens[index + 3], "include! source path"
+        )
+        literal_path = Path(literal)
+        if (
+            literal_path.is_absolute()
+            or "\\" in literal
+            or literal_path.as_posix() != literal
+        ):
+            raise ValueError(
+                f"include! path `{literal}` at source offset {token.start} "
+                "must be a file-relative POSIX path"
+            )
+        target = posixpath.normpath(
+            f"{Path(relative).parent.as_posix()}/{literal}"
+        )
+        if target == ".." or target.startswith("../"):
+            raise ValueError(
+                f"include! path `{literal}` at source offset {token.start} "
+                "escapes the repository"
+            )
+        inclusions.append(SourceInclusion(relative, target, token.start))
+    return inclusions, path_attributes
+
+
+def _cargo_library_findings(
+    root: Path, manifest: ArchitectureManifest
+) -> list[str]:
+    cargo_path = root / "Cargo.toml"
+    if not cargo_path.is_file() or cargo_path.is_symlink():
+        return ["Cargo.toml: required regular package manifest is missing"]
+    try:
+        cargo = tomllib.loads(cargo_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as error:
+        return [f"Cargo.toml: could not parse package manifest: {error}"]
+
+    package = cargo.get("package")
+    if not isinstance(package, dict):
+        return ["Cargo.toml: architecture root requires a package table"]
+    autolib = package.get("autolib", True)
+    if not isinstance(autolib, bool):
+        return ["Cargo.toml: package.autolib must be boolean when present"]
+
+    lib = cargo.get("lib")
+    if lib is None:
+        if not autolib:
+            return [
+                "Cargo.toml: package.autolib=false removes the governed library target"
+            ]
+        declared = "src/lib.rs"
+    else:
+        if not isinstance(lib, dict):
+            return ["Cargo.toml: lib target must be a table"]
+        raw_path = lib.get("path", "src/lib.rs")
+        try:
+            declared = _relative_manifest_path(raw_path, "Cargo.toml lib.path")
+        except ValueError as error:
+            return [str(error)]
+
+    if declared != manifest.production.crate_root:
+        return [
+            f"Cargo.toml: library target `{declared}` does not match governed crate "
+            f"root `{manifest.production.crate_root}`"
+        ]
+    return []
+
+
+def _crate_root_findings(root: Path, manifest: ArchitectureManifest) -> list[str]:
     failures: list[str] = []
+    crate_root = root / manifest.production.crate_root
+    try:
+        declarations = _crate_root_declarations(crate_root)
+    except (OSError, UnicodeError, ValueError) as error:
+        return [
+            f"{manifest.production.crate_root}: could not analyze crate-root modules: {error}"
+        ]
+
+    expected_overrides: dict[str, str] = {}
+    for override in manifest.physical_overrides:
+        if len(override.module_path) != 1:
+            continue
+        module = override.module_path[0]
+        expected = (
+            override.path
+            if override.kind == "file"
+            else f"{override.path}/mod.rs"
+        )
+        if module in expected_overrides:
+            failures.append(f"root `{module}` has multiple crate-root physical overrides")
+        expected_overrides[module] = expected
+
+    for module in sorted(declarations.keys() - manifest.roots.keys()):
+        failures.append(f"crate root declares unknown architecture root `{module}`")
+    for module in sorted(manifest.roots.keys() - declarations.keys()):
+        failures.append(f"manifest root `{module}` is not declared by the crate root")
+    for module in sorted(declarations.keys() & manifest.roots.keys()):
+        raw_path = declarations[module].path
+        try:
+            declared_path = (
+                None
+                if raw_path is None
+                else _declared_module_path(manifest.production.source_root, raw_path)
+            )
+        except ValueError as error:
+            failures.append(f"crate-root module `{module}`: {error}")
+            continue
+        expected_path = expected_overrides.get(module)
+        if declared_path != expected_path:
+            failures.append(
+                f"crate-root module `{module}` declares physical path "
+                f"`{declared_path or '<conventional>'}`, expected "
+                f"`{expected_path or '<conventional>'}`"
+            )
+    for owner in sorted({facade.owner for facade in manifest.facades}):
+        declaration = declarations.get(owner)
+        if declaration is not None and not declaration.public:
+            failures.append(
+                f"facade owner root `{owner}` must be a plain public crate-root module"
+            )
+    return failures
+
+
+def _production_paths(root: Path, manifest: ArchitectureManifest) -> list[Path]:
+    source_root = root / manifest.production.source_root
+    if not source_root.is_dir():
+        raise ValueError(
+            f"production source root `{manifest.production.source_root}` is missing"
+        )
+    if source_root.is_symlink():
+        raise ValueError(
+            f"production source root `{manifest.production.source_root}` must not be a symlink"
+        )
+    for candidate in sorted(source_root.rglob("*")):
+        if candidate.is_symlink():
+            relative = candidate.relative_to(root).as_posix()
+            raise ValueError(f"production source path `{relative}` must not be a symlink")
+    paths: list[Path] = []
+    for path in sorted(source_root.rglob("*.rs")):
+        relative = path.relative_to(root).as_posix()
+        if relative in manifest.production.excluded_files:
+            continue
+        if any(
+            relative == directory or relative.startswith(f"{directory}/")
+            for directory in manifest.production.excluded_directories
+        ):
+            continue
+        if path.is_symlink():
+            raise ValueError(f"production Rust path `{relative}` must not be a symlink")
+        if not path.is_file():
+            raise ValueError(f"production Rust path `{relative}` is not a regular file")
+        paths.append(path)
+    return paths
+
+
+def _source_inclusion_findings(
+    root: Path,
+    manifest: ArchitectureManifest,
+    analyses: dict[str, SourceAnalysis],
+) -> list[str]:
+    failures: list[str] = []
+    actual: list[SourceInclusion] = []
+    for analysis in analyses.values():
+        path = root / analysis.relative
+        try:
+            inclusions, path_attributes = _source_inclusion_surface(
+                path, analysis.relative, analysis.source
+            )
+        except (OSError, UnicodeError, ValueError) as error:
+            failures.append(
+                f"{analysis.relative}: could not analyze source inclusion: {error}"
+            )
+            continue
+        actual.extend(inclusions)
+        for offset, declared_path in path_attributes:
+            line = analysis.source.count("\n", 0, offset) + 1
+            failures.append(
+                f"{analysis.relative}:{line}: undeclared #[path = "
+                f"{declared_path!r}] module source; physical source geometry "
+                f"must be declared in {manifest.path} and the crate root"
+            )
+
+    crate_relative = manifest.production.crate_root
+    crate_path = root / crate_relative
+    try:
+        crate_production = production_source(crate_path)
+        crate_inclusions, _crate_path_attributes = _source_inclusion_surface(
+            crate_path, crate_relative, crate_production
+        )
+        actual.extend(crate_inclusions)
+    except (OSError, UnicodeError, ValueError) as error:
+        failures.append(f"{crate_relative}: could not analyze source inclusion: {error}")
+
+    declared = {
+        (fragment.included_from, fragment.path): fragment
+        for fragment in manifest.compiled_fragments
+    }
+    counts: dict[tuple[str, str], int] = {}
+    for inclusion in actual:
+        key = (inclusion.source, inclusion.target)
+        counts[key] = counts.get(key, 0) + 1
+        if key not in declared:
+            source = analyses.get(inclusion.source)
+            production = source.source if source is not None else production_source(
+                root / inclusion.source
+            )
+            line = production.count("\n", 0, inclusion.offset) + 1
+            failures.append(
+                f"{inclusion.source}:{line}: include! source `{inclusion.target}` "
+                f"is not declared in {manifest.path}"
+            )
+    for key, fragment in declared.items():
+        count = counts.get(key, 0)
+        if count != 1:
+            failures.append(
+                f"compiled fragment `{fragment.path}` must have exactly one include! "
+                f"from `{fragment.included_from}`; observed {count}"
+            )
+        owner_source = analyses.get(fragment.included_from)
+        if owner_source is None or owner_source.root != fragment.owner:
+            observed = "missing" if owner_source is None else owner_source.root
+            failures.append(
+                f"compiled fragment `{fragment.path}` owner source resolves to "
+                f"`{observed}`, expected `{fragment.owner}`"
+            )
+    return failures
+
+
+def _tarjan_components(
+    vertices: set[str], edges: set[tuple[str, str]]
+) -> list[tuple[str, ...]]:
+    adjacency = {
+        vertex: sorted(target for source, target in edges if source == vertex)
+        for vertex in vertices
+    }
+    index = 0
+    indices: dict[str, int] = {}
+    lowlinks: dict[str, int] = {}
+    stack: list[str] = []
+    on_stack: set[str] = set()
+    components: list[tuple[str, ...]] = []
+
+    def visit(vertex: str) -> None:
+        nonlocal index
+        indices[vertex] = index
+        lowlinks[vertex] = index
+        index += 1
+        stack.append(vertex)
+        on_stack.add(vertex)
+        for target in adjacency[vertex]:
+            if target not in indices:
+                visit(target)
+                lowlinks[vertex] = min(lowlinks[vertex], lowlinks[target])
+            elif target in on_stack:
+                lowlinks[vertex] = min(lowlinks[vertex], indices[target])
+        if lowlinks[vertex] != indices[vertex]:
+            return
+        component: list[str] = []
+        while True:
+            member = stack.pop()
+            on_stack.remove(member)
+            component.append(member)
+            if member == vertex:
+                break
+        components.append(tuple(sorted(component)))
+
+    for vertex in sorted(vertices):
+        if vertex not in indices:
+            visit(vertex)
+    return sorted(components)
+
+
+def audit_architecture(
+    root: Path, manifest_path: Path | None = None
+) -> ArchitectureAudit:
+    root = root.resolve()
+    failures: list[str] = []
+    try:
+        manifest = load_manifest(root, manifest_path)
+        paths = _production_paths(root, manifest)
+    except ValueError as error:
+        return ArchitectureAudit((str(error),), 0, 0, 0)
+
+    failures.extend(_crate_root_findings(root, manifest))
+    failures.extend(_cargo_library_findings(root, manifest))
+
+    source_entries: list[tuple[Path, tuple[str, ...] | None]] = [
+        (path, None) for path in paths
+    ]
+    source_entries.extend(
+        (root / fragment.path, (fragment.owner,))
+        for fragment in manifest.compiled_fragments
+    )
+
+    analyses: dict[str, SourceAnalysis] = {}
+    observed_roots: set[str] = set()
+    for path, declared_module_path in source_entries:
+        relative = path.relative_to(root).as_posix()
+        try:
+            module_path = declared_module_path or _file_module_path(
+                relative, manifest.physical_overrides
+            )
+            source = production_source(path)
+            dependencies, path_violations = dependency_paths(source, module_path)
+        except (OSError, UnicodeError, ValueError) as error:
+            failures.append(f"{relative}: could not analyze Rust tokens: {error}")
+            continue
+        analysis = SourceAnalysis(
+            relative,
+            module_path,
+            source,
+            tuple(dependencies),
+            tuple(path_violations),
+        )
+        analyses[relative] = analysis
+        observed_roots.add(analysis.root)
+        if analysis.root not in manifest.roots:
+            failures.append(
+                f"{relative}: production path resolves to unknown root `{analysis.root}`"
+            )
+        for violation in path_violations:
+            line = source.count("\n", 0, violation.offset) + 1
+            failures.append(
+                f"{relative}:{line}: {violation.message}; production architecture "
+                "surfaces require explicit root paths"
+            )
+
+    failures.extend(_source_inclusion_findings(root, manifest, analyses))
+
+    for root_name in sorted(manifest.roots.keys() - observed_roots):
+        failures.append(f"manifest root `{root_name}` has no production Rust source")
+
+    edges: set[tuple[str, str]] = set()
+    for analysis in analyses.values():
+        source_spec = manifest.roots.get(analysis.root)
+        if source_spec is None:
+            continue
+        for dependency in analysis.dependencies:
+            if dependency.module == analysis.root:
+                continue
+            edge = (analysis.root, dependency.module)
+            edges.add(edge)
+            line = analysis.source.count("\n", 0, dependency.offset) + 1
+            target_spec = manifest.roots.get(dependency.module)
+            if target_spec is None:
+                failures.append(
+                    f"{analysis.relative}:{line}: dependency `{dependency.display}` resolves "
+                    f"to unknown root `{dependency.module}`"
+                )
+                continue
+            if dependency.module not in source_spec.allowed_dependencies:
+                failures.append(
+                    f"{analysis.relative}:{line}: root edge `{analysis.root} -> "
+                    f"{dependency.module}` is not declared in {manifest.path}"
+                )
+            if target_spec.layer >= source_spec.layer:
+                failures.append(
+                    f"{analysis.relative}:{line}: root edge `{analysis.root} -> "
+                    f"{dependency.module}` does not descend from layer "
+                    f"{source_spec.layer} to a lower layer"
+                )
+
+    known_edges = {
+        (source, target)
+        for source, target in edges
+        if source in manifest.roots and target in manifest.roots
+    }
+    for component in _tarjan_components(set(manifest.roots), known_edges):
+        if len(component) > 1:
+            failures.append(
+                "multi-root strongly connected component detected: "
+                f"{', '.join(component)}; the declared root graph must remain a DAG"
+            )
+
+    for facade in manifest.facades:
+        source = analyses.get(facade.source)
+        display = "::".join(facade.path)
+        if source is None:
+            failures.append(f"facade `{display}` source `{facade.source}` is not production")
+            continue
+        if source.root != facade.owner:
+            failures.append(
+                f"facade `{display}` source resolves to `{source.root}`, not owner "
+                f"`{facade.owner}`"
+            )
+        if facade.kind == "module":
+            parents = [
+                analysis
+                for analysis in analyses.values()
+                if analysis.module_path == facade.path[:-1]
+            ]
+            if len(parents) != 1:
+                failures.append(
+                    f"facade `{display}` requires exactly one production parent "
+                    f"module `{'::'.join(facade.path[:-1])}`; observed {len(parents)}"
+                )
+            elif not _has_public_external_module(
+                parents[0].source, facade.path[-1]
+            ):
+                failures.append(
+                    f"facade `{display}` parent does not publicly declare external "
+                    f"module `{facade.path[-1]}`"
+                )
+        projection_error = _facade_projection_error(facade, source)
+        if projection_error is not None:
+            failures.append(projection_error)
+        if facade.target not in {
+            dependency.module
+            for dependency in source.dependencies
+            if dependency.module != source.root
+        }:
+            failures.append(
+                f"facade `{display}` source does not expose a direct "
+                f"`{facade.owner} -> {facade.target}` production edge"
+            )
+
     for rule in RULES:
         for relative in rule.paths:
-            path = root / relative
-            if not path.is_file():
+            analysis = analyses.get(relative)
+            if analysis is None:
                 failures.append(f"{relative}: required architecture surface is missing")
                 continue
-            try:
-                file_module_path = _file_module_path(relative)
-                source = production_source(path)
-            except ValueError as error:
-                failures.append(f"{relative}: could not analyze Rust tokens: {error}")
-                continue
-            dependencies, path_violations = dependency_paths(source, file_module_path)
-            for violation in path_violations:
-                line = source.count("\n", 0, violation.offset) + 1
-                failures.append(
-                    f"{relative}:{line}: {violation.message}; governed architecture surfaces require explicit root paths"
-                )
-            for dependency in dependencies:
+            for dependency in analysis.dependencies:
                 explicitly_forbidden = dependency.module in rule.forbidden_modules
                 outside_allowlist = (
                     rule.allowed_modules is not None
@@ -1066,11 +2478,23 @@ def findings(root: Path) -> list[str]:
                 )
                 if not explicitly_forbidden and not outside_allowlist:
                     continue
-                line = source.count("\n", 0, dependency.offset) + 1
+                line = analysis.source.count("\n", 0, dependency.offset) + 1
                 failures.append(
                     f"{relative}:{line}: forbidden dependency `{dependency.display}`; {rule.reason}"
                 )
-    return failures
+
+    return ArchitectureAudit(
+        tuple(failures),
+        len(paths),
+        len(observed_roots),
+        len(edges),
+    )
+
+
+def findings(root: Path, manifest_path: Path | None = None) -> list[str]:
+    """Compatibility wrapper returning only audit failures."""
+
+    return list(audit_architecture(root, manifest_path).failures)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1081,13 +2505,23 @@ def main(argv: list[str] | None = None) -> int:
         default=Path(__file__).resolve().parents[1],
         help="repository root (default: parent of scripts/)",
     )
+    parser.add_argument(
+        "--manifest",
+        type=Path,
+        help="manifest path, relative to --root (default: ci/architecture-roots.toml)",
+    )
     args = parser.parse_args(argv)
-    failures = findings(args.root.resolve())
-    if failures:
-        for failure in failures:
+    root = args.root.resolve()
+    audit = audit_architecture(root, args.manifest)
+    if audit.failures:
+        for failure in audit.failures:
             print(f"architecture boundary: FAIL: {failure}", file=sys.stderr)
         return 1
-    print("architecture dependency boundaries: PASS")
+    print(
+        "architecture dependency boundaries: PASS "
+        f"({audit.production_file_count} production files, "
+        f"{audit.root_count} roots, {audit.edge_count} cross-root edges)"
+    )
     return 0
 
 

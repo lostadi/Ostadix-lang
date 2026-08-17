@@ -404,6 +404,9 @@ class SourceReleaseTests(unittest.TestCase):
             "README.md": fixture_readme(),
             "SECURITY.md": "# Security\n",
             "boot-and-test.sh": "#!/bin/sh\nexit 0\n",
+            "ci/architecture-roots.toml": (
+                PROJECT_ROOT / "ci/architecture-roots.toml"
+            ).read_text(encoding="utf-8"),
             "ci/required-jobs.toml": (
                 'schema = "ostadix.ci-required-jobs/v1"\nrequired_jobs = ["contracts"]\n'
             ),
@@ -914,6 +917,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "README.md",
                 "SECURITY.md",
                 "boot-and-test.sh",
+                "ci/architecture-roots.toml",
                 "ci/required-jobs.toml",
                 "ci/test-suites.toml",
                 "rust-toolchain.toml",
@@ -1569,6 +1573,7 @@ class SourceReleaseTests(unittest.TestCase):
             ".github/workflows/ci.yml",
             ".github/workflows/fuzz.yml",
             "Cargo.lock",
+            "ci/architecture-roots.toml",
             "ci/required-jobs.toml",
             "ci/test-suites.toml",
             "rust-toolchain.toml",

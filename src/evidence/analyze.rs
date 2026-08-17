@@ -815,9 +815,10 @@ fn failure_class(summary: &EffectSummary, dispatch_adapter: DispatchAdapterV1) -
                 && !summary.spawn
                 && !summary.clock
                 && summary.actor_state.is_none()
-                && summary.reads.iter().all(|resource| {
-                    matches!(resource, crate::effects::ResourceKey::ScopeBinding(_))
-                }) =>
+                && summary
+                    .reads
+                    .iter()
+                    .all(|resource| matches!(resource, ResourceKey::ScopeBinding(_))) =>
         {
             FailureClassV1::MayFailNoExternalEffects
         }
