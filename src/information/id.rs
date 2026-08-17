@@ -53,7 +53,7 @@ macro_rules! digest_id {
                 Ok(Self(value))
             }
 
-            pub(crate) fn digest(bytes: &[u8]) -> Self {
+            pub(in crate::information) fn digest(bytes: &[u8]) -> Self {
                 Self(domain_digest($domain, bytes))
             }
 
