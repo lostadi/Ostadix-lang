@@ -581,7 +581,8 @@ class SourceReleaseTests(unittest.TestCase):
             "scripts/smoke-world-g0-conformance.sh": "#!/usr/bin/env bash\n",
             "scripts/release_evidence.py": "#!/usr/bin/env python3\n",
             "scripts/world_alpha_evidence.py": "#!/usr/bin/env python3\n",
-            "src/backend_catalog.inc.rs": "// fixture canonical backend catalog\n",
+            "src/backend_catalog.rs": "// fixture canonical backend catalog implementation\n",
+            "src/backend_catalog.inc.rs": "// fixture canonical backend catalog data\n",
             "src/api.rs": "// fixture curated public API\n",
             "src/backend.rs": "// fixture backend runtime\n",
             "src/backend_morphism.rs": "// fixture shadow backend morphism kernel\n",
@@ -1028,6 +1029,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "src/backend.rs",
                 "src/backend_morphism.rs",
                 "src/api.rs",
+                "src/backend_catalog.rs",
                 "src/backend_catalog.inc.rs",
                 "src/backend_state.rs",
                 "src/canonical_cbor.rs",
@@ -1639,6 +1641,7 @@ class SourceReleaseTests(unittest.TestCase):
             "src/backend.rs",
             "src/backend_morphism.rs",
             "src/backend_state.rs",
+            "src/backend_catalog.rs",
             "src/eval.rs",
             "docs/HOSTED_PLACEMENT_V6.md",
             "setup.sh",
@@ -1972,6 +1975,7 @@ class SourceReleaseTests(unittest.TestCase):
             "src/evidence/intent.rs",
             "src/evidence/mod.rs",
             "src/evidence/profile.rs",
+            "src/backend_catalog.rs",
             "src/backend_catalog.inc.rs",
             "src/runtime_exec.rs",
         )
@@ -1980,6 +1984,7 @@ class SourceReleaseTests(unittest.TestCase):
         with self.assertRaisesRegex(
             release.ReleaseError,
             r"missing required path\(s\): .*src/backend_catalog\.inc\.rs.*"
+            r"src/backend_catalog\.rs.*"
             r"src/evidence/admit\.rs.*"
             r"src/evidence/analyze\.rs.*src/evidence/fact\.rs.*"
             r"src/evidence/intent\.rs.*src/evidence/mod\.rs.*src/evidence/profile\.rs.*"

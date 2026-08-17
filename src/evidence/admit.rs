@@ -1523,7 +1523,7 @@ fn explain_hosted_task_layers(
         .iter()
         .filter_map(|node| match &node.kind {
             PlanNodeKind::Exec { backend, .. }
-                if backend.execution == crate::ir::ExecutionMode::Shim =>
+                if backend.execution == crate::backend_catalog::ExecutionMode::Shim =>
             {
                 Some(node.id)
             }
@@ -1793,7 +1793,7 @@ fn inside_left_to_right_region(plan: &ExecutionPlan, node: PlanNodeId) -> bool {
             matches!(
                 kind,
                 PlanNodeKind::Exec { backend, .. }
-                    if backend.execution == crate::ir::ExecutionMode::InlineAst
+                    if backend.execution == crate::backend_catalog::ExecutionMode::InlineAst
                         && backend.canonical == "O"
             )
         })
@@ -1832,6 +1832,7 @@ fn yes_no(value: bool) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend_catalog::BackendRegistry;
     use crate::evidence::{
         analyze_execution, runtime_binding_from_adapter_bytes, runtime_binding_from_directory,
         runtime_binding_from_directory_reusing_executables, BackendArtifactStateV1, CostEstimateV1,
@@ -1840,7 +1841,7 @@ mod tests {
     use crate::hgraph::from_oir::build_program;
     use crate::hgraph::solve::solve_types;
     use crate::hgraph::{DomainFlags, ValueState};
-    use crate::ir::{BackendRegistry, InvokeMode, OIr, OIrProgram, PlanNodeKind};
+    use crate::ir::{InvokeMode, OIr, OIrProgram, PlanNodeKind};
     use crate::parser::Parser;
     use crate::value::GroupMode;
 
@@ -2103,7 +2104,7 @@ mod tests {
                 lang: "html".into(),
                 env_id: u32::MAX,
                 attr: None,
-                backend: crate::ir::BackendRegistry::global().interface_for("html"),
+                backend: crate::backend_catalog::BackendRegistry::global().interface_for("html"),
                 body: vec![OIr::Text("<strong>fixed point</strong>".into())],
             }],
         };
@@ -2132,7 +2133,7 @@ mod tests {
                 lang: "python".into(),
                 env_id: u32::MAX,
                 attr: None,
-                backend: crate::ir::BackendRegistry::global().interface_for("text"),
+                backend: crate::backend_catalog::BackendRegistry::global().interface_for("text"),
                 body: vec![OIr::Text("not python".into())],
             }],
         };
@@ -2346,7 +2347,7 @@ mod tests {
             lang: "python".into(),
             env_id: u32::MAX,
             attr: None,
-            backend: crate::ir::BackendRegistry::global().interface_for("python"),
+            backend: crate::backend_catalog::BackendRegistry::global().interface_for("python"),
             body: vec![OIr::Text(format!("__oval_result__ = {value}"))],
         };
         let program = OIrProgram {

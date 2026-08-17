@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 
+use crate::backend_catalog::BackendRegistry;
 use crate::eval::PlacementFragmentBindingsV1;
-use crate::ir::BackendRegistry;
 use crate::placement::{
     ActorGenerationIdV1, CandidateDecisionV1, CanonicalPlacementRecordV1, CurrentBackendCatalogV1,
     EnvironmentRequirementV1, GenerationV1, LeaseExpectationV2, LeaseStateBindingV2,

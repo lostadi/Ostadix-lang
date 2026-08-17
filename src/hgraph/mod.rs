@@ -27,11 +27,11 @@ mod tests {
     use proptest::prelude::*;
 
     use crate::{
-        effects::ResourceKey,
-        ir::{
-            BackendRegistry, BackendValueCapabilities, IntegerExactness, InvokeMode, OIr,
-            OIrProgram, RichNumberPreservation,
+        backend_catalog::{
+            BackendRegistry, BackendValueCapabilities, IntegerExactness, RichNumberPreservation,
         },
+        effects::ResourceKey,
+        ir::{InvokeMode, OIr, OIrProgram},
         value::{AnnotationKind, Fidelity, FidelityAssessmentV2, GroupMode, ONumber, OValue},
     };
 
