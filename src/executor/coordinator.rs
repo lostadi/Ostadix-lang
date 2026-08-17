@@ -19,9 +19,11 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{bail, Result};
 
 use crate::effects::EffectSummary;
-use crate::eval::{derive_policy_contexts, Evaluator, ExecutionTrace, GraphEvalFrame};
+use crate::eval_core::{
+    derive_policy_contexts, trace_fingerprint, ExecutionTrace, GraphEvalFrame, GraphEvaluationHost,
+};
 use crate::evidence::{AdmittedExecution, DispatchAdapterV1, DispatchLaneV1, FailureClassV1};
-use crate::execution_contract::Policy;
+use crate::execution_contract::{validate_execution_metadata, Policy};
 use crate::hgraph::{schedule::ReadySchedule, NodeId, ValueState};
 use crate::ir::{ExecutionPlan, OIr, OIrProgram, PlanNodeId, PlanNodeKind};
 use crate::value::OValue;
@@ -197,13 +199,13 @@ impl<'a> Coordinator<'a> {
     /// Drive the plan to completion, committing store deltas and root results
     /// into `scope` in deterministic root order. Returns the last non-null,
     /// non-whitespace root value (the document value).
-    pub fn run(
+    pub(crate) fn run_host(
         mut self,
-        evaluator: &mut Evaluator,
+        evaluator: &mut dyn GraphEvaluationHost,
         scope: &mut std::collections::HashMap<String, OValue>,
     ) -> Result<OValue> {
         evaluator.verify_admitted_runtime_context(&self.admitted)?;
-        evaluator.prevalidate_graph_execution(self.plan, &self.flat)?;
+        validate_execution_metadata(&self.flat)?;
         self.frame.base_scope = scope.clone();
 
         self.materialize_literals()?;
@@ -242,18 +244,15 @@ impl<'a> Coordinator<'a> {
             let value = OValue::str_(text);
             self.trace.ready(id);
             self.trace.started(id);
-            self.trace.finished(
-                id,
-                value.type_name().to_string(),
-                Evaluator::trace_fingerprint(&value),
-            );
+            self.trace
+                .finished(id, value.type_name().to_string(), trace_fingerprint(&value));
             self.frame.set_value(id, value)?;
         }
         Ok(())
     }
 
     /// The readiness-driven event loop.
-    fn drive(&mut self, evaluator: &mut Evaluator) -> Result<()> {
+    fn drive(&mut self, evaluator: &mut dyn GraphEvaluationHost) -> Result<()> {
         let worker_operations = self
             .ops
             .iter()
@@ -559,7 +558,7 @@ impl<'a> Coordinator<'a> {
 
     fn dispatch_workers(
         &mut self,
-        evaluator: &Evaluator,
+        evaluator: &dyn GraphEvaluationHost,
         pool: &mut WorkerPool,
         selected: &[usize],
     ) -> Result<()> {
@@ -652,7 +651,7 @@ impl<'a> Coordinator<'a> {
 
     fn accept_worker_event(
         &mut self,
-        evaluator: &mut Evaluator,
+        evaluator: &mut dyn GraphEvaluationHost,
         pool: &mut WorkerPool,
         event: WorkerEvent,
     ) -> Result<()> {
@@ -675,7 +674,7 @@ impl<'a> Coordinator<'a> {
     /// its callback reply cannot be stranded during pool destruction.
     fn accept_worker_event_or_abort(
         &mut self,
-        evaluator: &mut Evaluator,
+        evaluator: &mut dyn GraphEvaluationHost,
         pool: &mut WorkerPool,
         event: WorkerEvent,
     ) -> Result<()> {
@@ -691,7 +690,7 @@ impl<'a> Coordinator<'a> {
 
     fn handle_worker_eval_request(
         &mut self,
-        evaluator: &mut Evaluator,
+        evaluator: &mut dyn GraphEvaluationHost,
         request: TaskEvalRequest,
     ) -> Result<()> {
         let index = request.token.0;
@@ -759,7 +758,7 @@ impl<'a> Coordinator<'a> {
                     let id = self.ops[index].plan_node;
                     let publication = WorkerPublication {
                         output_type: value.type_name().to_string(),
-                        fingerprint: Evaluator::trace_fingerprint(&value),
+                        fingerprint: trace_fingerprint(&value),
                     };
                     self.frame.set_value(id, *value)?;
                     self.publish_outputs(index);
@@ -831,7 +830,7 @@ impl<'a> Coordinator<'a> {
             match outcome {
                 TaskOutcome::Completed(Ok(value)) => {
                     let output_type = value.type_name().to_string();
-                    let fingerprint = Evaluator::trace_fingerprint(&value);
+                    let fingerprint = trace_fingerprint(&value);
                     if let Err(error) = self.frame.set_value(id, *value) {
                         crate::process::lifecycle_trace(
                             "coordinator.result_settled",
@@ -995,7 +994,11 @@ impl<'a> Coordinator<'a> {
 
     /// Execute one operation on the coordinator thread, under its derived
     /// policy context, and commit its value into the frame.
-    fn run_coordinator_op(&mut self, evaluator: &mut Evaluator, index: usize) -> Result<()> {
+    fn run_coordinator_op(
+        &mut self,
+        evaluator: &mut dyn GraphEvaluationHost,
+        index: usize,
+    ) -> Result<()> {
         let id = self.ops[index].plan_node;
         let launches_backend = matches!(
             self.flat[id.0],
@@ -1028,11 +1031,8 @@ impl<'a> Coordinator<'a> {
 
         match outcome {
             Ok(value) => {
-                self.trace.finished(
-                    id,
-                    value.type_name().to_string(),
-                    Evaluator::trace_fingerprint(&value),
-                );
+                self.trace
+                    .finished(id, value.type_name().to_string(), trace_fingerprint(&value));
                 self.frame.set_value(id, value)?;
                 self.materialize_success(index);
                 Ok(())
@@ -1101,6 +1101,7 @@ mod tests {
 
     use super::*;
     use crate::backend_catalog::BackendRegistry;
+    use crate::eval::Evaluator;
     use crate::evidence::{admit_execution, analyze_execution};
     use crate::executor::task::PreparedTask;
     use crate::hgraph::from_oir::build_program;
