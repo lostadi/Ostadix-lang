@@ -11,8 +11,8 @@ use o_lang::information::{
     information_pack_key_id_v1, AcquisitionModalityV1, EntityDescriptorV1, InformationAtomV1,
     InformationDeltaPackV1, InformationDeltaV1, InformationObjectKindV1,
     InformationPackKeyResolverV1, InformationPackSignerV1, InformationRevisionV1,
-    InformationSnapshotV1, InformationStoreV1, OfflinePackPolicyV1, PackedInformationObjectV1,
-    ParticipantV1, PayloadRefV1, PublicScalarV1, RevisionIdV1, ScopeV1,
+    InformationSnapshotV1, InformationStoreReaderV1, InformationStoreV1, OfflinePackPolicyV1,
+    PackedInformationObjectV1, ParticipantV1, PayloadRefV1, PublicScalarV1, RevisionIdV1, ScopeV1,
     SignedInformationDeltaPackV1, TypedInformationObjectV1, MAX_SIGNED_INFORMATION_PACK_BYTES_V1,
 };
 use serde::{Deserialize, Serialize};
@@ -25,6 +25,7 @@ const TRUST_SCHEMA_V1: &str = "ostadix.info-trust/v1";
 const TRUST_PURPOSE_V1: &str = "verify-offline-information-delta-packs-only";
 const NON_AUTHORITY_NOTICE: &str =
     "information presence and signatures grant no execution authority";
+const MAX_HEAD_INSPECTION_OUTPUT_BYTES_V1: usize = 256 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -453,15 +454,16 @@ fn import(state: &Path, head: &str, pack: &Path, trust: &Path) -> Result<()> {
 }
 
 fn inspect_head(state: &Path, head: &str) -> Result<()> {
-    let store = InformationStoreV1::open(state).context("could not open information store")?;
+    let store = InformationStoreReaderV1::open_existing(state)
+        .context("could not open existing information store for read-only inspection")?;
     let Some(revision_id) = store.read_head(head)? else {
         println!("head state={} name={} revision=none", state.display(), head);
         println!("authority={NON_AUTHORITY_NOTICE}");
         return Ok(());
     };
-    let revision = require_stored_revision(&store, &revision_id)?;
-    let snapshot = require_stored_snapshot(&store, revision.snapshot())?;
-    println!(
+    let revision = require_readonly_revision(&store, &revision_id)?;
+    let snapshot = require_readonly_snapshot(&store, revision.snapshot())?;
+    let mut output = format!(
         "head state={} name={} revision={} snapshot={} facts={}",
         state.display(),
         head,
@@ -469,10 +471,24 @@ fn inspect_head(state: &Path, head: &str) -> Result<()> {
         revision.snapshot(),
         snapshot.facts().len()
     );
+    output.push('\n');
     for fact in snapshot.facts() {
-        println!("fact={fact}");
+        output.push_str(&format!("fact={fact}\n"));
+        if output.len() > MAX_HEAD_INSPECTION_OUTPUT_BYTES_V1 {
+            bail!(
+                "read-only head inspection exceeds the {} byte output bound",
+                MAX_HEAD_INSPECTION_OUTPUT_BYTES_V1
+            );
+        }
     }
-    println!("authority={NON_AUTHORITY_NOTICE}");
+    output.push_str(&format!("authority={NON_AUTHORITY_NOTICE}\n"));
+    if output.len() > MAX_HEAD_INSPECTION_OUTPUT_BYTES_V1 {
+        bail!(
+            "read-only head inspection exceeds the {} byte output bound",
+            MAX_HEAD_INSPECTION_OUTPUT_BYTES_V1
+        );
+    }
+    print!("{output}");
     Ok(())
 }
 
@@ -620,6 +636,36 @@ fn require_stored_revision(
 
 fn require_stored_snapshot(
     store: &InformationStoreV1,
+    id: &o_lang::information::SnapshotRootIdV1,
+) -> Result<InformationSnapshotV1> {
+    let object = PackedInformationObjectV1 {
+        kind: InformationObjectKindV1::Snapshot,
+        sha256: id.to_string(),
+        canonical_bytes: store.get(InformationObjectKindV1::Snapshot, id.as_sha256())?,
+    };
+    match object.decode_typed()? {
+        TypedInformationObjectV1::Snapshot(value) => Ok(value),
+        _ => unreachable!("snapshot kind decoded to a different typed object"),
+    }
+}
+
+fn require_readonly_revision(
+    store: &InformationStoreReaderV1,
+    id: &RevisionIdV1,
+) -> Result<InformationRevisionV1> {
+    let object = PackedInformationObjectV1 {
+        kind: InformationObjectKindV1::Revision,
+        sha256: id.to_string(),
+        canonical_bytes: store.get(InformationObjectKindV1::Revision, id.as_sha256())?,
+    };
+    match object.decode_typed()? {
+        TypedInformationObjectV1::Revision(value) => Ok(value),
+        _ => unreachable!("revision kind decoded to a different typed object"),
+    }
+}
+
+fn require_readonly_snapshot(
+    store: &InformationStoreReaderV1,
     id: &o_lang::information::SnapshotRootIdV1,
 ) -> Result<InformationSnapshotV1> {
     let object = PackedInformationObjectV1 {
