@@ -10,10 +10,11 @@ use std::fmt::Write as _;
 
 use thiserror::Error;
 
+use crate::backend_catalog::ExecutionMode;
 use crate::effects::{ActorResourceId, EffectSummary, ResourceKey};
 use crate::eval::BlockOptions;
 use crate::hgraph::HGraph;
-use crate::ir::{ExecutionMode, ExecutionPlan, PlanEdgeKind, PlanNodeId, PlanNodeKind};
+use crate::ir::{ExecutionPlan, PlanEdgeKind, PlanNodeId, PlanNodeKind};
 use crate::value::{BackendAuthority, OValue, RehydratePolicy};
 
 use super::identity::{WorldId, WorldIdentity, WorldIdentityError};

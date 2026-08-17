@@ -34,12 +34,13 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::ir::{BackendAdapterKind, BackendRegistry, ExecutionMode, ExecutionPlan, PlanNodeKind};
-use crate::placement::SemanticDigestV1;
-use crate::registry::bundle::{
+use crate::backend_catalog::{
     backend_executable_set_v2 as project_backend_executable_set_v2, BackendExecutableSelectionV2,
     BackendExecutableSetRowV2,
 };
+use crate::backend_catalog::{BackendAdapterKind, BackendRegistry, ExecutionMode};
+use crate::ir::{ExecutionPlan, PlanNodeKind};
+use crate::placement::SemanticDigestV1;
 use crate::resource_identity::ArtifactId;
 
 pub const EXECUTABLE_MANIFEST_SCHEMA_V1: &str = "oexec.direct-executable-manifest/v1";
@@ -1983,7 +1984,8 @@ impl RuntimeCommandLease {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use crate::ir::{BackendRegistry, OIr, OIrProgram};
+    use crate::backend_catalog::BackendRegistry;
+    use crate::ir::{OIr, OIrProgram};
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
 
@@ -2177,7 +2179,7 @@ mod tests {
                 None,
                 ArtifactId::from_sha256("11".repeat(32)).unwrap(),
                 SemanticDigestV1::from_sha256("22".repeat(32)).unwrap(),
-                crate::registry::bundle::LOCAL_BACKEND_PROTOCOL_ABI_V1,
+                crate::backend_catalog::LOCAL_BACKEND_PROTOCOL_ABI_V1,
             )
             .unwrap_err();
         assert!(matches!(

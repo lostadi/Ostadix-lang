@@ -2142,7 +2142,7 @@ mod tests {
 
     #[test]
     fn textual_execution_graph_exposes_directed_state_and_completion_ports() {
-        let backend = crate::ir::BackendRegistry::global().interface_for("python");
+        let backend = crate::backend_catalog::BackendRegistry::global().interface_for("python");
         let program = crate::ir::OIrProgram {
             nodes: vec![OIr::Exec {
                 lang: "python".into(),
