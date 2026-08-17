@@ -40,7 +40,7 @@ use crate::registry::bundle::{
     backend_executable_set_v2 as project_backend_executable_set_v2, BackendExecutableSelectionV2,
     BackendExecutableSetRowV2,
 };
-use crate::world::ArtifactId;
+use crate::resource_identity::ArtifactId;
 
 pub const EXECUTABLE_MANIFEST_SCHEMA_V1: &str = "oexec.direct-executable-manifest/v1";
 pub const ADMITTED_EXECUTABLE_MANIFEST_ENV: &str = "O_ADMITTED_EXECUTABLE_MANIFEST";
