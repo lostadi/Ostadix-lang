@@ -998,7 +998,8 @@ impl<'a> Coordinator<'a> {
         let id = self.ops[index].plan_node;
         let launches_backend = matches!(
             self.flat[id.0],
-            OIr::Exec { backend, .. } if backend.execution == crate::ir::ExecutionMode::Shim
+            OIr::Exec { backend, .. }
+                if backend.execution == crate::backend_catalog::ExecutionMode::Shim
         );
         if self.ops[index].effect.unknown || launches_backend {
             // Recheck mutable shim/environment context plus retained executable
@@ -1008,7 +1009,7 @@ impl<'a> Coordinator<'a> {
             // current process and consume no launch artifact at this boundary.
             evaluator.verify_admitted_runtime_context(&self.admitted)?;
             if let OIr::Exec { backend, .. } = self.flat[id.0] {
-                if backend.execution == crate::ir::ExecutionMode::Shim {
+                if backend.execution == crate::backend_catalog::ExecutionMode::Shim {
                     self.admitted
                         .executable_leases()?
                         .verify_backend(&backend.canonical)?;
@@ -1098,12 +1099,12 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::backend_catalog::BackendRegistry;
     use crate::evidence::{admit_execution, analyze_execution};
     use crate::executor::task::PreparedTask;
     use crate::hgraph::from_oir::build_program;
     use crate::hgraph::solve::solve_types;
     use crate::hgraph::HNodeKind;
-    use crate::ir::BackendRegistry;
 
     struct PanicPreparedTask;
 

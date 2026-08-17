@@ -291,7 +291,7 @@ mod tests {
                 lang: "python".to_string(),
                 env_id: 0,
                 attr: None,
-                backend: crate::ir::BackendRegistry::global().interface_for("python"),
+                backend: crate::backend_catalog::BackendRegistry::global().interface_for("python"),
                 body: vec![OIr::Text("__oval_result__ = 1".to_string())],
             }],
         };
