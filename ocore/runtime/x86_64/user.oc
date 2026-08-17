@@ -386,18 +386,25 @@ pub unsafe fn ocore_user_entry(report_capability: u64) -> never {
         stop();
     }
 
-    // NT is writable by CPL3 but invalid on the kernel's eventual IRETQ path.
-    // A successful syscall return proves IA32_FMASK removed it on entry and
-    // the sanitized return frame removed it from the resumed user state.
-    let mut hostile_flags: u64 = 0;
-    asm!(
-        "pushfq\nor qword ptr [rsp], 0x4000\npopfq\npushfq\npop rax",
-        out("rax") hostile_flags
-    );
-    if (hostile_flags & 0x4000) == 0 {
+    // R11 is SYSCALL's hardware receipt for the exact pre-entry RFLAGS. IRQ0
+    // may legitimately clear NT before an attempt reaches SYSCALL, so retry
+    // until one exact entry observes it. The returned IRET state must clear NT.
+    let mut entered_flags: u64 = 0;
+    let mut flags_tick: u64 = 0;
+    let mut return_rip_scratch: u64 = 0;
+    let mut resumed_flags: u64 = 0;
+    while (entered_flags & 0x4000) == 0 {
+        asm!(
+            "pushfq\nor qword ptr [rsp], 0x4000\npopfq\nsyscall\npushfq\npop rdx",
+            out("r11") entered_flags,
+            inout("rax") SYS_TICKS -> flags_tick,
+            out("rcx") return_rip_scratch,
+            out("rdx") resumed_flags
+        );
+    }
+    if (resumed_flags & 0x4000) != 0 {
         stop();
     }
-    let flags_tick: u64 = syscall0(SYS_TICKS);
 
     // Syscalls run with IF masked. A later tick count can therefore advance
     // only while this loop is back at CPL3. Reaching the marker below proves
