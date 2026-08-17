@@ -313,6 +313,7 @@ def run_smoke(root: Path, binary: Path, timeout: float) -> None:
             raise SmokeError(f"o_runtimes returned an MCP tool error:\n{runtimes_text}")
         required_runtime_markers = {
             f"runtime-catalog-schema={catalog_schema}",
+            "runtime-catalog-legacy-schema-v4=ostadix.backend-catalog/v4",
             "runtime-catalog-projection=compiled-mcp-snapshot",
             "runtime-search-mode=discover-local",
             "runtime-search-entry index=0 source=inherited:0 path=/usr/bin",
@@ -324,6 +325,16 @@ def run_smoke(root: Path, binary: Path, timeout: float) -> None:
             "invocable=not-probed",
             "admitted=operation-scoped-not-evaluated",
             "path-sources=[python3=",
+            "backend=python integer-exactness=arbitrary rich-numbers=preserved "
+            "state-support=semantic-snapshot codec=ostadix.python-graph/v1 "
+            "compatibility=exact-implementation morphism-profile=python-plain-data",
+            "backend=javascript integer-exactness=exact-magnitude-bits:53 "
+            "rich-numbers=collapsed state-support=stateless "
+            "morphism-profile=javascript-binding-stdout",
+            "backend=html integer-exactness=arbitrary rich-numbers=collapsed "
+            "state-support=stateless morphism-profile=none",
+            "morphism profiles are bounded shadow descriptions; they do not authorize "
+            "execution or claim generic backend crossings",
         }
         if not all(marker in runtimes_text for marker in required_runtime_markers):
             raise SmokeError(
