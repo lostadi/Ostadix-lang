@@ -20,13 +20,14 @@ use std::sync::{Condvar, Mutex, MutexGuard};
 #[cfg(test)]
 use std::time::Duration;
 
+use crate::backend_catalog::SpliceRenderer;
 use crate::capability::BackendSandboxPolicy;
 use crate::dispatch_model::renderer_inputs_statically_preparable;
 pub use crate::dispatch_model::TaskKind;
 pub(crate) use crate::dispatch_model::{adapter_matches, effect_contract_worker_safe};
 use crate::eval::{render_with, GraphEvalFrame};
 use crate::evidence::DispatchAdapterV1;
-use crate::ir::{ExecutionPlan, OIr, PlanNodeId, PlanNodeKind, SpliceRenderer};
+use crate::ir::{ExecutionPlan, OIr, PlanNodeId, PlanNodeKind};
 use crate::process::run_ephemeral_with_eval_callback;
 use crate::value::OValue;
 

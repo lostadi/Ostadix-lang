@@ -8,8 +8,8 @@ use std::thread;
 
 use anyhow::{bail, Context, Result};
 
+use crate::backend_catalog::BackendRegistry;
 use crate::eval::Evaluator;
-use crate::ir::BackendRegistry;
 use crate::parser::Parser;
 use crate::runtime_exec::validate_native_runtime_binary;
 

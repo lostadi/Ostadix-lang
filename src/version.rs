@@ -5,12 +5,12 @@
 
 use serde::Serialize;
 
+use crate::backend_catalog::BACKEND_CATALOG_CURRENT_SCHEMA;
 use crate::evidence::{
     ADMISSION_SCHEMA_V5, ANALYZER_ID_V5, EVIDENCE_SCHEMA_V5, EXECUTION_INTENT_SCHEMA_V1,
 };
 use crate::hosted_remote::v2::HOSTED_PROTOCOL_V2;
 use crate::hosted_remote::{HOSTED_PROTOCOL_V1, HOSTED_TLS_ALPN_V1, HOSTED_TLS_ALPN_V2};
-use crate::registry::bundle::BACKEND_CATALOG_CURRENT_SCHEMA;
 use crate::world::{
     IDENTITY_WIRE_VERSION, OVALUE_WIRE_SCHEMA_V1, WORLD_RECEIPT_SCHEMA_V1, WORLD_SCHEMA_V1,
     WORLD_WIRE_CODEC_VERSION,

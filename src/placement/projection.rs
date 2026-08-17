@@ -1,5 +1,6 @@
+use crate::backend_catalog::ExecutionMode;
 use crate::environment::EnvironmentRefV2;
-use crate::ir::{ExecutionMode, ExecutionPlan, OIrProgram, PlanNodeId, PlanNodeKind};
+use crate::ir::{ExecutionPlan, OIrProgram, PlanNodeId, PlanNodeKind};
 use crate::placement_protocol::{
     CapabilityAtomV1, CapabilityKeyV1, EffectRequirementV1, EnvironmentRequirementV1,
     PlacementValidationError, RequirementAtomV1, RequirementFootprintV1, ResourceKindV1,
@@ -189,7 +190,7 @@ fn logical_environment_digest(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::BackendRegistry;
+    use crate::backend_catalog::BackendRegistry;
 
     fn exec(lang: &str, environment: EnvironmentRefV2) -> PlanNodeKind {
         PlanNodeKind::Exec {

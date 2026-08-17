@@ -70,10 +70,13 @@ The first cycle-breaking boundaries are executable repository contracts:
   `placement::SemanticDigestV1` and
   `placement::protocol::SemanticDigestV1` are compatibility aliases of that
   same Rust type, not separately compiled protocol copies;
-- backend-catalog/placement integration lives in Registry above the canonical,
-  registry-independent `placement_protocol` module. Registry implementation
-  code imports that module directly rather than re-entering through the public
-  `placement` facade. Generated AOT runtimes preserve the same geometry.
+- `src/backend_catalog.rs` is compiled exactly once as the crate-private
+  canonical catalog implementation. IR's historical named exports and
+  `registry::bundle` are public compatibility projections of those same Rust
+  types; internal library code imports the canonical module directly. Catalog
+  integration depends on the registry-independent `placement_protocol` module,
+  while registry storage and compatibility adapters remain above it. Generated
+  AOT runtimes preserve the same single-identity geometry.
 
 `python3 scripts/check_architecture_boundaries.py` rejects regressions to these
 wrong-way edges. More cycles remain to be separated before converting the

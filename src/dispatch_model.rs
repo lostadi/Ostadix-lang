@@ -6,12 +6,10 @@
 
 use std::collections::HashSet;
 
+use crate::backend_catalog::{ExecutionMode, SpliceRenderer};
 use crate::effects::{EffectConfidence, EffectSummary, Fallibility, ResourceKey};
 use crate::environment::EnvironmentRefV2;
-use crate::ir::{
-    ExecutionMode, ExecutionPlan, OIr, PlanEdgeKind, PlanNodeId, PlanNodeKind, PlanScheduleKind,
-    SpliceRenderer,
-};
+use crate::ir::{ExecutionPlan, OIr, PlanEdgeKind, PlanNodeId, PlanNodeKind, PlanScheduleKind};
 
 /// Stable preparation adapter selected by evidence analysis. The runtime may
 /// validate the bound adapter against admitted OIR, but may not choose a
