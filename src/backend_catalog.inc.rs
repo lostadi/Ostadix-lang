@@ -10,7 +10,8 @@
 // `[["dotnet"], ["mcs", "mono"]]` means dotnet OR (mcs AND mono).
 
 backend_catalog_metadata! {
-    current_schema: "ostadix.backend-catalog/v4",
+    current_schema: "ostadix.backend-catalog/v5",
+    legacy_schema_v4: "ostadix.backend-catalog/v4",
     legacy_schema_v3: "ostadix.backend-catalog/v3",
 }
 
@@ -168,6 +169,7 @@ backend_catalog! {
         integer_exactness: Arbitrary,
         rich_numbers: Preserved,
         state_support: Stateless,
+        morphism_profile: None,
     },
     {
         name: "quote",
@@ -181,6 +183,7 @@ backend_catalog! {
         integer_exactness: Unknown,
         rich_numbers: Unknown,
         state_support: Stateless,
+        morphism_profile: None,
     },
     {
         name: "nix",
@@ -194,6 +197,7 @@ backend_catalog! {
         integer_exactness: TwosComplementBits(63),
         rich_numbers: Collapsed,
         state_support: Stateless,
+        morphism_profile: None,
     },
     {
         name: "nix_expr",
@@ -209,6 +213,7 @@ backend_catalog! {
         integer_exactness: TwosComplementBits(63),
         rich_numbers: Collapsed,
         state_support: Stateless,
+        morphism_profile: None,
     },
     {
         name: "nix_store",
@@ -222,6 +227,7 @@ backend_catalog! {
         integer_exactness: TwosComplementBits(63),
         rich_numbers: Collapsed,
         state_support: Stateless,
+        morphism_profile: None,
     },
     {
         name: "nixos_test",
@@ -235,6 +241,7 @@ backend_catalog! {
         integer_exactness: Unknown,
         rich_numbers: Unknown,
         state_support: Stateless,
+        morphism_profile: None,
     },
     {
         name: "html",
@@ -248,6 +255,7 @@ backend_catalog! {
         integer_exactness: Arbitrary,
         rich_numbers: Collapsed,
         state_support: Stateless,
+        morphism_profile: None,
     },
     {
         name: "markdown",
@@ -261,6 +269,7 @@ backend_catalog! {
         integer_exactness: Arbitrary,
         rich_numbers: Collapsed,
         state_support: Stateless,
+        morphism_profile: None,
     },
     {
         name: "latex",
@@ -274,6 +283,7 @@ backend_catalog! {
         integer_exactness: Arbitrary,
         rich_numbers: Collapsed,
         state_support: Stateless,
+        morphism_profile: None,
     },
     {
         name: "text",
@@ -287,6 +297,7 @@ backend_catalog! {
         integer_exactness: Arbitrary,
         rich_numbers: Collapsed,
         state_support: Stateless,
+        morphism_profile: None,
     },
     {
         name: "sql",
@@ -303,6 +314,7 @@ backend_catalog! {
             codec: "ostadix.sqlite-cli-main/v1",
             compatibility: ExactImplementation,
         },
+        morphism_profile: None,
     },
     {
         name: "haskell",
@@ -316,6 +328,7 @@ backend_catalog! {
         integer_exactness: Arbitrary,
         rich_numbers: Preserved,
         state_support: Stateless,
+        morphism_profile: None,
     },
     {
         name: "ocaml",
@@ -329,6 +342,7 @@ backend_catalog! {
         integer_exactness: Unknown,
         rich_numbers: Unknown,
         state_support: Stateless,
+        morphism_profile: None,
     },
     {
         name: "webassembly",
@@ -342,6 +356,7 @@ backend_catalog! {
         integer_exactness: TwosComplementBits(63),
         rich_numbers: Collapsed,
         state_support: Stateless,
+        morphism_profile: None,
     },
     {
         name: "python",
@@ -358,6 +373,7 @@ backend_catalog! {
             codec: "ostadix.python-graph/v1",
             compatibility: ExactImplementation,
         },
+        morphism_profile: PythonPlainData,
     },
     {
         name: "ubuntu_vm",
@@ -373,6 +389,7 @@ backend_catalog! {
         state_support: ExternalPinned {
             manifest_schema: "ostadix.multipass-resource/v1",
         },
+        morphism_profile: None,
     },
     {
         name: "bash",
@@ -386,6 +403,7 @@ backend_catalog! {
         integer_exactness: Unknown,
         rich_numbers: Unknown,
         state_support: Stateless,
+        morphism_profile: None,
     },
     {
         name: "shell",
@@ -399,6 +417,7 @@ backend_catalog! {
         integer_exactness: Unknown,
         rich_numbers: Unknown,
         state_support: Stateless,
+        morphism_profile: None,
     },
     {
         name: "rust",
@@ -412,6 +431,7 @@ backend_catalog! {
         integer_exactness: TwosComplementBits(63),
         rich_numbers: Collapsed,
         state_support: Stateless,
+        morphism_profile: RustSourceConstantStdout,
     },
     {
         name: "racket",
@@ -425,6 +445,7 @@ backend_catalog! {
         integer_exactness: Arbitrary,
         rich_numbers: Preserved,
         state_support: Stateless,
+        morphism_profile: None,
     },
     {
         name: "csharp",
@@ -438,6 +459,7 @@ backend_catalog! {
         integer_exactness: TwosComplementBits(63),
         rich_numbers: Collapsed,
         state_support: Stateless,
+        morphism_profile: None,
     },
     {
         name: "c",
@@ -451,6 +473,7 @@ backend_catalog! {
         integer_exactness: TwosComplementBits(63),
         rich_numbers: Collapsed,
         state_support: Stateless,
+        morphism_profile: None,
     },
     {
         name: "cpp",
@@ -464,6 +487,7 @@ backend_catalog! {
         integer_exactness: TwosComplementBits(63),
         rich_numbers: Collapsed,
         state_support: Stateless,
+        morphism_profile: None,
     },
     {
         name: "lisp",
@@ -477,6 +501,7 @@ backend_catalog! {
         integer_exactness: Arbitrary,
         rich_numbers: Collapsed,
         state_support: Stateless,
+        morphism_profile: None,
     },
     {
         name: "common_lisp",
@@ -490,6 +515,7 @@ backend_catalog! {
         integer_exactness: Arbitrary,
         rich_numbers: Collapsed,
         state_support: Stateless,
+        morphism_profile: None,
     },
     {
         name: "ruby",
@@ -503,6 +529,7 @@ backend_catalog! {
         integer_exactness: Arbitrary,
         rich_numbers: Collapsed,
         state_support: Stateless,
+        morphism_profile: None,
     },
     {
         name: "matlab",
@@ -516,6 +543,7 @@ backend_catalog! {
         integer_exactness: ExactMagnitudeBits(53),
         rich_numbers: Collapsed,
         state_support: Stateless,
+        morphism_profile: None,
     },
     {
         name: "mathematica",
@@ -529,6 +557,7 @@ backend_catalog! {
         integer_exactness: Arbitrary,
         rich_numbers: Preserved,
         state_support: Stateless,
+        morphism_profile: None,
     },
     {
         name: "java",
@@ -542,6 +571,7 @@ backend_catalog! {
         integer_exactness: TwosComplementBits(63),
         rich_numbers: Collapsed,
         state_support: Stateless,
+        morphism_profile: None,
     },
     {
         name: "javascript",
@@ -555,5 +585,6 @@ backend_catalog! {
         integer_exactness: ExactMagnitudeBits(53),
         rich_numbers: Collapsed,
         state_support: Stateless,
+        morphism_profile: JavascriptBindingStdout,
     },
 }
