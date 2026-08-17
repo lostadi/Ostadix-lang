@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use thiserror::Error;
 
-use crate::backend::state::{BackendStateTierV1, EvaluatorStateSnapshotV1};
 use crate::backend_catalog::BackendRegistry;
+use crate::backend_state::{BackendStateTierV1, EvaluatorStateSnapshotV1};
 use crate::environment::EnvironmentRefV2;
 use crate::eval::{
     Evaluator, PreparedPlacementDeadlineExpiredV1, PreparedPlacementFragmentV1,
