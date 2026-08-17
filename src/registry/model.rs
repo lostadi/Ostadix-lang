@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::placement::NodeProfileV1;
+use crate::placement_protocol::NodeProfileV1;
 
 use super::RegistryError;
 

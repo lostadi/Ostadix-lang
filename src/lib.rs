@@ -29,6 +29,8 @@ pub mod nixos_ops;
 pub mod ocore;
 pub mod parser;
 pub mod placement;
+#[path = "placement/protocol/mod.rs"]
+pub(crate) mod placement_protocol;
 pub mod process;
 pub mod project;
 pub mod registry;
