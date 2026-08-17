@@ -8,7 +8,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 
-use crate::backend_catalog::{BackendAdapterKind, BackendRegistry, BACKEND_CATALOG_SCHEMA_V1};
+use crate::backend_catalog::{BackendAdapterKind, BackendRegistry, BACKEND_CATALOG_CURRENT_SCHEMA};
 use crate::dispatch_model;
 use crate::effects::{EffectConfidence, EffectSummary, Fallibility, ResourceKey};
 use crate::hgraph::{
@@ -19,15 +19,21 @@ use crate::runtime_exec::{
     capture_execution_manifest, capture_execution_manifest_with_current_executable,
     inspection_executable_manifest, ExecutableLeaseSet, ExecutableManifestV1,
 };
-use crate::value::GroupMode;
+use crate::value::{FidelityAssessmentV2, GroupMode};
 
 use super::fact::{
     BackendArtifactStateV1, BackendArtifactV1, CapabilityDispositionV1, CostEstimateV1,
     DispatchAdapterV1, DispatchContractV1, DispatchLaneV1, DispatchSemanticsV1, EffectContractV1,
-    EvidenceBindingsV2, EvidenceBundleV5, EvidenceProvenance, FailureClassV1, FailureContractV1,
-    NodeEvidence, PlacementContractV1, ResourceDemandContractV1, RuntimeBindingV1,
-    RuntimeSnapshotKindV1, TypeContractV1, ANALYZER_ID_V5, EVIDENCE_SCHEMA_V5,
+    EvidenceBindingsV2, EvidenceBundleV5, EvidenceBundleV6, EvidenceProvenance, FailureClassV1,
+    FailureContractV1, NodeEvidence, NodeEvidenceV2, PlacementContractV1, ResourceDemandContractV1,
+    RuntimeBindingV1, RuntimeSnapshotKindV1, TypeContractV1, TypeContractV2, ANALYZER_ID_V5,
+    ANALYZER_ID_V6, EVIDENCE_SCHEMA_V5, EVIDENCE_SCHEMA_V6,
 };
+
+pub const SOLVED_EXECUTABLE_HGRAPH_DIGEST_DOMAIN_V1: &str = "ostadix-solved-executable-hgraph/v1";
+pub const SOLVED_EXECUTABLE_HGRAPH_DIGEST_DOMAIN_V2: &str = "ostadix-solved-executable-hgraph/v2";
+pub const EVIDENCE_BUNDLE_DIGEST_DOMAIN_V5: &str = "ostadix-evidence-bundle/v5";
+pub const EVIDENCE_BUNDLE_DIGEST_DOMAIN_V6: &str = "ostadix-evidence-bundle/v6";
 
 /// Capture each compatibility shim plus the direct executable launch manifest
 /// selected by the plan's canonical adapter kinds. Missing legacy shims remain
@@ -181,7 +187,7 @@ pub(crate) fn backend_catalog_projection_sha256(plan: &ExecutionPlan) -> String 
         .collect::<BTreeSet<_>>();
     let registry = BackendRegistry::global();
     let mut hash = CanonicalHasher::new("ostadix-backend-catalog-projection/v1");
-    hash.field(BACKEND_CATALOG_SCHEMA_V1.as_bytes());
+    hash.field(BACKEND_CATALOG_CURRENT_SCHEMA.as_bytes());
     for backend in backends {
         hash.field(backend.as_bytes());
         match registry.specification_sha256(backend) {
@@ -199,7 +205,7 @@ pub(crate) fn backend_catalog_projection_sha256(plan: &ExecutionPlan) -> String 
 /// execution-intent projection and live evidence admission. Keeping this
 /// routine shared prevents a descriptive intent from blessing a graph that
 /// the admission analyzer would later reject as noncanonical.
-pub(crate) fn validate_canonical_solved_graph(
+pub(crate) fn validate_canonical_solved_graph_v1(
     program: &OIrProgram,
     plan: &ExecutionPlan,
     graph: &HGraph,
@@ -222,10 +228,66 @@ pub(crate) fn validate_canonical_solved_graph(
         .context("analysis could not rebuild the canonical HGraph")?;
     crate::hgraph::solve::solve_types(&mut canonical)
         .context("analysis could not solve the canonical HGraph")?;
-    if graph_sha256(&canonical) != graph_sha256(graph) {
+    if graph_sha256_v1(&canonical) != graph_sha256_v1(graph) {
         anyhow::bail!(
             "analysis requires the exact canonical solved HGraph; caller graph is unsolved or structurally divergent"
         );
+    }
+    Ok(())
+}
+
+/// Explicit Graph V2 validation. Besides comparing the complete V2 graph
+/// identity, reject a caller graph whose frozen V1 projection disagrees with
+/// its typed V2 assessment.
+pub(crate) fn validate_canonical_solved_graph_v2(
+    program: &OIrProgram,
+    plan: &ExecutionPlan,
+    graph: &HGraph,
+) -> Result<()> {
+    if plan != &program.plan() {
+        anyhow::bail!(
+            "analysis requires the canonical ExecutionPlan derived from the exact lowered OIR"
+        );
+    }
+    let flat = program.flatten_for_plan();
+    crate::execution_contract::validate_execution_metadata(&flat)
+        .context("analysis rejected invalid OIR execution metadata")?;
+    graph
+        .validate_execution_source(program, plan)
+        .map_err(anyhow::Error::msg)
+        .context("analysis rejected OIR/plan/HGraph provenance")?;
+    validate_fidelity_projection_v2(graph)?;
+    let mut canonical = program
+        .hgraph_for_plan(plan)
+        .map_err(anyhow::Error::msg)
+        .context("analysis could not rebuild the canonical HGraph")?;
+    crate::hgraph::solve::solve_types(&mut canonical)
+        .context("analysis could not solve the canonical HGraph")?;
+    validate_fidelity_projection_v2(&canonical)?;
+    if graph_sha256_v2(&canonical) != graph_sha256_v2(graph) {
+        anyhow::bail!(
+            "analysis requires the exact canonical solved HGraph V2; caller graph is unsolved or structurally divergent"
+        );
+    }
+    Ok(())
+}
+
+fn validate_fidelity_projection_v2(graph: &HGraph) -> Result<()> {
+    for id in graph.node_ids() {
+        let node = &graph.nodes[&id];
+        if !matches!(&node.kind, HNodeKind::Value) {
+            continue;
+        }
+        let projected = node
+            .fidelity_assessment
+            .as_ref()
+            .map(FidelityAssessmentV2::possible_fidelity);
+        if node.fidelity != projected {
+            anyhow::bail!(
+                "graph node {} has a legacy fidelity projection inconsistent with its V2 assessment",
+                id.0
+            );
+        }
     }
     Ok(())
 }
@@ -416,7 +478,7 @@ fn encode_backend_artifact_state(hash: &mut CanonicalHasher, state: &BackendArti
 /// Produce hard evidence and explicitly unknown soft estimates for one solved
 /// executable HGraph. This does not authorize execution; `admit_execution`
 /// rechecks every digest and compiles the evidence into readiness inputs.
-pub fn analyze_execution(
+pub fn analyze_execution_v5(
     program: &OIrProgram,
     plan: &ExecutionPlan,
     graph: &HGraph,
@@ -450,11 +512,11 @@ pub fn analyze_execution(
             .validate_inspection()
             .context("inspection evidence rejected malformed non-probing executable manifest")?;
     }
-    validate_canonical_solved_graph(program, plan, graph)
+    validate_canonical_solved_graph_v1(program, plan, graph)
         .context("evidence analyzer rejected noncanonical static execution input")?;
     let flat = program.flatten_for_plan();
 
-    let bindings = evidence_bindings(program, plan, graph, &runtime);
+    let bindings = evidence_bindings_v5(program, plan, graph, &runtime);
     let mut nodes = Vec::with_capacity(graph.op_map.len());
     for info in graph.exec_ops_ordered() {
         let output = graph.node(info.value_output).with_context(|| {
@@ -559,7 +621,154 @@ pub fn analyze_execution(
     })
 }
 
-pub(crate) fn evidence_bindings(
+/// Current analyzer compatibility surface. It remains byte-for-byte V5 until
+/// the package/current API rollover.
+pub fn analyze_execution(
+    program: &OIrProgram,
+    plan: &ExecutionPlan,
+    graph: &HGraph,
+    runtime: RuntimeBindingV1,
+) -> Result<EvidenceBundleV5> {
+    analyze_execution_v5(program, plan, graph, runtime)
+}
+
+/// Produce explicit Evidence V6 with the complete typed fidelity assessment.
+/// This is additive and does not replace the current V5 analyzer.
+pub fn analyze_execution_v6(
+    program: &OIrProgram,
+    plan: &ExecutionPlan,
+    graph: &HGraph,
+    runtime: RuntimeBindingV1,
+) -> Result<EvidenceBundleV6> {
+    if runtime.backend_catalog_projection_sha256 != backend_catalog_projection_sha256(plan) {
+        anyhow::bail!(
+            "runtime evidence backend catalog projection is stale or belongs to another ExecutionPlan"
+        );
+    }
+    if runtime.snapshot_kind == RuntimeSnapshotKindV1::Execution {
+        runtime
+            .executable_manifest
+            .validate_execution()
+            .context("execution evidence rejected malformed direct executable manifest")?;
+        let leases = runtime
+            .executable_leases
+            .as_ref()
+            .context("execution evidence requires retained direct-executable lease authority")?;
+        if leases.manifest() != &runtime.executable_manifest {
+            anyhow::bail!("execution evidence executable leases do not match their manifest");
+        }
+        leases
+            .verify_all()
+            .context("execution evidence rejected stale direct executable identity")?;
+    } else if runtime.executable_leases.is_some() {
+        anyhow::bail!("inspection evidence must not carry executable lease authority");
+    } else {
+        runtime
+            .executable_manifest
+            .validate_inspection()
+            .context("inspection evidence rejected malformed non-probing executable manifest")?;
+    }
+    validate_canonical_solved_graph_v2(program, plan, graph)
+        .context("evidence V6 analyzer rejected noncanonical static execution input")?;
+    let flat = program.flatten_for_plan();
+
+    let bindings = evidence_bindings_v6(program, plan, graph, &runtime);
+    let mut nodes = Vec::with_capacity(graph.op_map.len());
+    for info in graph.exec_ops_ordered() {
+        let output = graph.node(info.value_output).with_context(|| {
+            format!(
+                "operation {} has no distinguished value output",
+                info.plan_node.0
+            )
+        })?;
+        let summary = graph
+            .effect_summary(info.plan_node)
+            .with_context(|| format!("operation {} has no effect summary", info.plan_node.0))?;
+        let effect_provenance = effect_provenance(summary.confidence);
+        let (reads, writes) = summary.scheduling_accesses();
+        let worker_kind = dispatch_model::classify(plan, flat[info.plan_node.0], info.plan_node)
+            .filter(|_| {
+                dispatch_model::effect_contract_worker_safe(summary, flat[info.plan_node.0])
+            });
+        let worker_candidate = worker_kind.is_some();
+        let dispatch_adapter = worker_kind
+            .as_ref()
+            .map(dispatch_model::TaskKind::adapter)
+            .unwrap_or(DispatchAdapterV1::CoordinatorV1);
+        let (capability_disposition, capability_provenance) =
+            capability_contract(&plan.nodes[info.plan_node.0].kind);
+
+        nodes.push(NodeEvidenceV2 {
+            plan_node: info.plan_node,
+            type_contract: TypeContractV2 {
+                constraints_solved: true,
+                output_domain_bits: output.domain.bits(),
+                output_representation_bits: output.rep.bits(),
+                output_fidelity_assessment: output.fidelity_assessment.clone(),
+                provenance: EvidenceProvenance::CompilerVerified,
+            },
+            effect_contract: EffectContractV1 {
+                reads: reads.into_iter().collect(),
+                writes: writes.into_iter().collect(),
+                footprint_closed: !summary.unknown && effect_provenance.may_close_unknown_effect(),
+                provenance: effect_provenance,
+            },
+            dispatch_contract: DispatchContractV1 {
+                lane: if worker_candidate {
+                    DispatchLaneV1::LocalWorker
+                } else {
+                    DispatchLaneV1::Coordinator
+                },
+                adapter: dispatch_adapter,
+                semantics: if dispatch_adapter == DispatchAdapterV1::AutonomousEphemeralShimV1 {
+                    DispatchSemanticsV1::ExplicitAutonomousUnordered
+                } else {
+                    DispatchSemanticsV1::StrictEquivalent
+                },
+                send_only_preparation: worker_candidate,
+                provenance: if worker_candidate {
+                    EvidenceProvenance::TrustedAdapter
+                } else {
+                    EvidenceProvenance::CompilerVerified
+                },
+            },
+            capability_disposition,
+            capability_provenance,
+            placement: if worker_candidate {
+                PlacementContractV1::LocalWorker
+            } else {
+                PlacementContractV1::LocalCoordinator
+            },
+            placement_provenance: EvidenceProvenance::CompilerVerified,
+            failure_contract: FailureContractV1 {
+                class: failure_class(summary, dispatch_adapter),
+                cancellation_safe: summary.is_verified_pure_infallible(),
+                provenance: effect_provenance,
+            },
+            resource_demand: ResourceDemandContractV1 {
+                cpu_units: Some(1),
+                hard_memory_bytes: None,
+                file_descriptors: (dispatch_adapter
+                    == DispatchAdapterV1::AutonomousEphemeralShimV1)
+                    .then_some(3),
+                process_slots: (dispatch_adapter == DispatchAdapterV1::AutonomousEphemeralShimV1)
+                    .then_some(1),
+                provenance: EvidenceProvenance::Unknown,
+            },
+            cost_estimate: CostEstimateV1::unknown(),
+        });
+    }
+
+    Ok(EvidenceBundleV6 {
+        schema: EVIDENCE_SCHEMA_V6,
+        analyzer: ANALYZER_ID_V6,
+        bindings,
+        runtime,
+        nodes,
+    })
+}
+
+pub(crate) fn evidence_bindings_v5(
     program: &OIrProgram,
     plan: &ExecutionPlan,
     graph: &HGraph,
@@ -568,7 +777,7 @@ pub(crate) fn evidence_bindings(
     EvidenceBindingsV2 {
         oir_sha256: oir_sha256(program),
         plan_sha256: sha256_bytes(plan.to_text().as_bytes()),
-        analyzed_graph_sha256: graph_sha256(graph),
+        analyzed_graph_sha256: graph_sha256_v1(graph),
         backend_catalog_projection_sha256: runtime.backend_catalog_projection_sha256.clone(),
         backend_set_sha256: runtime.backend_set_sha256.clone(),
         executable_manifest_sha256: runtime.executable_manifest.sha256().to_string(),
@@ -579,10 +788,38 @@ pub(crate) fn evidence_bindings(
     }
 }
 
+pub(crate) fn evidence_bindings_v6(
+    program: &OIrProgram,
+    plan: &ExecutionPlan,
+    graph: &HGraph,
+    runtime: &RuntimeBindingV1,
+) -> EvidenceBindingsV2 {
+    EvidenceBindingsV2 {
+        oir_sha256: oir_sha256(program),
+        plan_sha256: sha256_bytes(plan.to_text().as_bytes()),
+        analyzed_graph_sha256: graph_sha256_v2(graph),
+        backend_catalog_projection_sha256: runtime.backend_catalog_projection_sha256.clone(),
+        backend_set_sha256: runtime.backend_set_sha256.clone(),
+        executable_manifest_sha256: runtime.executable_manifest.sha256().to_string(),
+        launch_context_sha256: runtime.launch_context_sha256.clone(),
+        environment_sha256: runtime.environment_sha256.clone(),
+        ambient_world_sha256: runtime.ambient_world_sha256.clone(),
+        analyzer_sha256: sha256_bytes(ANALYZER_ID_V6.as_bytes()),
+    }
+}
+
 /// Archival byte identity of the solved executable HGraph used by V5
 /// evidence and admission. This algorithm and its domain are frozen as V1.
-pub(crate) fn graph_sha256_v1(graph: &HGraph) -> String {
-    let mut hash = CanonicalHasher::new("ostadix-solved-executable-hgraph/v1");
+pub fn graph_sha256_v1(graph: &HGraph) -> String {
+    graph_sha256_versioned(graph, SOLVED_EXECUTABLE_HGRAPH_DIGEST_DOMAIN_V1, false)
+}
+
+pub fn graph_sha256_v2(graph: &HGraph) -> String {
+    graph_sha256_versioned(graph, SOLVED_EXECUTABLE_HGRAPH_DIGEST_DOMAIN_V2, true)
+}
+
+fn graph_sha256_versioned(graph: &HGraph, domain: &str, include_v2_assessment: bool) -> String {
+    let mut hash = CanonicalHasher::new(domain);
     for id in graph.node_ids() {
         let node = &graph.nodes[&id];
         hash.u64(id.0);
@@ -632,6 +869,9 @@ pub(crate) fn graph_sha256_v1(graph: &HGraph) -> String {
                     .expect("serializing fidelity into memory cannot fail"),
             ),
             None => hash.tag("no-fidelity"),
+        }
+        if include_v2_assessment {
+            encode_fidelity_assessment_v2(&mut hash, node.fidelity_assessment.as_ref());
         }
         encode_value_state(&mut hash, &node.state);
         hash.optional_u64(node.producer.map(|edge| edge.0));
@@ -712,14 +952,31 @@ pub(crate) fn graph_sha256_v1(graph: &HGraph) -> String {
     hash.finish()
 }
 
-/// Current solved-graph identity. Keep existing callers on the frozen V1
-/// algorithm until a future version is introduced through an explicit seam.
+fn encode_fidelity_assessment_v2(
+    hash: &mut CanonicalHasher,
+    assessment: Option<&FidelityAssessmentV2>,
+) {
+    match assessment {
+        Some(assessment) => {
+            hash.tag("fidelity-assessment-v2");
+            hash.field(
+                &serde_json::to_vec(assessment)
+                    .expect("serializing FidelityAssessmentV2 into memory cannot fail"),
+            );
+        }
+        None => hash.tag("no-fidelity-assessment-v2"),
+    }
+}
+
+/// Current solved-graph identity. Existing callers remain on the frozen V1
+/// algorithm; the explicit V2 seam does not retarget this compatibility path.
+#[cfg(test)]
 pub(crate) fn graph_sha256(graph: &HGraph) -> String {
     graph_sha256_v1(graph)
 }
 
-pub(crate) fn evidence_bundle_sha256(bundle: &EvidenceBundleV5) -> String {
-    let mut hash = CanonicalHasher::new("ostadix-evidence-bundle/v5");
+pub fn evidence_bundle_sha256_v5(bundle: &EvidenceBundleV5) -> String {
+    let mut hash = CanonicalHasher::new(EVIDENCE_BUNDLE_DIGEST_DOMAIN_V5);
     hash.field(bundle.schema.as_bytes());
     hash.field(bundle.analyzer.as_bytes());
     for binding in [
@@ -742,6 +999,72 @@ pub(crate) fn evidence_bundle_sha256(bundle: &EvidenceBundleV5) -> String {
         hash.u16(node.type_contract.output_domain_bits);
         hash.u16(node.type_contract.output_representation_bits);
         hash.field(node.type_contract.output_fidelity.as_bytes());
+        hash.field(node.type_contract.provenance.name().as_bytes());
+        for resource in &node.effect_contract.reads {
+            hash.tag("read");
+            encode_resource_key(&mut hash, resource);
+        }
+        for resource in &node.effect_contract.writes {
+            hash.tag("write");
+            encode_resource_key(&mut hash, resource);
+        }
+        hash.bool(node.effect_contract.footprint_closed);
+        hash.field(node.effect_contract.provenance.name().as_bytes());
+        hash.field(node.dispatch_contract.lane.name().as_bytes());
+        hash.field(node.dispatch_contract.adapter.name().as_bytes());
+        hash.field(node.dispatch_contract.semantics.name().as_bytes());
+        hash.bool(node.dispatch_contract.send_only_preparation);
+        hash.field(node.dispatch_contract.provenance.name().as_bytes());
+        hash.field(node.capability_disposition.name().as_bytes());
+        hash.field(node.capability_provenance.name().as_bytes());
+        hash.field(node.placement.name().as_bytes());
+        hash.field(node.placement_provenance.name().as_bytes());
+        hash.field(node.failure_contract.class.name().as_bytes());
+        hash.bool(node.failure_contract.cancellation_safe);
+        hash.field(node.failure_contract.provenance.name().as_bytes());
+        hash.optional_u64(node.resource_demand.cpu_units.map(u64::from));
+        hash.optional_u64(node.resource_demand.hard_memory_bytes);
+        hash.optional_u64(node.resource_demand.file_descriptors.map(u64::from));
+        hash.optional_u64(node.resource_demand.process_slots.map(u64::from));
+        hash.field(node.resource_demand.provenance.name().as_bytes());
+        hash.optional_u64(node.cost_estimate.expected_duration_micros);
+        hash.optional_u64(
+            node.cost_estimate
+                .confidence_parts_per_million
+                .map(u64::from),
+        );
+        hash.field(node.cost_estimate.provenance.name().as_bytes());
+    }
+    hash.finish()
+}
+
+pub fn evidence_bundle_sha256_v6(bundle: &EvidenceBundleV6) -> String {
+    let mut hash = CanonicalHasher::new(EVIDENCE_BUNDLE_DIGEST_DOMAIN_V6);
+    hash.field(bundle.schema.as_bytes());
+    hash.field(bundle.analyzer.as_bytes());
+    for binding in [
+        &bundle.bindings.oir_sha256,
+        &bundle.bindings.plan_sha256,
+        &bundle.bindings.analyzed_graph_sha256,
+        &bundle.bindings.backend_catalog_projection_sha256,
+        &bundle.bindings.backend_set_sha256,
+        &bundle.bindings.executable_manifest_sha256,
+        &bundle.bindings.launch_context_sha256,
+        &bundle.bindings.environment_sha256,
+        &bundle.bindings.ambient_world_sha256,
+        &bundle.bindings.analyzer_sha256,
+    ] {
+        hash.field(binding.as_bytes());
+    }
+    for node in &bundle.nodes {
+        hash.usize(node.plan_node.0);
+        hash.bool(node.type_contract.constraints_solved);
+        hash.u16(node.type_contract.output_domain_bits);
+        hash.u16(node.type_contract.output_representation_bits);
+        encode_fidelity_assessment_v2(
+            &mut hash,
+            node.type_contract.output_fidelity_assessment.as_ref(),
+        );
         hash.field(node.type_contract.provenance.name().as_bytes());
         for resource in &node.effect_contract.reads {
             hash.tag("read");
@@ -1324,6 +1647,146 @@ mod tests {
             "103d5d2f3f260407b74c7887ce4a9b9d8bfdbf208d5d86bdc5a3bf8f592bbd92"
         );
         assert_eq!(graph_sha256(&graph), v1);
+    }
+
+    #[test]
+    fn graph_v2_domains_are_explicit_and_v1_projection_stays_frozen() {
+        assert_eq!(
+            SOLVED_EXECUTABLE_HGRAPH_DIGEST_DOMAIN_V1,
+            "ostadix-solved-executable-hgraph/v1"
+        );
+        assert_eq!(
+            SOLVED_EXECUTABLE_HGRAPH_DIGEST_DOMAIN_V2,
+            "ostadix-solved-executable-hgraph/v2"
+        );
+        assert_eq!(
+            EVIDENCE_BUNDLE_DIGEST_DOMAIN_V5,
+            "ostadix-evidence-bundle/v5"
+        );
+        assert_eq!(
+            EVIDENCE_BUNDLE_DIGEST_DOMAIN_V6,
+            "ostadix-evidence-bundle/v6"
+        );
+
+        let program = program_for_backend("python", 1);
+        let mut graph = crate::hgraph::from_oir::build_program(&program);
+        crate::hgraph::solve::solve_types(&mut graph).unwrap();
+        assert_eq!(
+            graph_sha256_v1(&graph),
+            "103d5d2f3f260407b74c7887ce4a9b9d8bfdbf208d5d86bdc5a3bf8f592bbd92"
+        );
+        assert_eq!(
+            graph_sha256_v2(&graph),
+            "2cee20679dcffa4d1692243140d5da2909eb093b1f7b24b66e33d236bfc32978"
+        );
+    }
+
+    #[test]
+    fn graph_v2_binds_definite_losses_that_frozen_v1_cannot_see() {
+        use crate::value::AnnotationKind;
+
+        let program = program_for_backend("python", 1);
+        let mut left = crate::hgraph::from_oir::build_program(&program);
+        crate::hgraph::solve::solve_types(&mut left).unwrap();
+        let mut right = crate::hgraph::from_oir::build_program(&program);
+        crate::hgraph::solve::solve_types(&mut right).unwrap();
+        let possible = [
+            AnnotationKind::NumericPrecision,
+            AnnotationKind::NumericExactness,
+        ];
+        let left_assessment =
+            FidelityAssessmentV2::structural([AnnotationKind::NumericPrecision], possible.clone())
+                .unwrap();
+        let right_assessment = FidelityAssessmentV2::structural([], possible).unwrap();
+        let target = left
+            .node_ids()
+            .into_iter()
+            .find(|id| matches!(&left.nodes[id].kind, HNodeKind::Value))
+            .unwrap();
+        let left_node = left.node_mut(target).unwrap();
+        left_node.fidelity = Some(left_assessment.possible_fidelity());
+        left_node.fidelity_assessment = Some(left_assessment);
+        let right_node = right.node_mut(target).unwrap();
+        right_node.fidelity = Some(right_assessment.possible_fidelity());
+        right_node.fidelity_assessment = Some(right_assessment);
+
+        assert_eq!(graph_sha256_v1(&left), graph_sha256_v1(&right));
+        assert_ne!(graph_sha256_v2(&left), graph_sha256_v2(&right));
+    }
+
+    #[test]
+    fn graph_v2_validator_rejects_legacy_projection_mismatch() {
+        let program = program_for_backend("python", 1);
+        let plan = program.plan();
+        let mut graph = program.hgraph();
+        crate::hgraph::solve::solve_types(&mut graph).unwrap();
+        let node = graph
+            .nodes
+            .values_mut()
+            .find(|node| matches!(&node.kind, HNodeKind::Value))
+            .unwrap();
+        node.fidelity_assessment = Some(FidelityAssessmentV2::Unsupported);
+        node.fidelity = None;
+
+        let error = validate_canonical_solved_graph_v2(&program, &plan, &graph).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("legacy fidelity projection inconsistent"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn explicit_v6_is_typed_while_current_analyzer_remains_v5() {
+        let program = program_for_backend("python", 1);
+        let plan = program.plan();
+        let mut graph = program.hgraph();
+        crate::hgraph::solve::solve_types(&mut graph).unwrap();
+        let runtime = runtime_binding_from_adapter_bytes(
+            &plan,
+            &[],
+            &[("explicit-v6-test", "typed-current-v5")],
+        );
+
+        let current = analyze_execution(&program, &plan, &graph, runtime.clone()).unwrap();
+        let explicit_v5 = analyze_execution_v5(&program, &plan, &graph, runtime.clone()).unwrap();
+        let v6 = analyze_execution_v6(&program, &plan, &graph, runtime).unwrap();
+
+        assert_eq!(current, explicit_v5);
+        assert_eq!(current.schema(), EVIDENCE_SCHEMA_V5);
+        assert_eq!(current.analyzer(), ANALYZER_ID_V5);
+        assert_eq!(v6.schema(), EVIDENCE_SCHEMA_V6);
+        assert_eq!(v6.analyzer(), ANALYZER_ID_V6);
+        assert_eq!(
+            current.bindings().analyzed_graph_sha256,
+            graph_sha256_v1(&graph)
+        );
+        assert_eq!(v6.bindings().analyzed_graph_sha256, graph_sha256_v2(&graph));
+    }
+
+    #[test]
+    fn evidence_v6_hash_distinguishes_absence_from_explicit_unsupported() {
+        let program = program_for_backend("python", 1);
+        let plan = program.plan();
+        let mut graph = program.hgraph();
+        crate::hgraph::solve::solve_types(&mut graph).unwrap();
+        let runtime = runtime_binding_from_adapter_bytes(
+            &plan,
+            &[],
+            &[("explicit-v6-test", "absence-vs-unsupported")],
+        );
+        let mut absent = analyze_execution_v6(&program, &plan, &graph, runtime).unwrap();
+        absent.nodes[0].type_contract.output_fidelity_assessment = None;
+        let mut unsupported = absent.clone();
+        unsupported.nodes[0]
+            .type_contract
+            .output_fidelity_assessment = Some(FidelityAssessmentV2::Unsupported);
+
+        assert_ne!(
+            evidence_bundle_sha256_v6(&absent),
+            evidence_bundle_sha256_v6(&unsupported)
+        );
     }
 
     #[test]
