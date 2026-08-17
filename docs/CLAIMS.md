@@ -207,17 +207,19 @@
   re-evaluates candidate eligibility against its current catalog and exact
   locally prepared fragment before accepting execution authority.
 - Admission V5/V6 and backend-catalog generation are independent version axes.
-  The current authorizing catalog is `ostadix.backend-catalog/v4`, and its
+  The current authorizing catalog is `ostadix.backend-catalog/v5`, and its
   schema string participates in the whole-catalog and per-specification hash
   domains. `NodeProfileV1::validate_at` invokes
   `TargetDescriptorV1::validate_current_backend_catalog` before candidate
-  authorization. A profile containing a V3 or otherwise unknown backend
+  authorization. A profile containing a V4, V3, or otherwise unknown backend
   specification therefore fails with `NonCurrentBackendCatalog`, even if its
   old digest, detached signature, requirements, and warrants agree with one
   another. Decoding or independently verifying an archived signed record is
-  not current placement authorization, and no V3 digest is relabeled as V4.
-  V4 additionally binds the explicit backend-state support and snapshot-
-  compatibility declaration used by persistent-session placement.
+  not current placement authorization, and no archival digest is relabeled as
+  V5. V4 remains frozen with the explicit backend-state support and snapshot-
+  compatibility declaration used by persistent-session placement. V5 extends
+  that exact prefix with an explicitly absent or named bounded
+  backend-morphism profile.
   A descriptor with no backend implementations may remain structurally valid,
   but cannot discharge a backend-specification or backend-implementation
   requirement.
@@ -497,10 +499,14 @@
   the backend can accept that value as input. Both legs carry explicit
   compositional fidelity and their exact boundary descriptions appear in each
   shadow assessment.
-- These shadow profiles are not fields of backend-catalog V4 and therefore do
-  not change its specification digests, placement compatibility, evidence, or
-  protocol bytes. Enforcing them later requires an explicit catalog/evidence
-  version rollover. `tests/backend_morphism_v1.rs` exercises a real nested
+- Catalog V5 binds the optional shadow profile assignment for all 30 canonical
+  backends; archival V4 digests stay unchanged. This makes profile selection
+  part of the current catalog projection and placement identity, but does not
+  add the profile to `BackendInterface`, change HGraph solver facts or graph
+  hashing, add fields to evidence/admission protocols, or enforce a crossing
+  during dispatch. Enforcing the shadow assessment itself later requires an
+  explicit graph/evidence version rollover. `tests/backend_morphism_v1.rs`
+  exercises a real nested
   Python input binding, a real JavaScript scalar input binding, and the exact
   emitted Rust scalar program through Python, Node.js, and rustc; kernel unit
   tests cover negative values and numeric bounds.

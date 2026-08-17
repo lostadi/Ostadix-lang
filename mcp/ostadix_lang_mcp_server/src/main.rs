@@ -637,14 +637,17 @@ struct CatalogBackendRuntime {
     state_codec: Option<&'static str>,
     state_compatibility: Option<&'static str>,
     state_manifest_schema: Option<&'static str>,
+    morphism_profile: Option<&'static str>,
 }
 
 macro_rules! backend_catalog_metadata {
     (
         current_schema: $current_schema:literal,
+        legacy_schema_v4: $legacy_schema_v4:literal,
         legacy_schema_v3: $legacy_schema_v3:literal $(,)?
     ) => {
         const CATALOG_SCHEMA: &str = $current_schema;
+        const CATALOG_LEGACY_SCHEMA_V4: &str = $legacy_schema_v4;
         const CATALOG_LEGACY_SCHEMA_V3: &str = $legacy_schema_v3;
     };
 }
@@ -739,6 +742,23 @@ macro_rules! catalog_state_support {
     };
 }
 
+// Dependency-isolated projection of the catalog-owned profile labels. The MCP
+// intentionally does not link the runtime's nominal morphism type.
+macro_rules! catalog_morphism_profile {
+    (None) => {
+        None::<&'static str>
+    };
+    (PythonPlainData) => {
+        Some("python-plain-data")
+    };
+    (JavascriptBindingStdout) => {
+        Some("javascript-binding-stdout")
+    };
+    (RustSourceConstantStdout) => {
+        Some("rust-source-constant-stdout")
+    };
+}
+
 macro_rules! runtime_requirement_precision_name {
     (Exact) => {
         "exact"
@@ -792,6 +812,7 @@ macro_rules! backend_catalog {
                     $({
                         $($state_key:ident: $state_value:tt),* $(,)?
                     })?,
+                morphism_profile: $morphism_profile:ident,
             }
         ),* $(,)?
     ) => {
@@ -837,6 +858,7 @@ macro_rules! backend_catalog {
                         $state_support
                         $({ $($state_key: $state_value),* })?
                     ).3,
+                    morphism_profile: catalog_morphism_profile!($morphism_profile),
                 },
             )*
         ];
@@ -880,7 +902,7 @@ impl RuntimeDiscovery {
 
     fn to_text(&self) -> String {
         let mut out = format!(
-            "runtime-catalog-schema={CATALOG_SCHEMA}\nruntime-catalog-legacy-schema-v3={CATALOG_LEGACY_SCHEMA_V3}\nruntime-catalog-projection=compiled-mcp-snapshot\nruntime-search-mode={}\nruntime-search-path={}\n{}\n",
+            "runtime-catalog-schema={CATALOG_SCHEMA}\nruntime-catalog-legacy-schema-v4={CATALOG_LEGACY_SCHEMA_V4}\nruntime-catalog-legacy-schema-v3={CATALOG_LEGACY_SCHEMA_V3}\nruntime-catalog-projection=compiled-mcp-snapshot\nruntime-search-mode={}\nruntime-search-path={}\n{}\n",
             self.search.mode.name(),
             self.search.encoded.to_string_lossy(),
             self.summary()
@@ -902,6 +924,9 @@ impl RuntimeDiscovery {
         );
         out.push_str(
             "runtime-note only declared and located are established here; invocability, compatibility, authorization, health, and per-operation admission require separate evidence\n",
+        );
+        out.push_str(
+            "runtime-note morphism profiles are bounded shadow descriptions; they do not authorize execution or claim generic backend crossings\n",
         );
         out
     }
@@ -1011,12 +1036,13 @@ fn discover_runtimes(search: &RuntimeSearchPath, root: &Path) -> RuntimeDiscover
             _ => unreachable!("catalog state projection has inconsistent parameters"),
         };
         lines.push(format!(
-            "runtime-capability backend={} integer-exactness={} rich-numbers={} state-support={}{} provenance=catalog",
+            "runtime-capability backend={} integer-exactness={} rich-numbers={} state-support={}{} morphism-profile={} provenance=catalog",
             backend.name,
             integer_exactness,
             backend.rich_numbers,
             backend.state_support,
             state_detail,
+            backend.morphism_profile.unwrap_or("none"),
         ));
     }
 
@@ -1827,12 +1853,13 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        catalog_backends_for, is_lang_root, parse_execution_intent, random_intent_handle,
-        resolve_directory, resolve_file, resolve_run_target, run_cmd,
+        catalog_backends_for, discover_runtimes, is_lang_root, parse_execution_intent,
+        random_intent_handle, resolve_directory, resolve_file, resolve_run_target, run_cmd,
         runtime_search_path_with_mode, runtime_search_path_with_mode_and_manager_environment,
         validate_intent_target, EmptyArgs, IntentLease, IntentReservation, IntentStore, OstadixMcp,
-        RuntimePathMode, CATALOG_BACKEND_RUNTIMES, CATALOG_LEGACY_SCHEMA_V3,
-        CATALOG_RUNTIME_REQUIREMENTS, CATALOG_SCHEMA, INTENT_SCHEMA_V1, MAX_LIVE_INTENTS,
+        RuntimePathMode, RuntimeSearchPath, CATALOG_BACKEND_RUNTIMES, CATALOG_LEGACY_SCHEMA_V3,
+        CATALOG_LEGACY_SCHEMA_V4, CATALOG_RUNTIME_REQUIREMENTS, CATALOG_SCHEMA, INTENT_SCHEMA_V1,
+        MAX_LIVE_INTENTS,
     };
     use std::collections::BTreeSet;
     use std::ffi::OsStr;
@@ -1930,7 +1957,8 @@ mod tests {
 
     #[test]
     fn runtime_inventory_is_a_complete_catalog_projection() {
-        assert_eq!(CATALOG_SCHEMA, "ostadix.backend-catalog/v4");
+        assert_eq!(CATALOG_SCHEMA, "ostadix.backend-catalog/v5");
+        assert_eq!(CATALOG_LEGACY_SCHEMA_V4, "ostadix.backend-catalog/v4");
         assert_eq!(CATALOG_LEGACY_SCHEMA_V3, "ostadix.backend-catalog/v3");
         let requirement_keys = CATALOG_RUNTIME_REQUIREMENTS
             .iter()
@@ -1985,6 +2013,30 @@ mod tests {
         assert_eq!(stateless, 27);
         assert_eq!(semantic, ["sql", "python"]);
         assert_eq!(external, ["ubuntu_vm"]);
+
+        let profiled = CATALOG_BACKEND_RUNTIMES
+            .iter()
+            .filter_map(|backend| {
+                backend
+                    .morphism_profile
+                    .map(|profile| (backend.name, profile))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            profiled,
+            [
+                ("python", "python-plain-data"),
+                ("rust", "rust-source-constant-stdout"),
+                ("javascript", "javascript-binding-stdout"),
+            ]
+        );
+        assert_eq!(
+            CATALOG_BACKEND_RUNTIMES
+                .iter()
+                .filter(|backend| backend.morphism_profile.is_none())
+                .count(),
+            27
+        );
     }
 
     #[test]
@@ -2002,6 +2054,7 @@ mod tests {
         assert_eq!(python.state_codec, Some("ostadix.python-graph/v1"));
         assert_eq!(python.state_compatibility, Some("exact-implementation"));
         assert_eq!(python.state_manifest_schema, None);
+        assert_eq!(python.morphism_profile, Some("python-plain-data"));
 
         let sql = CATALOG_BACKEND_RUNTIMES
             .iter()
@@ -2020,6 +2073,10 @@ mod tests {
         assert_eq!(javascript.integer_exactness_min, None);
         assert_eq!(javascript.integer_exactness_max, None);
         assert_eq!(javascript.rich_numbers, "collapsed");
+        assert_eq!(
+            javascript.morphism_profile,
+            Some("javascript-binding-stdout")
+        );
 
         let java = CATALOG_BACKEND_RUNTIMES
             .iter()
@@ -2030,6 +2087,7 @@ mod tests {
         assert_eq!(java.integer_exactness_min, None);
         assert_eq!(java.integer_exactness_max, None);
         assert_eq!(java.state_support, "stateless");
+        assert_eq!(java.morphism_profile, None);
 
         let ubuntu_vm = CATALOG_BACKEND_RUNTIMES
             .iter()
@@ -2048,6 +2106,28 @@ mod tests {
             max: "20"
         });
         assert_eq!(range, ("exact-range", None, Some("-10"), Some("20")));
+    }
+
+    #[test]
+    fn runtime_inventory_output_exposes_profiles_with_an_explicit_nonclaim() {
+        let fixture = Fixture::new();
+        let search = RuntimeSearchPath::new(RuntimePathMode::InheritedOnly, Vec::new())
+            .expect("empty inherited runtime search path");
+        let output = discover_runtimes(&search, &fixture.0).to_text();
+        assert!(output.contains("runtime-catalog-schema=ostadix.backend-catalog/v5\n"));
+        assert!(output.contains("runtime-catalog-legacy-schema-v4=ostadix.backend-catalog/v4\n"));
+        assert!(output.contains(
+            "runtime-capability backend=python integer-exactness=arbitrary rich-numbers=preserved state-support=semantic-snapshot codec=ostadix.python-graph/v1 compatibility=exact-implementation morphism-profile=python-plain-data provenance=catalog"
+        ));
+        assert!(output.contains(
+            "runtime-capability backend=javascript integer-exactness=exact-magnitude-bits:53 rich-numbers=collapsed state-support=stateless morphism-profile=javascript-binding-stdout provenance=catalog"
+        ));
+        assert!(output.contains(
+            "runtime-capability backend=html integer-exactness=arbitrary rich-numbers=collapsed state-support=stateless morphism-profile=none provenance=catalog"
+        ));
+        assert!(output.contains(
+            "runtime-note morphism profiles are bounded shadow descriptions; they do not authorize execution or claim generic backend crossings"
+        ));
     }
 
     #[test]
