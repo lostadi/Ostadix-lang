@@ -621,7 +621,8 @@ impl PreparedTask for ParallelTask {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::eval::{ExecutionTrace, Policy};
+    use crate::eval::ExecutionTrace;
+    use crate::execution_contract::Policy;
     use crate::executor::pool::WorkerPool;
     use crate::executor::task::{TaskOutcome, TaskSubmission, TaskToken};
 
