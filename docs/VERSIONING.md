@@ -28,8 +28,31 @@ authorized, that an information projection is fresh, or that a World is live.
 | World wire family | V1 | `src/world/protocol.rs` `WORLD_SCHEMA_V1`; codec constants under `src/world/` | Offline World record, identity, value, and receipt codecs. These coordinates do not establish a live World. |
 | Information kernel family | V1 | `INFORMATION_SCHEMA_V1` and record constants under `src/information/` | Authority-free, immutable information identities, deltas, projections, and receipts. Each record validates its own exact schema. |
 
-“V6” in Hosted Placement V6 names the placement milestone and evidence model;
-it is not a promise that every schema or transport is numerically version 6.
+“V6” in Hosted Placement V6 names the placement milestone and placement-evidence
+model; it is not a promise that every schema or transport is numerically version
+6. It is also not the same coordinate as the additive local
+`oexec.evidence/v6` and `oexec.admission/v6` APIs below.
+
+### Additive non-current local admission coordinates
+
+Package `0.2.0` exposes an explicit, source-additive fidelity-preserving path for
+experimentation without changing the current rows above:
+
+| Explicit coordinate | Source authority | Meaning |
+|---|---|---|
+| Graph V2 / `ostadix-solved-executable-hgraph/v2` | `src/evidence/analyze.rs` `graph_sha256_v2` | Frozen Graph V1 fields plus the complete canonical `FidelityAssessmentV2`; absent and present assessments are distinct. |
+| `oexec.evidence/v6` / `ostadix-evidence-bundle/v6` | `EVIDENCE_SCHEMA_V6`; `evidence_bundle_sha256_v6` | Typed per-operation fidelity assessment bound to Graph V2 and the current Catalog V5 projection. |
+| `oexec.admission/v6` / `ostadix-execution-admission/v6` | `ADMISSION_SCHEMA_V6`; `admit_execution_v6` | Revalidated local V6 admission that can be inspected but is not accepted by the current coordinator. |
+| `oexec.admission-why/v2` | `SCHEDULE_WHY_SCHEMA_V2` | Inspection-only V6 why-view retaining typed fidelity evidence. |
+| `ostadix/placement-admission/v2` | `PLACEMENT_ADMISSION_DIGEST_DOMAIN_V2` | Process-portable semantic digest over explicit V6 schemas/analyzer, Graph V2 identities, current Catalog V5 projection, and policy. It is not a hosted placement fragment or lease. |
+
+The unversioned `analyze_execution` and `admit_execution`, `AdmittedExecution`,
+uppercase `O`, evaluator/coordinator, CLI JSON, version report, and MCP behavior
+remain V5/Graph V1. `ExecutionIntentV1` also remains Graph V1 while binding the
+current Catalog V5 projection. There is no V5-to-V6 conversion, no V6 prepared
+admission type, and no hosted-fragment migration. Advancing those current
+surfaces is a later package/workspace `0.3` compatibility decision; the
+additive explicit APIs do not require a `0.3` release first.
 
 ### World V1 coordinates
 
@@ -87,9 +110,9 @@ commits to them.
    contracts, and receipts. They do not version a storage engine and do not
    mint or replace evidence, admission, placement, or World authority.
 7. Backend-morphism V1 remains an inspection-only profile family. Catalog V5
-   binds the selected optional profile, but enforcing its assessment requires an
-   explicit graph/evidence version rollover; it cannot silently strengthen or
-   narrow V5 semantics.
+   binds the selected optional profile. The explicit Graph V2/Evidence V6 path
+   preserves typed solver assessments, but does not itself enforce morphism
+   profiles or silently strengthen or narrow current V5 semantics.
 8. The `o_lang::api` façade is the intended embedding surface. Historical
    top-level modules remain available during the 0.2 compatibility period but
    are not all promised as stable external contracts.
