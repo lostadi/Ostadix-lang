@@ -12,7 +12,10 @@ use o_lang::backend_morphism::{
     render_rust_scalar_stdout_program_v1, BackendMorphismKernelV1, BackendMorphismRejectionKindV1,
     BackendMorphismV1, BackendNativeValueV1,
 };
-use o_lang::hgraph::solve::{backend_morphism_shadow_assessment_for_value, fidelity_for_value};
+use o_lang::hgraph::{
+    solve::{backend_morphism_shadow_assessment_for_value, fidelity_for_value, solve_types},
+    HEdge, HGraph, HNode, OpKind, Port, PortRole,
+};
 use o_lang::value::{Fidelity, FidelityAssessmentV2, OValue};
 
 mod support;
@@ -139,13 +142,38 @@ console.log(JSON.stringify({"nested":[1,true,null,"x"]}));
         FidelityAssessmentV2::Structural { .. }
     ));
 
-    // Catalog V4's compatibility capability model still reports this generic
-    // container as lossless. The V1 morphism is intentionally only a shadow
-    // result and exposes the current native-binding gap without reducing
-    // execution capacity.
+    // Catalog V5 binds this bounded profile, but the compatibility capability
+    // model still reports this generic container as lossless. The V1 morphism
+    // remains a shadow result and exposes the current native-binding gap
+    // without reducing execution capacity.
     assert_eq!(
         fidelity_for_value(&expected, "javascript"),
         Fidelity::Lossless
+    );
+    let mut graph = HGraph::default();
+    let input = graph.add_node(HNode::with_value(expected.clone()));
+    let output = graph.add_node(HNode::fresh());
+    graph.add_edge(HEdge::constraint(
+        OpKind::BackendCrossing {
+            from_lang: "O".to_owned(),
+            to_lang: "javascript".to_owned(),
+        },
+        vec![
+            Port {
+                node: input,
+                role: PortRole::Input,
+            },
+            Port {
+                node: output,
+                role: PortRole::Output,
+            },
+        ],
+    ));
+    solve_types(&mut graph).unwrap();
+    assert_eq!(
+        graph.node(output).and_then(|node| node.fidelity.clone()),
+        Some(Fidelity::Lossless),
+        "Catalog V5 profile data must not rewrite production BackendCrossing fidelity"
     );
     let shadow = backend_morphism_shadow_assessment_for_value(&expected, "javascript").unwrap();
     assert!(!shadow.is_supported());
