@@ -33,6 +33,17 @@ fn domain(node_generation: u64, generation: u64) -> DomainIdentity {
 }
 
 #[test]
+fn world_artifact_id_remains_an_exact_shared_identity_reexport() {
+    let shared = o_lang::resource_identity::ArtifactId::from_sha256("a".repeat(64)).unwrap();
+    let through_world: o_lang::world::ArtifactId = shared.clone();
+    let through_world_identity_module: o_lang::world::identity::ArtifactId = shared.clone();
+    let shared_again: o_lang::resource_identity::ArtifactId = through_world;
+
+    assert_eq!(shared_again, shared);
+    assert_eq!(through_world_identity_module, shared);
+}
+
+#[test]
 fn identities_are_bounded_canonical_and_serializable() {
     assert!(WorldId::new("").is_err());
     assert!(WorldId::new(".").is_err());
