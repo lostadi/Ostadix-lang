@@ -1,12 +1,11 @@
 //! Trace helpers for the graph coordinator.
 //!
 //! The canonical trace types (`ExecutionTrace` / `TraceEvent`) live in the
-//! evaluator so that existing trace-dependent tests keep observing the same
-//! `NodeReady` / `NodeStarted` / `NodeFinished` / `NodeFailed` events. This
-//! module provides small helpers for emitting those events from the
-//! coordinator's event loop.
+//! evaluator-independent execution core. The evaluator publicly reexports the
+//! exact types so existing trace-dependent embedders keep observing the same
+//! `NodeReady` / `NodeStarted` / `NodeFinished` / `NodeFailed` events.
 
-use crate::eval::{ExecutionTrace, TraceEvent};
+use crate::eval_core::{ExecutionTrace, TraceEvent};
 use crate::ir::PlanNodeId;
 
 /// A thin sink that appends coordinator lifecycle events to an
