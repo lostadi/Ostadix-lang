@@ -1,10 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::{
+    backend_catalog::{BackendInterface, ExecutionMode},
     effects::{effect_summary_for_plan_node, EffectSummary, ResourceKey},
     ir::{
-        BackendInterface, ExecutionMode, ExecutionPlan, OIr, OIrProgram, PlanEdgeKind, PlanNodeId,
-        PlanNodeKind, PlanScheduleKind,
+        ExecutionPlan, OIr, OIrProgram, PlanEdgeKind, PlanNodeId, PlanNodeKind, PlanScheduleKind,
     },
     value::{GroupMode, OValue},
 };

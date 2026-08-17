@@ -99,7 +99,8 @@ const RUNTIME_CAPABILITY_RS: &str = include_str!("../capability.rs");
 const RUNTIME_ENVIRONMENT_RS: &str = include_str!("../environment.rs");
 const RUNTIME_PARSER_RS: &str = include_str!("../parser.rs");
 const RUNTIME_IR_RS: &str = include_str!("../ir.rs");
-const RUNTIME_BACKEND_CATALOG_RS: &str = include_str!("../backend_catalog.inc.rs");
+const RUNTIME_BACKEND_CATALOG_MODULE_RS: &str = include_str!("../backend_catalog.rs");
+const RUNTIME_BACKEND_CATALOG_DATA_RS: &str = include_str!("../backend_catalog.inc.rs");
 const RUNTIME_EVAL_RS: &str = include_str!("../eval.rs");
 const RUNTIME_PROCESS_RS: &str = include_str!("../process.rs");
 const RUNTIME_BACKEND_RS: &str = include_str!("../backend.rs");
@@ -1225,8 +1226,12 @@ fn write_runtime_sources(src_dir: &Path) -> Result<()> {
     fs::write(src_dir.join("parser.rs"), RUNTIME_PARSER_RS)?;
     fs::write(src_dir.join("ir.rs"), RUNTIME_IR_RS)?;
     fs::write(
+        src_dir.join("backend_catalog.rs"),
+        RUNTIME_BACKEND_CATALOG_MODULE_RS,
+    )?;
+    fs::write(
         src_dir.join("backend_catalog.inc.rs"),
-        RUNTIME_BACKEND_CATALOG_RS,
+        RUNTIME_BACKEND_CATALOG_DATA_RS,
     )?;
     fs::write(src_dir.join("eval.rs"), RUNTIME_EVAL_RS)?;
     fs::write(src_dir.join("process.rs"), RUNTIME_PROCESS_RS)?;
@@ -2078,6 +2083,7 @@ pub mod value;
 mod capability;
 pub mod environment;
 pub mod backend;
+pub(crate) mod backend_catalog;
 pub mod backend_morphism;
 pub mod parser;
 #[path = \"placement/protocol/mod.rs\"]
@@ -2863,6 +2869,7 @@ mod tests {
         let lib_rs = fs::read_to_string(src_dir.join("lib.rs")).unwrap();
         assert!(lib_rs.contains("pub mod effects;"));
         assert!(lib_rs.contains("pub mod environment;"));
+        assert!(lib_rs.contains("pub(crate) mod backend_catalog;"));
         assert!(lib_rs.contains("pub mod backend_morphism;"));
         assert!(lib_rs.contains("#[path = \"placement/protocol/mod.rs\"]"));
         assert!(lib_rs.contains("pub(crate) mod placement_protocol;"));
@@ -2879,6 +2886,7 @@ mod tests {
         assert!(lib_rs.contains("pub mod syntax_dialect;"));
 
         for path in [
+            "backend_catalog.rs",
             "backend_catalog.inc.rs",
             "backend_morphism.rs",
             "backend_state.rs",
@@ -2942,9 +2950,14 @@ mod tests {
             );
         }
         assert_eq!(
+            fs::read_to_string(src_dir.join("backend_catalog.rs")).unwrap(),
+            RUNTIME_BACKEND_CATALOG_MODULE_RS,
+            "generated runtimes must receive the canonical backend catalog implementation verbatim"
+        );
+        assert_eq!(
             fs::read_to_string(src_dir.join("backend_catalog.inc.rs")).unwrap(),
-            RUNTIME_BACKEND_CATALOG_RS,
-            "generated runtimes must receive the canonical backend catalog verbatim"
+            RUNTIME_BACKEND_CATALOG_DATA_RS,
+            "generated runtimes must receive the canonical backend catalog data verbatim"
         );
         assert_eq!(
             fs::read_to_string(src_dir.join("backend_morphism.rs")).unwrap(),

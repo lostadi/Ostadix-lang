@@ -4,11 +4,11 @@
 //! This implementation lives above both protocol and registry storage so the
 //! placement protocol remains registry-independent.
 
+use crate::backend_catalog::BackendRegistry;
 use crate::placement_protocol::{
     CandidateDecisionV1, NodeProfileV1, PlacementCandidateInputV1, PlacementValidationError,
     RecordAuthenticatorV1, TargetDescriptorV1, UnixMillisV1,
 };
-use crate::registry::bundle::BackendRegistry;
 
 impl TargetDescriptorV1 {
     pub fn validate_current_backend_catalog(&self) -> Result<(), PlacementValidationError> {
