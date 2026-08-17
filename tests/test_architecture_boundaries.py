@@ -29,7 +29,9 @@ def write_minimal_tree(root: Path) -> None:
         "src/syntax_dialect.rs",
         "src/ir.rs",
         "src/backend_catalog.rs",
+        "src/capability.rs",
         "src/execution_contract.rs",
+        "src/eval_core.rs",
         "src/effects.rs",
         "src/value.rs",
         "src/dispatch_model.rs",
@@ -50,11 +52,21 @@ def write_minimal_tree(root: Path) -> None:
         "src/registry/placement_compat.rs",
         "src/registry/store.rs",
         "src/eval.rs",
+        "src/executor/actor.rs",
+        "src/executor/cancellation.rs",
+        "src/executor/coordinator.rs",
+        "src/executor/effects.rs",
+        "src/executor/mod.rs",
+        "src/executor/parallel.rs",
+        "src/executor/pool.rs",
+        "src/executor/task.rs",
+        "src/executor/trace.rs",
         "src/runtime_exec.rs",
         "src/evidence/admit.rs",
         "src/evidence/analyze.rs",
         "src/evidence/fact.rs",
         "src/evidence/intent.rs",
+        "src/evidence/mod.rs",
         "src/evidence/profile.rs",
         "src/world/grounding.rs",
     ):
@@ -106,6 +118,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         for module in (
             "backend",
             "eval",
+            "eval_core",
             "evidence",
             "execution_contract",
             "executor",
@@ -281,6 +294,103 @@ class ArchitectureBoundaryTests(unittest.TestCase):
                 self.assertIn(
                     "forbidden dependency `crate::execution_contract`", result.stderr
                 )
+
+    def test_eval_core_cannot_reenter_evaluator_or_executor_realizations(self) -> None:
+        for module in ("eval", "executor"):
+            with self.subTest(module=module):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    write_minimal_tree(root)
+                    (root / "src/eval_core.rs").write_text(
+                        f"use crate::{module}::Boundary;\n", encoding="utf-8"
+                    )
+                    result = run_checker(root)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("graph-evaluation contract", result.stderr)
+
+    def test_eval_core_allowlist_rejects_an_unanticipated_root(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/eval_core.rs").write_text(
+                "use crate::information::InformationRootV1;\n", encoding="utf-8"
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("forbidden dependency `crate::information`", result.stderr)
+
+    def test_eval_core_accepts_exactly_its_six_lower_roots(self) -> None:
+        allowed = (
+            "backend_catalog",
+            "capability",
+            "evidence",
+            "execution_contract",
+            "ir",
+            "value",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/eval_core.rs").write_text(
+                "".join(f"use crate::{module}::Boundary;\n" for module in allowed),
+                encoding="utf-8",
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_every_executor_module_requires_eval_core_instead_of_evaluator(self) -> None:
+        for relative in (
+            "src/executor/actor.rs",
+            "src/executor/cancellation.rs",
+            "src/executor/coordinator.rs",
+            "src/executor/effects.rs",
+            "src/executor/mod.rs",
+            "src/executor/parallel.rs",
+            "src/executor/pool.rs",
+            "src/executor/task.rs",
+            "src/executor/trace.rs",
+        ):
+            with self.subTest(relative=relative):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    write_minimal_tree(root)
+                    (root / relative).write_text(
+                        "use crate::eval::Evaluator;\n", encoding="utf-8"
+                    )
+                    result = run_checker(root)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("canonical catalogs", result.stderr)
+
+    def test_executor_accepts_the_eval_core_host_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/executor/coordinator.rs").write_text(
+                "use crate::eval_core::GraphEvaluationHost;\n", encoding="utf-8"
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_eval_core_lower_dependencies_predeny_reverse_edges(self) -> None:
+        for relative in (
+            "src/backend_catalog.rs",
+            "src/capability.rs",
+            "src/execution_contract.rs",
+            "src/ir.rs",
+            "src/value.rs",
+            "src/evidence/analyze.rs",
+            "src/evidence/mod.rs",
+        ):
+            with self.subTest(relative=relative):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    write_minimal_tree(root)
+                    (root / relative).write_text(
+                        "use crate::eval_core::GraphEvalFrame;\n", encoding="utf-8"
+                    )
+                    result = run_checker(root)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("forbidden dependency `crate::eval_core`", result.stderr)
 
     def test_evidence_and_world_cannot_reenter_evaluator_for_contract_types(self) -> None:
         for relative in (

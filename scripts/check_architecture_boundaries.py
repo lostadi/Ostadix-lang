@@ -39,6 +39,18 @@ PLACEMENT_PROTOCOL_PATHS = (
     "src/placement/protocol/warrant.rs",
 )
 
+EXECUTOR_RUNTIME_PATHS = (
+    "src/executor/actor.rs",
+    "src/executor/cancellation.rs",
+    "src/executor/coordinator.rs",
+    "src/executor/effects.rs",
+    "src/executor/mod.rs",
+    "src/executor/parallel.rs",
+    "src/executor/pool.rs",
+    "src/executor/task.rs",
+    "src/executor/trace.rs",
+)
+
 # `src/lib.rs` loads this physical tree once through
 # `#[path = "placement/protocol/mod.rs"] mod placement_protocol;`. Relative
 # `super` paths must therefore be resolved from that declared module root, not
@@ -61,7 +73,14 @@ RULES = (
     ),
     Rule(
         ("src/ir.rs",),
-        ("execution_contract", "hgraph", "placement", "placement_protocol", "registry"),
+        (
+            "eval_core",
+            "execution_contract",
+            "hgraph",
+            "placement",
+            "placement_protocol",
+            "registry",
+        ),
         "IR must not depend on its execution-contract projection, its HGraph or placement projections, and must depend directly on the canonical backend catalog rather than registry compatibility projections",
     ),
     Rule(
@@ -69,6 +88,7 @@ RULES = (
         (
             "backend",
             "eval",
+            "eval_core",
             "evidence",
             "execution_contract",
             "executor",
@@ -130,8 +150,8 @@ RULES = (
     ),
     Rule(
         ("src/value.rs",),
-        ("execution_contract",),
-        "the runtime value vocabulary must remain below the execution contract",
+        ("eval_core", "execution_contract"),
+        "the runtime value vocabulary must remain below the execution contract and graph-evaluation core",
     ),
     Rule(
         (
@@ -139,9 +159,10 @@ RULES = (
             "src/evidence/analyze.rs",
             "src/evidence/fact.rs",
             "src/evidence/intent.rs",
+            "src/evidence/mod.rs",
             "src/evidence/profile.rs",
         ),
-        ("eval", "executor"),
+        ("eval", "eval_core", "executor"),
         "evidence must bind the canonical execution contract and dispatch model rather than import evaluator or executor realizations",
     ),
     Rule(
@@ -153,6 +174,34 @@ RULES = (
         ("src/dispatch_model.rs",),
         ("evidence", "executor", "hgraph"),
         "the shared dispatch model must remain independent of HGraph and executor consumers",
+    ),
+    Rule(
+        ("src/capability.rs",),
+        ("eval_core",),
+        "capability vocabulary must remain below the graph-evaluation core that consumes its sandbox policy",
+    ),
+    Rule(
+        ("src/eval_core.rs",),
+        (
+            "backend",
+            "eval",
+            "executor",
+            "hgraph",
+            "hosted_remote",
+            "process",
+            "project",
+            "registry",
+            "runtime_exec",
+            "scheduler",
+            "world",
+        ),
+        "the graph-evaluation contract must remain independent of evaluator and executor realizations",
+        ("backend_catalog", "capability", "evidence", "execution_contract", "ir", "value"),
+    ),
+    Rule(
+        EXECUTOR_RUNTIME_PATHS,
+        ("eval", "registry"),
+        "the graph executor must consume eval_core and canonical catalogs rather than evaluator or registry realizations",
     ),
     Rule(
         PLACEMENT_PROTOCOL_PATHS,

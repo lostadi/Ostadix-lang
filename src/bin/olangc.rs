@@ -103,6 +103,7 @@ const RUNTIME_IR_RS: &str = include_str!("../ir.rs");
 const RUNTIME_BACKEND_CATALOG_MODULE_RS: &str = include_str!("../backend_catalog.rs");
 const RUNTIME_BACKEND_CATALOG_DATA_RS: &str = include_str!("../backend_catalog.inc.rs");
 const RUNTIME_EXECUTION_CONTRACT_RS: &str = include_str!("../execution_contract.rs");
+const RUNTIME_EVAL_CORE_RS: &str = include_str!("../eval_core.rs");
 const RUNTIME_EVAL_RS: &str = include_str!("../eval.rs");
 const RUNTIME_PROCESS_RS: &str = include_str!("../process.rs");
 const RUNTIME_BACKEND_RS: &str = include_str!("../backend.rs");
@@ -1239,6 +1240,7 @@ fn write_runtime_sources(src_dir: &Path) -> Result<()> {
         src_dir.join("execution_contract.rs"),
         RUNTIME_EXECUTION_CONTRACT_RS,
     )?;
+    fs::write(src_dir.join("eval_core.rs"), RUNTIME_EVAL_CORE_RS)?;
     fs::write(src_dir.join("eval.rs"), RUNTIME_EVAL_RS)?;
     fs::write(src_dir.join("process.rs"), RUNTIME_PROCESS_RS)?;
     fs::write(src_dir.join("backend.rs"), RUNTIME_BACKEND_RS)?;
@@ -2099,6 +2101,7 @@ pub mod registry;
 pub mod ir;
 pub mod effects;
 pub mod execution_contract;
+pub(crate) mod eval_core;
 pub mod evidence;
 pub mod hgraph;
 pub mod executor;
@@ -2876,6 +2879,12 @@ mod tests {
         let lib_rs = fs::read_to_string(src_dir.join("lib.rs")).unwrap();
         assert!(lib_rs.contains("pub mod effects;"));
         assert!(lib_rs.contains("pub mod execution_contract;"));
+        assert!(lib_rs.contains("pub(crate) mod eval_core;"));
+        assert_eq!(
+            lib_rs.matches("mod eval_core;").count(),
+            1,
+            "generated runtimes must compile the evaluator core exactly once"
+        );
         assert!(lib_rs.contains("pub mod environment;"));
         assert!(lib_rs.contains("pub(crate) mod backend_catalog;"));
         assert!(lib_rs.contains("pub mod backend_morphism;"));
@@ -2904,6 +2913,7 @@ mod tests {
             "environment.rs",
             "effects.rs",
             "execution_contract.rs",
+            "eval_core.rs",
             "runtime_exec.rs",
             "placement/mod.rs",
             "placement/projection.rs",
@@ -3008,6 +3018,11 @@ mod tests {
             fs::read_to_string(src_dir.join("execution_contract.rs")).unwrap(),
             RUNTIME_EXECUTION_CONTRACT_RS,
             "generated runtimes must receive the canonical execution contract verbatim"
+        );
+        assert_eq!(
+            fs::read_to_string(src_dir.join("eval_core.rs")).unwrap(),
+            RUNTIME_EVAL_CORE_RS,
+            "generated runtimes must receive the evaluator-independent graph contract verbatim"
         );
         assert_eq!(
             fs::read_to_string(src_dir.join("dispatch_model.rs")).unwrap(),
