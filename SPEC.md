@@ -1,4 +1,4 @@
-# Ostadix-lang Specification (v0.2.0)
+# Ostadix-lang Specification (v0.3.0)
 
 Ostadix-lang is a meta-language whose syntactic unit ( the _typed expression_ ) carries
 its own interpreter as part of its syntax. Every expression declares which
@@ -183,7 +183,7 @@ Every authoritative Rust execution entry point follows this path:
 
 ```text
 .O source -> ONode -> OIrProgram -> validated ExecutionPlan -> solved HGraph
-          -> EvidenceBundleV5 -> AdmittedExecution -> graph coordinator | serial oracle
+          -> EvidenceBundleV6 -> AdmittedExecutionV6 -> graph coordinator | serial oracle
 ```
 
 This includes the `O` interpreter, REPL entries, notebook cells,
@@ -228,8 +228,9 @@ them. These rules apply after scheduler-visible alias expansion. An explicit or
 unknown `HostWorld` access remains exclusive and therefore fail-closed.
 
 Before either the graph coordinator or the serial differential oracle executes
-the plan, the runtime MUST produce an `EvidenceBundleV5` and compile it into an
-`AdmittedExecution`. The bundle MUST be bound to the canonical lowered OIR,
+the plan, the runtime MUST produce an `EvidenceBundleV6` and compile it into an
+`AdmittedExecutionV6`. The unversioned aliases name those V6 types. The bundle
+MUST be bound to the canonical lowered OIR,
 validated plan, solved analyzed graph, analyzer identity, backend artifacts,
 the plan-projected canonical backend specifications, a direct-executable
 manifest, environment, and descriptive ambient-World snapshot. An execution
@@ -245,7 +246,8 @@ manifest includes the current O proxy and, when consumed, the macOS sandbox
 wrapper. Inspection
 manifests remain explicitly non-probing and do not assert runtime readiness.
 The catalog projection binds specification identity only; it does not assert
-health, authorization, capacity, or readiness. This V5 binding does not claim
+health, authorization, capacity, or readiness. This V6 binding uses the current
+Catalog V5 projection and does not claim
 the original source-byte digest when the entry point receives an already
 lowered `OIrProgram`, nor does it bind caller initial-scope shape/values. Before
 issuing evidence, analysis
@@ -255,7 +257,8 @@ name/mode/arity. Each executable operation MUST consume admitted type,
 effect-footprint, dispatch, capability-policy, placement, failure-policy, and
 resource-budget facts. Stale or mismatched evidence MUST fail before execution
 starts. The ordinary graph `Coordinator` MUST accept only an
-`AdmittedExecution`, never a raw HGraph, and MUST revalidate the runtime binding
+`AdmittedExecutionV6`, never a raw HGraph or archival V5 admission, and MUST
+revalidate the runtime binding
 before dispatch. Both the coordinator and serial oracle MUST recheck immediately
 before opaque/deferred execution. Direct backend launch MUST consume the
 admitted absolute invocation path and MUST NOT reselect an alternative through
@@ -265,7 +268,7 @@ admitted ELF O proxy through the retained open object while preserving the
 admitted `argv[0]`; this is not applied to scripts or foreign direct launchers.
 All path-executed launchers retain a final same-principal
 verification-to-exec micro-window. macOS has no general public handle-exec
-primitive. V5 MUST NOT stage or copy arbitrary runtimes merely to close that
+primitive. V6 MUST NOT stage or copy arbitrary runtimes merely to close that
 window because doing so can change script, multicall, self-location,
 dynamic-loader, and toolchain behavior. The retained-object proxy route closes
 pathname substitution, not in-place mutation, interpreter, dynamic-library,
@@ -295,7 +298,7 @@ sequencing region. Outside the explicit autonomous contract below, any unknown
 fact preserves sequence. Conflicting resource frontiers still constrain
 explicit group members unless that group member has the following contract.
 
-The V5 `LocalWorker` lane MAY also accept an unknown hosted operation only when
+The V6 `LocalWorker` lane MAY also accept an unknown hosted operation only when
 it is an attribute-free ephemeral shim, is a direct typed-expression member of
 a coordination group, and the nearest enclosing `lazy` or `autonomous` policy
 schedule is `autonomous`. Its complete body MUST be preparable from literal Text
@@ -310,7 +313,7 @@ semantic opt-in, not an effect-independence proof: deterministic result and
 failure selection MUST be preserved, but external effects from already-started
 members MAY race and need not be rolled back.
 
-All other V5 `LocalWorker` operations MUST be compiler-verified O-scope `Load`
+All other V6 `LocalWorker` operations MUST be compiler-verified O-scope `Load`
 operations or attribute-free trusted inline-value renderers named `html`,
 `markdown`, `text`, or `latex` whose body is source-proven preparable: literal
 text, already-settled Store children, and recursively trusted renderers only.
@@ -360,7 +363,7 @@ unfinished semantic prefix. It MUST buffer out-of-order outcomes, settle them
 in semantic-ordinal order, select the lowest-ordinal failure, drain every
 started task, and discard every later provisional outcome. Infallible
 effect-free workers MAY be dispatched outside that prefix. Coordinator-owned
-operations MUST remain single-owner; this bounded V5 implementation does not
+operations MUST remain single-owner; this bounded V6 implementation does not
 run them while local-worker tasks are outstanding. Pool channel loss or
 submission failure MUST be treated as an infrastructure abort rather than a
 semantic program failure; the coordinator MUST stop new dispatch, drain every
@@ -391,7 +394,7 @@ describe permission, not an exact effect footprint.
 `olangc FILE --target ir --explain-schedule` MUST perform the type solve,
 analysis, and admission steps and print the digest bindings, per-operation
 evidence provenance, blockers, retained sequence reasons, and legal static
-waves without executing any operation. In V5 this inspection surface applies
+waves without executing any operation. In V6 this inspection surface applies
 only to ordinary `.O` HGraphs and MUST identify its runtime snapshot as
 `inspection-only`, not as a dispatch-compatible execution context. A reported
 wave is evidence of legal readiness,
@@ -424,11 +427,15 @@ simultaneous dispatch, CPU or memory fit, device or I/O capacity, backend
 readiness, placement, overlap, or execution realizability. An explicit
 inspection override MUST NOT be presented as a host-capacity fact.
 
+The complete JSON explanation MUST use `oexec.schedule-explanation/v2`; its
+focused per-operation Why view MUST use `oexec.admission-why/v2`. Archival V1
+views remain inspectable only and MUST NOT carry V6 identities.
+
 The explanation MUST also include the nonexecuting hosted-topology prediction
 schema `oexec.schedule-prediction/v1`, headed by
 `; SchedulePrediction oexec.schedule-prediction/v1`. This record is derived
 after admission and remains outside the admission digest; its
-`admission-sha256` field MUST equal the digest on the enclosing V5 admission's
+`admission-sha256` field MUST equal the digest on the enclosing V6 admission's
 canonical digest-binding line. Its single `schedule-prediction` record has the
 following fields:
 
@@ -438,7 +445,7 @@ following fields:
 | `status` | `admitted-static`; no execution was performed. |
 | `provenance` | `evidence-bound-admission`; the topology comes from the admitted plan and blockers. |
 | `model` | `unit-cost-shim-hosted-tasks`. |
-| `admission-sha256` | Lowercase SHA-256 reference to the enclosing `oexec.admission/v5` record. |
+| `admission-sha256` | Lowercase SHA-256 reference to the enclosing `oexec.admission/v6` record. |
 | `task-count` | Number of admitted shim-backed hosted `Exec` operations, regardless of execution lane. |
 | `predicted-width` | Maximum hosted-operation cardinality of any weighted-depth layer, or zero when `task-count=0`. |
 | `predicted-span` | Number of nonempty hosted-task layers, or zero when `task-count=0`. |
@@ -462,8 +469,8 @@ Admitted O-scope loads, source-proven-preparable trees of the four trusted
 inline renderers, and explicitly autonomous ephemeral group members execute
 through the per-run persistent pool. Enforced strict hosted footprints,
 actor-owned persistent environments, renewable-capacity allocation, and
-unification with the Request and project schedulers are not V5 behavior.
-Legacy compatibility shims remain separately content-bound. The V5
+unification with the Request and project schedulers are not V6 behavior.
+Legacy compatibility shims remain separately content-bound. The V6
 direct-executable manifest additionally opens and hashes each unique selected
 canonical launcher target once, retains the handle through execution, and checks
 its admitted identity immediately before spawn. Backend-scoped manifests carry
@@ -481,7 +488,7 @@ backend-scoped absolute paths without restricting subprocesses created by user
 Python code. It excludes interpreters selected by shebangs, compiler-driver
 subtools, dynamic libraries, and descendants launched by hosted code. Because
 the current plan omits
-WebAssembly body shape, V5 conservatively requires and binds a complete
+WebAssembly body shape, V6 conservatively requires and binds a complete
 `wat2wasm` plus runtime catalog alternative even for an already-binary body. It
 also excludes caller initial-scope shape/values, opaque live-actor
 state/generation, frozen child environment, Request/project admission authority,
@@ -491,8 +498,17 @@ its separate Request authority captures one command lease after a cache miss and
 shares it across that operation or autonomous batch. Unforced, cached, and
 non-Nix Request members MUST NOT require Nix, and inability to capture Nix MUST
 remain the affected member's result rather than suppress independent members.
-Actor identity in V5 is a serialization constraint only and MUST NOT close an
+Actor identity in V6 is a serialization constraint only and MUST NOT close an
 unknown hosted footprint.
+
+Graph V2 and Evidence/Admission V6 bind the complete canonical
+`FidelityAssessmentV2`, including absence versus an explicit unsupported
+assessment. Graph V1, Evidence/Admission V5, Schedule Explanation/Why V1, and
+Placement Fragment V1 are archival inspection coordinates. Package 0.3 MUST
+NOT convert, relabel, reconstruct, dispatch, or authorize them as current V2/V6
+authority. `ExecutionIntentV1` remains deliberately bound to Graph V1 and the
+current Catalog V5 projection; matching intent still requires fresh V6
+analysis and admission before dispatch.
 
 ---
 
@@ -967,7 +983,10 @@ Adding a new language: write a Backend subclass, add it to
 
 ## 8. Versioning
 
-This spec is v0.2.0. The v0.2 bump reflects:
+This spec accompanies package v0.3.0. The v0.3 package adds the publishable,
+explicit-shim `ostadix-api` embedding facade while retaining the root `o-lang`
+implementation package. Protocol and evidence coordinates remain independently
+versioned. The earlier v0.2 bump reflected:
 - `OExpr` wire format and `quote^` / `O.eval` semantics are now implemented in both runtimes.
 - `OValue` wire format table expanded with all Rust-runtime types.
 - `let` binding and `$var` substitution work in both runtimes.

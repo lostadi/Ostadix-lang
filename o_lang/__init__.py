@@ -37,4 +37,4 @@ __all__ = [
     "from_python", "to_python", "render_plain", "to_json_str",
 ]
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"

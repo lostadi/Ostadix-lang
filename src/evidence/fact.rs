@@ -165,7 +165,7 @@ pub struct TypeContractV1 {
     pub provenance: EvidenceProvenance,
 }
 
-/// Typed fidelity contract used only by the explicit Evidence V6 API.
+/// Typed fidelity contract used by current and explicit Evidence V6 APIs.
 ///
 /// V5 retains its conservative serialized [`crate::value::Fidelity`] string.
 /// The optional V2 assessment keeps absence distinct from an explicit
@@ -233,7 +233,7 @@ impl CostEstimateV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NodeEvidence {
+pub struct NodeEvidenceV1 {
     pub plan_node: PlanNodeId,
     pub type_contract: TypeContractV1,
     pub effect_contract: EffectContractV1,
@@ -248,7 +248,7 @@ pub struct NodeEvidence {
     pub cost_estimate: CostEstimateV1,
 }
 
-impl NodeEvidence {
+impl NodeEvidenceV1 {
     pub fn provenance_for(&self, fact: AdmissionFactKind) -> EvidenceProvenance {
         match fact {
             AdmissionFactKind::Type => self.type_contract.provenance,
@@ -279,6 +279,10 @@ pub struct NodeEvidenceV2 {
     /// Soft evidence. Admission never derives blockers from this field.
     pub cost_estimate: CostEstimateV1,
 }
+
+/// Current node-evidence vocabulary. Package 0.3 advances the unversioned
+/// surface to the complete typed FidelityAssessmentV2 contract.
+pub type NodeEvidence = NodeEvidenceV2;
 
 impl NodeEvidenceV2 {
     pub fn provenance_for(&self, fact: AdmissionFactKind) -> EvidenceProvenance {
@@ -428,7 +432,7 @@ pub struct EvidenceBundleV5 {
     pub(crate) analyzer: &'static str,
     pub(crate) bindings: EvidenceBindingsV2,
     pub(crate) runtime: RuntimeBindingV1,
-    pub(crate) nodes: Vec<NodeEvidence>,
+    pub(crate) nodes: Vec<NodeEvidenceV1>,
 }
 
 impl EvidenceBundleV5 {
@@ -448,14 +452,12 @@ impl EvidenceBundleV5 {
         &self.runtime
     }
 
-    pub fn nodes(&self) -> &[NodeEvidence] {
+    pub fn nodes(&self) -> &[NodeEvidenceV1] {
         &self.nodes
     }
 }
 
-/// Explicit non-current Evidence V6 bundle.
-///
-/// The unversioned analyzer remains V5 until the package/current API rollover.
+/// Current Evidence V6 bundle.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EvidenceBundleV6 {
     pub(crate) schema: &'static str,
