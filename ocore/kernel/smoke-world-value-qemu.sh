@@ -23,7 +23,7 @@ fi
 # The independent hosted implementation owns the pinned fixture.  Native
 # convergence is admitted only after both that oracle and the freestanding
 # Mode-29 implementation pass in the same invocation.
-cargo test --quiet --manifest-path "$ROOT/Cargo.toml" --test world_value
+cargo test --quiet --manifest-path "$ROOT/Cargo.toml" --package o-lang --test world_value
 OCORE_PROBE_MODE=29 OCORE_BUILD_DIR="$BUILD_DIR" \
   "$ROOT/ocore/kernel/build.sh" >/dev/null
 

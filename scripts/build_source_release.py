@@ -100,12 +100,19 @@ HOSTED_HGRAPH_BENCHMARK_RELEASE_PATHS = HOSTED_HGRAPH_BENCHMARK_PATHS | frozense
         "tests/test_benchmark_hgraph_hosted.py",
     }
 )
+OSTADIX_API_RELEASE_PATHS = frozenset(
+    {
+        "crates/ostadix-api/Cargo.toml",
+        "crates/ostadix-api/src/lib.rs",
+        "crates/ostadix-api/tests/public_surface.rs",
+    }
+)
 ALLOWED_EXACT_PATHS = frozenset(
     {
         "okernel-multikernel/boot-and-test.sh",
         "okernel-multikernel/MULTIKERNEL_PERSONALITY_PROPOSAL.md",
     }
-) | HOSTED_HGRAPH_BENCHMARK_PATHS
+) | HOSTED_HGRAPH_BENCHMARK_PATHS | OSTADIX_API_RELEASE_PATHS
 
 ALLOWED_TOP_LEVEL_DIRECTORIES = frozenset(
     {
@@ -222,6 +229,7 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "docs/HOSTED_WORLD_REFERENCE_PROFILE.md",
         "docs/CI_POSTURE.md",
         "docs/INFORMATION_KERNEL_V1.md",
+        "docs/releases/v0.3.0.md",
         "docs/O_MACHINE_CONTRACT.md",
         "docs/OSTADIX_BOOT.md",
         "docs/OSTADIX_WORLD.md",
@@ -370,6 +378,7 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "src/information/projection.rs",
         "src/information/root.rs",
         "src/information/store.rs",
+        "src/information_bridge/mod.rs",
         "src/ir.rs",
         "src/lib.rs",
         "src/main.rs",
@@ -462,6 +471,7 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "tests/hosted_remote_cli.rs",
         "tests/hosted_remote_v2.rs",
         "tests/o_info_cli.rs",
+        "tests/information_bridge_v1.rs",
         "tests/placement_v6.rs",
         "tests/registry_v1.rs",
         "tests/project_hgraph.rs",
@@ -476,7 +486,7 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "tests/world_receipt.rs",
         "tests/world_value.rs",
     }
-) | HOSTED_HGRAPH_BENCHMARK_RELEASE_PATHS
+) | HOSTED_HGRAPH_BENCHMARK_RELEASE_PATHS | OSTADIX_API_RELEASE_PATHS
 VALID_GIT_MODES = frozenset({"100644", "100755"})
 SAFE_PREFIX = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 HEX_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
@@ -1540,6 +1550,205 @@ def _validate_root_release_metadata(files: dict[str, bytes]) -> None:
         )
 
 
+def _validate_workspace_facade_release_surface(files: dict[str, bytes]) -> None:
+    """Validate the exact publishable workspace facade and dependency direction."""
+
+    required = {
+        "Cargo.toml",
+        "src/api.rs",
+        *OSTADIX_API_RELEASE_PATHS,
+    }
+    missing = sorted(required - files.keys())
+    if missing:
+        raise ReleaseError(
+            "workspace facade release surface is incomplete; missing: "
+            + ", ".join(missing)
+        )
+
+    root = _strict_toml(files["Cargo.toml"], "Cargo.toml")
+    package = root.get("package")
+    workspace = root.get("workspace")
+    if not isinstance(package, dict) or package.get("name") != "o-lang":
+        raise ReleaseError("Cargo.toml package.name must remain 'o-lang'")
+    if not isinstance(workspace, dict):
+        raise ReleaseError("Cargo.toml must contain a workspace table")
+    expected_workspace = {
+        "members": [".", "crates/ostadix-api"],
+        "default-members": [".", "crates/ostadix-api"],
+        "exclude": ["fuzz", "mcp/ostadix_lang_mcp_server"],
+        "resolver": "2",
+    }
+    for field, expected in expected_workspace.items():
+        if workspace.get(field) != expected:
+            raise ReleaseError(
+                f"Cargo.toml workspace.{field} must equal {expected!r}"
+            )
+
+    def reject_reverse_dependency(value: object, owner: str = "Cargo.toml") -> None:
+        if not isinstance(value, dict):
+            return
+        for key, nested in value.items():
+            if key in {"dependencies", "dev-dependencies", "build-dependencies"}:
+                if isinstance(nested, dict) and "ostadix-api" in nested:
+                    raise ReleaseError(
+                        f"{owner} root package must not depend on ostadix-api"
+                    )
+            if isinstance(nested, dict):
+                reject_reverse_dependency(nested, owner)
+
+    reject_reverse_dependency(root)
+
+    facade_path = "crates/ostadix-api/Cargo.toml"
+    facade = _strict_toml(files[facade_path], facade_path)
+    facade_package = facade.get("package")
+    if not isinstance(facade_package, dict):
+        raise ReleaseError(f"{facade_path} must contain a package table")
+    root_version = _required_string(package.get("version"), "Cargo.toml package.version")
+    expected_package = {
+        "name": "ostadix-api",
+        "version": root_version,
+        "edition": "2021",
+        "rust-version": package.get("rust-version"),
+        "repository": package.get("repository"),
+        "authors": package.get("authors"),
+        "license": package.get("license"),
+        "publish": True,
+    }
+    for field, expected in expected_package.items():
+        if facade_package.get(field) != expected:
+            raise ReleaseError(
+                f"{facade_path} package.{field} must equal {expected!r}"
+            )
+    _required_string(facade_package.get("description"), f"{facade_path} package.description")
+
+    dependencies = facade.get("dependencies")
+    if not isinstance(dependencies, dict) or set(dependencies) != {"o-lang"}:
+        raise ReleaseError(f"{facade_path} must depend only on o-lang")
+    root_dependency = dependencies["o-lang"]
+    expected_dependency = {"path": "../..", "version": f"={root_version}"}
+    if root_dependency != expected_dependency:
+        raise ReleaseError(
+            f"{facade_path} o-lang dependency must equal {expected_dependency!r}"
+        )
+
+    root_api = _utf8_text(files["src/api.rs"], "src/api.rs")
+    if not re.search(r"(?m)^pub use num_bigint::BigInt;\s*$", root_api):
+        raise ReleaseError("src/api.rs must explicitly reexport num_bigint::BigInt")
+
+    facade_source_path = "crates/ostadix-api/src/lib.rs"
+    source = _utf8_text(files[facade_source_path], facade_source_path)
+    if re.search(r"pub\s+use\s+[^;]*::\s*\*\s*;", source, re.DOTALL):
+        raise ReleaseError(f"{facade_source_path} must not contain a glob reexport")
+    if re.search(r"pub\s+(?:use|type)\s+[^;\n]*Evaluator", source):
+        raise ReleaseError(f"{facade_source_path} must not expose Evaluator")
+    if re.search(
+        r"pub\s+(?:use|type)\s+[^;]*\bBackendRegistry\b", source, re.DOTALL
+    ):
+        raise ReleaseError(f"{facade_source_path} must not expose BackendRegistry")
+    forbidden_bridge_symbols = (
+        "information_bridge",
+        "ParsedDocumentV1",
+        "ParsedDocumentInformationV1",
+        "PublicValueInformationV1",
+        "HGraphInformationV1",
+        "EvidenceInformationV1",
+        "RegistryProfileInformationV1",
+        "WorldReceiptInformationV1",
+        "ProjectGraphInformationV1",
+        "HostedJournalInformationV1",
+        "InformationBridgeErrorV1",
+        "project_parsed_document_v1",
+        "project_public_value_v1",
+        "project_hgraph_v1",
+        "project_evidence_v6",
+        "project_registry_profile_v1",
+        "project_world_receipt_v1",
+        "project_logical_hgraph_v1",
+        "project_hosted_journal_v2",
+    )
+    for symbol in forbidden_bridge_symbols:
+        if symbol in source:
+            raise ReleaseError(
+                f"{facade_source_path} must not expose experimental Information bridge symbol {symbol}"
+            )
+    for declaration in (
+        "pub struct Runtime",
+        "pub struct RuntimeError",
+        "pub enum RuntimeStage",
+        "pub fn evaluate",
+    ):
+        if declaration not in source:
+            raise ReleaseError(f"{facade_source_path} must contain {declaration!r}")
+    if "use o_lang::api::Parser;" not in source:
+        raise ReleaseError(
+            f"{facade_source_path} must use the stable Parser facade"
+        )
+    if "use o_lang::ir::BackendRegistry;" not in source:
+        raise ReleaseError(
+            f"{facade_source_path} must privately use the canonical BackendRegistry path"
+        )
+    if "use o_lang::eval::Evaluator;" not in source:
+        raise ReleaseError(
+            f"{facade_source_path} must privately use Evaluator as its execution engine"
+        )
+
+    payload_match = re.search(
+        r"pub\s+use\s+o_lang::api::\s*\{(?P<names>.*?)\};",
+        source,
+        re.DOTALL,
+    )
+    if payload_match is None:
+        raise ReleaseError(
+            f"{facade_source_path} must explicitly reexport the OValue payload closure"
+        )
+    payload_names = {
+        name.strip()
+        for name in payload_match.group("names").split(",")
+        if name.strip()
+    }
+    expected_payload_names = {
+        "BackendAuthority",
+        "BigInt",
+        "CapabilityKind",
+        "DecimalSpecial",
+        "FloatFormat",
+        "FloatSpecial",
+        "GraphNode",
+        "GroupMode",
+        "NativeBoundary",
+        "NativeCodecSafety",
+        "NativeIdentity",
+        "NodeId",
+        "OBytes",
+        "OKeyword",
+        "ONative",
+        "ONumber",
+        "OSymbol",
+        "OText",
+        "OValue",
+        "RehydratePolicy",
+        "RequestKind",
+        "RuntimeBoundary",
+        "SeqKind",
+        "SetKind",
+        "SnapshotKind",
+    }
+    if payload_names != expected_payload_names:
+        raise ReleaseError(
+            f"{facade_source_path} OValue payload closure differs from the exact public set"
+        )
+
+    facade_tests_path = "crates/ostadix-api/tests/public_surface.rs"
+    facade_tests = _utf8_text(files[facade_tests_path], facade_tests_path)
+    for marker in (
+        "complete_ovalue_payload_vocabulary_is_nameable_from_the_facade",
+        "runtime_owns_success_parse_failure_and_evaluate_failure_stages",
+        "facade_source_has_no_glob_or_public_evaluator_reexport",
+    ):
+        if marker not in facade_tests:
+            raise ReleaseError(f"{facade_tests_path} must retain test {marker}")
+
+
 def _required_string_list(
     value: object, owner: str, *, minimum: int = 0
 ) -> list[str]:
@@ -1600,6 +1809,14 @@ def _validate_mcp_release_surface(
         raise ReleaseError(f"{cargo_path} must contain a package table")
     if package.get("name") != "ostadix-mcp-server":
         raise ReleaseError(f"{cargo_path} package name must be 'ostadix-mcp-server'")
+    root_cargo = _strict_toml(files["Cargo.toml"], "Cargo.toml")
+    root_package = root_cargo.get("package")
+    if not isinstance(root_package, dict) or package.get("version") != root_package.get(
+        "version"
+    ):
+        raise ReleaseError(
+            f"{cargo_path} package version must match Cargo.toml package.version"
+        )
     if package.get("license") != "LGPL-2.1-only":
         raise ReleaseError(f"{cargo_path} license must be 'LGPL-2.1-only'")
     if package.get("publish") is not False:
@@ -3147,6 +3364,7 @@ def validate_release_metadata(entries: Sequence[SourceEntry]) -> None:
     if len(files) != len(entries):
         raise ReleaseError("release contains duplicate metadata paths")
     _validate_root_release_metadata(files)
+    _validate_workspace_facade_release_surface(files)
     _validate_mcp_release_surface(files, modes)
     _validate_example_manifest(files)
     _validate_evidence_manifest(files, modes)

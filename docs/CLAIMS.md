@@ -21,6 +21,20 @@
 - The hosted process protocol uses a 4-byte big-endian length prefix followed
   by canonical CBOR encoding in `src/wire.rs`; maps are sorted by encoded key
   length and bytes before transmission.
+- The experimental Information V1 bridge implements exactly eight typed,
+  bounded, read-only native metadata projections. Tests cover real fixtures,
+  pinned canonical/T2 vectors, exact source provenance, caller-public scalar
+  preflight, semantic/canonical decoder rejection, admitted-HGraph denial,
+  intentional HGraph/Evidence metadata collisions, raw locator/token absence,
+  and the lack of native reverse/authority edges. Its metadata digests are
+  deliberately lossy and are not native identity, confidentiality, freshness,
+  trust, continuity, admission, or authority. `InformationStoreReaderV1` and
+  fixed MCP `o_information_inspect` provide bounded existing-root head
+  inspection without directory/lock creation, mode repair, head mutation,
+  cloud, or network access. The tested no-mutation surface covers entries,
+  content, inode, mode, and mtime, not atime or concurrent hostile ancestor
+  replacement. The stable `ostadix-api` facade and generated AOT runtime do not
+  expose this bridge.
 - The repository contains three hosted implementations: the Rust authoritative
   runtime (`src/`), the C17 interpreter and AOT `olangc` (`c_cpp/Makefile` and
   `c_cpp/CMakeLists.txt`, both using C17), and the Python reference edition
@@ -178,13 +192,22 @@
   a bounded, expiring, one-use opaque handle and require `O` to recompute that
   same intent before dispatch. This is a local same-intent gate, not a
   capability, runtime-health result, retained admission, or authorization; `O`
-  still constructs and rechecks a fresh process-local V5 admission, and direct
-  `o_run` remains an explicitly ungated compatibility surface.
-- Admission V5 remains the supported legacy-local contract. Hosted Placement
-  V6 is an additive placement-aware contract; neither version is silently
-  upgraded or translated into the other. Existing MCP execution tools remain
-  local V5 surfaces. The direct V6 channel is exposed separately through
-  `o-node` and `octl node ...`; it does not upgrade a V5 handle.
+  still freshly analyzes Graph V2 and constructs and rechecks a process-local
+  V6 admission, and direct `o_run` remains an explicitly ungated compatibility
+  surface.
+- Package 0.3's supported current local execution contract is Graph V2 with
+  `oexec.evidence/v6` and `oexec.admission/v6`. The coordinator, evaluator,
+  CLI, and MCP execution paths accept fresh `AdmittedExecutionV6` authority and
+  expose Schedule Explanation/Why V2. Graph V1, Evidence/Admission V5, and
+  Schedule Explanation/Why V1 remain explicit archival inspection and
+  compatibility-verification surfaces only; they are never uplifted,
+  relabeled, authorized, or dispatched as V2/V6 authority.
+- Hosted Placement V6 is a separate placement milestone, not the local
+  `oexec.admission/v6` coordinate. Its direct-node channel is exposed through
+  `o-node` and `octl node ...`; it freshly prepares a
+  `PreparedPlacementFragmentV2` from local Graph V2/V6 authority. It does not
+  treat an `AdmittedExecutionV6` as portable authority or upgrade an archival
+  V5 admission or `PreparedPlacementFragmentV1` into an executable fragment.
 - The V6 placement core models a `RequirementFootprintV1` over operation
   capability, value, effect, environment, and resource constraints and compares
   it with a full `TargetDescriptorV1`. Eligibility never factors through an ISA
@@ -206,18 +229,21 @@
   policy, and compute reservation under one signed envelope; the node
   re-evaluates candidate eligibility against its current catalog and exact
   locally prepared fragment before accepting execution authority.
-- Admission V5/V6 and backend-catalog generation are independent version axes.
-  The current authorizing catalog is `ostadix.backend-catalog/v4`, and its
+- Local admission schema, Hosted Placement V6, and backend-catalog generation
+  are independent version axes.
+  The current authorizing catalog is `ostadix.backend-catalog/v5`, and its
   schema string participates in the whole-catalog and per-specification hash
   domains. `NodeProfileV1::validate_at` invokes
   `TargetDescriptorV1::validate_current_backend_catalog` before candidate
-  authorization. A profile containing a V3 or otherwise unknown backend
+  authorization. A profile containing a V4, V3, or otherwise unknown backend
   specification therefore fails with `NonCurrentBackendCatalog`, even if its
   old digest, detached signature, requirements, and warrants agree with one
   another. Decoding or independently verifying an archived signed record is
-  not current placement authorization, and no V3 digest is relabeled as V4.
-  V4 additionally binds the explicit backend-state support and snapshot-
-  compatibility declaration used by persistent-session placement.
+  not current placement authorization, and no archival digest is relabeled as
+  V5. V4 remains frozen with the explicit backend-state support and snapshot-
+  compatibility declaration used by persistent-session placement. V5 extends
+  that exact prefix with an explicitly absent or named bounded
+  backend-morphism profile.
   A descriptor with no backend implementations may remain structurally valid,
   but cannot discharge a backend-specification or backend-implementation
   requirement.
@@ -251,7 +277,7 @@
   `HostWorld` state chain. Persistent environments also use typed actor-state
   chains. The implementation does not claim exact effect inference from
   arbitrary Python, Bash, JavaScript, Rust, or other hosted source.
-- The current V5 scheduler's `ActorResourceId` remains the canonical backend
+- The current scheduler's `ActorResourceId` remains the canonical backend
   name plus persistent numeric environment; the process registry additionally
   keys sandbox and admitted launch generation. Hosted V2 does not substitute
   that smaller local scheduling key. It uses `ActorGenerationIdV1` as its
@@ -296,8 +322,9 @@
   The embedding `o-node` process is not treated as the O backend proxy: doctor
   and serve resolve a native `ostadix-evaluator`/sibling O or an explicit
   `--runtime-binary`, reject script dispatchers, and bind that exact executable
-  into each operation's retained V5 executable manifest. Doctor's native-image
-  check is a format preflight, not an ABI or backend-protocol probe; the
+  into each operation's retained executable manifest admitted under V6.
+  Doctor's native-image check is a format preflight, not an ABI or
+  backend-protocol probe; the
   default/sibling O path is exercised end-to-end, while an arbitrary explicit
   image proves protocol compatibility only on an admitted hosted-backend
   launch. Registry
@@ -326,7 +353,7 @@
   multi-key chain, discovery, or scheduler-selected placement.
 - Before V2 execution authorization, the node parses, lowers, solves, admits,
   and seals the exact submitted source as one non-cloneable
-  `PreparedPlacementFragmentV1`. The admissible shape has one non-whitespace
+  `PreparedPlacementFragmentV2`. The admissible shape has one non-whitespace
   semantic root and exactly one shim `Exec`; text children are allowed, while a second `Exec`, `Load`,
   `Store`, `Call`, `Request`, `Group`, `Schedule`, text-only input, a nonempty
   coordinator scope, or recursive `O.eval` authority is refused. The execution
@@ -346,8 +373,10 @@
   session lifetime: every execute separately binds exact source-derived OIR,
   task attempt, portable placement admission, deadline, operation, and one-use
   lease, permitting multiple commands only while those fixed coordinates remain
-  equal. The full V5 admission still binds process-local runtime freshness and
+  equal. The full V6 admission still binds process-local runtime freshness and
   is rechecked at dispatch; it is not used as a cross-process proof coordinate.
+  `PreparedPlacementFragmentV1` remains available for archival inspection only
+  and is never accepted, converted, or executed by the package-0.3 path.
 - V2 session access requires both the authenticated TLS client-certificate
   leaf fingerprint fixed at open and a separate random 256-bit bearer. The
   client creates and fsyncs its mode-0600 capability file before network send,
@@ -394,6 +423,12 @@
   cannot be reconciled to exact durable bytes, the store returns
   `store-reopen-required` and refuses mutations plus current-head views until a
   fresh open revalidates the journals.
+- Every root containing durable Hosted V2 state must carry the exact
+  package-0.3 `.execution-authority-v1` marker for Graph V2, Evidence/Admission
+  V6, and placement-admission V2. A durable root with no marker or a different
+  authority coordinate is rejected without mutation; archival journals are
+  never uplifted, resumed, relabeled, or executed. A root without existing
+  durable sessions or an authority journal may be initialized with the marker.
 - `Status` and `Actors` responses verify a node-signed receipt for the exact
   session journal head and correlate it to the requested session. Their
   projected convenience fields are carried over authenticated mTLS but are not
@@ -497,10 +532,14 @@
   the backend can accept that value as input. Both legs carry explicit
   compositional fidelity and their exact boundary descriptions appear in each
   shadow assessment.
-- These shadow profiles are not fields of backend-catalog V4 and therefore do
-  not change its specification digests, placement compatibility, evidence, or
-  protocol bytes. Enforcing them later requires an explicit catalog/evidence
-  version rollover. `tests/backend_morphism_v1.rs` exercises a real nested
+- Catalog V5 binds the optional shadow profile assignment for all 30 canonical
+  backends; archival V4 digests stay unchanged. This makes profile selection
+  part of the current catalog projection and placement identity, but does not
+  add the profile to `BackendInterface`, change HGraph solver facts or graph
+  hashing, add fields to evidence/admission protocols, or enforce a crossing
+  during dispatch. Enforcing the shadow assessment itself later requires an
+  explicit graph/evidence version rollover. `tests/backend_morphism_v1.rs`
+  exercises a real nested
   Python input binding, a real JavaScript scalar input binding, and the exact
   emitted Rust scalar program through Python, Node.js, and rustc; kernel unit
   tests cover negative values and numeric bounds.
@@ -1098,11 +1137,11 @@
   intent digests with `O --require-source-sha256` and
   `--require-execution-intent-sha256` makes graph execution recompute and
   compare that projection before dispatch; a match still proceeds through a
-  fresh process-local V5 `AdmittedExecution`. The stable intent deliberately
-  excludes runtime discovery, backend artifacts, environment and PID state,
-  capacity, authority, and live admission, so it is sameness evidence rather
-  than a capability or reusable admission token. The gate adds no work to an
-  ordinary `O` invocation when its two flags are absent.
+  fresh Graph V2 analysis and process-local V6 `AdmittedExecution`. The stable
+  intent deliberately excludes runtime discovery, backend artifacts,
+  environment and PID state, capacity, authority, and live admission, so it is
+  sameness evidence rather than a capability or reusable admission token. The
+  gate adds no work to an ordinary `O` invocation when its two flags are absent.
 - Ordinary source sequence is preserved by completion dependencies unless an
   explicit concurrent group or the narrow verified-inline rule removes it.
 - Full N-language communication soundness is not established; native OValue

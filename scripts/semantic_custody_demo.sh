@@ -86,7 +86,7 @@ manifest = {
     "artifacts": artifacts,
     "claim_scope": [
         "exact source bytes are bound to one stable analyzed execution intent",
-        "the gated run recomputed that same intent before fresh local V5 admission",
+        "the gated run recomputed that same intent before fresh local V6 admission",
         "result.json records the observed local terminal value",
     ],
     "nonclaims": [
