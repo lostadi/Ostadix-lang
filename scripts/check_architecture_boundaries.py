@@ -125,6 +125,7 @@ RULES = (
             "hgraph",
             "hosted_remote",
             "information",
+            "information_provenance",
             "kernel_world",
             "live_system",
             "nix_ops",

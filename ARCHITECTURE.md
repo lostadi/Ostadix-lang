@@ -102,8 +102,8 @@ runtime implementation outside its CLI entrypoints.
 Facades bind an unconditionally public owner and exact public alias or glob
 projection. The checker then rejects undeclared roots and edges, retains
 the narrow semantic rules above, and runs Tarjan's algorithm over the observed
-root graph. The frozen baseline contains 150 production engine module files,
-40 roots, 175 cross-root edges, and zero multi-root strongly connected
+root graph. The frozen baseline contains 152 production engine module files,
+41 roots, 179 cross-root edges, and zero multi-root strongly connected
 components. The separately scanned include fragment has no cross-root edge.
 
 That is a root-level acyclicity claim only. Dependencies and bounded strongly
@@ -125,6 +125,16 @@ inactive—because macro-generated physical module ownership is unsupported.
 The experimental authority-free information substrate is described in
 [`docs/INFORMATION_KERNEL_V1.md`](docs/INFORMATION_KERNEL_V1.md). It references
 existing native records without changing their bytes or execution authority.
+Its raw V2 provenance witnesses are additive sidecars over V1 atom identities;
+V1 atom, snapshot, revision, delta, pack, and digest bytes remain unchanged.
+Contextual provenance analysis is isolated in the layer-13
+`information_provenance` root, whose complete direct dependency image is
+`evidence`, `information`, `ir`, and `world`. It returns opaque admitted handles
+and cannot depend on `information_bridge`. Conversely, the authority-free
+bridge retains its prior dependency budget and cannot import the provenance
+admission root. The distinction between raw predicate validation and contextual
+image admission is specified in
+[`docs/IMAGE_ADMISSION.md`](docs/IMAGE_ADMISSION.md).
 
 ## Evaluation Pipeline
 

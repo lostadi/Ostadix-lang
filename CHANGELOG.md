@@ -9,6 +9,20 @@ Package SemVer is only one of the independent coordinates documented in
 
 ### Changed
 
+- Information Provenance V2 adds an authority-free, content-addressed sidecar
+  over frozen Information Atom V1 identities plus a higher-layer execution
+  analyzer that admits only its recomputed image. Acquisition origin is
+  projected from typed witnesses, enforcement is an orthogonal assurance, and
+  contradiction/invalidation remain separate claim-standing records. Recovery
+  is contextual and reports intrinsic loss, typed discharges, and unresolved
+  obligations; the first execution adapter deliberately reports
+  `Unestablished` until producer authentication, procedure resolution, signer
+  authorization, receipt currentness, exact plan-node attribution,
+  execution/effect fidelity, and morphism fidelity are established.
+- The architecture now names predicate, full-image, and projected-image
+  admission and states the Codomain Slack Theorem. Current Evidence V5/V6 is
+  precisely hard-projection image admission: analyzer-derived legality fields
+  are pinned, while historical cost estimates remain explicitly soft.
 - `ostadix-api` is now the independent runtime engine rather than a wrapper
   around `o-lang`. It owns the parser, IR, evaluator, HGraph,
   evidence/admission, scheduler, hosted/project/World implementations, runtime
