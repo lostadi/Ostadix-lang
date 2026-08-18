@@ -11,6 +11,7 @@ import unittest
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "smoke_ostadix_mcp.py"
+ROOT = SCRIPT.parents[1]
 CI_WORKFLOW = SCRIPT.parents[1] / ".github/workflows/ci.yml"
 SPEC = importlib.util.spec_from_file_location("ostadix_mcp_smoke", SCRIPT)
 if SPEC is None or SPEC.loader is None:  # pragma: no cover - import failure is fatal
@@ -44,6 +45,15 @@ class ResponseReaderTests(unittest.TestCase):
             workflow,
             "MCP smoke requires all three fixed local release binaries",
         )
+
+    def test_catalog_schema_is_read_from_the_independent_engine(self) -> None:
+        self.assertEqual(
+            smoke._current_catalog_schema(ROOT),
+            "ostadix.backend-catalog/v5",
+        )
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('"crates" / "ostadix-api" / "src"', source)
+        self.assertNotIn('root / "src" / "backend_catalog.inc.rs"', source)
 
     def test_out_of_order_response_is_retained_by_id(self) -> None:
         reader = smoke.ResponseReader(io.BytesIO(frame(2, "second") + frame(1, "first")))

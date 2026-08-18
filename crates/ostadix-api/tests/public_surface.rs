@@ -10,7 +10,19 @@ use ostadix_api::{
 fn assert_public<T>() {}
 
 #[test]
-fn complete_ovalue_payload_vocabulary_is_nameable_from_the_facade() {
+fn independent_package_carries_its_license_and_notice() {
+    let license = include_bytes!("../LICENSE");
+    let notice = include_bytes!("../NOTICE");
+    assert!(license
+        .windows(b"GNU LESSER GENERAL PUBLIC LICENSE".len())
+        .any(|window| window == b"GNU LESSER GENERAL PUBLIC LICENSE"));
+    assert!(notice
+        .windows(b"Ostadix".len())
+        .any(|window| window == b"Ostadix"));
+}
+
+#[test]
+fn complete_ovalue_payload_vocabulary_is_nameable_from_the_engine_root() {
     assert_public::<BackendAuthority>();
     assert_public::<BigInt>();
     assert_public::<CapabilityKind>();
@@ -68,20 +80,48 @@ fn runtime_matches_cli_shebang_and_repeated_document_boundaries() {
 }
 
 #[test]
-fn facade_source_has_no_glob_or_public_evaluator_reexport() {
+fn engine_owns_the_full_runtime_without_a_compatibility_dependency() {
     let source = include_str!("../src/lib.rs");
-    assert!(!source.contains("pub use o_lang::api::*"));
-    assert!(!source.lines().any(|line| {
-        let line = line.trim();
-        line.starts_with("pub use") && line.contains("Evaluator")
-    }));
-    assert!(!source.lines().any(|line| {
-        let line = line.trim();
-        line.starts_with("pub use") && line.contains("BackendRegistry")
-    }));
-    for forbidden in [
-        "information_bridge",
-        "ParsedDocumentV1",
+    let manifest = include_str!("../Cargo.toml");
+
+    for owned_module in [
+        "pub mod eval;",
+        "pub mod evidence;",
+        "pub mod executor;",
+        "pub mod hgraph;",
+        "pub mod information_bridge;",
+        "pub mod information_provenance;",
+        "pub mod parser;",
+        "pub mod project;",
+        "pub mod runtime_exec;",
+        "pub mod value;",
+        "pub mod world;",
+    ] {
+        assert!(source.contains(owned_module), "missing {owned_module}");
+    }
+    assert!(!source.contains("pub use o_lang"));
+    assert!(!manifest
+        .lines()
+        .any(|line| line.trim_start().starts_with("o-lang")));
+
+    assert_public::<ostadix_api::eval::Evaluator>();
+    assert_public::<ostadix_api::evidence::ExecutionAdmissionV6>();
+    assert_public::<ostadix_api::hgraph::HGraph>();
+    assert_public::<ostadix_api::information::InformationProvenanceV2>();
+    assert_public::<ostadix_api::information_provenance::InformationProvenanceAnalyzerV2>();
+    assert_public::<ostadix_api::parser::Parser<'static>>();
+}
+
+#[test]
+fn engine_source_keeps_parser_and_information_bridge_boundaries_closed() {
+    let parser_source = include_str!("../src/parser.rs");
+    assert!(!parser_source.contains("pub nodes: Vec<ONode>"));
+
+    let bridge_source = include_str!("../src/information_bridge/mod.rs");
+    assert!(!bridge_source.contains("graph_sha256_v2"));
+    assert!(!bridge_source.contains("evidence_bundle_sha256_v6"));
+
+    for record in [
         "ParsedDocumentInformationV1",
         "PublicValueInformationV1",
         "HGraphInformationV1",
@@ -90,20 +130,21 @@ fn facade_source_has_no_glob_or_public_evaluator_reexport() {
         "WorldReceiptInformationV1",
         "ProjectGraphInformationV1",
         "HostedJournalInformationV1",
-        "InformationBridgeErrorV1",
-        "NativeRecordRefV1",
-        "project_parsed_document_v1",
-        "project_public_value_v1",
-        "project_hgraph_v1",
-        "project_evidence_v6",
-        "project_registry_profile_v1",
-        "project_world_receipt_v1",
-        "project_logical_hgraph_v1",
-        "project_hosted_journal_v2",
     ] {
-        assert!(
-            !source.contains(forbidden),
-            "stable facade must not reexport experimental bridge symbol {forbidden}"
-        );
+        let declaration = format!("pub struct {record}");
+        let declaration_at = bridge_source
+            .find(&declaration)
+            .unwrap_or_else(|| panic!("missing public bridge record {record}"));
+        let derive_at = bridge_source[..declaration_at]
+            .rfind("#[derive(")
+            .unwrap_or_else(|| panic!("missing derive boundary for {record}"));
+        let public_prelude = &bridge_source[derive_at..declaration_at];
+        assert!(!public_prelude.contains("Serialize"), "{record}");
+        assert!(!public_prelude.contains("Deserialize"), "{record}");
+        assert!(!public_prelude.contains("#[serde"), "{record}");
+        assert!(!bridge_source.contains(&format!("impl Serialize for {record}")));
+        assert!(!bridge_source.contains(&format!("impl Deserialize for {record}")));
+        assert!(!bridge_source.contains(&format!("impl serde::Serialize for {record}")));
+        assert!(!bridge_source.contains(&format!("impl serde::Deserialize for {record}")));
     }
 }

@@ -62,7 +62,7 @@ hosted evaluator such as `python[0]` is not yet an O-core process.
 A **capability space**, or **CSpace**, is the process-local table that resolves
 generation-tagged integer handles to kernel objects, types, and rights. The
 table is authority. A serialized `OCapability` is not. The hosted
-`CapabilityBroker` in `src/ocore/capability_bridge.rs` already models the
+`CapabilityBroker` in `crates/ostadix-api/src/ocore/capability_bridge.rs` already models the
 required outer boundary by resolving a random session bearer through
 operation-specific policy to a live kernel handle before transport, but it is
 not yet connected to the booted kernel.
@@ -906,7 +906,7 @@ Crossings use the same OValue/capability/capsule contracts through a guest
 agent, never implicit host access.
 
 The execution-neutral Stage-0 contract for this milestone is implemented in
-`src/kernel_world.rs` and documented in
+`crates/ostadix-api/src/kernel_world.rs` and documented in
 [`KERNEL_WORLD_CONTRACT.md`](KERNEL_WORLD_CONTRACT.md). It strictly validates
 `ocore.kernel-world/v1` manifests for both `source_integrated` and
 `binary_contained` providers, then supplies a bounded host-side lifecycle oracle

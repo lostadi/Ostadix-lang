@@ -12,7 +12,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 BACKENDS = ROOT / "backends"
-SHIM_CATALOG = ROOT / "src" / "shims.rs"
+SHIM_CATALOG = ROOT / "crates" / "ostadix-api" / "src" / "shims.rs"
 
 sys.path.insert(0, str(BACKENDS))
 import o_shim_common as wire  # noqa: E402

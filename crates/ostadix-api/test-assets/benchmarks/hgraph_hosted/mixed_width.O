@@ -1,0 +1,35 @@
+# Diamond topology: one seed, four autonomous branches, one aggregate.
+let seed = python^(
+import time
+time.sleep(__SLEEP_SECONDS__)
+__oval_result__ = 10
+)_python
+
+let branches = autonomous(batch(
+python^(
+import time
+time.sleep(__SLEEP_SECONDS__)
+__oval_result__ = seed + 1
+)_python,
+python^(
+import time
+time.sleep(__SLEEP_SECONDS__)
+__oval_result__ = seed + 2
+)_python,
+python^(
+import time
+time.sleep(__SLEEP_SECONDS__)
+__oval_result__ = seed + 3
+)_python,
+python^(
+import time
+time.sleep(__SLEEP_SECONDS__)
+__oval_result__ = seed + 4
+)_python
+))
+
+python^(
+import time
+time.sleep(__SLEEP_SECONDS__)
+__oval_result__ = sum($branches)
+)_python

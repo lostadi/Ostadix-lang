@@ -146,7 +146,7 @@ immutable view using `runtime-search-entry` and `path-sources` records. Thus a
 fallback selected by discovery cannot later be mislabeled as client-inherited.
 
 `o_runtimes` projects every canonical backend and its ordered executable
-alternatives directly from `src/backend_catalog.inc.rs`; it has no independent
+alternatives directly from `crates/ostadix-api/src/backend_catalog.inc.rs`; it has no independent
 source inventory to synchronize. The report labels this as a compiled MCP
 snapshot: rebuild `ostadix-mcp` whenever the root catalog changes, since the
 dependency-isolated installed server and `O` may otherwise be different build

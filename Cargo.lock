@@ -465,12 +465,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d45db016d36b838f563236e9193d0ee6ce38f3f68b6c94e914b4929c96bbb890"
 
 [[package]]
-name = "fixedbitset"
-version = "0.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ce7134b9999ecaf8bcd65542e436736ef32ddca1b3e06094cb6ec5755203b80"
-
-[[package]]
 name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -844,33 +838,25 @@ dependencies = [
 
 [[package]]
 name = "o-lang"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "axum",
- "base64",
- "bitflags",
  "clap",
  "ed25519-dalek",
- "fs2",
  "getrandom 0.4.3",
  "hex",
  "ignore",
  "libc",
  "num-bigint",
- "num-traits",
- "petgraph",
+ "ostadix-api",
  "proptest",
- "rustls",
- "rustls-pemfile",
  "rustyline",
- "semver",
  "serde",
  "serde_json",
  "sha2",
  "signal-hook",
  "tempfile",
- "thiserror",
  "tokio",
  "toml",
  "which",
@@ -890,9 +876,30 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "ostadix-api"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
- "o-lang",
+ "anyhow",
+ "base64",
+ "bitflags",
+ "ed25519-dalek",
+ "fs2",
+ "getrandom 0.4.3",
+ "hex",
+ "ignore",
+ "libc",
+ "num-bigint",
+ "num-traits",
+ "proptest",
+ "rustls",
+ "rustls-pemfile",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "toml",
+ "which",
 ]
 
 [[package]]
@@ -923,16 +930,6 @@ name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
-
-[[package]]
-name = "petgraph"
-version = "0.6.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b4c5cc86750666a3ed20bdaf5ca2a0344f9c67674cae0515bec2da16fbaa47db"
-dependencies = [
- "fixedbitset",
- "indexmap",
-]
 
 [[package]]
 name = "pin-project-lite"
