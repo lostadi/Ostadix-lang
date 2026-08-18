@@ -176,7 +176,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         self.assertEqual(
             result.stdout,
             "architecture dependency boundaries: PASS "
-            "(150 production files, 40 roots, 175 cross-root edges)\n",
+            "(152 production files, 41 roots, 179 cross-root edges)\n",
         )
 
     def test_manifest_inventories_every_current_root_edge_override_and_facade(self) -> None:
@@ -197,12 +197,20 @@ class ArchitectureBoundaryTests(unittest.TestCase):
                 }
             ],
         )
-        self.assertEqual(len(roots), 40)
+        self.assertEqual(len(roots), 41)
         self.assertEqual(
-            sum(len(root["allowed_dependencies"]) for root in roots), 175
+            sum(len(root["allowed_dependencies"]) for root in roots), 179
         )
         api_root = next(root for root in roots if root["name"] == "api")
         self.assertIn("ir", api_root["allowed_dependencies"])
+        provenance_root = next(
+            root for root in roots if root["name"] == "information_provenance"
+        )
+        self.assertEqual(provenance_root["layer"], 13)
+        self.assertEqual(
+            provenance_root["allowed_dependencies"],
+            ["evidence", "information", "ir", "world"],
+        )
         self.assertEqual(
             {
                 (entry["path"], entry["kind"], tuple(entry["module_path"]))
@@ -1262,6 +1270,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
     def test_native_roots_cannot_depend_back_on_information_bridge(self) -> None:
         for native_root in (
             "information",
+            "information_provenance",
             "parser",
             "value",
             "hgraph",
@@ -1288,7 +1297,14 @@ class ArchitectureBoundaryTests(unittest.TestCase):
                 )
 
     def test_information_bridge_cannot_import_authority_or_execution_roots(self) -> None:
-        for forbidden in ("capability", "eval", "executor", "placement", "runtime_exec"):
+        for forbidden in (
+            "capability",
+            "eval",
+            "executor",
+            "information_provenance",
+            "placement",
+            "runtime_exec",
+        ):
             with self.subTest(forbidden=forbidden):
                 with tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
@@ -1673,6 +1689,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
             "hgraph",
             "hosted_remote",
             "information",
+            "information_provenance",
             "kernel_world",
             "live_system",
             "nix_ops",

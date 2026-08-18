@@ -15,6 +15,25 @@ every fact is true, current, mutually consistent, causally related, or
 authorized for execution. Existing admission and placement records remain the
 only execution authority.
 
+## V1 byte compatibility and the V2 provenance sidecar
+
+The provenance extension is additive. `InformationAtomV1`,
+`AcquisitionModalityV1`, their canonical CBOR encodings, and the
+domain-separated `AtomIdV1` digest remain byte-for-byte unchanged. The same is
+true of V1 snapshots, revisions, deltas, signed packs, and every identity that
+transitively binds those bytes. A V1 atom is never rewritten in place to add a
+witness or to change its acquisition modality.
+
+Instead, V2 provenance is a separate sidecar bound to the existing
+`AtomIdV1`. Raw witness shapes live inside the low-layer information root;
+contextual analysis and opaque admitted handles live in the higher-layer
+`information_provenance` root described by
+[`IMAGE_ADMISSION.md`](IMAGE_ADMISSION.md). This keeps the V1 information
+kernel and the authority-free `information_bridge` free of execution or
+evidence authority. The existing `o-info` V1 import path remains bounded to
+declared atoms; it does not silently uplift V1 records into admitted V2
+provenance.
+
 The V1 implementation currently provides:
 
 - domain-separated identifiers for entities, atoms, snapshots, revisions,

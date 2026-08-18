@@ -90,6 +90,7 @@ fn engine_owns_the_full_runtime_without_a_compatibility_dependency() {
         "pub mod executor;",
         "pub mod hgraph;",
         "pub mod information_bridge;",
+        "pub mod information_provenance;",
         "pub mod parser;",
         "pub mod project;",
         "pub mod runtime_exec;",
@@ -106,6 +107,8 @@ fn engine_owns_the_full_runtime_without_a_compatibility_dependency() {
     assert_public::<ostadix_api::eval::Evaluator>();
     assert_public::<ostadix_api::evidence::ExecutionAdmissionV6>();
     assert_public::<ostadix_api::hgraph::HGraph>();
+    assert_public::<ostadix_api::information::InformationProvenanceV2>();
+    assert_public::<ostadix_api::information_provenance::InformationProvenanceAnalyzerV2>();
     assert_public::<ostadix_api::parser::Parser<'static>>();
 }
 

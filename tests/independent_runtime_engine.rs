@@ -54,6 +54,14 @@ fn compatibility_modules_preserve_the_engine_type_identities() {
         ostadix_api::information::InformationSnapshotV1
     );
     assert_same!(
+        o_lang::information::InformationProvenanceV2,
+        ostadix_api::information::InformationProvenanceV2
+    );
+    assert_same!(
+        o_lang::information_provenance::InformationProvenanceAnalyzerV2,
+        ostadix_api::information_provenance::InformationProvenanceAnalyzerV2
+    );
+    assert_same!(
         o_lang::world::WorldIdentity,
         ostadix_api::world::WorldIdentity
     );
