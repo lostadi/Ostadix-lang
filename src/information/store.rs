@@ -73,6 +73,63 @@ pub struct InformationStoreV1 {
     lock: File,
 }
 
+/// Existing-root, lock-free reader for bounded information inspection.
+///
+/// Construction performs no directory creation, permission repair, lock-file
+/// open, or head mutation. Writers remain responsible for synchronization;
+/// every object read still verifies its content identity after the bounded
+/// regular-file read.
+#[derive(Clone, Debug)]
+pub struct InformationStoreReaderV1 {
+    root: PathBuf,
+}
+
+impl InformationStoreReaderV1 {
+    pub fn open_existing(root: impl AsRef<Path>) -> Result<Self, InformationErrorV1> {
+        let root = root.as_ref().to_path_buf();
+        validate_existing_private_directory(&root)?;
+        validate_existing_private_directory(&root.join("objects"))?;
+        validate_existing_private_directory(&root.join("heads"))?;
+        Ok(Self { root })
+    }
+
+    pub fn get(
+        &self,
+        kind: InformationObjectKindV1,
+        sha256: &str,
+    ) -> Result<Vec<u8>, InformationErrorV1> {
+        validate_digest(sha256)?;
+        let kind_directory = self.root.join("objects").join(kind.directory());
+        validate_existing_private_directory(&kind_directory)?;
+        let path = kind_directory.join(sha256);
+        let bytes = read_regular_file(&path, maximum_object_bytes(kind))?;
+        let actual = domain_digest(kind.domain(), &bytes);
+        if actual != sha256 {
+            return Err(InformationErrorV1::ObjectDigestMismatch {
+                expected: sha256.to_string(),
+                actual,
+            });
+        }
+        Ok(bytes)
+    }
+
+    pub fn read_head(&self, name: &str) -> Result<Option<RevisionIdV1>, InformationErrorV1> {
+        validate_head_name(name)?;
+        let path = self.root.join("heads").join(name);
+        let Some(bytes) = read_regular_file_if_exists(&path, INFORMATION_HEAD_BYTES_V1)? else {
+            return Ok(None);
+        };
+        if bytes.len() != INFORMATION_HEAD_BYTES_V1 || bytes[64] != b'\n' {
+            return Err(InformationErrorV1::InvalidRecord(format!(
+                "information head `{name}` must be exactly 64 lowercase hex bytes followed by one newline"
+            )));
+        }
+        let text = std::str::from_utf8(&bytes[..64])
+            .map_err(|error| InformationErrorV1::InvalidRecord(error.to_string()))?;
+        RevisionIdV1::from_sha256(text.to_string()).map(Some)
+    }
+}
+
 impl InformationStoreV1 {
     pub fn open(root: impl AsRef<Path>) -> Result<Self, InformationErrorV1> {
         let root = root.as_ref().to_path_buf();
@@ -303,6 +360,33 @@ fn ensure_private_directory(path: &Path) -> Result<(), InformationErrorV1> {
                 path.display()
             ))
         })?;
+    }
+    Ok(())
+}
+
+fn validate_existing_private_directory(path: &Path) -> Result<(), InformationErrorV1> {
+    reject_symlink(path)?;
+    let metadata = fs::metadata(path).map_err(|error| {
+        InformationErrorV1::Io(format!(
+            "failed to inspect existing information directory {}: {error}",
+            path.display()
+        ))
+    })?;
+    if !metadata.is_dir() {
+        return Err(InformationErrorV1::Io(format!(
+            "{} is not an existing directory",
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(InformationErrorV1::Io(format!(
+                "{} is not private to its owner",
+                path.display()
+            )));
+        }
     }
     Ok(())
 }

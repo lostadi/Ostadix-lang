@@ -12,7 +12,7 @@ for tool in cargo cmp nm python3 qemu-system-x86_64; do
   fi
 done
 
-cargo build --quiet --manifest-path "$ROOT/Cargo.toml" --bin ocorec
+cargo build --quiet --manifest-path "$ROOT/Cargo.toml" --package o-lang --bin ocorec
 OCOREC="$ROOT/target/debug/ocorec"
 
 SOURCES=(

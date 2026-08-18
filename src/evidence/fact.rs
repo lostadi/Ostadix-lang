@@ -2,6 +2,7 @@ use crate::effects::ResourceKey;
 use crate::hgraph::AdmissionFactKind;
 use crate::ir::PlanNodeId;
 use crate::runtime_exec::{ExecutableLeaseSet, ExecutableManifestV1};
+use crate::value::FidelityAssessmentV2;
 use std::sync::Arc;
 
 pub use crate::dispatch_model::DispatchAdapterV1;
@@ -9,6 +10,9 @@ pub use crate::dispatch_model::DispatchAdapterV1;
 pub const EVIDENCE_SCHEMA_V5: &str = "oexec.evidence/v5";
 pub const ADMISSION_SCHEMA_V5: &str = "oexec.admission/v5";
 pub const ANALYZER_ID_V5: &str = "ostadix-oir-evidence-compiler/v5";
+pub const EVIDENCE_SCHEMA_V6: &str = "oexec.evidence/v6";
+pub const ADMISSION_SCHEMA_V6: &str = "oexec.admission/v6";
+pub const ANALYZER_ID_V6: &str = "ostadix-oir-evidence-compiler/v6";
 
 /// Strength and origin of a pre-execution fact. Declaration order is not used
 /// as an authorization lattice; callers must use the explicit predicates.
@@ -161,6 +165,20 @@ pub struct TypeContractV1 {
     pub provenance: EvidenceProvenance,
 }
 
+/// Typed fidelity contract used by current and explicit Evidence V6 APIs.
+///
+/// V5 retains its conservative serialized [`crate::value::Fidelity`] string.
+/// The optional V2 assessment keeps absence distinct from an explicit
+/// unsupported crossing and preserves separate definite/possible loss bounds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TypeContractV2 {
+    pub constraints_solved: bool,
+    pub output_domain_bits: u16,
+    pub output_representation_bits: u16,
+    pub output_fidelity_assessment: Option<FidelityAssessmentV2>,
+    pub provenance: EvidenceProvenance,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EffectContractV1 {
     pub reads: Vec<ResourceKey>,
@@ -215,7 +233,7 @@ impl CostEstimateV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NodeEvidence {
+pub struct NodeEvidenceV1 {
     pub plan_node: PlanNodeId,
     pub type_contract: TypeContractV1,
     pub effect_contract: EffectContractV1,
@@ -230,7 +248,43 @@ pub struct NodeEvidence {
     pub cost_estimate: CostEstimateV1,
 }
 
-impl NodeEvidence {
+impl NodeEvidenceV1 {
+    pub fn provenance_for(&self, fact: AdmissionFactKind) -> EvidenceProvenance {
+        match fact {
+            AdmissionFactKind::Type => self.type_contract.provenance,
+            AdmissionFactKind::EffectFootprint => self.effect_contract.provenance,
+            AdmissionFactKind::Dispatch => self.dispatch_contract.provenance,
+            AdmissionFactKind::CapabilityPolicy => self.capability_provenance,
+            AdmissionFactKind::Placement => self.placement_provenance,
+            AdmissionFactKind::FailurePolicy => self.failure_contract.provenance,
+            AdmissionFactKind::ResourceBudget => self.resource_demand.provenance,
+        }
+    }
+}
+
+/// Versioned node evidence carrying the complete stratified fidelity result.
+/// All non-fidelity contracts retain their V1 meanings and types.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeEvidenceV2 {
+    pub plan_node: PlanNodeId,
+    pub type_contract: TypeContractV2,
+    pub effect_contract: EffectContractV1,
+    pub dispatch_contract: DispatchContractV1,
+    pub capability_disposition: CapabilityDispositionV1,
+    pub capability_provenance: EvidenceProvenance,
+    pub placement: PlacementContractV1,
+    pub placement_provenance: EvidenceProvenance,
+    pub failure_contract: FailureContractV1,
+    pub resource_demand: ResourceDemandContractV1,
+    /// Soft evidence. Admission never derives blockers from this field.
+    pub cost_estimate: CostEstimateV1,
+}
+
+/// Current node-evidence vocabulary. Package 0.3 advances the unversioned
+/// surface to the complete typed FidelityAssessmentV2 contract.
+pub type NodeEvidence = NodeEvidenceV2;
+
+impl NodeEvidenceV2 {
     pub fn provenance_for(&self, fact: AdmissionFactKind) -> EvidenceProvenance {
         match fact {
             AdmissionFactKind::Type => self.type_contract.provenance,
@@ -378,7 +432,7 @@ pub struct EvidenceBundleV5 {
     pub(crate) analyzer: &'static str,
     pub(crate) bindings: EvidenceBindingsV2,
     pub(crate) runtime: RuntimeBindingV1,
-    pub(crate) nodes: Vec<NodeEvidence>,
+    pub(crate) nodes: Vec<NodeEvidenceV1>,
 }
 
 impl EvidenceBundleV5 {
@@ -398,7 +452,43 @@ impl EvidenceBundleV5 {
         &self.runtime
     }
 
-    pub fn nodes(&self) -> &[NodeEvidence] {
+    pub fn nodes(&self) -> &[NodeEvidenceV1] {
         &self.nodes
+    }
+}
+
+/// Current Evidence V6 bundle.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EvidenceBundleV6 {
+    pub(crate) schema: &'static str,
+    pub(crate) analyzer: &'static str,
+    pub(crate) bindings: EvidenceBindingsV2,
+    pub(crate) runtime: RuntimeBindingV1,
+    pub(crate) nodes: Vec<NodeEvidenceV2>,
+}
+
+impl EvidenceBundleV6 {
+    pub fn schema(&self) -> &'static str {
+        self.schema
+    }
+
+    pub fn analyzer(&self) -> &'static str {
+        self.analyzer
+    }
+
+    pub fn bindings(&self) -> &EvidenceBindingsV2 {
+        &self.bindings
+    }
+
+    pub fn runtime(&self) -> &RuntimeBindingV1 {
+        &self.runtime
+    }
+
+    pub fn nodes(&self) -> &[NodeEvidenceV2] {
+        &self.nodes
+    }
+
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
     }
 }

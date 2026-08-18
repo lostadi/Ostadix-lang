@@ -35,6 +35,9 @@ const CHECKPOINTS_DIRECTORY: &str = "checkpoints";
 const JOURNAL_FILE: &str = "journal.cborseq";
 const AUTHORITY_JOURNAL_FILE: &str = "placement-authority.cborseq";
 const STATE_LOCK_FILE: &str = ".exclusive-runtime.lock";
+const STATE_AUTHORITY_FILE: &str = ".execution-authority-v1";
+const STATE_AUTHORITY_BYTES: &[u8] = b"schema=ostadix.hosted-state-authority/v1\ngraph=ostadix-solved-executable-hgraph/v2\nevidence=oexec.evidence/v6\nadmission=oexec.admission/v6\nplacement=ostadix/placement-admission/v2\n";
+pub const HOSTED_STATE_AUTHORITY_SCHEMA_V1: &str = "ostadix.hosted-state-authority/v1";
 pub const AUTHORITY_JOURNAL_ID_V2: &str = "placement-authority";
 /// Runtime admission must leave this much of the signed total-state quota
 /// unused so the two bounded authority frames required by GC stay reachable.
@@ -183,6 +186,12 @@ struct StateRootLockV2 {
     _file: File,
 }
 
+impl Drop for StateRootLockV2 {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self._file);
+    }
+}
+
 impl std::fmt::Debug for DurableSessionStoreV2 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -196,6 +205,7 @@ impl std::fmt::Debug for DurableSessionStoreV2 {
 impl DurableSessionStoreV2 {
     pub fn open(root: impl Into<PathBuf>, signer: HostedNodeSignerV2) -> Result<Self> {
         let root = root.into();
+        reject_archival_state_before_mutation(&root)?;
         ensure_private_directory_v2(&root)?;
         let lock_path = root.join(STATE_LOCK_FILE);
         let mut lock_options = OpenOptions::new();
@@ -204,7 +214,7 @@ impl DurableSessionStoreV2 {
         {
             lock_options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
         }
-        let mut lock_file = lock_options.open(&lock_path).with_context(|| {
+        let lock_file = lock_options.open(&lock_path).with_context(|| {
             format!(
                 "failed to open hosted V2 state-root lock for `{}`",
                 root.display()
@@ -222,16 +232,19 @@ impl DurableSessionStoreV2 {
                 root.display()
             )
         })?;
+        let mut lock = StateRootLockV2 { _file: lock_file };
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            lock_file.set_permissions(fs::Permissions::from_mode(0o600))?;
+            lock._file
+                .set_permissions(fs::Permissions::from_mode(0o600))?;
         }
-        lock_file.set_len(0)?;
-        writeln!(lock_file, "pid={}", std::process::id())?;
-        lock_file.sync_all()?;
+        lock._file.set_len(0)?;
+        writeln!(lock._file, "pid={}", std::process::id())?;
+        lock._file.sync_all()?;
         sync_directory(&root)?;
-        let lock = Arc::new(StateRootLockV2 { _file: lock_file });
+        let lock = Arc::new(lock);
+        bind_current_state_authority(&root)?;
         let sessions = root.join(SESSIONS_DIRECTORY);
         ensure_private_directory_v2(&sessions)?;
         let session_staging = root.join(SESSION_STAGING_DIRECTORY);
@@ -1987,6 +2000,93 @@ impl DurableSessionStoreV2 {
     }
 }
 
+fn reject_archival_state_before_mutation(root: &Path) -> Result<()> {
+    let marker = root.join(STATE_AUTHORITY_FILE);
+    match fs::symlink_metadata(&marker) {
+        Ok(_) => return validate_current_state_authority_marker(&marker),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).context(
+                "failed to inspect hosted state execution-authority marker before opening",
+            )
+        }
+    }
+
+    for legacy_path in [
+        root.join(SESSIONS_DIRECTORY),
+        root.join(AUTHORITY_JOURNAL_FILE),
+    ] {
+        match fs::symlink_metadata(&legacy_path) {
+            Ok(_) => {
+                bail!(
+                    "hosted state root predates the package-0.3 Graph V2/Admission V6 authority boundary; archival journals are inspection-only and cannot be resumed"
+                )
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to inspect hosted state path `{}` before opening",
+                        legacy_path.display()
+                    )
+                })
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_current_state_authority_marker(marker: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(marker)
+        .context("failed to inspect hosted state execution-authority marker")?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!(
+            "hosted state authority marker `{}` is not a regular file",
+            marker.display()
+        );
+    }
+    if metadata.len() != STATE_AUTHORITY_BYTES.len() as u64 {
+        bail!("hosted state root carries a different execution-authority coordinate");
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    let mut file = options
+        .open(marker)
+        .context("failed to read hosted state execution-authority marker")?;
+    let mut bytes = Vec::with_capacity(STATE_AUTHORITY_BYTES.len());
+    file.read_to_end(&mut bytes)?;
+    if bytes != STATE_AUTHORITY_BYTES {
+        bail!("hosted state root carries a different execution-authority coordinate");
+    }
+    Ok(())
+}
+
+fn bind_current_state_authority(root: &Path) -> Result<()> {
+    let marker = root.join(STATE_AUTHORITY_FILE);
+    match fs::symlink_metadata(&marker) {
+        Ok(_) => validate_current_state_authority_marker(&marker),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            reject_archival_state_before_mutation(root)?;
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            options.mode(0o600);
+            let mut file = options
+                .open(&marker)
+                .context("failed to create hosted state execution-authority marker")?;
+            file.write_all(STATE_AUTHORITY_BYTES)?;
+            file.sync_all()?;
+            sync_directory(root)?;
+            Ok(())
+        }
+        Err(error) => {
+            Err(error).context("failed to inspect hosted state execution-authority marker")
+        }
+    }
+}
+
 fn is_emergency_authority_control_event(event: &JournalEventV2) -> bool {
     matches!(
         event,
@@ -2930,7 +3030,7 @@ mod tests {
     };
 
     #[test]
-    fn persistent_state_lock_reopens_but_refuses_concurrent_owner() -> Result<()> {
+    fn persistent_state_lock_reopens_after_last_clone_drops() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let root = directory.path().join("state");
         ensure_private_directory_v2(&root)?;
@@ -2939,9 +3039,23 @@ mod tests {
         // ownership; only the advisory lock on its open inode is.
         let stale = root.join(STATE_LOCK_FILE);
         fs::write(&stale, b"pid=stale\n")?;
+        #[cfg(unix)]
+        let stale_inode = {
+            use std::os::unix::fs::MetadataExt;
+            stale.metadata()?.ino()
+        };
 
         let signer = HostedNodeSignerV2::from_secret_bytes([7; 32]);
         let first = DurableSessionStoreV2::open(&root, signer.clone())?;
+        let retained_clone = first.clone();
+        // Model a descriptor inherited across fork or duplicated elsewhere in
+        // the process. Closing the store's File alone does not release flock
+        // while this duplicate remains open; StateRootLockV2 must unlock it.
+        #[cfg(unix)]
+        let duplicated_lock_file = first._lock._file.try_clone()?;
+        let (session_id, _) =
+            install_test_session(&first, &signer, b"state-lock-durable-mutation")?;
+        assert_eq!(first.list_session_ids()?, vec![session_id.clone()]);
         let concurrent = DurableSessionStoreV2::open(&root, signer.clone())
             .expect_err("a live state-root owner must exclude a concurrent runtime");
         assert!(
@@ -2949,13 +3063,83 @@ mod tests {
             "{concurrent:#}"
         );
         drop(first);
+        let concurrent = DurableSessionStoreV2::open(&root, signer.clone())
+            .expect_err("a retained store clone must keep the state-root lock");
+        assert!(
+            format!("{concurrent:#}").contains("already locked"),
+            "{concurrent:#}"
+        );
+        drop(retained_clone);
 
         let reopened = DurableSessionStoreV2::open(&root, signer.clone())?;
+        assert_eq!(reopened.list_session_ids()?, vec![session_id]);
         assert!(
             stale.is_file(),
             "the advisory-lock inode must stay persistent"
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(stale.metadata()?.ino(), stale_inode);
+            assert!(duplicated_lock_file.metadata()?.is_file());
+            drop(duplicated_lock_file);
+        }
         drop(reopened);
+        Ok(())
+    }
+
+    #[test]
+    fn state_root_binds_current_graph_v2_admission_v6_authority() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("state");
+        let signer = HostedNodeSignerV2::from_secret_bytes([31; 32]);
+        let store = DurableSessionStoreV2::open(&root, signer.clone())?;
+        let marker = root.join(STATE_AUTHORITY_FILE);
+        assert_eq!(fs::read(&marker)?, STATE_AUTHORITY_BYTES);
+        drop(store);
+
+        let reopened = DurableSessionStoreV2::open(&root, signer.clone())?;
+        drop(reopened);
+        fs::write(&marker, b"schema=archival-v1\n")?;
+        let lock = root.join(STATE_LOCK_FILE);
+        let lock_before = fs::read(&lock)?;
+        let error = DurableSessionStoreV2::open(&root, signer)
+            .expect_err("a changed durable authority coordinate must fail closed");
+        assert!(
+            format!("{error:#}").contains("different execution-authority coordinate"),
+            "{error:#}"
+        );
+        assert_eq!(fs::read(lock)?, lock_before);
+        Ok(())
+    }
+
+    #[test]
+    fn pre_v03_journal_root_is_rejected_without_migration_or_mutation() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("state");
+        ensure_private_directory_v2(&root)?;
+        let sessions = root.join(SESSIONS_DIRECTORY);
+        ensure_private_directory_v2(&sessions)?;
+        let legacy_journal = root.join(AUTHORITY_JOURNAL_FILE);
+        fs::write(&legacy_journal, b"archival-v1-journal-bytes")?;
+        let before = fs::read_dir(&root)?
+            .map(|entry| Ok(entry?.file_name()))
+            .collect::<Result<BTreeSet<_>>>()?;
+
+        let error =
+            DurableSessionStoreV2::open(&root, HostedNodeSignerV2::from_secret_bytes([32; 32]))
+                .expect_err("pre-0.3 journals must not be resumed or migrated");
+        assert!(
+            format!("{error:#}").contains("archival journals are inspection-only"),
+            "{error:#}"
+        );
+        assert_eq!(fs::read(&legacy_journal)?, b"archival-v1-journal-bytes");
+        assert!(!root.join(STATE_AUTHORITY_FILE).exists());
+        assert!(!root.join(STATE_LOCK_FILE).exists());
+        let after = fs::read_dir(&root)?
+            .map(|entry| Ok(entry?.file_name()))
+            .collect::<Result<BTreeSet<_>>>()?;
+        assert_eq!(after, before);
         Ok(())
     }
 

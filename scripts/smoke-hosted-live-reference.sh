@@ -19,7 +19,7 @@ trap cleanup EXIT HUP INT TERM
 
 output="$(
   cd "$repo_root"
-  cargo run --quiet --bin o-live-host -- demo --state "$state_dir"
+  cargo run --quiet --package o-lang --bin o-live-host -- demo --state "$state_dir"
 )"
 
 python3 - "$output" <<'PY'
