@@ -7,7 +7,8 @@ use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use crate::effects::{EffectSummary, ResourceKey};
+use crate::backend_catalog::ExecutionMode;
+use crate::effects::{EffectSummary, Fallibility, ResourceKey};
 use crate::execution_contract::Policy;
 use crate::hgraph::{AdmissionFactKind, EdgeId, HGraph, HNodeKind, NodeId, ReadySchedule};
 use crate::ir::{ExecutionPlan, OIrProgram, PlanEdgeKind, PlanNodeId, PlanNodeKind};
@@ -15,13 +16,16 @@ use crate::placement::SemanticDigestV1;
 use crate::runtime_exec::{ExecutableLeaseSet, ExecutableManifestV1};
 
 use super::analyze::{
-    analyze_execution, digest_fields, evidence_bindings, evidence_bundle_sha256, graph_sha256,
-    oir_sha256,
+    analyze_execution_v5, analyze_execution_v6, digest_fields, evidence_bindings_v5,
+    evidence_bindings_v6, evidence_bundle_sha256_v5, evidence_bundle_sha256_v6, graph_sha256_v1,
+    graph_sha256_v2, oir_sha256,
 };
 use super::fact::{
-    BackendArtifactV1, DispatchAdapterV1, DispatchLaneV1, DispatchSemanticsV1, EvidenceBindingsV2,
-    EvidenceBundleV5, NodeEvidence, PlacementContractV1, RuntimeBindingV1, RuntimeSnapshotKindV1,
-    ADMISSION_SCHEMA_V5, ANALYZER_ID_V5, EVIDENCE_SCHEMA_V5,
+    BackendArtifactStateV1, BackendArtifactV1, DispatchAdapterV1, DispatchLaneV1,
+    DispatchSemanticsV1, EvidenceBindingsV2, EvidenceBundleV5, EvidenceBundleV6, FailureClassV1,
+    NodeEvidenceV1, NodeEvidenceV2, PlacementContractV1, RuntimeBindingV1, RuntimeSnapshotKindV1,
+    ADMISSION_SCHEMA_V5, ADMISSION_SCHEMA_V6, ANALYZER_ID_V5, ANALYZER_ID_V6, EVIDENCE_SCHEMA_V5,
+    EVIDENCE_SCHEMA_V6,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -86,15 +90,28 @@ pub struct RetainedSequenceV1 {
 pub struct AdmittedOperationV1 {
     pub plan_node: PlanNodeId,
     pub ordinal: u64,
-    pub evidence: NodeEvidence,
+    pub evidence: NodeEvidenceV1,
+    pub blockers: Vec<OperationBlockerV1>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdmittedOperationV2 {
+    pub plan_node: PlanNodeId,
+    pub ordinal: u64,
+    pub evidence: NodeEvidenceV2,
     pub blockers: Vec<OperationBlockerV1>,
 }
 
 pub const SCHEDULE_WHY_SCHEMA_V1: &str = "oexec.admission-why/v1";
+pub const SCHEDULE_WHY_SCHEMA_V2: &str = "oexec.admission-why/v2";
 pub const SCHEDULE_EXPLANATION_SCHEMA_V1: &str = "oexec.schedule-explanation/v1";
+pub const SCHEDULE_EXPLANATION_SCHEMA_V2: &str = "oexec.schedule-explanation/v2";
 pub const SCHEDULE_REALIZABILITY_SCHEMA_V1: &str = "oexec.realizability/v1";
 pub const SCHEDULE_PREDICTION_SCHEMA_V1: &str = "oexec.schedule-prediction/v1";
 pub const PLACEMENT_ADMISSION_DIGEST_DOMAIN_V1: &str = "ostadix/placement-admission/v1";
+pub const PLACEMENT_ADMISSION_DIGEST_DOMAIN_V2: &str = "ostadix/placement-admission/v2";
+pub const EXECUTION_ADMISSION_DIGEST_DOMAIN_V5: &str = "ostadix-execution-admission/v5";
+pub const EXECUTION_ADMISSION_DIGEST_DOMAIN_V6: &str = "ostadix-execution-admission/v6";
 
 /// Digest coordinates identifying the exact admitted computation rendered by
 /// a schedule explanation. These are copied from [`ExecutionAdmissionV5`]; the
@@ -175,6 +192,44 @@ pub struct ScheduleExplanationV1 {
     pub prediction: SchedulePredictionV1,
 }
 
+/// Current schedule-explanation projection for Admission V6. The outer and
+/// admission records are versioned separately from V1 so current Graph V2/V6
+/// identities never appear under the archival V1 schema.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ScheduleExplanationV2 {
+    pub schema: &'static str,
+    pub admission: ScheduleExplanationAdmissionV2,
+    pub realizability: ScheduleRealizabilityV1,
+    pub prediction: SchedulePredictionV1,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ScheduleExplanationAdmissionV2 {
+    pub schema: &'static str,
+    pub analyzer: &'static str,
+    pub runtime_snapshot_kind: &'static str,
+    pub base_policy: &'static str,
+    pub bindings: ScheduleExplanationBindingsV2,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ScheduleExplanationBindingsV2 {
+    pub lowered_oir_sha256: String,
+    pub plan_sha256: String,
+    pub analyzed_graph_sha256: String,
+    pub backend_catalog_projection_sha256: String,
+    pub backend_set_sha256: String,
+    pub direct_executable_manifest_sha256: String,
+    pub launch_context_sha256: String,
+    pub environment_sha256: String,
+    pub ambient_world_sha256: String,
+    pub analyzer_sha256: String,
+    pub evidence_sha256: String,
+    pub admitted_graph_sha256: String,
+    pub placement_admission_sha256: String,
+    pub admission_sha256: String,
+}
+
 /// One exact HGraph input/producer correspondence behind a blocker.
 ///
 /// Unlike the compact predecessor aggregation in [`OperationBlockerV1`], a
@@ -216,6 +271,25 @@ pub struct ScheduleWhyViewV1 {
     pub hosted_task_layer: Option<(usize, Vec<PlanNodeId>)>,
 }
 
+/// Explicit Admission V6 why-view. The dependency witness vocabulary remains
+/// V1; only the embedded admitted operation carries typed V2 node evidence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScheduleWhyViewV2 {
+    pub schema: &'static str,
+    pub bindings: EvidenceBindingsV2,
+    pub evidence_sha256: String,
+    pub admitted_graph_sha256: String,
+    pub admission_sha256: String,
+    pub plan_kind: PlanNodeKind,
+    pub operation: AdmittedOperationV2,
+    pub blocker_witnesses: Vec<ScheduleWhyWitnessV1>,
+    pub dependents: Vec<ScheduleWhyDependentV1>,
+    pub retained_sequences: Vec<RetainedSequenceV1>,
+    pub wave_index: usize,
+    pub wave: Vec<PlanNodeId>,
+    pub hosted_task_layer: Option<(usize, Vec<PlanNodeId>)>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecutionAdmissionV5 {
     schema: &'static str,
@@ -230,6 +304,26 @@ pub struct ExecutionAdmissionV5 {
     admission_sha256: String,
     base_policy: Policy,
     operations: Vec<AdmittedOperationV1>,
+    retained_sequences: Vec<RetainedSequenceV1>,
+    waves: Vec<Vec<PlanNodeId>>,
+    hosted_task_layers: Vec<Vec<PlanNodeId>>,
+}
+
+/// Current Admission V6 record bound to Graph V2 and typed node evidence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExecutionAdmissionV6 {
+    schema: &'static str,
+    bindings: EvidenceBindingsV2,
+    analyzer: &'static str,
+    runtime_snapshot_kind: RuntimeSnapshotKindV1,
+    backend_artifacts: Vec<BackendArtifactV1>,
+    executable_manifest: ExecutableManifestV1,
+    evidence_sha256: String,
+    admitted_graph_sha256: String,
+    placement_admission: SemanticDigestV1,
+    admission_sha256: String,
+    base_policy: Policy,
+    operations: Vec<AdmittedOperationV2>,
     retained_sequences: Vec<RetainedSequenceV1>,
     waves: Vec<Vec<PlanNodeId>>,
     hosted_task_layers: Vec<Vec<PlanNodeId>>,
@@ -523,7 +617,7 @@ impl ExecutionAdmissionV5 {
                 artifact.state.name(),
                 artifact.state.sha256().unwrap_or("none"),
                 match &artifact.state {
-                    crate::evidence::BackendArtifactStateV1::Unreadable { error_kind } => {
+                    BackendArtifactStateV1::Unreadable { error_kind } => {
                         format!(" error-kind={error_kind}")
                     }
                     _ => String::new(),
@@ -694,6 +788,443 @@ impl ExecutionAdmissionV5 {
     }
 }
 
+impl ExecutionAdmissionV6 {
+    pub fn schema(&self) -> &'static str {
+        self.schema
+    }
+
+    pub fn bindings(&self) -> &EvidenceBindingsV2 {
+        &self.bindings
+    }
+
+    pub fn analyzer(&self) -> &'static str {
+        self.analyzer
+    }
+
+    pub fn runtime_snapshot_kind(&self) -> RuntimeSnapshotKindV1 {
+        self.runtime_snapshot_kind
+    }
+
+    pub fn backend_artifacts(&self) -> &[BackendArtifactV1] {
+        &self.backend_artifacts
+    }
+
+    pub fn executable_manifest(&self) -> &ExecutableManifestV1 {
+        &self.executable_manifest
+    }
+
+    pub fn evidence_sha256(&self) -> &str {
+        &self.evidence_sha256
+    }
+
+    pub fn admitted_graph_sha256(&self) -> &str {
+        &self.admitted_graph_sha256
+    }
+
+    pub fn placement_admission(&self) -> &SemanticDigestV1 {
+        &self.placement_admission
+    }
+
+    pub fn admission_sha256(&self) -> &str {
+        &self.admission_sha256
+    }
+
+    pub fn base_policy(&self) -> Policy {
+        self.base_policy
+    }
+
+    pub fn operations(&self) -> &[AdmittedOperationV2] {
+        &self.operations
+    }
+
+    pub fn waves(&self) -> &[Vec<PlanNodeId>] {
+        &self.waves
+    }
+
+    pub fn retained_sequences(&self) -> &[RetainedSequenceV1] {
+        &self.retained_sequences
+    }
+
+    pub fn admitted_static_max_wave_width(&self) -> usize {
+        self.waves.iter().map(Vec::len).max().unwrap_or(0)
+    }
+
+    pub fn admitted_hosted_task_max_wave_width(&self) -> usize {
+        self.hosted_task_layers
+            .iter()
+            .map(Vec::len)
+            .max()
+            .unwrap_or(0)
+    }
+
+    pub fn admitted_hosted_task_wave_count(&self) -> usize {
+        self.hosted_task_layers.len()
+    }
+
+    pub fn admitted_hosted_task_layers(&self) -> &[Vec<PlanNodeId>] {
+        &self.hosted_task_layers
+    }
+
+    pub fn admitted_max_wave_width(&self) -> usize {
+        let local_workers = self
+            .operations
+            .iter()
+            .filter_map(|operation| {
+                (operation.evidence.dispatch_contract.lane == DispatchLaneV1::LocalWorker)
+                    .then_some(operation.plan_node)
+            })
+            .collect::<BTreeSet<_>>();
+        self.waves
+            .iter()
+            .map(|wave| {
+                wave.iter()
+                    .filter(|plan_node| local_workers.contains(plan_node))
+                    .count()
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    pub fn resolved_worker_count(&self, cli_override: Option<usize>) -> usize {
+        resolve_worker_count(
+            cli_override,
+            available_parallelism(),
+            self.admitted_max_wave_width(),
+        )
+    }
+
+    pub fn schedule_explanation_with_worker_override(
+        &self,
+        cli_override: Option<usize>,
+    ) -> ScheduleExplanationV2 {
+        let available = available_parallelism();
+        let admitted_max_local_worker_wave_width = self.admitted_max_wave_width();
+        let selected_workers = resolve_worker_count(
+            cli_override,
+            available,
+            admitted_max_local_worker_wave_width,
+        );
+        let worker_count_covers_static_wave = if admitted_max_local_worker_wave_width == 0 {
+            "not-applicable"
+        } else if selected_workers >= admitted_max_local_worker_wave_width {
+            "yes"
+        } else {
+            "no"
+        };
+        ScheduleExplanationV2 {
+            schema: SCHEDULE_EXPLANATION_SCHEMA_V2,
+            admission: ScheduleExplanationAdmissionV2 {
+                schema: self.schema,
+                analyzer: self.analyzer,
+                runtime_snapshot_kind: self.runtime_snapshot_kind.name(),
+                base_policy: self.base_policy.name(),
+                bindings: ScheduleExplanationBindingsV2 {
+                    lowered_oir_sha256: self.bindings.oir_sha256.clone(),
+                    plan_sha256: self.bindings.plan_sha256.clone(),
+                    analyzed_graph_sha256: self.bindings.analyzed_graph_sha256.clone(),
+                    backend_catalog_projection_sha256: self
+                        .bindings
+                        .backend_catalog_projection_sha256
+                        .clone(),
+                    backend_set_sha256: self.bindings.backend_set_sha256.clone(),
+                    direct_executable_manifest_sha256: self
+                        .bindings
+                        .executable_manifest_sha256
+                        .clone(),
+                    launch_context_sha256: self.bindings.launch_context_sha256.clone(),
+                    environment_sha256: self.bindings.environment_sha256.clone(),
+                    ambient_world_sha256: self.bindings.ambient_world_sha256.clone(),
+                    analyzer_sha256: self.bindings.analyzer_sha256.clone(),
+                    evidence_sha256: self.evidence_sha256.clone(),
+                    admitted_graph_sha256: self.admitted_graph_sha256.clone(),
+                    placement_admission_sha256: self.placement_admission.as_sha256().to_string(),
+                    admission_sha256: self.admission_sha256.clone(),
+                },
+            },
+            realizability: ScheduleRealizabilityV1 {
+                schema: SCHEDULE_REALIZABILITY_SCHEMA_V1,
+                status: "inspection-only",
+                execution_realizable: "unknown",
+                dispatch: "not-run",
+                scope: "local-worker-static-wave",
+                worker_count_covers_static_wave,
+                runtime_readiness: "unknown",
+                placement_lease: "none",
+                observed_overlap: "not-run",
+                source: if cli_override.is_some() {
+                    "cli-override"
+                } else {
+                    "machine-default"
+                },
+                available_parallelism: available,
+                admitted_static_max_wave_width: self.admitted_static_max_wave_width(),
+                admitted_max_local_worker_wave_width,
+                selected_workers,
+            },
+            prediction: SchedulePredictionV1 {
+                schema: SCHEDULE_PREDICTION_SCHEMA_V1,
+                status: "admitted-static",
+                provenance: "evidence-bound-admission",
+                model: "unit-cost-shim-hosted-tasks",
+                admission_sha256: self.admission_sha256.clone(),
+                task_count: self.hosted_task_layers.iter().map(Vec::len).sum(),
+                predicted_width: self.admitted_hosted_task_max_wave_width(),
+                predicted_span: self.admitted_hosted_task_wave_count(),
+                span_unit: "hosted-task-layers",
+                layers: self
+                    .hosted_task_layers
+                    .iter()
+                    .enumerate()
+                    .map(|(index, layer)| SchedulePredictionLayerV1 {
+                        index: index + 1,
+                        operations: layer.iter().map(|node| format!("P{}", node.0)).collect(),
+                    })
+                    .collect(),
+            },
+        }
+    }
+
+    pub fn to_explanation_json_with_worker_override(
+        &self,
+        cli_override: Option<usize>,
+    ) -> serde_json::Result<String> {
+        serde_json::to_string(&self.schedule_explanation_with_worker_override(cli_override))
+    }
+
+    pub fn to_explanation_text(&self) -> String {
+        self.to_explanation_text_with_worker_override(None)
+    }
+
+    pub fn to_explanation_text_with_worker_override(&self, cli_override: Option<usize>) -> String {
+        render_schedule_explanation_v2(
+            self,
+            &self.schedule_explanation_with_worker_override(cli_override),
+        )
+    }
+}
+
+fn render_schedule_explanation_v2(
+    record: &ExecutionAdmissionV6,
+    explanation: &ScheduleExplanationV2,
+) -> String {
+    let admission = &explanation.admission;
+    let bindings = &admission.bindings;
+    let mut out = format!("; ExecutionAdmission {}\n", admission.schema);
+    writeln!(
+        out,
+        "binding lowered-oir-sha256={} plan-sha256={} analyzed-graph-sha256={}",
+        bindings.lowered_oir_sha256, bindings.plan_sha256, bindings.analyzed_graph_sha256
+    )
+    .expect("writing to a String cannot fail");
+    writeln!(
+        out,
+        "binding backend-catalog-projection-sha256={} backend-set-sha256={} direct-executable-manifest-sha256={} launch-context-sha256={} environment-sha256={} ambient-world-sha256={}",
+        bindings.backend_catalog_projection_sha256,
+        bindings.backend_set_sha256,
+        bindings.direct_executable_manifest_sha256,
+        bindings.launch_context_sha256,
+        bindings.environment_sha256,
+        bindings.ambient_world_sha256
+    )
+    .expect("writing to a String cannot fail");
+    writeln!(
+        out,
+        "binding analyzer-sha256={} evidence-sha256={} admitted-graph-sha256={} placement-admission-sha256={} admission-sha256={}",
+        bindings.analyzer_sha256,
+        bindings.evidence_sha256,
+        bindings.admitted_graph_sha256,
+        bindings.placement_admission_sha256,
+        bindings.admission_sha256
+    )
+    .expect("writing to a String cannot fail");
+    writeln!(out, "analyzer {}", admission.analyzer).expect("writing to a String cannot fail");
+    writeln!(
+        out,
+        "runtime-snapshot kind={} dispatch-context={}",
+        admission.runtime_snapshot_kind,
+        match record.runtime_snapshot_kind {
+            RuntimeSnapshotKindV1::Execution => "execution",
+            RuntimeSnapshotKindV1::Inspection => "inspection-only",
+        }
+    )
+    .expect("writing to a String cannot fail");
+    for artifact in &record.backend_artifacts {
+        writeln!(
+            out,
+            "backend-artifact canonical={} identity={} state={} sha256={}{}",
+            artifact.canonical_backend,
+            artifact.resolved_identity,
+            artifact.state.name(),
+            artifact.state.sha256().unwrap_or("none"),
+            match &artifact.state {
+                BackendArtifactStateV1::Unreadable { error_kind } => {
+                    format!(" error-kind={error_kind}")
+                }
+                _ => String::new(),
+            }
+        )
+        .expect("writing to a String cannot fail");
+    }
+    writeln!(
+        out,
+        "direct-executable-manifest schema={} scope={} sha256={} guarantee=direct-launcher-only transitive-runtime-closure=not-bound",
+        record.executable_manifest.schema,
+        record.executable_manifest.scope,
+        record.executable_manifest.sha256()
+    )
+    .expect("writing to a String cannot fail");
+    for executable in record.executable_manifest.artifacts() {
+        writeln!(
+            out,
+            "direct-executable backend={} requirement={} selected-alternative={} selection={} command={} role={} state={} invocation-path={} invocation-identity={} canonical-target={} target-identity={} sha256={} guarantee={}",
+            executable.canonical_backend,
+            executable.requirement_key,
+            executable
+                .selected_alternative
+                .map(|index| index.to_string())
+                .unwrap_or_else(|| "not-selected".to_string()),
+            executable.selection.name(),
+            executable.logical_command,
+            executable.role,
+            executable.state.name(),
+            executable
+                .invocation_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "not-probed".to_string()),
+            executable.invocation_identity,
+            executable
+                .canonical_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "not-probed".to_string()),
+            executable.resolved_identity,
+            executable.sha256.as_deref().unwrap_or("not-probed"),
+            executable.guarantee.name(),
+        )
+        .expect("writing to a String cannot fail");
+    }
+    writeln!(out, "policy {}", admission.base_policy).expect("writing to a String cannot fail");
+    let realizability = &explanation.realizability;
+    writeln!(out, "; ScheduleRealizability {}", realizability.schema)
+        .expect("writing to a String cannot fail");
+    writeln!(
+        out,
+        "realizability status={} execution-realizable={} dispatch={} scope={} worker-count-covers-static-wave={} runtime-readiness={} placement-lease={} observed-overlap={} source={} available-parallelism={} admitted-static-max-wave-width={} admitted-max-local-worker-wave-width={} selected-workers={}",
+        realizability.status,
+        realizability.execution_realizable,
+        realizability.dispatch,
+        realizability.scope,
+        realizability.worker_count_covers_static_wave,
+        realizability.runtime_readiness,
+        realizability.placement_lease,
+        realizability.observed_overlap,
+        realizability.source,
+        realizability.available_parallelism,
+        realizability.admitted_static_max_wave_width,
+        realizability.admitted_max_local_worker_wave_width,
+        realizability.selected_workers
+    )
+    .expect("writing to a String cannot fail");
+    let prediction = &explanation.prediction;
+    writeln!(out, "; SchedulePrediction {}", prediction.schema)
+        .expect("writing to a String cannot fail");
+    writeln!(
+        out,
+        "schedule-prediction schema={} status={} provenance={} model={} admission-sha256={} task-count={} predicted-width={} predicted-span={} span-unit={}",
+        prediction.schema,
+        prediction.status,
+        prediction.provenance,
+        prediction.model,
+        prediction.admission_sha256,
+        prediction.task_count,
+        prediction.predicted_width,
+        prediction.predicted_span,
+        prediction.span_unit
+    )
+    .expect("writing to a String cannot fail");
+    for layer in &prediction.layers {
+        writeln!(
+            out,
+            "schedule-prediction-layer index={} operations=[{}]",
+            layer.index,
+            layer.operations.join(",")
+        )
+        .expect("writing to a String cannot fail");
+    }
+    for operation in &record.operations {
+        render_operation_v2(&mut out, operation);
+    }
+    for sequence in &record.retained_sequences {
+        writeln!(
+            out,
+            "sequence P{} -> P{} retained reason={} token=N{}",
+            sequence.predecessor.0,
+            sequence.successor.0,
+            sequence.reason.name(),
+            sequence.completion.0
+        )
+        .expect("writing to a String cannot fail");
+    }
+    for (index, wave) in record.waves.iter().enumerate() {
+        let nodes = wave
+            .iter()
+            .map(|node| format!("P{}", node.0))
+            .collect::<Vec<_>>()
+            .join(",");
+        writeln!(out, "wave {index} [{nodes}]").expect("writing to a String cannot fail");
+    }
+    out.push_str(
+        "admission-note waves describe the legal static frontier, not observed dispatch\n",
+    );
+    out.push_str(
+        "admission-note hosted-task prediction assigns unit cost to shim-backed execution and zero cost to other admitted operations; it predicts topology, not duration, capacity fit, dispatch, or observed overlap\n",
+    );
+    out.push_str(
+        "admission-note worker-count-covers-static-wave checks local-worker count only; execution realizability remains unknown and no simultaneous dispatch, CPU or memory fit, or overlap is proved\n",
+    );
+    out.push_str(
+        "admission-note admitted maximum local-worker wave width is a static Kahn-wave capacity heuristic, not a bound on the completion-driven dynamic frontier\n",
+    );
+    out.push_str(
+        "admission-note dispatch adapter IDs are evidence-bound; runtime preparation may validate but cannot reclassify an operation\n",
+    );
+    out.push_str(
+        "admission-note explicit-autonomous-unordered dispatch is a source-level semantic opt-in; deterministic result settlement does not roll back external effects from already-started hosted tasks\n",
+    );
+    out.push_str(
+        "admission-note local-worker runtime uses a fixed-size per-run pool with per-completion wakeups; static waves are not pool batches or capacity promises\n",
+    );
+    out.push_str(
+        "admission-note fallible local-worker outcomes may complete out of order but remain provisional and settle at the contiguous serial-topological prefix\n",
+    );
+    out.push_str(
+        "admission-note verified-pure infallible local-worker outputs may provisionally unlock only equally safe worker dependents; dependent NodeStarted may precede producer NodeFinished, durable settlement remains serial-topological, and any earlier failure revokes provisionally published outputs\n",
+    );
+    out.push_str(
+        "admission-note ambient-world-sha256 is descriptive HostWorld context, not governed authority\n",
+    );
+    out.push_str(
+        "admission-note backend-catalog-projection-sha256 binds only canonical specifications referenced by this plan; it is not runtime discovery, health, authorization, capacity, or readiness evidence\n",
+    );
+    out.push_str(
+        "admission-note backend artifact states distinguish hashed, missing, non-regular, and unreadable paths\n",
+    );
+    out.push_str(
+        "admission-note V6 direct-launch leases retain opened hashed canonical targets and dispatch their admitted absolute invocation paths after immediate identity checks; this preserves multicall symlink names and prevents PATH alternative reselection but does not freeze the child environment or eliminate a final same-principal stat-to-exec micro-window\n",
+    );
+    out.push_str(
+        "admission-note direct-launch binding excludes shebang interpreters, compiler-driver subtools, dynamic libraries, hosted descendants, Request/project authorities, and live actor state/generation\n",
+    );
+    out.push_str(
+        "admission-note caller initial scope shape and values are installed after admission and are not digest-bound in V6\n",
+    );
+    out.push_str(
+        "admission-note local placement is descriptive in V6 and does not assert a current lease\n",
+    );
+    out
+}
+
 impl ScheduleWhyViewV1 {
     /// Stable, non-executing text form for the focused admission projection.
     pub fn to_text(&self) -> String {
@@ -785,6 +1316,97 @@ impl ScheduleWhyViewV1 {
     }
 }
 
+impl ScheduleWhyViewV2 {
+    /// Stable, non-executing text form for the explicit Admission V6 view.
+    pub fn to_text(&self) -> String {
+        let mut out = format!("; ExecutionAdmissionWhy {}\n", self.schema);
+        writeln!(
+            out,
+            "why operation=P{} status=admitted-static inspection-only=yes dispatch=not-run admission-sha256={}",
+            self.operation.plan_node.0, self.admission_sha256
+        )
+        .expect("writing to a String cannot fail");
+        writeln!(
+            out,
+            "binding lowered-oir-sha256={} plan-sha256={} analyzed-graph-sha256={}",
+            self.bindings.oir_sha256,
+            self.bindings.plan_sha256,
+            self.bindings.analyzed_graph_sha256
+        )
+        .expect("writing to a String cannot fail");
+        writeln!(
+            out,
+            "binding analyzer-sha256={} evidence-sha256={} admitted-graph-sha256={} admission-sha256={}",
+            self.bindings.analyzer_sha256,
+            self.evidence_sha256,
+            self.admitted_graph_sha256,
+            self.admission_sha256
+        )
+        .expect("writing to a String cannot fail");
+        writeln!(
+            out,
+            "binding backend-catalog-projection-sha256={}",
+            self.bindings.backend_catalog_projection_sha256
+        )
+        .expect("writing to a String cannot fail");
+        writeln!(
+            out,
+            "plan-node P{} kind={}",
+            self.operation.plan_node.0,
+            self.plan_kind.describe()
+        )
+        .expect("writing to a String cannot fail");
+        render_operation_v2(&mut out, &self.operation);
+
+        for witness in &self.blocker_witnesses {
+            render_witness(&mut out, "blocker-witness", witness);
+        }
+        for dependent in &self.dependents {
+            writeln!(out, "dependent operation=P{}", dependent.operation.0)
+                .expect("writing to a String cannot fail");
+            for witness in &dependent.witnesses {
+                render_witness(&mut out, "dependent-witness", witness);
+            }
+        }
+        for sequence in &self.retained_sequences {
+            writeln!(
+                out,
+                "sequence P{} -> P{} retained reason={} token=N{}",
+                sequence.predecessor.0,
+                sequence.successor.0,
+                sequence.reason.name(),
+                sequence.completion.0
+            )
+            .expect("writing to a String cannot fail");
+        }
+        writeln!(
+            out,
+            "wave index={} operations=[{}]",
+            self.wave_index,
+            plan_nodes_text(&self.wave)
+        )
+        .expect("writing to a String cannot fail");
+        if let Some((index, operations)) = &self.hosted_task_layer {
+            writeln!(
+                out,
+                "hosted-task-layer index={} operations=[{}]",
+                index,
+                plan_nodes_text(operations)
+            )
+            .expect("writing to a String cannot fail");
+        } else {
+            out.push_str("hosted-task-layer none\n");
+        }
+        out.push_str(
+            "why-note this V2 view is derived from explicit Admission V6 and does not dispatch the program\n",
+        );
+        out.push_str(
+            "why-note blockers and waves describe admitted static readiness, not observed execution, timing, worker identity, or overlap\n",
+        );
+        out
+    }
+}
+
 fn render_operation(out: &mut String, operation: &AdmittedOperationV1) {
     let evidence = &operation.evidence;
     writeln!(
@@ -801,6 +1423,103 @@ fn render_operation(out: &mut String, operation: &AdmittedOperationV1) {
         evidence.type_contract.output_domain_bits,
         evidence.type_contract.output_representation_bits,
         evidence.type_contract.output_fidelity
+    )
+    .expect("writing to a String cannot fail");
+    writeln!(
+        out,
+        "  dispatch lane={} adapter={} semantics={} preparation={}",
+        evidence.dispatch_contract.lane.name(),
+        evidence.dispatch_contract.adapter.name(),
+        evidence.dispatch_contract.semantics.name(),
+        if evidence.dispatch_contract.send_only_preparation {
+            "deferred-materialized-input-check"
+        } else {
+            "coordinator-owned"
+        }
+    )
+    .expect("writing to a String cannot fail");
+    writeln!(
+        out,
+        "  effects provenance={} closed={} failure={} reads=[{}] writes=[{}]",
+        evidence.effect_contract.provenance.name(),
+        yes_no(evidence.effect_contract.footprint_closed),
+        evidence.failure_contract.class.name(),
+        resources_text(&evidence.effect_contract.reads),
+        resources_text(&evidence.effect_contract.writes)
+    )
+    .expect("writing to a String cannot fail");
+    writeln!(
+        out,
+        "  capability={} provenance={} placement={} provenance={}",
+        evidence.capability_disposition.name(),
+        evidence.capability_provenance.name(),
+        evidence.placement.name(),
+        evidence.placement_provenance.name()
+    )
+    .expect("writing to a String cannot fail");
+    writeln!(
+        out,
+        "  demand cpu={} memory={} file-descriptors={} process-slots={} provenance={} cost={} cost-provenance={}",
+        optional_number(evidence.resource_demand.cpu_units),
+        optional_number(evidence.resource_demand.hard_memory_bytes),
+        optional_number(evidence.resource_demand.file_descriptors),
+        optional_number(evidence.resource_demand.process_slots),
+        evidence.resource_demand.provenance.name(),
+        optional_number(evidence.cost_estimate.expected_duration_micros),
+        evidence.cost_estimate.provenance.name()
+    )
+    .expect("writing to a String cannot fail");
+    let facts = AdmissionFactKind::ALL
+        .iter()
+        .map(|fact| format!("{}:{}", fact.name(), evidence.provenance_for(*fact).name()))
+        .collect::<Vec<_>>()
+        .join(",");
+    writeln!(out, "  evidence-inputs=[{facts}]").expect("writing to a String cannot fail");
+    let blockers = operation
+        .blockers
+        .iter()
+        .map(|blocker| {
+            format!(
+                "P{}:{}",
+                blocker.predecessor.0,
+                blocker
+                    .reasons
+                    .iter()
+                    .map(BlockerReasonV1::label)
+                    .collect::<Vec<_>>()
+                    .join("+")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    writeln!(out, "  blockers=[{blockers}]").expect("writing to a String cannot fail");
+}
+
+fn render_operation_v2(out: &mut String, operation: &AdmittedOperationV2) {
+    let evidence = &operation.evidence;
+    let fidelity = evidence
+        .type_contract
+        .output_fidelity_assessment
+        .as_ref()
+        .map(|assessment| {
+            serde_json::to_string(assessment)
+                .expect("serializing FidelityAssessmentV2 into memory cannot fail")
+        })
+        .unwrap_or_else(|| "absent".to_string());
+    writeln!(
+        out,
+        "operation P{} admitted=yes ordinal={}",
+        operation.plan_node.0, operation.ordinal
+    )
+    .expect("writing to a String cannot fail");
+    writeln!(
+        out,
+        "  type constraints-solved={} provenance={} domain-bounds=0x{:04x} representation-bounds=0x{:04x} fidelity-assessment={}",
+        yes_no(evidence.type_contract.constraints_solved),
+        evidence.type_contract.provenance.name(),
+        evidence.type_contract.output_domain_bits,
+        evidence.type_contract.output_representation_bits,
+        fidelity
     )
     .expect("writing to a String cannot fail");
     writeln!(
@@ -930,30 +1649,38 @@ fn resolve_worker_count(
         .unwrap_or_else(|| std::cmp::min(available_parallelism, admitted_max_wave_width).max(1))
 }
 
-/// Frozen authority boundary consumed by the coordinator. Its fields and
-/// constructor are private; the only route from a solved graph to execution is
-/// the digest-checking admission compiler below.
-pub struct AdmittedExecution<'a> {
+/// Archival V5 admission result retained for inspection and compatibility
+/// verification. The package-0.3 coordinator does not accept this type.
+pub struct AdmittedExecutionV5<'a> {
+    program: &'a OIrProgram,
+    plan: &'a ExecutionPlan,
+    graph: HGraph,
+    admission: ExecutionAdmissionV5,
+}
+
+/// Current Admission V6 authority consumed by the coordinator and evaluator.
+pub struct AdmittedExecutionV6<'a> {
     program: &'a OIrProgram,
     plan: &'a ExecutionPlan,
     graph: HGraph,
     runtime: RuntimeBindingV1,
-    admission: ExecutionAdmissionV5,
+    admission: ExecutionAdmissionV6,
 }
 
-/// Owned half of an admitted execution used when a caller must retain exact
-/// admission authority across an external authorization round trip.  The
-/// lowered program and plan deliberately live with the caller: storing their
-/// references here would make the resulting object self-referential.  The
-/// only reconstruction path revalidates those owned sources before yielding
-/// the short-lived borrowed [`AdmittedExecution`] consumed by the runtime.
-pub(crate) struct PreparedAdmissionPartsV1 {
+/// Current execution authority. There is deliberately no conversion from the
+/// archival V5 authority; callers must analyze and admit fresh V6 evidence.
+pub type AdmittedExecution<'a> = AdmittedExecutionV6<'a>;
+
+/// Owned V6 authority retained across a placement authorization round trip.
+/// This is structurally separate from V1 so archival fragments cannot be
+/// relabeled or rebound into current execution.
+pub(crate) struct PreparedAdmissionPartsV2 {
     graph: HGraph,
     runtime: RuntimeBindingV1,
-    admission: ExecutionAdmissionV5,
+    admission: ExecutionAdmissionV6,
 }
 
-impl<'a> AdmittedExecution<'a> {
+impl<'a> AdmittedExecutionV5<'a> {
     pub fn program(&self) -> &'a OIrProgram {
         self.program
     }
@@ -968,64 +1695,6 @@ impl<'a> AdmittedExecution<'a> {
 
     pub fn admission(&self) -> &ExecutionAdmissionV5 {
         &self.admission
-    }
-
-    pub(crate) fn into_prepared_parts(self) -> PreparedAdmissionPartsV1 {
-        PreparedAdmissionPartsV1 {
-            graph: self.graph,
-            runtime: self.runtime,
-            admission: self.admission,
-        }
-    }
-
-    /// Return the process-local executable launch authority retained by this
-    /// admission. Inspection admissions intentionally have no such authority.
-    pub(crate) fn executable_leases(&self) -> Result<Arc<ExecutableLeaseSet>> {
-        self.runtime.executable_leases().context(
-            "execution admission carries no executable leases (inspection-only runtime snapshot)",
-        )
-    }
-
-    /// Conservative generation identity for a backend process launch. It
-    /// binds that backend's selected direct executable set, consumed legacy
-    /// shim artifact rows, and the complete admitted environment snapshot.
-    /// Persistent actors use this digest to prevent reuse across any of those
-    /// launch-context changes.
-    pub(crate) fn backend_launch_generation_sha256(&self, backend: &str) -> Result<String> {
-        let leases = self.executable_leases()?;
-        let executable_set = leases.backend_executable_set_sha256(backend)?;
-        let mut fields = vec![executable_set, self.runtime.launch_context_sha256()];
-        for artifact in self
-            .runtime
-            .backend_artifacts()
-            .iter()
-            .filter(|artifact| artifact.canonical_backend == backend)
-        {
-            fields.push(artifact.resolved_identity.as_str());
-            fields.push(artifact.state.name());
-            fields.push(artifact.state.sha256().unwrap_or("none"));
-        }
-        Ok(digest_fields(
-            "ostadix-backend-launch-generation/v1",
-            &fields,
-        ))
-    }
-
-    /// Recheck mutable legacy-shim/environment context without re-resolving or
-    /// re-hashing direct executables. The retained lease set owns direct-launch
-    /// freshness and is verified separately at each backend spawn.
-    pub(crate) fn verify_runtime_context(
-        &self,
-        shim_dir: &Path,
-        context: &[(&str, &str)],
-    ) -> Result<()> {
-        let current = super::analyze::runtime_binding_from_directory_reusing_executables(
-            self.plan,
-            shim_dir,
-            context,
-            self.runtime.executable_manifest.clone(),
-        );
-        self.verify_runtime(&current)
     }
 
     /// Project one canonical plan operation and its immediate admitted
@@ -1137,86 +1806,259 @@ impl<'a> AdmittedExecution<'a> {
             hosted_task_layer,
         })
     }
+}
+
+impl<'a> AdmittedExecutionV6<'a> {
+    pub fn program(&self) -> &'a OIrProgram {
+        self.program
+    }
+
+    pub fn plan(&self) -> &'a ExecutionPlan {
+        self.plan
+    }
+
+    pub fn graph(&self) -> &HGraph {
+        &self.graph
+    }
+
+    pub fn runtime(&self) -> &RuntimeBindingV1 {
+        &self.runtime
+    }
+
+    pub fn admission(&self) -> &ExecutionAdmissionV6 {
+        &self.admission
+    }
+
+    pub(crate) fn into_prepared_parts(self) -> PreparedAdmissionPartsV2 {
+        PreparedAdmissionPartsV2 {
+            graph: self.graph,
+            runtime: self.runtime,
+            admission: self.admission,
+        }
+    }
+
+    /// Return the process-local executable launch authority retained by this
+    /// V6 admission. Inspection admissions intentionally have no authority.
+    pub(crate) fn executable_leases(&self) -> Result<Arc<ExecutableLeaseSet>> {
+        self.runtime.executable_leases().context(
+            "execution admission carries no executable leases (inspection-only runtime snapshot)",
+        )
+    }
+
+    pub(crate) fn backend_launch_generation_sha256(&self, backend: &str) -> Result<String> {
+        let leases = self.executable_leases()?;
+        let executable_set = leases.backend_executable_set_sha256(backend)?;
+        let mut fields = vec![executable_set, self.runtime.launch_context_sha256()];
+        for artifact in self
+            .runtime
+            .backend_artifacts()
+            .iter()
+            .filter(|artifact| artifact.canonical_backend == backend)
+        {
+            fields.push(artifact.resolved_identity.as_str());
+            fields.push(artifact.state.name());
+            fields.push(artifact.state.sha256().unwrap_or("none"));
+        }
+        Ok(digest_fields(
+            "ostadix-backend-launch-generation/v1",
+            &fields,
+        ))
+    }
+
+    pub(crate) fn verify_runtime_context(
+        &self,
+        shim_dir: &Path,
+        context: &[(&str, &str)],
+    ) -> Result<()> {
+        let current = super::analyze::runtime_binding_from_directory_reusing_executables(
+            self.plan,
+            shim_dir,
+            context,
+            self.runtime.executable_manifest.clone(),
+        );
+        self.verify_runtime(&current)
+    }
+
+    /// Project one canonical plan operation and its immediate admitted
+    /// dependency neighborhood without dispatching any work.
+    pub fn schedule_why(&self, target: PlanNodeId) -> Result<ScheduleWhyViewV2> {
+        let Some(plan_node) = self
+            .plan
+            .nodes
+            .get(target.0)
+            .filter(|node| node.id == target)
+        else {
+            if self.plan.nodes.is_empty() {
+                bail!("cannot explain P{}: the ExecutionPlan is empty", target.0);
+            }
+            bail!(
+                "cannot explain P{}: the ExecutionPlan contains {} nodes (valid range P0..P{})",
+                target.0,
+                self.plan.nodes.len(),
+                self.plan.nodes.len() - 1
+            );
+        };
+        let operation = self
+            .admission
+            .operations
+            .iter()
+            .find(|operation| operation.plan_node == target)
+            .cloned()
+            .with_context(|| {
+                format!(
+                    "P{} exists in the ExecutionPlan as `{}` but is not an admitted executable operation",
+                    target.0,
+                    plan_node.kind.describe()
+                )
+            })?;
+
+        let producer_by_edge = self
+            .graph
+            .op_map
+            .values()
+            .map(|operation| (operation.edge, operation.plan_node))
+            .collect::<BTreeMap<_, _>>();
+        let sequences = self
+            .graph
+            .sequence_dependencies
+            .iter()
+            .map(|dependency| (dependency.predecessor, dependency.successor))
+            .collect::<BTreeSet<_>>();
+        let blocker_witnesses =
+            schedule_why_witnesses(&self.graph, target, &producer_by_edge, &sequences)?;
+
+        let mut dependents = Vec::new();
+        for candidate in self.graph.exec_ops_ordered() {
+            if candidate.plan_node == target {
+                continue;
+            }
+            let witnesses = schedule_why_witnesses(
+                &self.graph,
+                candidate.plan_node,
+                &producer_by_edge,
+                &sequences,
+            )?
+            .into_iter()
+            .filter(|witness| witness.predecessor == target)
+            .collect::<Vec<_>>();
+            if !witnesses.is_empty() {
+                dependents.push(ScheduleWhyDependentV1 {
+                    operation: candidate.plan_node,
+                    witnesses,
+                });
+            }
+        }
+
+        let retained_sequences = self
+            .admission
+            .retained_sequences
+            .iter()
+            .filter(|sequence| sequence.predecessor == target || sequence.successor == target)
+            .cloned()
+            .collect::<Vec<_>>();
+        let (wave_index, wave) = self
+            .admission
+            .waves
+            .iter()
+            .enumerate()
+            .find(|(_, wave)| wave.contains(&target))
+            .map(|(index, wave)| (index, wave.clone()))
+            .with_context(|| format!("admission static waves omit operation P{}", target.0))?;
+        let hosted_task_layer = self
+            .admission
+            .hosted_task_layers
+            .iter()
+            .enumerate()
+            .find(|(_, layer)| layer.contains(&target))
+            .map(|(index, layer)| (index + 1, layer.clone()));
+
+        Ok(ScheduleWhyViewV2 {
+            schema: SCHEDULE_WHY_SCHEMA_V2,
+            bindings: self.admission.bindings.clone(),
+            evidence_sha256: self.admission.evidence_sha256.clone(),
+            admitted_graph_sha256: self.admission.admitted_graph_sha256.clone(),
+            admission_sha256: self.admission.admission_sha256.clone(),
+            plan_kind: plan_node.kind.clone(),
+            operation,
+            blocker_witnesses,
+            dependents,
+            retained_sequences,
+            wave_index,
+            wave,
+            hosted_task_layer,
+        })
+    }
 
     pub(crate) fn verify_runtime(&self, current: &RuntimeBindingV1) -> Result<()> {
-        let mut changed = Vec::new();
-        let snapshot_kind_changed = self.runtime.snapshot_kind != current.snapshot_kind;
-        let backend_artifacts_changed = self.runtime.backend_artifacts != current.backend_artifacts;
-        let executable_manifest_changed =
-            self.runtime.executable_manifest != current.executable_manifest;
-        let backend_set_changed = self.runtime.backend_set_sha256 != current.backend_set_sha256;
-        let launch_context_changed =
-            self.runtime.launch_context_sha256 != current.launch_context_sha256;
-        let environment_changed = self.runtime.environment_sha256 != current.environment_sha256;
-
-        if snapshot_kind_changed {
-            changed.push("snapshot kind");
-        }
-        if backend_artifacts_changed {
-            changed.push("backend artifacts");
-        }
-        if executable_manifest_changed {
-            changed.push("direct executable manifest");
-        }
-        if self.runtime.backend_catalog_projection_sha256
-            != current.backend_catalog_projection_sha256
-        {
-            changed.push("backend catalog projection digest");
-        }
-        // Report the earliest changed source in each deterministic digest
-        // chain. A changed artifact necessarily changes backend-set,
-        // environment, and ambient-World digests; repeating every downstream
-        // consequence obscures the actionable freshness failure.
-        if !backend_artifacts_changed && backend_set_changed {
-            changed.push("backend-set digest");
-        }
-        if launch_context_changed {
-            changed.push("backend launch context digest");
-        }
-        if !snapshot_kind_changed
-            && !backend_set_changed
-            && !launch_context_changed
-            && environment_changed
-        {
-            changed.push("environment digest");
-        }
-        if !environment_changed && self.runtime.ambient_world_sha256 != current.ambient_world_sha256
-        {
-            changed.push("ambient World digest");
-        }
-        if !changed.is_empty() {
-            bail!(
-                "execution admission runtime binding is stale; changed components: {}",
-                changed.join(", ")
-            );
-        }
-        Ok(())
+        verify_runtime_binding(&self.runtime, current)
     }
 }
 
-impl PreparedAdmissionPartsV1 {
-    /// Reconstruct the runtime authority view without re-analysis or
-    /// re-admission.  The inputs are borrowed only for the lifetime of the
-    /// returned value and must reproduce the exact canonical bindings sealed
-    /// at preparation time.
+fn verify_runtime_binding(runtime: &RuntimeBindingV1, current: &RuntimeBindingV1) -> Result<()> {
+    let mut changed = Vec::new();
+    let snapshot_kind_changed = runtime.snapshot_kind != current.snapshot_kind;
+    let backend_artifacts_changed = runtime.backend_artifacts != current.backend_artifacts;
+    let executable_manifest_changed = runtime.executable_manifest != current.executable_manifest;
+    let backend_set_changed = runtime.backend_set_sha256 != current.backend_set_sha256;
+    let launch_context_changed = runtime.launch_context_sha256 != current.launch_context_sha256;
+    let environment_changed = runtime.environment_sha256 != current.environment_sha256;
+
+    if snapshot_kind_changed {
+        changed.push("snapshot kind");
+    }
+    if backend_artifacts_changed {
+        changed.push("backend artifacts");
+    }
+    if executable_manifest_changed {
+        changed.push("direct executable manifest");
+    }
+    if runtime.backend_catalog_projection_sha256 != current.backend_catalog_projection_sha256 {
+        changed.push("backend catalog projection digest");
+    }
+    if !backend_artifacts_changed && backend_set_changed {
+        changed.push("backend-set digest");
+    }
+    if launch_context_changed {
+        changed.push("backend launch context digest");
+    }
+    if !snapshot_kind_changed
+        && !backend_set_changed
+        && !launch_context_changed
+        && environment_changed
+    {
+        changed.push("environment digest");
+    }
+    if !environment_changed && runtime.ambient_world_sha256 != current.ambient_world_sha256 {
+        changed.push("ambient World digest");
+    }
+    if !changed.is_empty() {
+        bail!(
+            "execution admission runtime binding is stale; changed components: {}",
+            changed.join(", ")
+        );
+    }
+    Ok(())
+}
+
+impl PreparedAdmissionPartsV2 {
     pub(crate) fn bind<'a>(
         self,
         program: &'a OIrProgram,
         plan: &'a ExecutionPlan,
-    ) -> Result<AdmittedExecution<'a>> {
+    ) -> Result<AdmittedExecutionV6<'a>> {
         if plan != &program.plan() {
             bail!(
-                "prepared execution requires the canonical ExecutionPlan derived from its exact lowered OIR"
+                "prepared V6 execution requires the canonical ExecutionPlan derived from its exact lowered OIR"
             );
         }
         self.graph
             .validate_execution_source(program, plan)
             .map_err(anyhow::Error::msg)
-            .context("prepared execution rejected OIR/plan/HGraph provenance")?;
+            .context("prepared V6 execution rejected OIR/plan/HGraph provenance")?;
         let plan_sha256 = hex::encode(Sha256::digest(plan.to_text().as_bytes()));
         if self.admission.bindings.oir_sha256 != oir_sha256(program)
             || self.admission.bindings.plan_sha256 != plan_sha256
-            || self.admission.admitted_graph_sha256 != graph_sha256(&self.graph)
+            || self.admission.admitted_graph_sha256 != graph_sha256_v2(&self.graph)
             || self.admission.bindings.backend_catalog_projection_sha256
                 != self.runtime.backend_catalog_projection_sha256()
             || self.admission.bindings.backend_set_sha256 != self.runtime.backend_set_sha256()
@@ -1227,16 +2069,16 @@ impl PreparedAdmissionPartsV1 {
             || self.admission.bindings.ambient_world_sha256 != self.runtime.ambient_world_sha256()
         {
             bail!(
-                "prepared execution binding mismatch: lowered OIR, plan, graph, catalog, runtime, or environment changed"
+                "prepared V6 execution binding mismatch: lowered OIR, plan, Graph V2, catalog, runtime, or environment changed"
             );
         }
         if self.admission.runtime_snapshot_kind != self.runtime.snapshot_kind()
             || self.admission.backend_artifacts != self.runtime.backend_artifacts()
             || self.admission.executable_manifest != *self.runtime.executable_manifest()
         {
-            bail!("prepared execution runtime authority no longer matches its admission");
+            bail!("prepared V6 execution runtime authority no longer matches its admission");
         }
-        Ok(AdmittedExecution {
+        Ok(AdmittedExecutionV6 {
             program,
             plan,
             graph: self.graph,
@@ -1246,16 +2088,17 @@ impl PreparedAdmissionPartsV1 {
     }
 }
 
-/// Compile a solved graph and its exact evidence bundle into the only graph
-/// type accepted by the runtime coordinator.
-pub fn admit_execution<'a>(
+/// Explicit archival V5 admission compiler retained for inspection and
+/// compatibility verification. Its result carries no package-0.3 dispatch or
+/// prepared-placement authority.
+pub fn admit_execution_v5<'a>(
     program: &'a OIrProgram,
     plan: &'a ExecutionPlan,
     mut graph: HGraph,
     base_policy: Policy,
     runtime: RuntimeBindingV1,
     evidence: EvidenceBundleV5,
-) -> Result<AdmittedExecution<'a>> {
+) -> Result<AdmittedExecutionV5<'a>> {
     if plan != &program.plan() {
         bail!(
             "execution admission requires the canonical ExecutionPlan derived from the exact lowered OIR"
@@ -1271,13 +2114,13 @@ pub fn admit_execution<'a>(
     if evidence.runtime != runtime {
         bail!("evidence runtime binding is stale or belongs to another execution context");
     }
-    let expected_bindings = evidence_bindings(program, plan, &graph, &runtime);
+    let expected_bindings = evidence_bindings_v5(program, plan, &graph, &runtime);
     if evidence.bindings != expected_bindings {
         bail!(
             "evidence digest binding mismatch: lowered OIR, plan, graph, backend catalog projection, backend artifacts, environment, or ambient World changed"
         );
     }
-    let baseline = analyze_execution(program, plan, &graph, runtime.clone())
+    let baseline = analyze_execution_v5(program, plan, &graph, runtime.clone())
         .context("admission could not reproduce the trusted analyzer result")?;
     let baseline_by_plan = baseline
         .nodes
@@ -1300,10 +2143,10 @@ pub fn admit_execution<'a>(
         let expected = baseline_by_plan
             .get(plan_node)
             .with_context(|| format!("trusted analyzer omitted operation {}", plan_node.0))?;
-        validate_node_evidence(&graph, plan, flat[plan_node.0], *plan_node, node, expected)?;
+        validate_node_evidence_v1(&graph, plan, flat[plan_node.0], *plan_node, node, expected)?;
     }
 
-    let evidence_sha256 = evidence_bundle_sha256(&evidence);
+    let evidence_sha256 = evidence_bundle_sha256_v5(&evidence);
     for plan_node in expected_operations {
         for fact in AdmissionFactKind::ALL {
             graph
@@ -1315,18 +2158,18 @@ pub fn admit_execution<'a>(
         .validate_admitted_execution_graph()
         .map_err(anyhow::Error::msg)
         .context("admission compiler produced an invalid admitted graph")?;
-    let admitted_graph_sha256 = graph_sha256(&graph);
+    let admitted_graph_sha256 = graph_sha256_v1(&graph);
     let schedule = ReadySchedule::derive(&graph)
         .map_err(anyhow::Error::msg)
         .context("admitted graph has no executable ready schedule")?;
     let waves = schedule.waves().map_err(anyhow::Error::msg)?;
     let hosted_task_layers = explain_hosted_task_layers(plan, &schedule, &waves)?;
-    let operations = explain_operations(&graph, &schedule, &by_plan)?;
+    let operations = explain_operations_v1(&graph, &schedule, &by_plan)?;
     let retained_sequences = explain_sequences(plan, &graph);
     let placement_admission =
-        placement_admission_digest(&expected_bindings, &admitted_graph_sha256, base_policy);
+        placement_admission_digest_v1(&expected_bindings, &admitted_graph_sha256, base_policy);
     let admission_sha256 = digest_fields(
-        "ostadix-execution-admission/v5",
+        EXECUTION_ADMISSION_DIGEST_DOMAIN_V5,
         &[&evidence_sha256, &admitted_graph_sha256, base_policy.name()],
     );
 
@@ -1347,7 +2190,150 @@ pub fn admit_execution<'a>(
         waves,
         hosted_task_layers,
     };
-    Ok(AdmittedExecution {
+    Ok(AdmittedExecutionV5 {
+        program,
+        plan,
+        graph,
+        admission,
+    })
+}
+
+/// Current admission surface. Package 0.3 requires freshly analyzed Evidence
+/// V6 and yields Graph V2-bound Admission V6 authority.
+pub fn admit_execution<'a>(
+    program: &'a OIrProgram,
+    plan: &'a ExecutionPlan,
+    graph: HGraph,
+    base_policy: Policy,
+    runtime: RuntimeBindingV1,
+    evidence: EvidenceBundleV6,
+) -> Result<AdmittedExecutionV6<'a>> {
+    admit_execution_v6(program, plan, graph, base_policy, runtime, evidence)
+}
+
+/// Compile freshly analyzed Evidence V6 into current Admission V6 authority.
+///
+/// V5 evidence cannot be silently uplifted:
+///
+/// ```compile_fail
+/// use o_lang::evidence::{
+///     admit_execution_v6, AdmittedExecutionV6, EvidenceBundleV5, RuntimeBindingV1,
+/// };
+/// use o_lang::execution_contract::Policy;
+/// use o_lang::hgraph::HGraph;
+/// use o_lang::ir::{ExecutionPlan, OIrProgram};
+///
+/// fn forbidden_uplift<'a>(
+///     program: &'a OIrProgram,
+///     plan: &'a ExecutionPlan,
+///     graph: HGraph,
+///     policy: Policy,
+///     runtime: RuntimeBindingV1,
+///     evidence_v5: EvidenceBundleV5,
+/// ) -> anyhow::Result<AdmittedExecutionV6<'a>> {
+///     admit_execution_v6(program, plan, graph, policy, runtime, evidence_v5)
+/// }
+/// ```
+pub fn admit_execution_v6<'a>(
+    program: &'a OIrProgram,
+    plan: &'a ExecutionPlan,
+    mut graph: HGraph,
+    base_policy: Policy,
+    runtime: RuntimeBindingV1,
+    evidence: EvidenceBundleV6,
+) -> Result<AdmittedExecutionV6<'a>> {
+    if plan != &program.plan() {
+        bail!(
+            "execution admission V6 requires the canonical ExecutionPlan derived from the exact lowered OIR"
+        );
+    }
+    graph
+        .validate_execution_source(program, plan)
+        .map_err(anyhow::Error::msg)
+        .context("admission V6 rejected OIR/plan/HGraph provenance")?;
+    if evidence.schema != EVIDENCE_SCHEMA_V6 || evidence.analyzer != ANALYZER_ID_V6 {
+        bail!("unsupported or untrusted Evidence V6 bundle schema/analyzer");
+    }
+    if evidence.runtime != runtime {
+        bail!("Evidence V6 runtime binding is stale or belongs to another execution context");
+    }
+    let expected_bindings = evidence_bindings_v6(program, plan, &graph, &runtime);
+    if evidence.bindings != expected_bindings {
+        bail!(
+            "Evidence V6 digest binding mismatch: lowered OIR, plan, Graph V2, backend catalog projection, backend artifacts, environment, or ambient World changed"
+        );
+    }
+    let baseline = analyze_execution_v6(program, plan, &graph, runtime.clone())
+        .context("Admission V6 could not reproduce the trusted analyzer result")?;
+    let baseline_by_plan = baseline
+        .nodes
+        .iter()
+        .map(|node| (node.plan_node, node))
+        .collect::<BTreeMap<_, _>>();
+
+    let mut by_plan = BTreeMap::new();
+    for node in &evidence.nodes {
+        if by_plan.insert(node.plan_node, node).is_some() {
+            bail!("Evidence V6 repeats operation {}", node.plan_node.0);
+        }
+    }
+    let expected_operations = graph.op_map.keys().copied().collect::<BTreeSet<_>>();
+    if by_plan.keys().copied().collect::<BTreeSet<_>>() != expected_operations {
+        bail!("Evidence V6 operation inventory does not match the executable graph");
+    }
+    let flat = program.flatten_for_plan();
+    for (plan_node, node) in &by_plan {
+        let expected = baseline_by_plan
+            .get(plan_node)
+            .with_context(|| format!("trusted V6 analyzer omitted operation {}", plan_node.0))?;
+        validate_node_evidence_v2(&graph, plan, flat[plan_node.0], *plan_node, node, expected)?;
+    }
+
+    let evidence_sha256 = evidence_bundle_sha256_v6(&evidence);
+    for plan_node in expected_operations {
+        for fact in AdmissionFactKind::ALL {
+            graph
+                .add_admission_evidence_input(plan_node, fact)
+                .map_err(anyhow::Error::msg)?;
+        }
+    }
+    graph
+        .validate_admitted_execution_graph()
+        .map_err(anyhow::Error::msg)
+        .context("Admission V6 compiler produced an invalid admitted graph")?;
+    let admitted_graph_sha256 = graph_sha256_v2(&graph);
+    let schedule = ReadySchedule::derive(&graph)
+        .map_err(anyhow::Error::msg)
+        .context("Admission V6 graph has no executable ready schedule")?;
+    let waves = schedule.waves().map_err(anyhow::Error::msg)?;
+    let hosted_task_layers = explain_hosted_task_layers(plan, &schedule, &waves)?;
+    let operations = explain_operations_v2(&graph, &schedule, &by_plan)?;
+    let retained_sequences = explain_sequences(plan, &graph);
+    let placement_admission =
+        placement_admission_digest_v2(&expected_bindings, &admitted_graph_sha256, base_policy);
+    let admission_sha256 = digest_fields(
+        EXECUTION_ADMISSION_DIGEST_DOMAIN_V6,
+        &[&evidence_sha256, &admitted_graph_sha256, base_policy.name()],
+    );
+
+    let admission = ExecutionAdmissionV6 {
+        schema: ADMISSION_SCHEMA_V6,
+        bindings: expected_bindings,
+        analyzer: ANALYZER_ID_V6,
+        runtime_snapshot_kind: runtime.snapshot_kind(),
+        backend_artifacts: runtime.backend_artifacts().to_vec(),
+        executable_manifest: runtime.executable_manifest().clone(),
+        evidence_sha256,
+        admitted_graph_sha256,
+        placement_admission,
+        admission_sha256,
+        base_policy,
+        operations,
+        retained_sequences,
+        waves,
+        hosted_task_layers,
+    };
+    Ok(AdmittedExecutionV6 {
         program,
         plan,
         graph,
@@ -1356,7 +2342,7 @@ pub fn admit_execution<'a>(
     })
 }
 
-fn placement_admission_digest(
+fn placement_admission_digest_v1(
     bindings: &EvidenceBindingsV2,
     admitted_graph_sha256: &str,
     base_policy: Policy,
@@ -1378,13 +2364,36 @@ fn placement_admission_digest(
         .expect("canonical placement admission hashing always yields lowercase SHA-256")
 }
 
-fn validate_node_evidence(
+fn placement_admission_digest_v2(
+    bindings: &EvidenceBindingsV2,
+    admitted_graph_sha256: &str,
+    base_policy: Policy,
+) -> SemanticDigestV1 {
+    let digest = digest_fields(
+        PLACEMENT_ADMISSION_DIGEST_DOMAIN_V2,
+        &[
+            ADMISSION_SCHEMA_V6,
+            EVIDENCE_SCHEMA_V6,
+            ANALYZER_ID_V6,
+            &bindings.oir_sha256,
+            &bindings.plan_sha256,
+            &bindings.analyzed_graph_sha256,
+            admitted_graph_sha256,
+            &bindings.backend_catalog_projection_sha256,
+            base_policy.name(),
+        ],
+    );
+    SemanticDigestV1::from_sha256(digest)
+        .expect("canonical placement admission V2 hashing always yields lowercase SHA-256")
+}
+
+fn validate_node_evidence_v1(
     graph: &HGraph,
     plan: &ExecutionPlan,
     oir: &crate::ir::OIr,
     plan_node: PlanNodeId,
-    evidence: &NodeEvidence,
-    expected: &NodeEvidence,
+    evidence: &NodeEvidenceV1,
+    expected: &NodeEvidenceV1,
 ) -> Result<()> {
     if evidence.type_contract != expected.type_contract
         || evidence.effect_contract != expected.effect_contract
@@ -1473,11 +2482,11 @@ fn validate_node_evidence(
                 || !((strict_semantics
                     && (summary.is_verified_pure_infallible()
                         || evidence.failure_contract.class
-                            == crate::evidence::FailureClassV1::MayFailNoExternalEffects))
+                            == FailureClassV1::MayFailNoExternalEffects))
                     || (explicitly_autonomous_shim
                         && autonomous_semantics
                         && evidence.failure_contract.class
-                            == crate::evidence::FailureClassV1::MayFailUnorderedExternalEffects))
+                            == FailureClassV1::MayFailUnorderedExternalEffects))
             {
                 bail!(
                     "operation {} has an unsafe worker dispatch claim",
@@ -1505,6 +2514,134 @@ fn validate_node_evidence(
     Ok(())
 }
 
+fn validate_node_evidence_v2(
+    graph: &HGraph,
+    plan: &ExecutionPlan,
+    oir: &crate::ir::OIr,
+    plan_node: PlanNodeId,
+    evidence: &NodeEvidenceV2,
+    expected: &NodeEvidenceV2,
+) -> Result<()> {
+    if evidence.type_contract != expected.type_contract
+        || evidence.effect_contract != expected.effect_contract
+        || evidence.dispatch_contract != expected.dispatch_contract
+        || evidence.capability_disposition != expected.capability_disposition
+        || evidence.capability_provenance != expected.capability_provenance
+        || evidence.placement != expected.placement
+        || evidence.placement_provenance != expected.placement_provenance
+        || evidence.failure_contract != expected.failure_contract
+        || evidence.resource_demand != expected.resource_demand
+    {
+        bail!(
+            "operation {} hard Evidence V6 differs from the trusted analyzer result",
+            plan_node.0
+        );
+    }
+    if !evidence.type_contract.constraints_solved {
+        bail!("operation {} lacks solved type constraints", plan_node.0);
+    }
+    let output = graph
+        .node(
+            graph
+                .op_for(plan_node)
+                .expect("inventory checked")
+                .value_output,
+        )
+        .expect("validated graph output exists");
+    if evidence.type_contract.output_domain_bits != output.domain.bits()
+        || evidence.type_contract.output_representation_bits != output.rep.bits()
+        || evidence.type_contract.output_fidelity_assessment != output.fidelity_assessment
+    {
+        bail!("operation {} typed fidelity evidence is stale", plan_node.0);
+    }
+    let summary = graph
+        .effect_summary(plan_node)
+        .expect("validated graph effect summary exists");
+    let (reads, writes) = summary.scheduling_accesses();
+    if evidence
+        .effect_contract
+        .reads
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        != reads
+        || evidence
+            .effect_contract
+            .writes
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            != writes
+    {
+        bail!("operation {} effect evidence is stale", plan_node.0);
+    }
+    if summary.unknown && evidence.effect_contract.footprint_closed {
+        bail!(
+            "operation {} cannot close an unknown effect footprint",
+            plan_node.0
+        );
+    }
+    if evidence.effect_contract.footprint_closed
+        && !evidence
+            .effect_contract
+            .provenance
+            .may_close_unknown_effect()
+    {
+        bail!(
+            "operation {} effect provenance cannot close a footprint",
+            plan_node.0
+        );
+    }
+    match evidence.dispatch_contract.lane {
+        DispatchLaneV1::LocalWorker => {
+            let explicitly_autonomous_shim = evidence.dispatch_contract.adapter
+                == DispatchAdapterV1::AutonomousEphemeralShimV1
+                && crate::dispatch_model::autonomous_ephemeral_group(plan, plan_node, oir)
+                    .is_some()
+                && summary.unknown
+                && !evidence.effect_contract.footprint_closed;
+            let strict_semantics =
+                evidence.dispatch_contract.semantics == DispatchSemanticsV1::StrictEquivalent;
+            let autonomous_semantics = evidence.dispatch_contract.semantics
+                == DispatchSemanticsV1::ExplicitAutonomousUnordered;
+            if !evidence.dispatch_contract.adapter.is_local_worker()
+                || !evidence.dispatch_contract.send_only_preparation
+                || evidence.placement != PlacementContractV1::LocalWorker
+                || !((strict_semantics
+                    && (summary.is_verified_pure_infallible()
+                        || evidence.failure_contract.class
+                            == FailureClassV1::MayFailNoExternalEffects))
+                    || (explicitly_autonomous_shim
+                        && autonomous_semantics
+                        && evidence.failure_contract.class
+                            == FailureClassV1::MayFailUnorderedExternalEffects))
+            {
+                bail!(
+                    "operation {} has an unsafe worker dispatch claim",
+                    plan_node.0
+                );
+            }
+        }
+        DispatchLaneV1::Coordinator => {
+            if evidence.dispatch_contract.adapter != DispatchAdapterV1::CoordinatorV1
+                || evidence.dispatch_contract.semantics != DispatchSemanticsV1::StrictEquivalent
+                || evidence.dispatch_contract.send_only_preparation
+                || evidence.placement != PlacementContractV1::LocalCoordinator
+            {
+                bail!(
+                    "operation {} has an incoherent coordinator dispatch claim",
+                    plan_node.0
+                );
+            }
+        }
+        _ => bail!(
+            "operation {} selects an execution lane unsupported by Admission V6",
+            plan_node.0
+        ),
+    }
+    Ok(())
+}
+
 /// Project the admitted dependency DAG onto unit-cost shim-backed hosted
 /// operations. Every other operation has zero weight, so structural stores,
 /// groups, schedule controls, and scope loads preserve causality without
@@ -1518,9 +2655,7 @@ fn explain_hosted_task_layers(
         .nodes
         .iter()
         .filter_map(|node| match &node.kind {
-            PlanNodeKind::Exec { backend, .. }
-                if backend.execution == crate::backend_catalog::ExecutionMode::Shim =>
-            {
+            PlanNodeKind::Exec { backend, .. } if backend.execution == ExecutionMode::Shim => {
                 Some(node.id)
             }
             _ => None,
@@ -1578,10 +2713,10 @@ fn explain_hosted_task_layers(
     Ok(result)
 }
 
-fn explain_operations(
+fn explain_operations_v1(
     graph: &HGraph,
     schedule: &ReadySchedule,
-    evidence: &BTreeMap<PlanNodeId, &NodeEvidence>,
+    evidence: &BTreeMap<PlanNodeId, &NodeEvidenceV1>,
 ) -> Result<Vec<AdmittedOperationV1>> {
     let edge_to_index = schedule
         .ops
@@ -1621,6 +2756,62 @@ fn explain_operations(
             evidence: (*evidence
                 .get(&op.plan_node)
                 .with_context(|| format!("missing evidence for operation {}", op.plan_node.0))?)
+            .clone(),
+            blockers: blockers
+                .into_iter()
+                .map(|(predecessor, reasons)| OperationBlockerV1 {
+                    predecessor,
+                    reasons: reasons.into_iter().collect(),
+                })
+                .collect(),
+        });
+    }
+    Ok(operations)
+}
+
+fn explain_operations_v2(
+    graph: &HGraph,
+    schedule: &ReadySchedule,
+    evidence: &BTreeMap<PlanNodeId, &NodeEvidenceV2>,
+) -> Result<Vec<AdmittedOperationV2>> {
+    let edge_to_index = schedule
+        .ops
+        .iter()
+        .enumerate()
+        .map(|(index, op)| (op.edge, index))
+        .collect::<BTreeMap<_, _>>();
+    let sequences = graph
+        .sequence_dependencies
+        .iter()
+        .map(|dependency| (dependency.predecessor, dependency.successor))
+        .collect::<BTreeSet<_>>();
+    let mut operations = Vec::with_capacity(schedule.ops.len());
+    for op in &schedule.ops {
+        let mut blockers: BTreeMap<PlanNodeId, BTreeSet<BlockerReasonV1>> = BTreeMap::new();
+        for input in &op.inputs {
+            let Some(node) = graph.node(*input) else {
+                continue;
+            };
+            let Some(producer_edge) = node.producer else {
+                continue;
+            };
+            let Some(producer_index) = edge_to_index.get(&producer_edge).copied() else {
+                continue;
+            };
+            let predecessor = schedule.ops[producer_index].plan_node;
+            let Some(reasons) =
+                blocker_reasons(graph, &sequences, predecessor, op.plan_node, &node.kind)?
+            else {
+                continue;
+            };
+            blockers.entry(predecessor).or_default().extend(reasons);
+        }
+        operations.push(AdmittedOperationV2 {
+            plan_node: op.plan_node,
+            ordinal: op.ordinal,
+            evidence: (*evidence.get(&op.plan_node).with_context(|| {
+                format!("missing Evidence V6 for operation {}", op.plan_node.0)
+            })?)
             .clone(),
             blockers: blockers
                 .into_iter()
@@ -1772,8 +2963,8 @@ fn sequence_reason(
         || right.unknown
         || !left.writes.is_empty()
         || !right.writes.is_empty()
-        || !matches!(left.fallibility, crate::effects::Fallibility::Infallible)
-        || !matches!(right.fallibility, crate::effects::Fallibility::Infallible)
+        || !matches!(left.fallibility, Fallibility::Infallible)
+        || !matches!(right.fallibility, Fallibility::Infallible)
     {
         return SequenceRetentionReasonV1::StrictFailStopUnproven;
     }
@@ -1789,7 +2980,7 @@ fn inside_left_to_right_region(plan: &ExecutionPlan, node: PlanNodeId) -> bool {
             matches!(
                 kind,
                 PlanNodeKind::Exec { backend, .. }
-                    if backend.execution == crate::backend_catalog::ExecutionMode::InlineAst
+                    if backend.execution == ExecutionMode::InlineAst
                         && backend.canonical == "O"
             )
         })
@@ -1822,7 +3013,8 @@ mod tests {
     use super::*;
     use crate::backend_catalog::BackendRegistry;
     use crate::evidence::{
-        analyze_execution, runtime_binding_from_adapter_bytes, runtime_binding_from_directory,
+        analyze_execution, analyze_execution_v5, analyze_execution_v6,
+        runtime_binding_from_adapter_bytes, runtime_binding_from_directory,
         runtime_binding_from_directory_reusing_executables, BackendArtifactStateV1, CostEstimateV1,
         EvidenceProvenance,
     };
@@ -1831,7 +3023,7 @@ mod tests {
     use crate::hgraph::{DomainFlags, ValueState};
     use crate::ir::{InvokeMode, OIr, OIrProgram, PlanNodeKind};
     use crate::parser::Parser;
-    use crate::value::GroupMode;
+    use crate::value::{FidelityAssessmentV2, GroupMode};
 
     fn reader_writer_program(initial: &str) -> OIrProgram {
         OIrProgram {
@@ -1860,17 +3052,32 @@ mod tests {
         runtime_binding_from_adapter_bytes(plan, &[], &[("evidence-test", label)])
     }
 
-    fn compile_admission(
+    fn compile_admission_v5(
         program: &OIrProgram,
         graph: HGraph,
         policy: Policy,
         runtime: RuntimeBindingV1,
     ) -> ExecutionAdmissionV5 {
         let plan = program.plan();
-        let evidence = analyze_execution(program, &plan, &graph, runtime.clone())
-            .expect("fixture evidence must analyze");
-        admit_execution(program, &plan, graph, policy, runtime, evidence)
-            .expect("fixture evidence must admit")
+        let evidence = analyze_execution_v5(program, &plan, &graph, runtime.clone())
+            .expect("fixture Evidence V5 must analyze");
+        admit_execution_v5(program, &plan, graph, policy, runtime, evidence)
+            .expect("fixture Evidence V5 must admit")
+            .admission()
+            .clone()
+    }
+
+    fn compile_admission_v6(
+        program: &OIrProgram,
+        graph: HGraph,
+        policy: Policy,
+        runtime: RuntimeBindingV1,
+    ) -> ExecutionAdmissionV6 {
+        let plan = program.plan();
+        let evidence = analyze_execution_v6(program, &plan, &graph, runtime.clone())
+            .expect("fixture Evidence V6 must analyze");
+        admit_execution_v6(program, &plan, graph, policy, runtime, evidence)
+            .expect("fixture Evidence V6 must admit")
             .admission()
             .clone()
     }
@@ -1880,7 +3087,7 @@ mod tests {
         Vec<(PlanNodeId, Vec<OperationBlockerV1>)>,
     );
 
-    fn legal_projection(admission: &ExecutionAdmissionV5) -> LegalProjection {
+    fn legal_projection(admission: &ExecutionAdmissionV6) -> LegalProjection {
         (
             admission.waves().to_vec(),
             admission
@@ -1903,12 +3110,12 @@ mod tests {
 
         let evidence_a = analyze_execution(&program, &plan, &graph_a, runtime_a.clone()).unwrap();
         let evidence_b = analyze_execution(&program, &plan, &graph_b, runtime_b.clone()).unwrap();
-        assert_eq!(evidence_a.schema(), EVIDENCE_SCHEMA_V5);
-        assert_eq!(evidence_a.analyzer(), ANALYZER_ID_V5);
+        assert_eq!(evidence_a.schema(), EVIDENCE_SCHEMA_V6);
+        assert_eq!(evidence_a.analyzer(), ANALYZER_ID_V6);
         assert_eq!(evidence_a.bindings(), evidence_b.bindings());
         assert_eq!(
-            evidence_bundle_sha256(&evidence_a),
-            evidence_bundle_sha256(&evidence_b)
+            evidence_bundle_sha256_v6(&evidence_a),
+            evidence_bundle_sha256_v6(&evidence_b)
         );
 
         let admitted_a = admit_execution(
@@ -1939,7 +3146,7 @@ mod tests {
             admitted_b.admission().to_explanation_text()
         );
         let explanation = admitted_a.admission().to_explanation_text();
-        assert!(explanation.starts_with("; ExecutionAdmission oexec.admission/v5\n"));
+        assert!(explanation.starts_with("; ExecutionAdmission oexec.admission/v6\n"));
         assert!(explanation.contains("binding lowered-oir-sha256="));
         assert!(explanation.contains("binding backend-catalog-projection-sha256="));
         assert_eq!(
@@ -1991,9 +3198,9 @@ mod tests {
         );
 
         let admission_a =
-            compile_admission(&program, solved_graph(&program), Policy::Eager, runtime_a);
+            compile_admission_v5(&program, solved_graph(&program), Policy::Eager, runtime_a);
         let admission_b =
-            compile_admission(&program, solved_graph(&program), Policy::Eager, runtime_b);
+            compile_admission_v5(&program, solved_graph(&program), Policy::Eager, runtime_b);
         assert_ne!(
             admission_a.admission_sha256(),
             admission_b.admission_sha256(),
@@ -2005,7 +3212,7 @@ mod tests {
             "placement admission must be portable across process context"
         );
 
-        let lazy = compile_admission(
+        let lazy = compile_admission_v5(
             &program,
             solved_graph(&program),
             Policy::Lazy,
@@ -2019,7 +3226,7 @@ mod tests {
 
         let mut changed_catalog_bindings = admission_a.bindings().clone();
         changed_catalog_bindings.backend_catalog_projection_sha256 = "ab".repeat(32);
-        let changed_catalog = placement_admission_digest(
+        let changed_catalog = placement_admission_digest_v1(
             &changed_catalog_bindings,
             admission_a.admitted_graph_sha256(),
             Policy::Eager,
@@ -2032,7 +3239,7 @@ mod tests {
 
         let mut changed_graph_bindings = admission_a.bindings().clone();
         changed_graph_bindings.analyzed_graph_sha256 = "cd".repeat(32);
-        let changed_analyzed_graph = placement_admission_digest(
+        let changed_analyzed_graph = placement_admission_digest_v1(
             &changed_graph_bindings,
             admission_a.admitted_graph_sha256(),
             Policy::Eager,
@@ -2044,11 +3251,281 @@ mod tests {
         );
 
         let changed_admitted_graph =
-            placement_admission_digest(admission_a.bindings(), &"ef".repeat(32), Policy::Eager);
+            placement_admission_digest_v1(admission_a.bindings(), &"ef".repeat(32), Policy::Eager);
         assert_ne!(
             admission_a.placement_admission(),
             &changed_admitted_graph,
             "admitted HGraph semantics are a placement coordinate"
+        );
+        assert_eq!(admission_a.schema(), ADMISSION_SCHEMA_V5);
+        assert!(admission_a
+            .to_explanation_text()
+            .starts_with("; ExecutionAdmission oexec.admission/v5\n"));
+        let explanation: serde_json::Value = serde_json::from_str(
+            &admission_a
+                .to_explanation_json_with_worker_override(None)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(explanation["schema"], SCHEDULE_EXPLANATION_SCHEMA_V1);
+    }
+
+    #[test]
+    fn current_admission_wrapper_is_exactly_explicit_v6() {
+        let program = reader_writer_program("current-v6");
+        let plan = program.plan();
+        let current_graph = solved_graph(&program);
+        let explicit_graph = solved_graph(&program);
+        let runtime = inspection_runtime(&plan, "current-v6");
+        let evidence = analyze_execution(&program, &plan, &current_graph, runtime.clone()).unwrap();
+        assert_eq!(
+            evidence,
+            analyze_execution_v6(&program, &plan, &explicit_graph, runtime.clone()).unwrap()
+        );
+
+        let current = admit_execution(
+            &program,
+            &plan,
+            current_graph,
+            Policy::Eager,
+            runtime.clone(),
+            evidence.clone(),
+        )
+        .unwrap();
+        let explicit = admit_execution_v6(
+            &program,
+            &plan,
+            explicit_graph,
+            Policy::Eager,
+            runtime,
+            evidence,
+        )
+        .unwrap();
+        assert_eq!(current.admission(), explicit.admission());
+        assert_eq!(
+            graph_sha256_v2(current.graph()),
+            graph_sha256_v2(explicit.graph())
+        );
+        assert_eq!(current.admission().schema(), ADMISSION_SCHEMA_V6);
+    }
+
+    #[test]
+    fn explicit_v6_admits_graph_v2_and_exposes_why_v2_without_dispatch() {
+        let program = reader_writer_program("explicit-v6");
+        let plan = program.plan();
+        let graph = solved_graph(&program);
+        let analyzed_graph_v2 = graph_sha256_v2(&graph);
+        let runtime = inspection_runtime(&plan, "explicit-v6");
+        let evidence = analyze_execution_v6(&program, &plan, &graph, runtime.clone()).unwrap();
+        let admitted = admit_execution_v6(
+            &program,
+            &plan,
+            graph,
+            Policy::Eager,
+            runtime.clone(),
+            evidence,
+        )
+        .unwrap();
+
+        assert_eq!(admitted.admission().schema(), ADMISSION_SCHEMA_V6);
+        assert_eq!(admitted.admission().analyzer(), ANALYZER_ID_V6);
+        assert_eq!(
+            admitted.admission().bindings().analyzed_graph_sha256,
+            analyzed_graph_v2
+        );
+        assert_eq!(
+            admitted.admission().admitted_graph_sha256(),
+            graph_sha256_v2(admitted.graph())
+        );
+        assert_eq!(admitted.runtime(), &runtime);
+        assert_ne!(
+            admitted.admission().bindings().analyzed_graph_sha256,
+            admitted.admission().admitted_graph_sha256(),
+            "materialized admission evidence nodes must change Graph V2 identity"
+        );
+
+        let target = admitted.admission().operations()[0].plan_node;
+        let why = admitted.schedule_why(target).unwrap();
+        assert_eq!(why.schema, SCHEDULE_WHY_SCHEMA_V2);
+        assert_eq!(why.operation.plan_node, target);
+        let text = why.to_text();
+        assert!(text.starts_with("; ExecutionAdmissionWhy oexec.admission-why/v2\n"));
+        assert!(text.contains("fidelity-assessment="));
+        assert!(text.contains("explicit Admission V6 and does not dispatch"));
+    }
+
+    #[test]
+    fn admission_v6_rejects_schema_analyzer_binding_inventory_and_typed_tampering() {
+        let program = reader_writer_program("v6-tamper");
+        let plan = program.plan();
+        let graph = solved_graph(&program);
+        let runtime = inspection_runtime(&plan, "v6-tamper");
+        let evidence = analyze_execution_v6(&program, &plan, &graph, runtime.clone()).unwrap();
+
+        let mut wrong_schema = evidence.clone();
+        wrong_schema.schema = EVIDENCE_SCHEMA_V5;
+        let error = admit_execution_v6(
+            &program,
+            &plan,
+            solved_graph(&program),
+            Policy::Eager,
+            runtime.clone(),
+            wrong_schema,
+        )
+        .err()
+        .expect("Admission V6 must reject a V5 schema token");
+        assert!(error.to_string().contains("schema/analyzer"), "{error:#}");
+
+        let mut wrong_analyzer = evidence.clone();
+        wrong_analyzer.analyzer = ANALYZER_ID_V5;
+        let error = admit_execution_v6(
+            &program,
+            &plan,
+            solved_graph(&program),
+            Policy::Eager,
+            runtime.clone(),
+            wrong_analyzer,
+        )
+        .err()
+        .expect("Admission V6 must reject a V5 analyzer token");
+        assert!(error.to_string().contains("schema/analyzer"), "{error:#}");
+
+        let mut wrong_binding = evidence.clone();
+        wrong_binding.bindings.analyzed_graph_sha256 = "00".repeat(32);
+        let error = admit_execution_v6(
+            &program,
+            &plan,
+            solved_graph(&program),
+            Policy::Eager,
+            runtime.clone(),
+            wrong_binding,
+        )
+        .err()
+        .expect("Admission V6 must reject changed digest bindings");
+        assert!(
+            error.to_string().contains("digest binding mismatch"),
+            "{error:#}"
+        );
+
+        let mut missing_node = evidence.clone();
+        missing_node
+            .nodes
+            .pop()
+            .expect("fixture has Evidence V6 nodes");
+        let error = admit_execution_v6(
+            &program,
+            &plan,
+            solved_graph(&program),
+            Policy::Eager,
+            runtime.clone(),
+            missing_node,
+        )
+        .err()
+        .expect("Admission V6 must reject an incomplete evidence inventory");
+        assert!(
+            error.to_string().contains("operation inventory"),
+            "{error:#}"
+        );
+
+        let mut wrong_assessment = evidence;
+        let assessment = &mut wrong_assessment.nodes[0]
+            .type_contract
+            .output_fidelity_assessment;
+        *assessment = if assessment.is_some() {
+            None
+        } else {
+            Some(FidelityAssessmentV2::Unsupported)
+        };
+        let error = admit_execution_v6(
+            &program,
+            &plan,
+            solved_graph(&program),
+            Policy::Eager,
+            runtime,
+            wrong_assessment,
+        )
+        .err()
+        .expect("Admission V6 must reject changed typed fidelity evidence");
+        assert!(
+            error
+                .to_string()
+                .contains("hard Evidence V6 differs from the trusted analyzer result"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn placement_admission_v2_excludes_process_context_and_binds_v6_coordinates() {
+        assert_eq!(
+            EXECUTION_ADMISSION_DIGEST_DOMAIN_V5,
+            "ostadix-execution-admission/v5"
+        );
+        assert_eq!(
+            EXECUTION_ADMISSION_DIGEST_DOMAIN_V6,
+            "ostadix-execution-admission/v6"
+        );
+        assert_eq!(
+            PLACEMENT_ADMISSION_DIGEST_DOMAIN_V2,
+            "ostadix/placement-admission/v2"
+        );
+
+        let program = reader_writer_program("portable-v6-admission");
+        let plan = program.plan();
+        let runtime_a = inspection_runtime(&plan, "v6-process-a");
+        let runtime_b = inspection_runtime(&plan, "v6-process-b");
+        assert_ne!(
+            runtime_a.launch_context_sha256(),
+            runtime_b.launch_context_sha256()
+        );
+
+        let admission_a =
+            compile_admission_v6(&program, solved_graph(&program), Policy::Eager, runtime_a);
+        let admission_b =
+            compile_admission_v6(&program, solved_graph(&program), Policy::Eager, runtime_b);
+        assert_ne!(
+            admission_a.admission_sha256(),
+            admission_b.admission_sha256()
+        );
+        assert_eq!(
+            admission_a.placement_admission(),
+            admission_b.placement_admission()
+        );
+
+        let lazy = compile_admission_v6(
+            &program,
+            solved_graph(&program),
+            Policy::Lazy,
+            inspection_runtime(&plan, "v6-process-a"),
+        );
+        assert_ne!(
+            admission_a.placement_admission(),
+            lazy.placement_admission()
+        );
+
+        let mut changed_catalog = admission_a.bindings().clone();
+        changed_catalog.backend_catalog_projection_sha256 = "ab".repeat(32);
+        assert_ne!(
+            admission_a.placement_admission(),
+            &placement_admission_digest_v2(
+                &changed_catalog,
+                admission_a.admitted_graph_sha256(),
+                Policy::Eager,
+            )
+        );
+
+        let mut changed_analyzed_graph = admission_a.bindings().clone();
+        changed_analyzed_graph.analyzed_graph_sha256 = "cd".repeat(32);
+        assert_ne!(
+            admission_a.placement_admission(),
+            &placement_admission_digest_v2(
+                &changed_analyzed_graph,
+                admission_a.admitted_graph_sha256(),
+                Policy::Eager,
+            )
+        );
+        assert_ne!(
+            admission_a.placement_admission(),
+            &placement_admission_digest_v2(admission_a.bindings(), &"ef".repeat(32), Policy::Eager,)
         );
     }
 
@@ -2100,8 +3577,8 @@ mod tests {
         let graph = build_program(&program);
         let canonical_solved = solved_graph(&program);
         assert_ne!(
-            graph_sha256(&graph),
-            graph_sha256(&canonical_solved),
+            graph_sha256_v1(&graph),
+            graph_sha256_v1(&canonical_solved),
             "fixture must actually distinguish an unsolved graph from its canonical fixed point"
         );
         let runtime = inspection_runtime(&plan, "unsolved");
@@ -2257,7 +3734,7 @@ mod tests {
         .err()
         .expect("changed solved facts must invalidate admission");
         assert!(
-            format!("{error:#}").contains("evidence digest binding mismatch"),
+            format!("{error:#}").contains("Evidence V6 digest binding mismatch"),
             "{error:#}"
         );
 
@@ -2275,7 +3752,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("evidence runtime binding is stale"),
+                .contains("Evidence V6 runtime binding is stale"),
             "{error:#}"
         );
 
@@ -2324,7 +3801,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("hard evidence differs from the trusted analyzer result"),
+                .contains("hard Evidence V6 differs from the trusted analyzer result"),
             "{error:#}"
         );
     }
@@ -2403,7 +3880,7 @@ mod tests {
             .to_explanation_json_with_worker_override(Some(2))
             .unwrap();
         let explanation_value: serde_json::Value = serde_json::from_str(&explanation_json).unwrap();
-        assert_eq!(explanation_value["schema"], SCHEDULE_EXPLANATION_SCHEMA_V1);
+        assert_eq!(explanation_value["schema"], SCHEDULE_EXPLANATION_SCHEMA_V2);
         assert_eq!(
             explanation_value["admission"]["bindings"]["admission_sha256"],
             admitted.admission().admission_sha256()
@@ -2444,7 +3921,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("hard evidence differs from the trusted analyzer result"),
+                .contains("hard Evidence V6 differs from the trusted analyzer result"),
             "{error:#}"
         );
     }
@@ -2836,7 +4313,7 @@ python^(__oval_result__ = sum(branches))_python
             .expect("fixture must contain a second writer");
 
         let why = admitted.schedule_why(writer).unwrap();
-        assert_eq!(why.schema, SCHEDULE_WHY_SCHEMA_V1);
+        assert_eq!(why.schema, SCHEDULE_WHY_SCHEMA_V2);
         assert_eq!(why.operation.plan_node, writer);
         for reader in &loads {
             let witness = why
@@ -2867,7 +4344,7 @@ python^(__oval_result__ = sum(branches))_python
         }));
 
         let text = why.to_text();
-        assert!(text.contains("; ExecutionAdmissionWhy oexec.admission-why/v1"));
+        assert!(text.contains("; ExecutionAdmissionWhy oexec.admission-why/v2"));
         assert!(text.contains("inspection-only=yes dispatch=not-run"));
         assert!(text.contains("blocker-witness predecessor=P"));
         assert!(text.contains("producer=E"));

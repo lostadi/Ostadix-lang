@@ -1,0 +1,262 @@
+schema_version = 1
+
+# The production library view intentionally excludes crate entrypoints,
+# binary crates, and generated include data. Embedded #[cfg(test)] items are
+# removed by the token-aware checker after these files are enumerated.
+[production]
+source_root = "src"
+crate_root = "src/lib.rs"
+excluded_files = ["src/backend_catalog.inc.rs", "src/lib.rs", "src/main.rs"]
+excluded_directories = ["src/bin"]
+
+# This token fragment is compiled into backend_catalog.rs with include!(). It
+# is scanned under that owning root but is not counted as a standalone module
+# file in the 149-file production-module inventory.
+[[compiled_fragment]]
+path = "src/backend_catalog.inc.rs"
+owner = "backend_catalog"
+included_from = "src/backend_catalog.rs"
+
+# These physical paths are compiled under roots that differ from their
+# conventional on-disk module path. They are part of the dependency identity,
+# not documentation-only aliases.
+[[physical_override]]
+path = "src/placement/protocol"
+kind = "directory"
+module_path = ["placement_protocol"]
+
+[[physical_override]]
+path = "src/world/identity.rs"
+kind = "file"
+module_path = ["resource_identity"]
+
+# Compatibility facades remain real dependency edges through their owner.
+# The checker validates that each owner has a direct edge to its canonical
+# target, while imports through the facade still depend on the owner root.
+[[facade]]
+path = "backend::state"
+kind = "alias"
+source = "src/backend.rs"
+owner = "backend"
+target = "backend_state"
+
+[[facade]]
+path = "placement::protocol"
+kind = "inline_module"
+source = "src/placement/mod.rs"
+owner = "placement"
+target = "placement_protocol"
+
+[[facade]]
+path = "registry::bundle"
+kind = "module"
+source = "src/registry/bundle/mod.rs"
+owner = "registry"
+target = "backend_catalog"
+
+[[facade]]
+path = "world::identity"
+kind = "alias"
+source = "src/world/mod.rs"
+owner = "world"
+target = "resource_identity"
+
+[[root]]
+name = "api"
+layer = 14
+allowed_dependencies = ["backend_morphism", "eval", "evidence", "execution_contract", "hosted_remote", "information_bridge", "parser", "value", "version", "world"]
+
+[[root]]
+name = "backend"
+layer = 9
+allowed_dependencies = ["backend_catalog", "backend_state", "process", "runtime_exec", "value", "wire"]
+
+[[root]]
+name = "backend_catalog"
+layer = 2
+allowed_dependencies = ["placement_protocol", "resource_identity", "syntax_dialect", "value"]
+
+[[root]]
+name = "backend_morphism"
+layer = 3
+allowed_dependencies = ["backend_catalog", "value"]
+
+[[root]]
+name = "backend_state"
+layer = 2
+allowed_dependencies = ["environment", "value", "wire"]
+
+[[root]]
+name = "canonical_cbor"
+layer = 0
+allowed_dependencies = []
+
+[[root]]
+name = "capability"
+layer = 1
+allowed_dependencies = ["value"]
+
+[[root]]
+name = "dispatch_model"
+layer = 5
+allowed_dependencies = ["backend_catalog", "effects", "environment", "ir"]
+
+[[root]]
+name = "effects"
+layer = 4
+allowed_dependencies = ["backend_catalog", "environment", "ir", "resource_identity"]
+
+[[root]]
+name = "environment"
+layer = 0
+allowed_dependencies = []
+
+[[root]]
+name = "eval"
+layer = 11
+allowed_dependencies = ["backend_catalog", "backend_state", "capability", "environment", "eval_core", "evidence", "execution_contract", "executor", "hgraph", "ir", "nix_ops", "nixos_ops", "parser", "placement", "process", "resource_identity", "runtime_exec", "scheduler", "value"]
+
+[[root]]
+name = "eval_core"
+layer = 9
+allowed_dependencies = ["backend_catalog", "capability", "evidence", "execution_contract", "ir", "value"]
+
+[[root]]
+name = "evidence"
+layer = 8
+allowed_dependencies = ["backend_catalog", "dispatch_model", "effects", "execution_contract", "hgraph", "ir", "placement", "runtime_exec", "value"]
+
+[[root]]
+name = "execution_contract"
+layer = 5
+allowed_dependencies = ["backend_catalog", "effects", "ir", "value"]
+
+[[root]]
+name = "executor"
+layer = 10
+allowed_dependencies = ["backend_catalog", "capability", "dispatch_model", "effects", "environment", "eval_core", "evidence", "execution_contract", "hgraph", "ir", "process", "runtime_exec", "value"]
+
+[[root]]
+name = "hgraph"
+layer = 6
+allowed_dependencies = ["backend_catalog", "backend_morphism", "dispatch_model", "effects", "environment", "ir", "value"]
+
+[[root]]
+name = "hosted_remote"
+layer = 12
+allowed_dependencies = ["backend_catalog", "backend_state", "environment", "eval", "parser", "placement", "process", "registry", "runtime_exec", "value", "wire"]
+
+[[root]]
+name = "information"
+layer = 1
+allowed_dependencies = ["canonical_cbor"]
+
+[[root]]
+name = "information_bridge"
+layer = 13
+allowed_dependencies = ["canonical_cbor", "evidence", "hgraph", "hosted_remote", "information", "parser", "project", "registry", "value", "world"]
+
+[[root]]
+name = "ir"
+layer = 3
+allowed_dependencies = ["backend_catalog", "environment", "parser", "value"]
+
+[[root]]
+name = "kernel_world"
+layer = 8
+allowed_dependencies = ["live_system", "world"]
+
+[[root]]
+name = "live_system"
+layer = 2
+allowed_dependencies = ["capability", "value", "wire"]
+
+[[root]]
+name = "nix_ops"
+layer = 8
+allowed_dependencies = ["runtime_exec", "value"]
+
+[[root]]
+name = "nixos_ops"
+layer = 1
+allowed_dependencies = ["value"]
+
+[[root]]
+name = "ocore"
+layer = 2
+allowed_dependencies = ["capability", "value"]
+
+[[root]]
+name = "parser"
+layer = 1
+allowed_dependencies = ["environment", "syntax_dialect"]
+
+[[root]]
+name = "placement"
+layer = 6
+allowed_dependencies = ["backend_catalog", "dispatch_model", "environment", "ir", "placement_protocol"]
+
+[[root]]
+name = "placement_protocol"
+layer = 1
+allowed_dependencies = ["resource_identity"]
+
+[[root]]
+name = "process"
+layer = 8
+allowed_dependencies = ["backend_state", "capability", "environment", "runtime_exec", "value", "wire"]
+
+[[root]]
+name = "project"
+layer = 11
+allowed_dependencies = ["backend_catalog", "effects", "executor", "hgraph", "ir", "parser", "process", "value", "world"]
+
+[[root]]
+name = "registry"
+layer = 3
+allowed_dependencies = ["backend_catalog", "placement_protocol", "wire"]
+
+[[root]]
+name = "resource_identity"
+layer = 0
+allowed_dependencies = []
+
+[[root]]
+name = "runtime_exec"
+layer = 7
+allowed_dependencies = ["backend_catalog", "ir", "placement", "resource_identity"]
+
+[[root]]
+name = "scheduler"
+layer = 9
+allowed_dependencies = ["nix_ops", "nixos_ops", "runtime_exec", "value"]
+
+[[root]]
+name = "shims"
+layer = 0
+allowed_dependencies = []
+
+[[root]]
+name = "syntax_dialect"
+layer = 0
+allowed_dependencies = []
+
+[[root]]
+name = "value"
+layer = 0
+allowed_dependencies = []
+
+[[root]]
+name = "version"
+layer = 13
+allowed_dependencies = ["backend_catalog", "evidence", "hosted_remote", "world"]
+
+[[root]]
+name = "wire"
+layer = 1
+allowed_dependencies = ["canonical_cbor"]
+
+[[root]]
+name = "world"
+layer = 7
+allowed_dependencies = ["backend_catalog", "effects", "execution_contract", "hgraph", "ir", "resource_identity", "value"]

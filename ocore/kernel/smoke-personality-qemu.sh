@@ -11,7 +11,19 @@ DIGEST="f5924eeb64b5a3d332e20b5d0fae7b233ae2714eb58b72ea07f08a4d26334417"
 IMAGE_BYTES=62104
 IMAGE="$ROOT/target/ocore-m6-artifacts/images/root-${DIGEST}.ovfs"
 
-for tool in qemu-system-x86_64 nm python3 shasum; do
+if command -v llvm-nm >/dev/null 2>&1; then
+  NM_TOOL="$(command -v llvm-nm)"
+elif command -v xcrun >/dev/null 2>&1 \
+    && NM_TOOL="$(xcrun --find llvm-nm 2>/dev/null)"; then
+  :
+elif command -v nm >/dev/null 2>&1; then
+  NM_TOOL="$(command -v nm)"
+else
+  echo "error: llvm-nm or nm is required for the M6A personality smoke" >&2
+  exit 127
+fi
+
+for tool in qemu-system-x86_64 python3 shasum; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     echo "error: $tool is required for the M6A personality smoke" >&2
     exit 127
@@ -41,7 +53,7 @@ fi
 # The four principals must enter the kernel only as bytes in the verified OVFS
 # image. Source-module symbols in kernel.elf would bypass the package and loader
 # boundary that this gate claims.
-if ! KERNEL_SYMBOLS="$(nm "$BUILD_DIR/kernel.elf" 2>/dev/null)"; then
+if ! KERNEL_SYMBOLS="$("$NM_TOOL" "$BUILD_DIR/kernel.elf" 2>/dev/null)"; then
   echo "error: nm could not inspect the M6A kernel ELF" >&2
   exit 1
 fi
@@ -52,7 +64,7 @@ if grep -Eq '_O_runtime__m6_(client|personalityd|supervisord|observer)__' \
 fi
 
 python3 - "$BUILD_DIR/kernel.elf" "$TIMEOUT_SECONDS" "$DIGEST" \
-  "$IMAGE_BYTES" <<'PY'
+  "$IMAGE_BYTES" "$NM_TOOL" <<'PY'
 import atexit
 import json
 import os
@@ -69,6 +81,7 @@ kernel = sys.argv[1]
 timeout_seconds = float(sys.argv[2])
 digest = sys.argv[3]
 image_bytes = int(sys.argv[4])
+nm_tool = sys.argv[5]
 qmp_dir = tempfile.mkdtemp(prefix="o18q.", dir="/tmp")
 qmp_socket = os.path.join(qmp_dir, "qmp.sock")
 
@@ -249,7 +262,7 @@ def capture_qmp_failure_state(path, budget_seconds=2.0):
         if remaining <= 0:
             raise TimeoutError("QMP diagnostic capture budget exhausted")
         result = subprocess.run(
-            ["nm", "-S", "-n", "--defined-only", kernel],
+            [nm_tool, "-S", "-n", "-U", kernel],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

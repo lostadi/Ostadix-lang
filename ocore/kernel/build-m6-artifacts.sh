@@ -44,7 +44,7 @@ if ! command -v nm >/dev/null 2>&1; then
   exit 127
 fi
 
-cargo build --quiet --manifest-path "$ROOT/Cargo.toml" --bin ocorec
+cargo build --quiet --manifest-path "$ROOT/Cargo.toml" --package o-lang --bin ocorec
 OCOREC="$ROOT/target/debug/ocorec"
 LLD="$(find_lld)"
 
