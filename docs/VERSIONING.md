@@ -176,6 +176,10 @@ commits to them.
 9. Package-0.3-and-later hosted state roots carry
    `HOSTED_STATE_AUTHORITY_SCHEMA_V1`. A root containing earlier journals but
    no exact marker is rejected without mutation; there is no journal uplift.
+10. Information Atom V1 canonical bytes and IDs remain frozen. Information
+    Provenance V2 is an additive sidecar keyed by `AtomIdV1`; a raw sidecar is
+    descriptive, while verified provenance requires an opaque admitted handle
+    returned after trusted contextual reanalysis.
 
 Execution Intent V1 continues to bind the solved graph V1 identity and the
 process's current backend-catalog projection. The V5 catalog rollover therefore
@@ -207,6 +211,24 @@ never authorize a current Catalog V5-backed placement V2.
   borrowed access or `into_nodes()` for owned extraction. Its derived equality
   also includes parser-captured source SHA-256 and length. The stable
   `ostadix-api` facade did not expose this type and remains source-unchanged.
+
+## Information Provenance V2
+
+`ostadix.info-provenance/v2` separates acquisition origin, assurance, claim
+standing, and recoverability instead of storing them as one caller-selected
+modality. Its recovery result is relative to an explicit question, equivalence
+contract, domain, and trusted context. A digest reference names bytes; it does
+not by itself discharge execution fidelity or freshness.
+
+The initial execution adapter image-produces only `Derivation`
+classifications from an opaque V6 admission and a signature-verified World
+receipt. It binds the admission digest and terminal T2 output, but
+conservatively leaves unresolved
+producer authentication, signer authorization, receipt currentness, exact
+plan-node attribution, execution/effect fidelity, and morphism fidelity. The
+signature proof is cryptographic verification under a caller-supplied resolver,
+not proof that the signer was authorized for this claim. This is a new V2
+coordinate and never silently upgrades, relabels, or rewrites V1 atoms.
 
 ## Unreleased engine-ownership boundary
 

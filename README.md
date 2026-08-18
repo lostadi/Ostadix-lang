@@ -566,6 +566,20 @@ base-plus-addition revision. Otherwise it retains the verified pack under
 Neither a signature nor head membership grants execution authority. See
 [Information Kernel V1](docs/INFORMATION_KERNEL_V1.md) for the exact boundary.
 
+The Unreleased 0.4 engine adds `ostadix_api::information_provenance` as a
+higher, authority-bearing adapter over a byte-stable V1 information substrate.
+It derives a V2 sidecar from an opaque V6 execution admission and a verified
+World receipt, then admits only an exact recomputation of that sidecar. Raw V2
+records remain descriptive. Recovery is relative to an explicit equivalence
+contract and domain, and the current adapter deliberately returns
+`Unestablished` while producer authentication, signer authorization, execution
+fidelity, receipt currentness, exact plan-node attribution, effect closure, and
+morphism fidelity remain unproved. Receipt verification proves a signature
+against the caller-supplied resolver; it does not establish that the signer was
+authorized for the provenance claim. The opaque handle therefore exposes the
+analyzer classification but no established origin. See
+[Image admission and codomain slack](docs/IMAGE_ADMISSION.md).
+
 Package 0.3 also exposes eight explicit `o_lang::information_bridge` metadata
 projections for parsed documents, caller-public scalars, unadmitted HGraphs,
 Evidence V6, verified registry/World inputs, logical project graphs, and
