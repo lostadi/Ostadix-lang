@@ -1591,7 +1591,7 @@ fn admit_ir_for_inspection<'a>(
 fn print_schedule_why_origins(
     input: &Path,
     source: &str,
-    why: &o_lang::evidence::ScheduleWhyViewV1,
+    why: &o_lang::evidence::ScheduleWhyViewV2,
     origins: &[o_lang::parser::SourceSpanV1],
 ) -> Result<()> {
     use std::collections::BTreeSet;
@@ -1679,7 +1679,7 @@ fn inspect_ir_with_origins(
         .parse_with_origins()
         .context("failed to parse .O source with source origins")?;
     let origins = parsed.plan_origins().to_vec();
-    let program = OIrProgram::lower(&parsed.nodes);
+    let program = OIrProgram::lower(parsed.nodes());
     let plan = program.plan();
     let graph = program
         .hgraph_for_plan(&plan)
@@ -2908,6 +2908,10 @@ mod tests {
         assert!(lib_rs.contains("mod canonical_cbor;"));
         assert!(lib_rs.contains("mod dispatch_model;"));
         assert!(lib_rs.contains("pub mod syntax_dialect;"));
+        assert!(!lib_rs.contains("mod information;"));
+        assert!(!lib_rs.contains("mod information_bridge;"));
+        assert!(!src_dir.join("information").exists());
+        assert!(!src_dir.join("information_bridge").exists());
 
         for path in [
             "backend_catalog.rs",
@@ -3186,6 +3190,17 @@ mod tests {
                     expected_dependencies.insert("ignore");
                 }
                 assert_eq!(actual_dependencies, expected_dependencies);
+                assert_eq!(
+                    packages
+                        .iter()
+                        .filter_map(toml::Value::as_table)
+                        .filter(|package| {
+                            package.get("name").and_then(toml::Value::as_str) == Some("ostadix-api")
+                        })
+                        .count(),
+                    0,
+                    "the facade must remain unreachable from generated-runtime locks"
+                );
             }
         }
     }
@@ -3195,6 +3210,11 @@ mod tests {
         let build_dir = tempfile::tempdir().unwrap();
         let src_dir = build_dir.path().join("src");
         write_project_sources(&src_dir).unwrap();
+        let lib_rs = generate_lib_rs(true);
+        assert!(!lib_rs.contains("mod information;"));
+        assert!(!lib_rs.contains("mod information_bridge;"));
+        assert!(!src_dir.join("information").exists());
+        assert!(!src_dir.join("information_bridge").exists());
         for &(relative_path, embedded) in RUNTIME_PROJECT_SOURCES {
             let emitted = fs::read_to_string(src_dir.join("project").join(relative_path))
                 .unwrap_or_else(|error| panic!("missing generated {relative_path}: {error}"));
@@ -3226,20 +3246,35 @@ use ostadix_generated_serde::placement::SemanticDigestV1;
 use ostadix_generated_serde::placement::protocol::SemanticDigestV1 as NestedSemanticDigestV1;
 use ostadix_generated_serde::execution_contract::Policy as CanonicalPolicy;
 use ostadix_generated_serde::eval::Policy as CompatibilityPolicy;
+use ostadix_generated_serde::evidence::{
+    admit_execution, admit_execution_v5, analyze_execution, analyze_execution_v5,
+    analyze_execution_v6, graph_sha256_v1, graph_sha256_v2,
+    runtime_binding_from_adapter_bytes, ExecutionIntentV1, ADMISSION_SCHEMA_V5,
+    ADMISSION_SCHEMA_V6, EVIDENCE_SCHEMA_V5, EVIDENCE_SCHEMA_V6,
+    EXECUTION_INTENT_SCHEMA_V1, PLACEMENT_ADMISSION_DIGEST_DOMAIN_V2,
+    SCHEDULE_WHY_SCHEMA_V2, SOLVED_EXECUTABLE_HGRAPH_DIGEST_DOMAIN_V1,
+    SOLVED_EXECUTABLE_HGRAPH_DIGEST_DOMAIN_V2,
+};
+use ostadix_generated_serde::ir::{OIr, OIrProgram};
 use ostadix_generated_serde::registry::bundle::{
-    BackendRegistry, IntegerExactness, BACKEND_CATALOG_CURRENT_SCHEMA,
-    BACKEND_CATALOG_SCHEMA_V4,
+    BackendMorphismProfileV1, BackendRegistry, IntegerExactness,
+    BACKEND_CATALOG_CURRENT_SCHEMA, BACKEND_CATALOG_SCHEMA_V4, BACKEND_CATALOG_SCHEMA_V5,
 };
 use ostadix_generated_serde::{resource_identity, world};
 
 #[test]
 fn catalog_placement_and_checkpoint_sources_are_live() {
-    assert_eq!(BACKEND_CATALOG_CURRENT_SCHEMA, BACKEND_CATALOG_SCHEMA_V4);
+    assert_eq!(BACKEND_CATALOG_CURRENT_SCHEMA, BACKEND_CATALOG_SCHEMA_V5);
+    assert_eq!(BACKEND_CATALOG_SCHEMA_V4, "ostadix.backend-catalog/v4");
     let rust = BackendRegistry::global().interface_for("rust");
     assert!(matches!(
         rust.value_capabilities.integer_exactness,
         IntegerExactness::TwosComplementBits(63)
     ));
+    assert_eq!(
+        BackendRegistry::global().morphism_profile_for("rust"),
+        Some(BackendMorphismProfileV1::RustSourceConstantStdout)
+    );
 
     let runtime = SemanticDigestV1::hash_bytes(
         "ostadix/generated-runtime-closure-test/v1",
@@ -3287,6 +3322,85 @@ fn execution_policy_is_one_type_in_generated_aot_runtime() {
     assert_eq!(canonical.name(), "autonomous");
     assert_eq!(CanonicalPolicy::from_name(canonical.name()), Some(canonical));
 }
+
+#[test]
+fn current_v6_and_archival_v5_authorities_are_distinct_in_generated_runtime() {
+    let program = OIrProgram {
+        nodes: vec![OIr::Load("generated-runtime-input".to_string())],
+    };
+    let plan = program.plan();
+    let mut graph = program.hgraph_for_plan(&plan).unwrap();
+    ostadix_generated_serde::hgraph::solve::solve_types(&mut graph).unwrap();
+    let runtime = runtime_binding_from_adapter_bytes(
+        &plan,
+        &[],
+        &[("generated-runtime-v6", "explicit")],
+    );
+
+    let current = analyze_execution(&program, &plan, &graph, runtime.clone()).unwrap();
+    assert_eq!(current.schema(), EVIDENCE_SCHEMA_V6);
+    let v6 = analyze_execution_v6(&program, &plan, &graph, runtime.clone()).unwrap();
+    assert_eq!(v6.schema(), EVIDENCE_SCHEMA_V6);
+    assert_eq!(current, v6);
+    assert_eq!(v6.bindings().analyzed_graph_sha256, graph_sha256_v2(&graph));
+    assert_ne!(graph_sha256_v1(&graph), graph_sha256_v2(&graph));
+
+    let mut archival_graph = program.hgraph_for_plan(&plan).unwrap();
+    ostadix_generated_serde::hgraph::solve::solve_types(&mut archival_graph).unwrap();
+    let archival =
+        analyze_execution_v5(&program, &plan, &archival_graph, runtime.clone()).unwrap();
+    assert_eq!(archival.schema(), EVIDENCE_SCHEMA_V5);
+    assert_eq!(
+        archival.bindings().analyzed_graph_sha256,
+        graph_sha256_v1(&archival_graph)
+    );
+    let archival_admitted = admit_execution_v5(
+        &program,
+        &plan,
+        archival_graph,
+        CanonicalPolicy::Eager,
+        runtime.clone(),
+        archival,
+    )
+    .unwrap();
+    assert_eq!(archival_admitted.admission().schema(), ADMISSION_SCHEMA_V5);
+
+    let intent = ExecutionIntentV1::compile(
+        b"generated-runtime-intent-v1",
+        &program,
+        &plan,
+        &graph,
+        CanonicalPolicy::Eager,
+    )
+    .unwrap();
+    assert_eq!(intent.schema, EXECUTION_INTENT_SCHEMA_V1);
+    assert_eq!(intent.analyzed_graph_sha256, graph_sha256_v1(&graph));
+
+    let admitted = admit_execution(
+        &program,
+        &plan,
+        graph,
+        CanonicalPolicy::Eager,
+        runtime,
+        current,
+    )
+    .unwrap();
+    assert_eq!(admitted.admission().schema(), ADMISSION_SCHEMA_V6);
+    assert_eq!(
+        SOLVED_EXECUTABLE_HGRAPH_DIGEST_DOMAIN_V1,
+        "ostadix-solved-executable-hgraph/v1"
+    );
+    assert_eq!(
+        SOLVED_EXECUTABLE_HGRAPH_DIGEST_DOMAIN_V2,
+        "ostadix-solved-executable-hgraph/v2"
+    );
+    assert_eq!(
+        PLACEMENT_ADMISSION_DIGEST_DOMAIN_V2,
+        "ostadix/placement-admission/v2"
+    );
+    let target = admitted.admission().operations()[0].plan_node;
+    assert_eq!(admitted.schedule_why(target).unwrap().schema, SCHEDULE_WHY_SCHEMA_V2);
+}
 "#,
         )
         .unwrap();
@@ -3295,6 +3409,9 @@ fn execution_policy_is_one_type_in_generated_aot_runtime() {
         let output = Command::new(cargo)
             .args(["check", "--offline", "--locked", "--color", "never"])
             .env("CARGO_TARGET_DIR", build_dir.path().join("target"))
+            .env("CARGO_INCREMENTAL", "0")
+            .env("CARGO_PROFILE_DEV_DEBUG", "0")
+            .env("CARGO_PROFILE_TEST_DEBUG", "0")
             .current_dir(build_dir.path())
             .output()
             .expect("Cargo must be available to check the generated project");
@@ -3317,6 +3434,9 @@ fn execution_policy_is_one_type_in_generated_aot_runtime() {
                 "generated_runtime_closure",
             ])
             .env("CARGO_TARGET_DIR", build_dir.path().join("target"))
+            .env("CARGO_INCREMENTAL", "0")
+            .env("CARGO_PROFILE_DEV_DEBUG", "0")
+            .env("CARGO_PROFILE_TEST_DEBUG", "0")
             .current_dir(build_dir.path())
             .output()
             .expect("Cargo must be available to exercise the generated project closure");

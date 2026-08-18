@@ -35,6 +35,63 @@ The V1 implementation currently provides:
 - canonical, signed offline delta packs whose signer is checked against an
   independent local trust resolver.
 
+## Typed native bridge
+
+Package 0.3 adds the experimental `information_bridge` leaf root. It projects
+only eight allowlisted, read-only records into T2-shaped canonical metadata;
+there is no generic `Serialize` entry point, native reverse edge, authority
+conversion, mutation, dispatch, credential, capability, admission, or
+execution handle.
+
+| Native input | Bridge record | Exported metadata only |
+| --- | --- | --- |
+| `ParsedDocumentV1` plus exact source bytes | `ParsedDocumentInformationV1` | source SHA-256/length, immutable syntax/origin counts, origin-map digest |
+| caller-declared-public scalar `OValue` | `PublicValueInformationV1` | allowlisted scalar kind, canonical digest/length, caller-public flag |
+| unadmitted `HGraph` | `HGraphInformationV1` | structural counts and `metadata_projection_sha256` over exactly those counts |
+| Evidence V6 | `EvidenceInformationV1` | exact evidence schema/analyzer, Catalog V5 public projection digest, node count, metadata projection digest |
+| verified registry profile | `RegistryProfileInformationV1` | canonical namespace, projected node identity, generation, event digest, validity range, stale flag |
+| verified World receipt | `WorldReceiptInformationV1` | receipt/semantic digests and `signature_validated=true` |
+| logical project HGraph | `ProjectGraphInformationV1` | logical/source-bundle digests and operation/root counts |
+| self-signature-consistent Hosted V2 journal entry | `HostedJournalInformationV1` | projected session/current/previous entry identities, sequence/time, self-consistency, explicit `signer_trust_evaluated=false` |
+
+Every record has its own `ostadix.info-bridge-*/v1` schema, strict canonical
+decoder, semantic validator, and digest-only `NativeRecordRefV1`. Decoding
+checks bytes and declared invariants; it does not establish supplier trust.
+T2 references contain no native locator or inverse lookup mechanism.
+
+The parser captures exact source SHA-256 and byte length. A parsed-document
+projection fails unless supplied bytes match both. `ParsedDocumentV1.nodes` is
+private; `nodes()` and `into_nodes()` are the supported borrowed and owned
+accessors. Derived equality now also includes captured source digest and length.
+Scalar projection preflights size, numeric recursion/node count, bigint
+magnitude, rational denominator, binary-float width, and BigFloat precision
+before canonicalization. Container, path, byte/blob, graph, native, request,
+system, capability, snapshot, thunk, group, and error values are rejected.
+
+HGraph and Evidence `metadata_projection_sha256` values hash only the fields in
+the table. Inputs with the same allowlisted metadata intentionally collide even
+when omitted source, value, OIR, plan, native graph/evidence identity, runtime,
+environment, capability, placement, or dispatch fields differ. These digests
+are neither native identities, privacy commitments, nor authority. HGraphs
+with an admission map or any admission-evidence node are rejected.
+
+Registry namespaces remain raw because their bounded slash-separated grammar
+is a public descriptive scope, not a locator or secret classifier. Raw
+registry node IDs and Hosted session/journal-link tokens are removed by
+bridge-specific, length-framed, domain-separated SHA-256 projections. These
+projections preserve equality (and Hosted link equality), but remain dictionary
+oracles for low-entropy inputs; they are not confidentiality or privacy
+primitives. Registry `stale` is descriptive only. World
+`signature_validated=true` proves neither freshness nor authorization. Hosted
+self-consistency proves neither signer trust, journal continuity, nor
+currentness.
+
+The broader advanced `o_lang::api` façade reexports the explicit bridge. The
+stable publishable `ostadix-api` façade exposes neither the bridge nor
+`ParsedDocumentV1`. Generated AOT projects intentionally embed neither
+`information` nor `information_bridge`; their existing one-copy runtime closure
+is unchanged.
+
 ## Payload tiers
 
 Canonical information records have no typed variants for bearer tokens,
@@ -90,6 +147,22 @@ ceilings even when a caller supplies a looser policy. The local store uses the
 same 256 KiB bound for canonical record objects and 1 MiB bound for historical
 packs, while separately managed T1 blob content retains its exact 16 MiB
 capacity.
+
+`InformationStoreReaderV1::open_existing` is the separate inspection path for
+an already initialized private root. It creates no directory or lock file,
+repairs no mode, and performs no head update. Its bounded regular-file reads
+verify object identity. `o-info head` uses this reader; tests prove no change to
+directory entries, file content, inode, mode, or mtime. Atime is not part of
+that claim. Missing, nonprivate, or symlinked roots/kind directories fail
+without repair. This path does not claim hostile same-user resistance if an
+attacker can replace ancestor directories concurrently.
+
+The bridge decoder ceilings are conjunctive safety bounds: 64 KiB of input,
+256 decoded items, and depth 8. Not every ceiling is independently reachable
+after the item budget and per-record semantic limits are applied. The tests pin
+reachable exact item/depth and scalar limits plus one-over rejection; 64 KiB is
+an outer byte ceiling, not a claim that a valid V1 projection exists at exactly
+that size.
 
 ## Local CLI
 

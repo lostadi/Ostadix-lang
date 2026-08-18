@@ -1,9 +1,9 @@
 //! Bounded, shadow-mode backend morphism contracts.
 //!
 //! This V1 kernel describes only crossings the current adapters can actually
-//! demonstrate. It is intentionally not part of backend-catalog V4 identity,
-//! evidence admission, or dispatch. The HGraph solver can query the shadow
-//! assessment beside its compatibility fidelity result without changing
+//! demonstrate. Catalog V5 binds the selected profile name, while evidence,
+//! admission, and dispatch remain unchanged. The HGraph solver can query the
+//! shadow assessment beside its compatibility fidelity result without changing
 //! execution behavior.
 
 use std::collections::{BTreeSet, HashMap};
@@ -12,29 +12,12 @@ use num_bigint::BigInt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub use crate::backend_catalog::BackendMorphismProfileV1;
 use crate::backend_catalog::BackendRegistry;
 use crate::value::{AnnotationKind, FidelityAssessmentV2, FloatFormat, ONumber, OText, OValue};
 
 pub const BACKEND_MORPHISM_SCHEMA_V1: &str = "ostadix.backend-morphism/v1";
 pub const MAX_BACKEND_MORPHISM_DEPTH_V1: usize = 64;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum BackendMorphismProfileV1 {
-    PythonPlainData,
-    JavascriptBindingStdout,
-    RustSourceConstantStdout,
-}
-
-impl BackendMorphismProfileV1 {
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::PythonPlainData => "python-plain-data",
-            Self::JavascriptBindingStdout => "javascript-binding-stdout",
-            Self::RustSourceConstantStdout => "rust-source-constant-stdout",
-        }
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -379,14 +362,13 @@ pub enum BackendMorphismKernelV1 {
 }
 
 impl BackendMorphismKernelV1 {
-    /// Resolve aliases through the canonical backend catalog, while keeping
-    /// these shadow profiles outside the catalog's V4 identity.
+    /// Resolve aliases and the selected shadow profile through the canonical
+    /// V5 backend catalog.
     pub fn for_backend(tag: &str) -> Option<Self> {
-        match BackendRegistry::global().get(tag)?.name {
-            "python" => Some(Self::Python),
-            "javascript" => Some(Self::Javascript),
-            "rust" => Some(Self::Rust),
-            _ => None,
+        match BackendRegistry::global().morphism_profile_for(tag)? {
+            BackendMorphismProfileV1::PythonPlainData => Some(Self::Python),
+            BackendMorphismProfileV1::JavascriptBindingStdout => Some(Self::Javascript),
+            BackendMorphismProfileV1::RustSourceConstantStdout => Some(Self::Rust),
         }
     }
 }
@@ -892,14 +874,21 @@ mod tests {
     }
 
     #[test]
-    fn canonical_alias_resolves_without_extending_catalog_identity() {
+    fn canonical_alias_and_unknown_resolution_are_driven_by_catalog_v5_profiles() {
         let python = BackendMorphismKernelV1::for_backend("py").unwrap();
         assert_eq!(python.spec(), &PYTHON_SPEC_V1);
         assert_eq!(
             python.spec().integration,
             BackendMorphismIntegrationV1::Shadow
         );
+        let javascript = BackendMorphismKernelV1::for_backend("javascript").unwrap();
+        assert_eq!(
+            javascript.spec().profile,
+            BackendMorphismProfileV1::JavascriptBindingStdout
+        );
+        assert!(BackendMorphismKernelV1::for_backend("java").is_none());
         assert!(BackendMorphismKernelV1::for_backend("html").is_none());
+        assert!(BackendMorphismKernelV1::for_backend("unknown").is_none());
     }
 
     #[test]

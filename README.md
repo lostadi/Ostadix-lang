@@ -28,8 +28,8 @@ elastic governed computer; it is not part of the release name. Existing
 Ostadix-lang commands, package identities, URLs, and citation metadata remain
 compatible.
 
-The bounded v0.2.0 release record, verification boundary, and explicit
-nonclaims are in [docs/releases/v0.2.0.md](docs/releases/v0.2.0.md).
+The bounded v0.3.0 release record, verification boundary, and explicit
+nonclaims are in [docs/releases/v0.3.0.md](docs/releases/v0.3.0.md).
 
 Ostadix-lang is a language system built on one
 radical idea: the language an expression is written in is a structural part
@@ -109,6 +109,27 @@ toolchain, admission, catalog, Hosted, and World schema versions. It is
 descriptive: it does not prove that optional backend runtimes are installed,
 that a placement is authorized, or that a World is live.
 
+### Rust embedding facade
+
+Package `0.3.0` keeps the implementation and CLI in the root `o-lang` crate and
+adds the narrow, publishable `ostadix-api` workspace crate for new embedders.
+The facade requires an explicit backend-shim directory and owns its stable
+parse/evaluate error surface:
+
+```rust
+use ostadix_api::{OValue, Runtime};
+
+let mut runtime = Runtime::new("/absolute/path/to/backends");
+let value: OValue = runtime.evaluate("text^(hello)_text")?;
+```
+
+`ostadix-api` explicitly reexports the complete `OValue` payload vocabulary;
+it does not reexport the implementation `Evaluator`, `Parser`, or backend
+registry. Registry publication must publish `o-lang 0.3.0` before
+`ostadix-api 0.3.0` because the facade intentionally uses an exact same-version
+dependency. Ordinary workspace checks include both packages; fuzz and MCP keep
+their independent roots and lockfiles.
+
 Choose the next path according to what you want to inspect:
 
 | Goal | Continue with |
@@ -125,7 +146,8 @@ Choose the next path according to what you want to inspect:
 | Surface | Current status |
 |---|---|
 | Typed-parenthesis hosted language and OValue crossing | Supported core |
-| OIR, ExecutionPlan, HGraph, V5 evidence/admission, local executor | Supported core under hardening |
+| OIR, ExecutionPlan, Graph V2, Evidence/Admission V6, local executor | Supported core under hardening |
+| Explicit Graph V1 / Evidence and Admission V5 / Why V1 | Archival inspection and compatibility verification only |
 | Information Kernel V1 and backend-morphism V1 | Experimental local shadow surfaces; non-authorizing |
 | Hosted V2 durable sessions and direct-node placement | Experimental integration with dedicated lifecycle and recovery tests |
 | Project lifting, route execution, and live supervision | Experimental integration |
@@ -139,29 +161,45 @@ distributed guarantees are narrower than the supported hosted core. See
 
 ## Hosted Placement V6
 
-Ostadix-lang has two current admission contracts. V5 remains the supported
-legacy-local contract used by the uppercase `O` compatibility CLI and the
-existing MCP execution tools. Hosted Placement V6 adds a transport-independent
-descriptor, requirement, warrant, capacity, and lease core. Its direct-node V1
-compatibility path executes one fresh source document; its opt-in V2 path
-combines a locally prepared single-shim fragment with the complete signed
-placement proof and a durable, explicitly closed session. Neither an admission
-nor a transport version is silently translated into another.
+Package 0.3 uses local `oexec.evidence/v6` and `oexec.admission/v6` through
+Graph V2 for uppercase `O`, the evaluator/coordinator, CLI, and MCP execution.
+It preserves typed fidelity, exposes Why V2, and freshly prepares placement V2
+fragments. Graph V1/Evidence and Admission V5 remain explicit archival
+inspection APIs and are never converted into current authority. Hosted
+Placement V6 is a separate milestone name: it adds
+a transport-independent descriptor, requirement, warrant, capacity, and lease
+core. Its direct-node V1 compatibility path executes one fresh source document;
+its opt-in V2 path combines a locally prepared single-shim fragment with the
+complete signed placement proof and a durable, explicitly closed session. None
+of these coordinates is silently translated into another.
+
+Current durable Hosted V2 state roots carry an exact package-0.3 execution
+authority marker for Graph V2, Evidence/Admission V6, and placement-admission
+V2. A pre-0.3 root containing archival journals but no marker is rejected
+without mutation; old journals and signed V1 placement-admission leases are not
+migrated, relabeled, or executed.
 
 Admission version and backend-catalog generation are separate version axes.
 `O version --json` reports the independent coordinates compiled into the
 interpreter; [VERSIONING.md](docs/VERSIONING.md) defines their compatibility
 rules.
-The current authorizing catalog is `ostadix.backend-catalog/v4`; its schema is
+The current authorizing catalog is `ostadix.backend-catalog/v5`; its schema is
 part of both the whole-catalog digest and every backend-specification digest.
-A placement profile that advertises any V3 backend identity remains decodable
+A placement profile that advertises any V4 or older backend identity remains decodable
 and independently auditable, but fails current profile validation before it can
 authorize candidate selection or warrant discharge. There is no digest
-relabeling or silent V3-to-V4 uplift. V4 additionally binds each backend's
-state-support tier and snapshot-compatibility identity. Rebuild the runtime and
-MCP server, then regenerate short-lived profiles and all derived placement
-evidence after this rollover. The exact boundary and regeneration sequence are in
-[Hosted Placement V6](docs/HOSTED_PLACEMENT_V6.md#backend-catalog-v4-hard-rollover).
+relabeling or silent V4-to-V5 uplift. V4 remains the archival generation that
+added each backend's state-support tier and snapshot-compatibility identity.
+V5 extends that frozen projection with one explicit optional bounded
+backend-morphism profile: Python, JavaScript, and Rust are profiled, while the
+other 27 canonical backends explicitly are not. The Catalog V5 rollover itself
+changed catalog identity without changing `BackendInterface` or execution
+behavior at that rollover. Package 0.3 separately makes Graph V2/Evidence V6
+current; that path still does not enforce the shadow morphism profiles. Rebuild
+the runtime and MCP server, then regenerate
+short-lived profiles and all derived placement evidence after this rollover. The
+exact boundary and regeneration sequence are in [Hosted Placement
+V6](docs/HOSTED_PLACEMENT_V6.md#backend-catalog-v5-hard-rollover).
 
 Current implementation identity also uses the path-independent
 `ostadix/backend-executable-set/v2` projection and
@@ -385,7 +423,7 @@ The node locally prepares the submitted bytes and re-evaluates the full proof
 against the current catalog before consuming the non-cloneable fragment.
 Preparation accepts one non-whitespace semantic root containing exactly one
 shim `Exec`, no coordinator scope, and no nested evaluator authority. The
-complete process-local V5 admission remains a separate dispatch-freshness
+complete process-local V6 admission remains a separate dispatch-freshness
 check; ambient process identity is deliberately excluded from the signed
 portable coordinate.
 
@@ -518,6 +556,15 @@ base-plus-addition revision. Otherwise it retains the verified pack under
 Neither a signature nor head membership grants execution authority. See
 [Information Kernel V1](docs/INFORMATION_KERNEL_V1.md) for the exact boundary.
 
+Package 0.3 also exposes eight explicit `o_lang::information_bridge` metadata
+projections for parsed documents, caller-public scalars, unadmitted HGraphs,
+Evidence V6, verified registry/World inputs, logical project graphs, and
+self-signature-consistent Hosted journals. They are bounded, lossy, and
+non-authorizing; there is no generic native serializer or reverse conversion.
+`o info head` uses a separate existing-root reader that creates no lock or
+directory and performs no head update. The advanced root API exports these
+records; stable `ostadix-api` and generated AOT projects do not.
+
 This hosted profile is not a World, Governor, G1/G10, physical-machine,
 exactly-once, global-effect-isolation, project-migration, cancellation, or mid-
 operation-migration claim. Its complete contract, trust rules, user commands,
@@ -561,10 +608,11 @@ reconstructing executable and backend paths by hand.
 | `o_doctor` | Checks the local toolchain and inventories compatibility shims plus the complete backend runtime report. |
 | `o_smoke` | Runs `examples/hello.O` with an absolute backend path and expects `2`. |
 | `o_analyze_intent` | Nonexecutingly creates a bounded one-use handle for an exact source and stable analyzed graph intent. |
-| `o_execute_intent` | Consumes that handle, requires O to recompute the same intent, then performs a fresh V5 admission before dispatch. |
+| `o_execute_intent` | Consumes that handle, requires O to recompute the same Intent V1, then performs a fresh V6 admission before dispatch. |
 | `o_run` | Runs one local `.O` file directly with an explicit working directory and timeout; this remains an ungated compatibility path. |
 | `o_olangc` | Runs `olangc` with the resolved shim directory; supports `ir`, `dot`, `script`, and `wasm`, or the default target. |
 | `o_search_run` | Runs a named search program from an external `a18re` work tree when that optional tree is present. |
+| `o_information_inspect` | Runs fixed local `o-info head` against one existing non-symlink state root with bounded input, output, and timeout; returns sanitized object IDs/count only, never the state path, raw stderr, cloud/network access, logical/content/inode/mode/mtime mutation, or authority. Atime is untested. |
 
 The normal setup builds this separate, lockfile-pinned Rust crate and, unless
 wrappers are disabled, copies the executable to
@@ -574,11 +622,11 @@ wrappers are disabled, copies the executable to
 ./setup.sh --minimal --yes
 ```
 
-For a build without the rest of setup, build the two Ostadix commands used by
+For a build without the rest of setup, build the three Ostadix commands used by
 the server and then the server itself:
 
 ```bash
-cargo build --release --bin O --bin olangc
+cargo build --release --locked --package o-lang --bin O --bin olangc --bin o-info
 cargo build --release --locked \
   --manifest-path mcp/ostadix_lang_mcp_server/Cargo.toml
 ```
@@ -591,8 +639,10 @@ own lockfile, rejects Clippy warnings, and exercises initialization, exact tool
 and object-schema discovery, `o_env`, `o_runtimes`, and `o_smoke` over the real
 stdio transport with `scripts/smoke_ostadix_mcp.py`. The smoke launches the
 server with a system-only `PATH`, then calls `o_run` with both forms of relative
-path and calls `o_olangc`; transport discovery alone therefore cannot mask a
-broken runtime-path recovery or execution tool. Use `./setup.sh --no-mcp` when
+path, calls `o_olangc`, and inspects a temporary local Information V1 head
+without mutating its entries/content/inode/mode/mtime; transport discovery
+alone therefore cannot mask a broken runtime-path recovery, execution tool, or
+inspection boundary. Use `./setup.sh --no-mcp` when
 the MCP server is not wanted. The deterministic source release includes `mcp/`,
 `.mcp.json`, and the smoke client, and its link/schema/metadata verifier rejects
 an incomplete MCP release surface without executing archive payloads. The
@@ -635,6 +685,7 @@ o_runtimes {}
 o_smoke {}
 o_run {"path":"/absolute/path/to/Ostadix-lang/examples/hello.O"}
 o_olangc {"path":"/absolute/path/to/Ostadix-lang/examples/hello.O","target":"ir"}
+o_information_inspect {"state":"/absolute/path/to/existing-information-state","head":"main"}
 ```
 
 These are MCP tool names and argument objects, not shell commands. `o_smoke`
@@ -1590,13 +1641,13 @@ direct Cargo build.
 Build the versioned image and run `hello.O` from a read-only source mount:
 
 ```bash
-docker build -t o-lang:0.2.0 .
+docker build -t o-lang:0.3.0 .
 
 docker run --rm \
     --mount type=bind,src="$PWD",dst=/work,readonly \
-    o-lang:0.2.0 examples/hello.O
+    o-lang:0.3.0 examples/hello.O
 
-docker run --rm -it o-lang:0.2.0 --repl
+docker run --rm -it o-lang:0.3.0 --repl
 ```
 
 Bare single-directory mode deliberately literal-links and immediately runs all
@@ -1608,7 +1659,7 @@ the entrypoint still finds the image's shims through `O_BACKENDS_DIR`:
 docker run --rm \
     --mount type=bind,src="$PWD/examples/docker_literal",dst=/work,readonly \
     --entrypoint o-link \
-    o-lang:0.2.0 . -o /tmp/app.O
+    o-lang:0.3.0 . -o /tmp/app.O
 # 42
 ```
 
@@ -1622,7 +1673,7 @@ mkdir -p target/docker
 docker run --rm \
     --mount type=bind,src="$PWD",dst=/work,readonly \
     --entrypoint o-link \
-    o-lang:0.2.0 --project . --stdout > target/docker/project.O
+    o-lang:0.3.0 --project . --stdout > target/docker/project.O
 ```
 
 The `Docker minimal runtime profile` lane is named in
@@ -2045,7 +2096,7 @@ actor-state tokens, and strict-equivalent worker dispatch is restricted to
 compiler-verified O-scope loads plus source-proven-preparable trees of four
 trusted pure inline renderers (`html`, `markdown`, `text`, and `latex`). Direct
 ephemeral members of an explicitly autonomous group may separately opt into
-non-strict, unordered host effects. Evidence schema V5 binds those choices,
+non-strict, unordered host effects. Evidence schema V6 binds those choices,
 their dispatch semantics, and the plan-referenced canonical backend-catalog
 specifications before execution. That catalog identity is not runtime
 discovery, health, authorization, capacity, or readiness evidence. A
@@ -2371,11 +2422,11 @@ The Rust runtime uses an internal ephemeral environment identifier for bare
 blocks and destroys that backend process after the expression. An explicit
 `[*]` identifies a fresh isolated evaluator without prematurely naming its
 physical process or placement. An explicit numeric identifier names persistent
-logical `(canonical backend, environment)` affinity in the current V5
+logical `(canonical backend, environment)` affinity in the current V6
 scheduler; it is not a node, backend-specification, or process-generation
 identifier. The V6 placement projection can bind the backend specification and
 stronger actor-generation coordinates separately, but does not silently change
-that V5 key. Two `[*]` blocks never communicate through evaluator state; use an
+that logical key. Two `[*]` blocks never communicate through evaluator state; use an
 explicit numeric environment when state sharing is the program's intended
 semantics.
 
@@ -3017,7 +3068,7 @@ bash scripts/semantic_custody_demo.sh
 
 The ignored `target/semantic-custody/` directory contains the execution-intent
 JSON, schedule explanation, HGraph DOT, observed result, and a manifest hashing
-all four. The run performs fresh local V5 admission and records an observed
+all four. The run performs fresh local V6 admission and records an observed
 value; it does not manufacture a signed Hosted V2 or World receipt.
 
 ```text
@@ -3172,7 +3223,7 @@ emits an authority-free `oexec.execution-intent/v1` identity over exact source,
 OIR, plan, solved graph, the plan-specific backend-catalog projection, analyzer,
 and base policy. `O --require-source-sha256 ...
 --require-execution-intent-sha256 ...` recomputes this identity before any
-dispatch and still constructs a fresh live V5 admission. The intent is not a
+dispatch and still constructs a fresh live V6 admission. The intent is not a
 capability, runtime-health proof, capacity lease, or serializable replacement
 for `AdmittedExecution`.
 
@@ -3180,7 +3231,7 @@ The validated plan is projected into a directed HGraph before execution.
 Ordinary results, successful completion, evaluator/host resource versions, and
 persistent actor state are nodes. Operations are directed hyperedges whose
 outputs include one ordinary value, one completion token, and successor state
-versions. Evidence schema V5 admits each executable operation and binds its
+versions. Evidence schema V6 admits each executable operation and binds its
 dispatch adapter before the coordinator accepts the graph. The coordinator
 marks an operation graph-ready exactly when every input node is materialized;
 dispatch additionally respects its admitted adapter, local-pool capacity, and
@@ -3228,7 +3279,7 @@ state-complete HGraph used by the runtime. `olangc --target dot` shows both
 constraint hyperedges and the directed operation ports for ordinary, resource,
 actor, and completion/control nodes.
 
-`olangc --target ir --explain-schedule` additionally prints the v5 admission
+`olangc --target ir --explain-schedule` additionally prints the V6 admission
 digests, exact adapter IDs, provenance, blockers, and legal static waves without
 dispatching. Its advisory marker has schema ID
 `oexec.realizability/v1`, introduced by the line
@@ -3950,7 +4001,7 @@ type-checked scaffolding.
 
 ## Status
 
-**v0.2.0**, with the Rust hosted runtime authoritative, the C17 edition as the
+**v0.3.0**, with the Rust hosted runtime authoritative, the C17 edition as the
 standalone native port, the Python edition as the semantic reference, and
 O-core as the freestanding systems language.
 
@@ -4376,7 +4427,7 @@ citing the current source before a separate tagged source-release DOI exists,
 identify the repository version and exact revision:
 
     Lee Daghlar Ostadi. Ostadix-lang: Recursive Evaluator Composition for
-    Whole-Program Polyglot Execution. Version 0.2.0.
+    Whole-Program Polyglot Execution. Version 0.3.0.
     Commit: `FULL_COMMIT_SHA_USED`.
     https://github.com/lostadi/Ostadix-lang
 

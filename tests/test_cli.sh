@@ -21,17 +21,18 @@ trap cleanup EXIT
 
 mkdir -p "$ARTIFACT_DIR"
 
-O_BIN="./target/release/O"
-OLANGC_BIN="./target/release/olangc"
-OCOREC_BIN="./target/release/ocorec"
-OGIT_BIN="./target/release/ogit"
-OINFO_BIN="./target/release/o-info"
-if [ -x ./target/release/olink ]; then
-    OLINK_BIN="./target/release/olink"
+RELEASE_DIR="${O_LANG_RELEASE_DIR:-$ROOT/target/release}"
+O_BIN="$RELEASE_DIR/O"
+OLANGC_BIN="$RELEASE_DIR/olangc"
+OCOREC_BIN="$RELEASE_DIR/ocorec"
+OGIT_BIN="$RELEASE_DIR/ogit"
+OINFO_BIN="$RELEASE_DIR/o-info"
+if [ -x "$RELEASE_DIR/olink" ]; then
+    OLINK_BIN="$RELEASE_DIR/olink"
 else
-    OLINK_BIN="./target/release/o-link"
+    OLINK_BIN="$RELEASE_DIR/o-link"
 fi
-OUNLINK_BIN="./target/release/o-unlink"
+OUNLINK_BIN="$RELEASE_DIR/o-unlink"
 O_CLI="./scripts/o-cli.sh"
 O_KERNEL_CLI="./scripts/o-kernel.sh"
 O_KERNEL_QEMU_RUNNER="./ocore/kernel/run-qemu.sh"
@@ -262,7 +263,7 @@ EOF
         return
     fi
     for pattern in \
-        '^; ExecutionAdmission oexec\.admission/v5$' \
+        '^; ExecutionAdmission oexec\.admission/v6$' \
         '^binding analyzer-sha256=[0-9a-f]{64} evidence-sha256=[0-9a-f]{64} admitted-graph-sha256=[0-9a-f]{64} placement-admission-sha256=[0-9a-f]{64} admission-sha256=[0-9a-f]{64}$' \
         '^binding lowered-oir-sha256=' \
         '^runtime-snapshot kind=inspection dispatch-context=inspection-only$' \
@@ -353,12 +354,12 @@ import sys
 
 document = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 assert set(document) == {"schema", "admission", "realizability", "prediction"}
-assert document["schema"] == "oexec.schedule-explanation/v1"
+assert document["schema"] == "oexec.schedule-explanation/v2"
 admission = document["admission"]
 assert set(admission) == {
     "schema", "analyzer", "runtime_snapshot_kind", "base_policy", "bindings"
 }
-assert admission["schema"] == "oexec.admission/v5"
+assert admission["schema"] == "oexec.admission/v6"
 assert admission["runtime_snapshot_kind"] == "inspection"
 bindings = admission["bindings"]
 assert set(bindings) == {
@@ -393,7 +394,7 @@ assert len(layer["operations"]) == 1
 assert layer["operations"][0].startswith("P")
 PY
     then
-        fail "$desc" "(schedule explanation was not strict v1 JSON)"
+        fail "$desc" "(schedule explanation was not strict v2 JSON)"
         return
     fi
     if [ -e "$marker" ]; then
@@ -445,7 +446,7 @@ EOF
     fi
     cp "$STDOUT_FILE" "$why_direct"
     for pattern in \
-        '^; ExecutionAdmissionWhy oexec\.admission-why/v1$' \
+        '^; ExecutionAdmissionWhy oexec\.admission-why/v2$' \
         "^why operation=$target status=admitted-static inspection-only=yes dispatch=not-run admission-sha256=[0-9a-f]{64}$" \
         '^binding lowered-oir-sha256=' \
         "^plan-node $target kind=" \

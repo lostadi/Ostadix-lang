@@ -689,6 +689,37 @@ impl HGraph {
         ids
     }
 
+    /// Read-only structural counts for authority-free inspection surfaces.
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    pub fn constraint_edge_count(&self) -> usize {
+        self.edges.len()
+    }
+
+    pub fn execution_operation_count(&self) -> usize {
+        self.op_map.len()
+    }
+
+    pub fn root_nodes(&self) -> &[NodeId] {
+        &self.root_nodes
+    }
+
+    pub fn sequence_dependencies(&self) -> &[SequenceDependency] {
+        &self.sequence_dependencies
+    }
+
+    pub fn admission_evidence_input_count(&self) -> usize {
+        self.admission_evidence_nodes.len()
+    }
+
+    pub fn contains_admission_evidence_node(&self) -> bool {
+        self.nodes
+            .values()
+            .any(|node| matches!(node.kind, HNodeKind::AdmissionEvidence { .. }))
+    }
+
     /// Stable-ordinal-sorted executable operation handles.
     pub fn exec_ops_ordered(&self) -> Vec<ExecInfo> {
         let mut ops = self.op_map.values().cloned().collect::<Vec<_>>();
