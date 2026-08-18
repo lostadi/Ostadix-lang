@@ -6,7 +6,7 @@ follow-on now consumes a hash-pinned normal-form record, applies independent
 default-deny policy, and configures nonexecuting VM/vCPU/guest-page objects. No
 foreign kernel is executed by either stage.
 
-`src/kernel_world.rs` defines the common public boundary for the two planned
+`crates/ostadix-api/src/kernel_world.rs` defines the common public boundary for the two planned
 foreign-kernel integration tracks:
 
 | Track | Image mechanism | Required execution mechanism |

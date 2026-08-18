@@ -828,6 +828,21 @@ def _require_string_list(
     return result
 
 
+def _working_tree_source_candidate(root: Path, text: str) -> Path:
+    """Map only a removed pre-extraction engine path to its current owner."""
+    path = PurePosixPath(text)
+    candidate = root.joinpath(*path.parts)
+    if (
+        not candidate.exists()
+        and not candidate.is_symlink()
+        and text.startswith("src/")
+        and not text.startswith("src/bin/")
+        and text not in {"src/lib.rs", "src/main.rs"}
+    ):
+        return root / "crates" / "ostadix-api" / text
+    return candidate
+
+
 def _repo_file(root: Path, value: Any, location: str) -> tuple[str, Path]:
     text = _require_string(value, location)
     path = PurePosixPath(text)
@@ -843,7 +858,11 @@ def _repo_file(root: Path, value: Any, location: str) -> tuple[str, Path]:
             f"{location} must be a normalized repository-relative path"
         )
     root_resolved = root.resolve()
-    candidate = root.joinpath(*path.parts)
+    candidate = _working_tree_source_candidate(root, text)
+    # Exact-byte-sealed World records retain the pre-extraction `src/...`
+    # coordinate they were minted with. Resolve only the physical lookup into
+    # the independent engine; keep `text` unchanged for claim derivation and
+    # diagnostics. Root library/CLI entrypoints are not engine records.
     try:
         resolved = candidate.resolve(strict=True)
         resolved.relative_to(root_resolved)
@@ -1378,10 +1397,16 @@ def _derive_claims(
 def _resolve_source_snapshot(
     root: Path, source_commit: str, source_digests: dict[str, str]
 ) -> str | None:
-    working_tree_matches = all(
-        hashlib.sha256((root / path).read_bytes()).hexdigest() == digest
-        for path, digest in source_digests.items()
-    )
+    try:
+        working_tree_matches = all(
+            hashlib.sha256(
+                _working_tree_source_candidate(root, path).read_bytes()
+            ).hexdigest()
+            == digest
+            for path, digest in source_digests.items()
+        )
+    except OSError:
+        working_tree_matches = False
 
     def commit_matches(commit: str) -> bool:
         for path, digest in source_digests.items():

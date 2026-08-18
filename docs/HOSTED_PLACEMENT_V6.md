@@ -176,7 +176,7 @@ The behavioral rollover seam is
 it round-trips a real archival V4 descriptor, then proves that current profile
 validation returns `NonCurrentBackendCatalog`. The catalog hash-domain check is
 covered by
-`src/backend_catalog.rs::catalog_digests_are_stable_canonical_projections`, and
+`crates/ostadix-api/src/backend_catalog.rs::catalog_digests_are_stable_canonical_projections`, and
 the MCP projection pins current V5 plus archival V4 and V3 in
 `mcp/ostadix_lang_mcp_server/src/main.rs::runtime_inventory_is_a_complete_catalog_projection`.
 The companion regression
@@ -765,7 +765,7 @@ capacity-observation lifetime between separate human commands. It remains a
 co-located self-attested authority, not an independent observation, discovery,
 enrollment, scheduler, production key policy, or automatic recovery service.
 The deterministic source-release closure includes
-`src/hosted_remote/v2/dev.rs` together with the V2 protocol, cryptography,
+`crates/ostadix-api/src/hosted_remote/v2/dev.rs` together with the V2 protocol, cryptography,
 authorizer, client, server, runtime, and store modules; the release validator
 rejects an archive that omits the development bridge.
 

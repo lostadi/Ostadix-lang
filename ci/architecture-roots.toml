@@ -1,32 +1,34 @@
 schema_version = 1
 
-# The production library view intentionally excludes crate entrypoints,
-# binary crates, and generated include data. Embedded #[cfg(test)] items are
-# removed by the token-aware checker after these files are enumerated.
+# The governed production engine is the independently packageable
+# `ostadix-api` crate. Its crate entrypoint and generated include data are not
+# standalone module roots. Embedded #[cfg(test)] items are removed by the
+# token-aware checker after these files are enumerated.
 [production]
-source_root = "src"
-crate_root = "src/lib.rs"
-excluded_files = ["src/backend_catalog.inc.rs", "src/lib.rs", "src/main.rs"]
-excluded_directories = ["src/bin"]
+package_manifest = "crates/ostadix-api/Cargo.toml"
+source_root = "crates/ostadix-api/src"
+crate_root = "crates/ostadix-api/src/lib.rs"
+excluded_files = ["crates/ostadix-api/src/backend_catalog.inc.rs", "crates/ostadix-api/src/lib.rs"]
+excluded_directories = []
 
 # This token fragment is compiled into backend_catalog.rs with include!(). It
 # is scanned under that owning root but is not counted as a standalone module
-# file in the 149-file production-module inventory.
+# file in the 152-file production-module inventory.
 [[compiled_fragment]]
-path = "src/backend_catalog.inc.rs"
+path = "crates/ostadix-api/src/backend_catalog.inc.rs"
 owner = "backend_catalog"
-included_from = "src/backend_catalog.rs"
+included_from = "crates/ostadix-api/src/backend_catalog.rs"
 
 # These physical paths are compiled under roots that differ from their
 # conventional on-disk module path. They are part of the dependency identity,
 # not documentation-only aliases.
 [[physical_override]]
-path = "src/placement/protocol"
+path = "crates/ostadix-api/src/placement/protocol"
 kind = "directory"
 module_path = ["placement_protocol"]
 
 [[physical_override]]
-path = "src/world/identity.rs"
+path = "crates/ostadix-api/src/world/identity.rs"
 kind = "file"
 module_path = ["resource_identity"]
 
@@ -36,35 +38,35 @@ module_path = ["resource_identity"]
 [[facade]]
 path = "backend::state"
 kind = "alias"
-source = "src/backend.rs"
+source = "crates/ostadix-api/src/backend.rs"
 owner = "backend"
 target = "backend_state"
 
 [[facade]]
 path = "placement::protocol"
 kind = "inline_module"
-source = "src/placement/mod.rs"
+source = "crates/ostadix-api/src/placement/mod.rs"
 owner = "placement"
 target = "placement_protocol"
 
 [[facade]]
 path = "registry::bundle"
 kind = "module"
-source = "src/registry/bundle/mod.rs"
+source = "crates/ostadix-api/src/registry/bundle/mod.rs"
 owner = "registry"
 target = "backend_catalog"
 
 [[facade]]
 path = "world::identity"
 kind = "alias"
-source = "src/world/mod.rs"
+source = "crates/ostadix-api/src/world/mod.rs"
 owner = "world"
 target = "resource_identity"
 
 [[root]]
 name = "api"
 layer = 14
-allowed_dependencies = ["backend_morphism", "eval", "evidence", "execution_contract", "hosted_remote", "information_bridge", "parser", "value", "version", "world"]
+allowed_dependencies = ["backend_morphism", "eval", "evidence", "execution_contract", "hosted_remote", "information_bridge", "ir", "parser", "value", "version", "world"]
 
 [[root]]
 name = "backend"
@@ -155,6 +157,11 @@ allowed_dependencies = ["canonical_cbor"]
 name = "information_bridge"
 layer = 13
 allowed_dependencies = ["canonical_cbor", "evidence", "hgraph", "hosted_remote", "information", "parser", "project", "registry", "value", "world"]
+
+[[root]]
+name = "information_provenance"
+layer = 13
+allowed_dependencies = ["evidence", "information", "ir", "world"]
 
 [[root]]
 name = "ir"

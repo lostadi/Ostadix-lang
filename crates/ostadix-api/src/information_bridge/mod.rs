@@ -129,7 +129,7 @@ pub struct RegistryProfileInformationV1 {
 /// [`Self::decode_canonical`].
 ///
 /// ```compile_fail
-/// use o_lang::api::WorldReceiptInformationV1;
+/// use ostadix_api::api::WorldReceiptInformationV1;
 ///
 /// fn require_serialize<T: serde::Serialize>() {}
 /// require_serialize::<WorldReceiptInformationV1>();
