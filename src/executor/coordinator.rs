@@ -18,6 +18,7 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::{bail, Result};
 
+use crate::backend_catalog::ExecutionMode;
 use crate::effects::EffectSummary;
 use crate::eval_core::{
     derive_policy_contexts, trace_fingerprint, ExecutionTrace, GraphEvalFrame, GraphEvaluationHost,
@@ -1003,7 +1004,7 @@ impl<'a> Coordinator<'a> {
         let launches_backend = matches!(
             self.flat[id.0],
             OIr::Exec { backend, .. }
-                if backend.execution == crate::backend_catalog::ExecutionMode::Shim
+                if backend.execution == ExecutionMode::Shim
         );
         if self.ops[index].effect.unknown || launches_backend {
             // Recheck mutable shim/environment context plus retained executable
@@ -1013,7 +1014,7 @@ impl<'a> Coordinator<'a> {
             // current process and consume no launch artifact at this boundary.
             evaluator.verify_admitted_runtime_context(&self.admitted)?;
             if let OIr::Exec { backend, .. } = self.flat[id.0] {
-                if backend.execution == crate::backend_catalog::ExecutionMode::Shim {
+                if backend.execution == ExecutionMode::Shim {
                     self.admitted
                         .executable_leases()?
                         .verify_backend(&backend.canonical)?;

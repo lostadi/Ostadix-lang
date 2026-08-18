@@ -76,11 +76,55 @@ The first cycle-breaking boundaries are executable repository contracts:
   types; internal library code imports the canonical module directly. Catalog
   integration depends on the registry-independent `placement_protocol` module,
   while registry storage and compatibility adapters remain above it. Generated
-  AOT runtimes preserve the same single-identity geometry.
+  AOT runtimes preserve the same single-identity geometry;
+- `src/execution_contract.rs`, `src/eval_core.rs`, and
+  `src/backend_state.rs` are canonical lower seams for execution policy,
+  evaluator-independent graph execution, and backend lifecycle state. Their
+  historical public paths preserve type identity without recompiling the
+  implementation or reopening the higher realization roots.
 
-`python3 scripts/check_architecture_boundaries.py` rejects regressions to these
-wrong-way edges. More cycles remain to be separated before converting the
-monolith into a multi-crate workspace.
+[`ci/architecture-roots.toml`](ci/architecture-roots.toml) is the executable
+root-dependency contract. It declares every current production root, allowed
+cross-root edge and layer, the non-conventional `resource_identity` and
+`placement_protocol` physical mappings, and compatibility facades. The
+token-aware `python3 scripts/check_architecture_boundaries.py` enumerates all
+production library module files, verifies the crate-root declarations and
+their physical paths as a pure external-module aggregator bound to Cargo's
+actual library target, scans the compiled `backend_catalog.inc.rs` token
+fragment under its owning root, rejects symlink geometry, and rejects every
+undeclared direct or production-active conditional `#[path]` and every direct
+or aliased `include!` source escape. Physical overrides are explicitly
+enumerated even when their filename does not end in `.rs`; each maps exactly
+one crate root, cannot overlap an exclusion, and cannot retain a second
+conventional `mod child;` owner. Directory overrides require a regular
+`mod.rs`; file overrides cannot declare external children because their
+descendant filesystem convention would re-enter the displaced root. External
+child declarations nested inside inline modules or block items are rejected
+because that physical module stack is not part of the manifest model. The
+exclusion set is closed to the library and binary
+entrypoints, conventional binary directory, and declared compiled fragments.
+Facades bind an unconditionally public owner and exact public alias or glob
+projection. The checker then rejects undeclared roots and edges, retains
+the narrow semantic rules above, and runs Tarjan's algorithm over the observed
+root graph. The frozen baseline contains 149 production library module files,
+40 roots, 174 cross-root edges, and zero multi-root strongly connected
+components. The separately scanned include fragment has no cross-root edge.
+
+That is a root-level acyclicity claim only. Dependencies and bounded strongly
+connected components may remain among files or modules inside one declared
+root; the guard deliberately collapses them to that root. A future multi-crate
+extraction therefore still needs root-internal ownership work rather than
+treating this DAG result as file-level acyclicity.
+
+The proof surface is the enumerated, token-level production source plus each
+declared compiled fragment; it is not a `rustc` expansion trace. External
+procedural or declarative macros that synthesize paths without a lexical
+`crate`/`super` token remain outside this claim. Locally visible macro
+invocations carrying either root token fail closed instead of being interpreted
+as ordinary paths. Macro matchers and `$name` metavariable references are
+treated as non-emitted syntax, but a literal `mod` keyword in a transcriber or
+direct invocation fails closed—even when that macro is unused or conditionally
+inactive—because macro-generated physical module ownership is unsupported.
 
 The experimental authority-free information substrate is described in
 [`docs/INFORMATION_KERNEL_V1.md`](docs/INFORMATION_KERNEL_V1.md). It references

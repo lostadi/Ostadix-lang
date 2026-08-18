@@ -1,7 +1,8 @@
 //! Canonical compiled backend catalog and exact implementation metadata.
 //!
 //! This module is the one source of truth for backend aliases, adapters,
-//! runtime requirements, value fidelity, state support, and catalog identity.
+//! runtime requirements, value fidelity, state support, bounded morphism-profile
+//! assignment, and catalog identity.
 //! The placement protocol depends only on an injected catalog interface; this
 //! module supplies the process-wide current implementation. Public
 //! compatibility paths are projections of this single module identity.
@@ -412,6 +413,29 @@ const UNKNOWN_RUNTIME_REQUIREMENT: RuntimeRequirementSpec = RuntimeRequirementSp
     alternatives: &[&["python3"]],
 };
 
+/// Named bounded crossing profile attached to a canonical backend catalog row.
+///
+/// Catalog V5 binds only this profile label. The profile remains descriptive
+/// shadow metadata: it does not extend [`BackendInterface`], grant execution
+/// authority, or make a claim about every structural edge through a backend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BackendMorphismProfileV1 {
+    PythonPlainData,
+    JavascriptBindingStdout,
+    RustSourceConstantStdout,
+}
+
+impl BackendMorphismProfileV1 {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::PythonPlainData => "python-plain-data",
+            Self::JavascriptBindingStdout => "javascript-binding-stdout",
+            Self::RustSourceConstantStdout => "rust-source-constant-stdout",
+        }
+    }
+}
+
 /// Static metadata for one backend: the single source of truth for aliases,
 /// purity, rendering, execution mode, authority, adapter ownership, and
 /// executable requirements.
@@ -486,14 +510,17 @@ macro_rules! runtime_requirement_catalog {
 macro_rules! backend_catalog_metadata {
     (
         current_schema: $current_schema:literal,
+        legacy_schema_v4: $legacy_schema_v4:literal,
         legacy_schema_v3: $legacy_schema_v3:literal $(,)?
     ) => {
         /// Legacy catalog domain retained for archival V3 inspection.
         pub const BACKEND_CATALOG_SCHEMA_V3: &str = $legacy_schema_v3;
+        /// Archival V4 catalog domain retained byte-for-byte.
+        pub const BACKEND_CATALOG_SCHEMA_V4: &str = $legacy_schema_v4;
         /// Current catalog domain. Only identities derived under this domain
         /// authorize new placement records.
-        pub const BACKEND_CATALOG_SCHEMA_V4: &str = $current_schema;
-        pub const BACKEND_CATALOG_CURRENT_SCHEMA: &str = BACKEND_CATALOG_SCHEMA_V4;
+        pub const BACKEND_CATALOG_SCHEMA_V5: &str = $current_schema;
+        pub const BACKEND_CATALOG_CURRENT_SCHEMA: &str = BACKEND_CATALOG_SCHEMA_V5;
         /// Compatibility name retained for evidence code that predates the
         /// explicit current-schema constant. It always names the current domain.
         pub const BACKEND_CATALOG_SCHEMA_V1: &str = BACKEND_CATALOG_CURRENT_SCHEMA;
@@ -578,6 +605,21 @@ macro_rules! state_support {
     };
 }
 
+macro_rules! morphism_profile {
+    (None) => {
+        None
+    };
+    (PythonPlainData) => {
+        Some(BackendMorphismProfileV1::PythonPlainData)
+    };
+    (JavascriptBindingStdout) => {
+        Some(BackendMorphismProfileV1::JavascriptBindingStdout)
+    };
+    (RustSourceConstantStdout) => {
+        Some(BackendMorphismProfileV1::RustSourceConstantStdout)
+    };
+}
+
 macro_rules! backend_catalog {
     (
         $(
@@ -598,6 +640,7 @@ macro_rules! backend_catalog {
                     $({
                         $($state_key:ident: $state_value:tt),* $(,)?
                     })?,
+                morphism_profile: $morphism_profile:ident,
             }
         ),* $(,)?
     ) => {
@@ -627,6 +670,13 @@ macro_rules! backend_catalog {
                 },
             )*
         ]);
+        const BACKEND_MORPHISM_PROFILE_ASSIGNMENTS: &[
+            (&str, Option<BackendMorphismProfileV1>)
+        ] = &[
+            $(
+                ($name, morphism_profile!($morphism_profile)),
+            )*
+        ];
     };
 }
 
@@ -734,11 +784,31 @@ pub(crate) fn hash_backend_spec_v4(
     spec: &BackendSpec,
     requirement: &RuntimeRequirementSpec,
 ) {
-    // V4 is the exact V3 projection extended by one explicit state-support
-    // field. Keeping the shared prefix makes the rollover auditable while the
-    // distinct schema domain prevents cross-version authorization.
+    // Archival V4 is the exact V3 projection extended by one explicit
+    // state-support field. Keeping the shared prefix makes the rollover
+    // auditable while the distinct schema domain prevents cross-version
+    // authorization. Its field order and encoding are compatibility-frozen.
     hash_backend_spec_v3(hash, spec, requirement);
     hash_state_support(hash, &spec.state_support);
+}
+
+pub(crate) fn hash_backend_spec_v5(
+    hash: &mut Sha256,
+    spec: &BackendSpec,
+    requirement: &RuntimeRequirementSpec,
+    morphism_profile: Option<BackendMorphismProfileV1>,
+) {
+    // V5 is the exact archival V4 projection extended by one explicitly
+    // discriminated optional profile. Length-framed fields make absence,
+    // presence, and every profile name unambiguous.
+    hash_backend_spec_v4(hash, spec, requirement);
+    match morphism_profile {
+        None => catalog_hash_field(hash, b"no-backend-morphism-profile"),
+        Some(profile) => {
+            catalog_hash_field(hash, b"backend-morphism-profile");
+            catalog_hash_field(hash, profile.name().as_bytes());
+        }
+    }
 }
 
 pub(crate) fn finish_catalog_hash(hash: Sha256) -> String {
@@ -848,6 +918,16 @@ impl BackendRegistry {
         self.get(lang).map(|spec| &spec.state_support)
     }
 
+    /// Bounded shadow crossing profile for a canonical name or alias. Unknown
+    /// and explicitly unprofiled backends both return None.
+    pub fn morphism_profile_for(&self, lang: &str) -> Option<BackendMorphismProfileV1> {
+        let canonical = self.get(lang)?.name;
+        BACKEND_MORPHISM_PROFILE_ASSIGNMENTS
+            .iter()
+            .find(|(name, _)| *name == canonical)
+            .and_then(|(_, profile)| *profile)
+    }
+
     /// Deterministic SHA-256 of the complete ordered canonical catalog. This
     /// identifies descriptive metadata only; it is not runtime readiness or
     /// execution authority.
@@ -871,13 +951,13 @@ impl BackendRegistry {
             .clone()
     }
 
-    /// Deterministic SHA-256 of the complete current ordered catalog.
-    pub fn catalog_sha256(&self) -> String {
-        static CURRENT_DIGEST: OnceLock<String> = OnceLock::new();
-        CURRENT_DIGEST
+    /// Deterministic SHA-256 of the complete ordered archival V4 catalog.
+    pub fn catalog_sha256_v4(&self) -> String {
+        static V4_DIGEST: OnceLock<String> = OnceLock::new();
+        V4_DIGEST
             .get_or_init(|| {
                 let mut hash = Sha256::new();
-                catalog_hash_field(&mut hash, BACKEND_CATALOG_CURRENT_SCHEMA.as_bytes());
+                catalog_hash_field(&mut hash, BACKEND_CATALOG_SCHEMA_V4.as_bytes());
                 catalog_hash_count(&mut hash, RUNTIME_REQUIREMENT_SPECS.len());
                 for requirement in RUNTIME_REQUIREMENT_SPECS {
                     hash_runtime_requirement(&mut hash, requirement);
@@ -891,6 +971,37 @@ impl BackendRegistry {
             .clone()
     }
 
+    /// Deterministic SHA-256 of the complete ordered current V5 catalog.
+    pub fn catalog_sha256_v5(&self) -> String {
+        static V5_DIGEST: OnceLock<String> = OnceLock::new();
+        V5_DIGEST
+            .get_or_init(|| {
+                let mut hash = Sha256::new();
+                catalog_hash_field(&mut hash, BACKEND_CATALOG_SCHEMA_V5.as_bytes());
+                catalog_hash_count(&mut hash, RUNTIME_REQUIREMENT_SPECS.len());
+                for requirement in RUNTIME_REQUIREMENT_SPECS {
+                    hash_runtime_requirement(&mut hash, requirement);
+                }
+                catalog_hash_count(&mut hash, self.specs.len());
+                for spec in self.specs {
+                    hash_backend_spec_v5(
+                        &mut hash,
+                        spec,
+                        self.runtime_requirements_for(spec.name),
+                        self.morphism_profile_for(spec.name),
+                    );
+                }
+                finish_catalog_hash(hash)
+            })
+            .clone()
+    }
+
+    /// Deterministic SHA-256 of the complete current ordered catalog.
+    /// Current behavior is an alias of the explicit V5 helper.
+    pub fn catalog_sha256(&self) -> String {
+        self.catalog_sha256_v5()
+    }
+
     /// Deterministic SHA-256 of one canonical backend specification and its
     /// referenced runtime requirements. Aliases resolve to the same digest.
     pub fn specification_sha256_v3(&self, lang: &str) -> Option<String> {
@@ -901,14 +1012,35 @@ impl BackendRegistry {
         Some(finish_catalog_hash(hash))
     }
 
-    /// Deterministic SHA-256 of one current canonical backend specification.
-    /// Aliases resolve to the same exact implementation identity.
-    pub fn specification_sha256(&self, lang: &str) -> Option<String> {
+    /// Deterministic SHA-256 of one archival V4 canonical backend
+    /// specification. Aliases resolve to the same exact identity.
+    pub fn specification_sha256_v4(&self, lang: &str) -> Option<String> {
         let spec = self.get(lang)?;
         let mut hash = Sha256::new();
-        catalog_hash_field(&mut hash, BACKEND_CATALOG_CURRENT_SCHEMA.as_bytes());
+        catalog_hash_field(&mut hash, BACKEND_CATALOG_SCHEMA_V4.as_bytes());
         hash_backend_spec_v4(&mut hash, spec, self.runtime_requirements_for(spec.name));
         Some(finish_catalog_hash(hash))
+    }
+
+    /// Deterministic SHA-256 of one current V5 canonical backend
+    /// specification. Aliases resolve to the same exact identity.
+    pub fn specification_sha256_v5(&self, lang: &str) -> Option<String> {
+        let spec = self.get(lang)?;
+        let mut hash = Sha256::new();
+        catalog_hash_field(&mut hash, BACKEND_CATALOG_SCHEMA_V5.as_bytes());
+        hash_backend_spec_v5(
+            &mut hash,
+            spec,
+            self.runtime_requirements_for(spec.name),
+            self.morphism_profile_for(spec.name),
+        );
+        Some(finish_catalog_hash(hash))
+    }
+
+    /// Deterministic SHA-256 of one current canonical backend specification.
+    /// Current behavior is an alias of the explicit V5 helper.
+    pub fn specification_sha256(&self, lang: &str) -> Option<String> {
+        self.specification_sha256_v5(lang)
     }
 
     /// Build the exact implementation identity shared by local publication
@@ -1126,6 +1258,17 @@ impl CurrentBackendCatalogV1 for BackendRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const CATALOG_V4_WHOLE_SHA256: &str =
+        "abbe7201cd985baaa9c8da81a09791830a2cceb5697b514fea942852c25e10ea";
+    const CATALOG_V4_SOURCE_SHA256: &str =
+        "6d4e19cdf737982a5cfaf7d802c716e08ef5fc1e031465379a8a20348e08687a";
+    const CATALOG_V4_SOURCE_BYTES: usize = 14_568;
+    const CATALOG_V5_WHOLE_SHA256: &str =
+        "9c7b98d7404b98af97d188abb96917db0edf091b22d3ae904eb14c509a2d4a78";
+    const CATALOG_V5_SOURCE_SHA256: &str =
+        "c5fd5baf4b282230f7be9be65af0728f2dfa722b85876865b8e7608a995df1bf";
+    const CATALOG_V5_SOURCE_BYTES: usize = 15_630;
 
     const CATALOG_V3_SPEC_GOLDENS: &[(&str, &str)] = &[
         (
@@ -1373,6 +1516,129 @@ mod tests {
         ),
     ];
 
+    const CATALOG_V5_SPEC_GOLDENS: &[(&str, &str)] = &[
+        (
+            "O",
+            "4eaf4ee3f9378b04e4d2d83bbb975bb05903d007322fff4ec498cd98adf0350d",
+        ),
+        (
+            "quote",
+            "1c5a67e8f20c4bf2f3b01fc6cdb9fdd8f1950f6191571bd1b1fa4127c5ec23ec",
+        ),
+        (
+            "nix",
+            "84da0cee3957b1866ec03ca8b1aa6294a567547defa20dd26b232a714f5417f0",
+        ),
+        (
+            "nix_expr",
+            "1a3dfc4fce61c7fdf5d1b15cce6a91779df8e1fc8ffe8e649e70a972041b5c54",
+        ),
+        (
+            "nix_store",
+            "f11e2031be3da7741257679c2b835a6ca9c6bb7aed05ed5c293cde34458dcd27",
+        ),
+        (
+            "nixos_test",
+            "fdbb640a2f32518090d7f5be2e4333bcd2e4b20d1ac4de033483ba816896a672",
+        ),
+        (
+            "html",
+            "f4ca2f859046a283860f49b47ad82ba1ed42bc69294b6540e28bd6fcf6e9c845",
+        ),
+        (
+            "markdown",
+            "fcd939eb381234d3dfb3e8f2db761c9a7959a5ff39dd26ca9013a0693f17c2b0",
+        ),
+        (
+            "latex",
+            "8356fc7ab0943fa278900b379e65b7fa10b7e4cccd060355894fd02e31433256",
+        ),
+        (
+            "text",
+            "783594e04e69af1e63bdfd1b4c7d26c3b00735135c4dcb222953037a911cc111",
+        ),
+        (
+            "sql",
+            "d98950e57a6f2cab49a92beb708118b0f86183e26b810ffbc3b647606d6e24e1",
+        ),
+        (
+            "haskell",
+            "66667ba90aac7d754e2bfce210f36f046614c720ba51e05de0396afedb55b910",
+        ),
+        (
+            "ocaml",
+            "418d4bffa108dd7475c55b88a0356ade563415163a1260de625ae1b477cfad20",
+        ),
+        (
+            "webassembly",
+            "fb1fdee37816519ea63a06bea3a98030857c3e33d4d32c305aac9cd4e680b183",
+        ),
+        (
+            "python",
+            "eaca98374a864d55ccb8ab464d4aa1ef34470cd6dc065e0de902e41fbf9d9655",
+        ),
+        (
+            "ubuntu_vm",
+            "375097f43e8ae928870e95e54096d26a11546be0f71817323523bbc3f765ba77",
+        ),
+        (
+            "bash",
+            "937763643b6cc8b7cf83897b0627fc2bc4860b05fb9ef7e4ee596dde386d3493",
+        ),
+        (
+            "shell",
+            "1fbfd046d62fa62bbe90d2913b0bca52e481956633f47b54d2274565a18566de",
+        ),
+        (
+            "rust",
+            "f96d7fc986621b7c1453fb8f966bb6b128344a3cb816a5a426fec13c31f67005",
+        ),
+        (
+            "racket",
+            "45d053f8249c6ef81b5d785ca2200a3b1aa4c730511ae3d9401904047b991595",
+        ),
+        (
+            "csharp",
+            "8bdbb520f8b53b5d12010307847ad79d7b560e9efb59ee011e12cad9b054642c",
+        ),
+        (
+            "c",
+            "4b2beae8c2175941f0f5d68fba89460e68d9e1faec0107c0bdf3bdb93d36f7e8",
+        ),
+        (
+            "cpp",
+            "1e55fddd42f3a0c5e6db06e3d2cb2ac61c347fad48b2182936958bc37741ca1a",
+        ),
+        (
+            "lisp",
+            "ece45e7b377c9f255923884ddca788d7ffbfa52e84d17bd9fb47d1c0e7103d4f",
+        ),
+        (
+            "common_lisp",
+            "6491e355afdd00ed5d5bc07890ed051b3b03509d9bea7ca9c475d5ed63630335",
+        ),
+        (
+            "ruby",
+            "1fe5866e42fc211b2628cd06f582d57b8dfa00691f4b9b24de659b0b131ea023",
+        ),
+        (
+            "matlab",
+            "6ff94492952ad5fc3f8e1d20a3278a0fe2e9b5e03df8d068d40f17bef245a600",
+        ),
+        (
+            "mathematica",
+            "4e9cb060df4d0ffa91c8fa1b37479215cea3bfcdb266267a12c5ac95f057ace3",
+        ),
+        (
+            "java",
+            "9421ed01c9a024b23ed0f4ddc8acd17ecaa59096f30780d1862541c876c21afa",
+        ),
+        (
+            "javascript",
+            "8025c41424acbe27467b62d2a127145538b60490dfea5cef02f4254970417b42",
+        ),
+    ];
+
     fn artifact(byte: u8) -> ArtifactId {
         ArtifactId::from_sha256(format!("{byte:02x}").repeat(32)).unwrap()
     }
@@ -1394,7 +1660,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_v1_through_v4_archive_coordinates_are_explicit_and_v4_source_is_current() {
+    fn catalog_v1_through_v5_archive_coordinates_are_explicit_and_v5_source_is_current() {
         let coordinates = [
             (
                 "v1",
@@ -1420,9 +1686,16 @@ mod tests {
             (
                 "v4",
                 "4f7d503dff73525b5d7f9c5b6a2f51c856bfe2e1",
-                "abbe7201cd985baaa9c8da81a09791830a2cceb5697b514fea942852c25e10ea",
-                "6d4e19cdf737982a5cfaf7d802c716e08ef5fc1e031465379a8a20348e08687a",
-                14_568,
+                CATALOG_V4_WHOLE_SHA256,
+                CATALOG_V4_SOURCE_SHA256,
+                CATALOG_V4_SOURCE_BYTES,
+            ),
+            (
+                "v5",
+                "f6f830c475fe582c61d5c6ffd8fef29008c6ac34",
+                CATALOG_V5_WHOLE_SHA256,
+                CATALOG_V5_SOURCE_SHA256,
+                CATALOG_V5_SOURCE_BYTES,
             ),
         ];
         let mut whole = BTreeSet::new();
@@ -1441,17 +1714,20 @@ mod tests {
 
         let registry = BackendRegistry::global();
         assert_eq!(registry.catalog_sha256_v3(), coordinates[2].2);
-        assert_eq!(registry.catalog_sha256(), coordinates[3].2);
+        assert_eq!(registry.catalog_sha256_v4(), coordinates[3].2);
+        assert_eq!(registry.catalog_sha256_v5(), coordinates[4].2);
+        assert_eq!(registry.catalog_sha256(), coordinates[4].2);
+        assert_ne!(registry.catalog_sha256(), coordinates[3].2);
         let current_source = include_bytes!("backend_catalog.inc.rs");
-        assert_eq!(current_source.len(), coordinates[3].4);
+        assert_eq!(current_source.len(), coordinates[4].4);
         assert_eq!(
             hex::encode(Sha256::digest(current_source)),
-            coordinates[3].3
+            coordinates[4].3
         );
     }
 
     #[test]
-    fn catalog_v3_and_v4_specification_goldens_cover_every_canonical_backend() {
+    fn catalog_v3_through_v5_specification_goldens_cover_every_canonical_backend() {
         let registry = BackendRegistry::global();
         assert_eq!(
             registry.canonical_specs().len(),
@@ -1461,29 +1737,51 @@ mod tests {
             registry.canonical_specs().len(),
             CATALOG_V4_SPEC_GOLDENS.len()
         );
-        for ((v3_name, v3_digest), (v4_name, v4_digest)) in
-            CATALOG_V3_SPEC_GOLDENS.iter().zip(CATALOG_V4_SPEC_GOLDENS)
+        assert_eq!(
+            registry.canonical_specs().len(),
+            CATALOG_V5_SPEC_GOLDENS.len()
+        );
+        for (((v3_name, v3_digest), (v4_name, v4_digest)), (v5_name, v5_digest)) in
+            CATALOG_V3_SPEC_GOLDENS
+                .iter()
+                .zip(CATALOG_V4_SPEC_GOLDENS)
+                .zip(CATALOG_V5_SPEC_GOLDENS)
         {
             assert_eq!(v3_name, v4_name);
+            assert_eq!(v4_name, v5_name);
             assert_eq!(
                 registry.specification_sha256_v3(v3_name).as_deref(),
                 Some(*v3_digest)
             );
             assert_eq!(
-                registry.specification_sha256(v4_name).as_deref(),
+                registry.specification_sha256_v4(v4_name).as_deref(),
                 Some(*v4_digest)
             );
+            assert_eq!(
+                registry.specification_sha256_v5(v5_name).as_deref(),
+                Some(*v5_digest)
+            );
+            assert_eq!(
+                registry.specification_sha256(v5_name),
+                registry.specification_sha256_v5(v5_name)
+            );
             assert_ne!(v3_digest, v4_digest);
+            assert_ne!(v4_digest, v5_digest);
             assert!(!registry.contains_specification_sha256(v3_digest));
-            assert!(registry.contains_specification_sha256(v4_digest));
+            assert!(!registry.contains_specification_sha256(v4_digest));
+            assert!(registry.contains_specification_sha256(v5_digest));
         }
         assert_eq!(
-            registry.specification_sha256("py"),
-            registry.specification_sha256("python")
+            registry.specification_sha256_v4("py"),
+            registry.specification_sha256_v4("python")
         );
         assert_eq!(
             registry.specification_sha256_v3("py"),
             registry.specification_sha256_v3("python")
+        );
+        assert_eq!(
+            registry.specification_sha256_v5("py"),
+            registry.specification_sha256_v5("python")
         );
     }
 
@@ -1506,6 +1804,14 @@ mod tests {
         assert_eq!(
             TypeId::of::<BackendRegistry>(),
             TypeId::of::<crate::registry::bundle::BackendRegistry>()
+        );
+        assert_eq!(
+            TypeId::of::<BackendMorphismProfileV1>(),
+            TypeId::of::<crate::backend_morphism::BackendMorphismProfileV1>()
+        );
+        assert_eq!(
+            TypeId::of::<BackendMorphismProfileV1>(),
+            TypeId::of::<crate::ir::BackendMorphismProfileV1>()
         );
 
         let canonical = BackendRegistry::global().get("python").unwrap();
@@ -1580,8 +1886,36 @@ mod tests {
         );
         assert_eq!(
             canonical.realization_pipeline().as_sha256(),
+            "4aeb615bec8522275e4424e6a7738186be568c5637b48b6cd8a413f80e83f6c4"
+        );
+
+        // The catalog coordinate is a transitive input to the realization
+        // pipeline. Preserve the exact V4 implementation identity as an
+        // archival oracle while proving that the current V5 coordinate rolls
+        // the derived identity forward.
+        let v4_backend_specification = registry.specification_sha256_v4("markdown").unwrap();
+        assert_eq!(
+            v4_backend_specification,
+            "01e3d22d55f365c4c7074b5b5ced2e04bfe15f96ee93e0f8758457d1c1e8c78b"
+        );
+        let v4_realization_material = serde_json::json!({
+            "schema": LOCAL_REALIZATION_SCHEMA_V2,
+            "backend_specification": v4_backend_specification,
+            "adapter_kind": "inline",
+            "adapter_artifact": "11".repeat(32),
+            "executable_set_schema": BACKEND_EXECUTABLE_SET_DIGEST_DOMAIN_V2,
+            "executable_set": "22".repeat(32),
+            "protocol": LOCAL_BACKEND_PROTOCOL_ABI_V1,
+        });
+        let v4_realization_pipeline = SemanticDigestV1::hash_bytes(
+            LOCAL_REALIZATION_DIGEST_DOMAIN_V2,
+            &serde_json::to_vec(&v4_realization_material).unwrap(),
+        );
+        assert_eq!(
+            v4_realization_pipeline.as_sha256(),
             "862eb13d45352d2ce3728700252c2b47ad237ced2521d38c4e315c5ad8af5a0b"
         );
+        assert_ne!(canonical.realization_pipeline(), &v4_realization_pipeline);
 
         // Compatibility oracle for the formula formerly owned by
         // `o-registry::discover_backend_implementations`.
@@ -1599,8 +1933,25 @@ mod tests {
         );
         assert_eq!(
             legacy_pipeline.as_sha256(),
+            "2c8faf4c5fa06d272893378c627f7ee276ef3235f35c97f0efca85f82c1fef36"
+        );
+        let v4_legacy_material = serde_json::json!({
+            "schema": "ostadix.local-realization/v1",
+            "backend_specification": v4_backend_specification,
+            "adapter_kind": "inline",
+            "adapter_artifact": "11".repeat(32),
+            "executable_set": "22".repeat(32),
+            "protocol": "o-backend-cbor-v1",
+        });
+        let v4_legacy_pipeline = SemanticDigestV1::hash_bytes(
+            LOCAL_REALIZATION_DIGEST_DOMAIN_V1,
+            &serde_json::to_vec(&v4_legacy_material).unwrap(),
+        );
+        assert_eq!(
+            v4_legacy_pipeline.as_sha256(),
             "c98daed592288c5e4e80bd10be1c8f26786303d07d001d4250171616e4e41c90"
         );
+        assert_ne!(legacy_pipeline, v4_legacy_pipeline);
         assert_ne!(canonical.realization_pipeline(), &legacy_pipeline);
         let legacy = BackendImplementationIdV1::new(
             canonical.backend_specification().clone(),
@@ -1940,14 +2291,18 @@ mod tests {
         let registry = BackendRegistry::global();
         assert_eq!(BACKEND_CATALOG_SCHEMA_V3, "ostadix.backend-catalog/v3");
         assert_eq!(BACKEND_CATALOG_SCHEMA_V4, "ostadix.backend-catalog/v4");
-        assert_eq!(BACKEND_CATALOG_CURRENT_SCHEMA, BACKEND_CATALOG_SCHEMA_V4);
-        assert_eq!(BACKEND_CATALOG_SCHEMA_V1, BACKEND_CATALOG_SCHEMA_V4);
+        assert_eq!(BACKEND_CATALOG_SCHEMA_V5, "ostadix.backend-catalog/v5");
+        assert_eq!(BACKEND_CATALOG_CURRENT_SCHEMA, BACKEND_CATALOG_SCHEMA_V5);
+        assert_eq!(BACKEND_CATALOG_SCHEMA_V1, BACKEND_CATALOG_SCHEMA_V5);
         let catalog = registry.catalog_sha256();
         assert_eq!(catalog.len(), 64);
         assert!(catalog.bytes().all(|byte| byte.is_ascii_hexdigit()));
         assert_eq!(catalog, registry.catalog_sha256());
+        assert_eq!(catalog, registry.catalog_sha256_v5());
+        assert_ne!(catalog, registry.catalog_sha256_v4());
 
         let python = registry.specification_sha256("python").unwrap();
+        assert_eq!(python, registry.specification_sha256_v5("python").unwrap());
         assert_eq!(python, registry.specification_sha256("py").unwrap());
         assert_ne!(python, registry.specification_sha256("bash").unwrap());
         assert_eq!(python.len(), 64);
@@ -1963,6 +2318,10 @@ mod tests {
         assert_ne!(legacy_v3, python);
         assert_eq!(legacy_v3, registry.specification_sha256_v3("py").unwrap());
         assert!(!registry.contains_specification_sha256(&legacy_v3));
+        let legacy_v4 = registry.specification_sha256_v4("python").unwrap();
+        assert_ne!(legacy_v4, python);
+        assert_eq!(legacy_v4, registry.specification_sha256_v4("py").unwrap());
+        assert!(!registry.contains_specification_sha256(&legacy_v4));
     }
 
     #[test]
@@ -2161,6 +2520,108 @@ mod tests {
     }
 
     #[test]
+    fn catalog_v5_declares_the_exact_morphism_profile_partition_and_aliases() {
+        let registry = BackendRegistry::global();
+        assert_eq!(
+            BACKEND_MORPHISM_PROFILE_ASSIGNMENTS.len(),
+            registry.canonical_specs().len()
+        );
+        let mut assignment_names = BTreeSet::new();
+        for (spec, (assigned_name, _)) in registry
+            .canonical_specs()
+            .iter()
+            .zip(BACKEND_MORPHISM_PROFILE_ASSIGNMENTS)
+        {
+            assert_eq!(spec.name, *assigned_name);
+            assert!(assignment_names.insert(*assigned_name));
+        }
+        let profiled = BACKEND_MORPHISM_PROFILE_ASSIGNMENTS
+            .iter()
+            .filter_map(|(name, profile)| profile.map(|profile| (*name, profile)))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            profiled,
+            [
+                ("python", BackendMorphismProfileV1::PythonPlainData),
+                ("rust", BackendMorphismProfileV1::RustSourceConstantStdout),
+                (
+                    "javascript",
+                    BackendMorphismProfileV1::JavascriptBindingStdout,
+                ),
+            ]
+        );
+        assert_eq!(
+            BACKEND_MORPHISM_PROFILE_ASSIGNMENTS
+                .iter()
+                .filter(|(_, profile)| profile.is_none())
+                .count(),
+            27
+        );
+        assert_eq!(
+            registry.morphism_profile_for("py"),
+            Some(BackendMorphismProfileV1::PythonPlainData)
+        );
+        assert_eq!(registry.morphism_profile_for("html"), None);
+        assert_eq!(registry.morphism_profile_for("unknown"), None);
+        assert_eq!(
+            serde_json::to_string(&BackendMorphismProfileV1::JavascriptBindingStdout).unwrap(),
+            "\"javascript-binding-stdout\""
+        );
+    }
+
+    #[test]
+    fn catalog_v5_hashes_the_profile_partition_while_v4_stays_archival() {
+        let registry = BackendRegistry::global();
+        let python = registry.get("python").unwrap();
+        let requirement = registry.runtime_requirements_for("python");
+        let v4_digest_for = |_profile: Option<BackendMorphismProfileV1>| {
+            let mut hash = Sha256::new();
+            catalog_hash_field(&mut hash, BACKEND_CATALOG_SCHEMA_V4.as_bytes());
+            hash_backend_spec_v4(&mut hash, python, requirement);
+            finish_catalog_hash(hash)
+        };
+        let v5_digest_for = |profile| {
+            let mut hash = Sha256::new();
+            catalog_hash_field(&mut hash, BACKEND_CATALOG_SCHEMA_V5.as_bytes());
+            hash_backend_spec_v5(&mut hash, python, requirement, profile);
+            finish_catalog_hash(hash)
+        };
+
+        let direct_v4 = v4_digest_for(Some(BackendMorphismProfileV1::PythonPlainData));
+        assert_eq!(
+            direct_v4,
+            v4_digest_for(None),
+            "archival V4 identity predates morphism profiles"
+        );
+        assert_eq!(
+            direct_v4,
+            v4_digest_for(Some(BackendMorphismProfileV1::JavascriptBindingStdout)),
+            "archival V4 identity must not accept a profile input"
+        );
+        assert_eq!(
+            direct_v4,
+            CATALOG_V4_SPEC_GOLDENS
+                .iter()
+                .find_map(|(name, digest)| (*name == "python").then_some(*digest))
+                .unwrap()
+        );
+
+        let direct_v5 = v5_digest_for(Some(BackendMorphismProfileV1::PythonPlainData));
+        assert_eq!(
+            direct_v5,
+            CATALOG_V5_SPEC_GOLDENS
+                .iter()
+                .find_map(|(name, digest)| (*name == "python").then_some(*digest))
+                .unwrap()
+        );
+        let absent_v5 = v5_digest_for(None);
+        let javascript_v5 = v5_digest_for(Some(BackendMorphismProfileV1::JavascriptBindingStdout));
+        assert_ne!(direct_v5, absent_v5);
+        assert_ne!(direct_v5, javascript_v5);
+        assert_ne!(absent_v5, javascript_v5);
+    }
+
+    #[test]
     fn catalog_v4_hashes_state_support_while_v3_stays_archival() {
         use crate::placement::BackendStateSupportV2;
 
@@ -2184,10 +2645,19 @@ mod tests {
             digest_for(BACKEND_CATALOG_SCHEMA_V3, &weakened, hash_backend_spec_v3),
             "archival V3 identity predates state support"
         );
+        let direct_v4 = digest_for(BACKEND_CATALOG_SCHEMA_V4, python, hash_backend_spec_v4);
+        assert_eq!(
+            direct_v4,
+            CATALOG_V4_SPEC_GOLDENS
+                .iter()
+                .find_map(|(name, digest)| (*name == "python").then_some(*digest))
+                .unwrap(),
+            "the internal V4 hash helper must retain the published Python anchor"
+        );
         assert_ne!(
-            digest_for(BACKEND_CATALOG_SCHEMA_V4, python, hash_backend_spec_v4),
+            direct_v4,
             digest_for(BACKEND_CATALOG_SCHEMA_V4, &weakened, hash_backend_spec_v4),
-            "current V4 identity must bind state support"
+            "archival V4 identity must bind state support"
         );
     }
 

@@ -64,13 +64,19 @@ from each projected scalar before it is compiled and run by the real shim.
 They also cover negative boundaries. Richer runtime values outside these
 profiles remain executable but acquire no V1 morphism claim.
 
-V1 is shadow-only. It is resolved through canonical backend names and aliases,
-but is not hashed into backend-catalog V4, does not alter existing solver facts,
-and cannot authorize evidence, admission, placement, or dispatch. The explicit
-shadow result exposes differences such as the compatibility solver's optimistic
-container classification without reducing current execution capacity. A future
-enforcing integration requires a separately reviewed catalog/evidence schema
-rollover rather than silently changing V4 identity.
+V1 is shadow-only. Catalog V5 hashes the explicit optional profile assignment
+and resolves it through canonical backend names and aliases; archival V4
+identity remains unchanged. The profile is not a `BackendInterface` field and
+does not itself authorize evidence, admission, placement, or dispatch. Existing
+current-catalog projections bind the Catalog V5 digest without adding a new
+evidence field. Package 0.3's current Graph V2/Evidence V6 path preserves the
+complete typed solver assessment in its hashes and Why V2 view and is accepted
+by the coordinator, but still does not enforce the catalog profile. Graph
+V1/Evidence and Admission V5 remain archival; there is no conversion from V5
+to V6. The
+shadow result can therefore expose differences such as the compatibility
+solver's optimistic container classification without reducing current
+execution capacity.
 
 ## Executable artifact
 

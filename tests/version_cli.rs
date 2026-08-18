@@ -9,7 +9,7 @@ fn plain_and_machine_readable_version_surfaces_agree() {
         .output()
         .unwrap();
     assert!(plain.status.success());
-    assert_eq!(String::from_utf8(plain.stdout).unwrap(), "O 0.2.0\n");
+    assert_eq!(String::from_utf8(plain.stdout).unwrap(), "O 0.3.0\n");
 
     let plain_subcommand = Command::new(env!("CARGO_BIN_EXE_O"))
         .arg("version")
@@ -18,7 +18,7 @@ fn plain_and_machine_readable_version_surfaces_agree() {
     assert!(plain_subcommand.status.success());
     assert_eq!(
         String::from_utf8(plain_subcommand.stdout).unwrap(),
-        "O 0.2.0\n"
+        "O 0.3.0\n"
     );
 
     let json = Command::new(env!("CARGO_BIN_EXE_O"))
@@ -30,9 +30,23 @@ fn plain_and_machine_readable_version_surfaces_agree() {
     let direct = OstadixVersionReportV1::current();
     assert_eq!(report, serde_json::to_value(&direct).unwrap());
     assert_eq!(report["schema"], VERSION_REPORT_SCHEMA_V1);
-    assert_eq!(report["package_version"], "0.2.0");
+    assert_eq!(report["package_version"], "0.3.0");
     assert_eq!(report["minimum_rust_version"], "1.93.1");
     assert_eq!(report["release_rust_toolchain"], "1.97.1");
+    assert_eq!(report["evidence_schema"], "oexec.evidence/v6");
+    assert_eq!(report["admission_schema"], "oexec.admission/v6");
+    assert_eq!(
+        report["evidence_analyzer"],
+        "ostadix-oir-evidence-compiler/v6"
+    );
+    assert_eq!(
+        report["execution_intent_schema"],
+        "oexec.execution-intent/v1"
+    );
+    assert_eq!(
+        report["backend_catalog_schema"],
+        "ostadix.backend-catalog/v5"
+    );
 
     assert_eq!(
         report["backend_catalog_schema"],

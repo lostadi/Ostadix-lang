@@ -7,6 +7,79 @@ Package SemVer is only one of the independent coordinates documented in
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-17
+
+Release notes: [docs/releases/v0.3.0.md](docs/releases/v0.3.0.md).
+
+### Added
+
+- A two-member Cargo workspace retains the root `o-lang` package and adds the
+  publishable `ostadix-api` crate: an owned explicit-shim `Runtime`, facade-owned
+  parse/evaluate errors, and the complete public `OValue` payload vocabulary.
+- Source-release, Dependabot, Docker, CI, and lock-projection contracts now
+  distinguish the workspace facade from the independently locked fuzz and MCP
+  roots.
+- Explicit, source-additive Graph V2, Evidence/Admission V6, placement-admission
+  V2 digest, and Why V2 APIs preserve complete typed fidelity assessments.
+  Package 0.3 atomically makes those coordinates current for unversioned APIs,
+  coordinator/evaluator/CLI/MCP execution, and new placement fragments.
+  Execution Intent V1 remains bound to Graph V1 plus Catalog V5, while explicit
+  Admission V5, Graph V1, Why V1, and prepared-fragment V1 surfaces are
+  archival inspection APIs only: there is no silent V5-to-V6 uplift or hosted
+  placement-fragment conversion.
+- Durable Hosted V2 state roots carry an exact package-0.3 execution-authority
+  marker. Pre-0.3 roots, V1 prepared fragments, and V1 placement-admission
+  digests are rejected by current execution rather than migrated or relabeled.
+- Experimental Information Bridge V1 adds eight explicit, bounded,
+  authority-free native metadata projections plus a lock-free existing-root
+  reader, `o-info head`, and fixed local MCP head inspection. HGraph/Evidence
+  metadata digests intentionally omit source/value/runtime identity; raw
+  registry and Hosted locators/tokens are domain-projected equality oracles,
+  not confidentiality primitives.
+- A manifest-governed production-library root DAG now closes source geometry,
+  compiled fragments, physical overrides, facade projections, allowed edges,
+  layer descent, and multi-root cycles under fail-closed CI validation.
+- O-core personality smoke failures now capture bounded QMP scheduler, thread,
+  frame, and RPC state only after the failure verdict is frozen; successful
+  runs remain byte- and behavior-compatible with the prior guest artifacts.
+
+### Changed
+
+- Root and MCP package coordinates advance to `0.3.0`; generated-runtime stays
+  frozen at `0.1.0`. Publication, when separately authorized, must publish
+  `o-lang` before its exact-version `ostadix-api` dependent.
+- Backend catalog V5 now binds the explicit optional BackendMorphism V1 profile
+  assignment for all 30 canonical backends. Archival V4 hashes remain frozen;
+  the three profiled crossings remain shadow-only and do not change
+  `BackendInterface`, HGraph solving, graph hashing, evidence/admission schemas,
+  or execution behavior.
+- `ParsedDocumentV1.nodes` is private before the 0.3 tag. Use `nodes()` or
+  `into_nodes()`; parsed-document equality now also binds parser-captured exact
+  source SHA-256 and length. The stable `ostadix-api` facade remains unchanged.
+- Canonical placement, backend catalog/state, execution-contract, and graph
+  evaluation seams remove wrong-way module dependencies without changing the
+  corresponding execution semantics or archived identity formulas.
+
+### Fixed
+
+- O-core x86-64 asynchronous user-frame returns preserve arithmetic status
+  flags while clearing hazardous control flags, and the mode-0 proof binds the
+  syscall FMASK entry behavior without charging capacity-tight probe modes.
+- The hosted durable-state lock explicitly unlocks its final file descriptor
+  before drop; a duplicated-descriptor regression proves immediate reopen after
+  the final store clone is released.
+- Mode-25 crash monitoring preserves the armed lifecycle state across the
+  crash transition, and ArtifactId ownership no longer depends on the World
+  facade.
+
+### Release boundary
+
+The v0.3.0 tag identifies an advanced systems-research release, not OSTADIX
+Alpha qualification or a production-readiness claim. The exact included
+claims, explicit nonclaims, independent version coordinates, and source-asset
+verification procedure are recorded in
+[docs/releases/v0.3.0.md](docs/releases/v0.3.0.md).
+
 ## [0.2.0] - 2026-08-16
 
 Release notes: [docs/releases/v0.2.0.md](docs/releases/v0.2.0.md).
@@ -53,11 +126,13 @@ Release notes: [docs/releases/v0.2.0.md](docs/releases/v0.2.0.md).
 
 ### Release boundary
 
-The current `0.2.0` value in `Cargo.toml` is a package coordinate. Its presence
-here or in source does not itself assert a tag, publication, production
-readiness, hardware result, remote placement result, or live-World result.
+The `0.2.0` value recorded for this historical release is a package coordinate.
+Its presence here or in archived source does not itself assert a tag,
+publication, production readiness, hardware results, remote placement results,
+or a live World.
 Release entries must be dated and linked to the exact released commit or tag
 when a release is cut.
 
-[Unreleased]: https://github.com/lostadi/Ostadix-lang/compare/v0.2.0...HEAD
-[0.2.0]: https://github.com/lostadi/Ostadix-lang/releases/tag/v0.2.0
+[Unreleased]: https://github.com/lostadi/Ostadix-lang/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/lostadi/Ostadix-lang/tree/v0.3.0
+[0.2.0]: https://github.com/lostadi/Ostadix-lang/tree/v0.2.0

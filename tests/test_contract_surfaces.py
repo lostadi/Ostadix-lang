@@ -99,11 +99,14 @@ class ContractSurfacesTests(unittest.TestCase):
     def test_schedule_explanation_schema_and_fields_are_governed(self) -> None:
         self.assertEqual(
             contracts.schedule_explanation_schema(),
-            "oexec.schedule-explanation/v1",
+            "oexec.schedule-explanation/v2",
         )
         contracts.validate_schedule_explanation_contract()
         source = contracts.EVIDENCE_ADMISSION.read_text(encoding="utf-8")
-        for name, expected in contracts.SCHEDULE_EXPLANATION_STRUCT_FIELDS.items():
+        for name, expected in {
+            **contracts.ARCHIVAL_SCHEDULE_EXPLANATION_STRUCT_FIELDS,
+            **contracts.SCHEDULE_EXPLANATION_STRUCT_FIELDS,
+        }.items():
             self.assertEqual(
                 contracts.rust_public_struct_fields(source, name),
                 expected,
