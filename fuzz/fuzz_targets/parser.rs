@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 
 use libfuzzer_sys::fuzz_target;
-use o_lang::parser::Parser;
+use ostadix_api::parser::Parser;
 
 fuzz_target!(|input: &[u8]| {
     let source = String::from_utf8_lossy(input);

@@ -389,11 +389,11 @@ mod tests {
     fn hosted_bridge_constants_match_the_freestanding_native_abi() {
         let native_abi = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/ocore/runtime/x86_64/native_abi.oc"
+            "/test-assets/ocore/runtime/x86_64/native_abi.oc"
         ));
         let capability_abi = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/ocore/runtime/x86_64/capability.oc"
+            "/test-assets/ocore/runtime/x86_64/capability.oc"
         ));
         assert!(native_abi.contains(&format!(
             "pub const SYS_DEBUG_WRITE: u64 = {SYS_DEBUG_WRITE};"

@@ -1,4 +1,4 @@
-# Ostadix-lang Specification (v0.3.0)
+# Ostadix-lang Specification (v0.4.0, Unreleased)
 
 Ostadix-lang is a meta-language whose syntactic unit ( the _typed expression_ ) carries
 its own interpreter as part of its syntax. Every expression declares which
@@ -504,11 +504,11 @@ unknown hosted footprint.
 Graph V2 and Evidence/Admission V6 bind the complete canonical
 `FidelityAssessmentV2`, including absence versus an explicit unsupported
 assessment. Graph V1, Evidence/Admission V5, Schedule Explanation/Why V1, and
-Placement Fragment V1 are archival inspection coordinates. Package 0.3 MUST
-NOT convert, relabel, reconstruct, dispatch, or authorize them as current V2/V6
-authority. `ExecutionIntentV1` remains deliberately bound to Graph V1 and the
-current Catalog V5 projection; matching intent still requires fresh V6
-analysis and admission before dispatch.
+Placement Fragment V1 are archival inspection coordinates. Package 0.3 and
+later MUST NOT convert, relabel, reconstruct, dispatch, or authorize them as
+current V2/V6 authority. `ExecutionIntentV1` remains deliberately bound to
+Graph V1 and the current Catalog V5 projection; matching intent still requires
+fresh V6 analysis and admission before dispatch.
 
 ---
 
@@ -983,10 +983,16 @@ Adding a new language: write a Backend subclass, add it to
 
 ## 8. Versioning
 
-This spec accompanies package v0.3.0. The v0.3 package adds the publishable,
-explicit-shim `ostadix-api` embedding facade while retaining the root `o-lang`
-implementation package. Protocol and evidence coordinates remain independently
-versioned. The earlier v0.2 bump reflected:
+This spec accompanies the Unreleased package v0.4.0 line. The immutable v0.3
+tag added the
+publishable explicit-shim `ostadix-api` embedding facade while retaining the
+root `o-lang` implementation package. The post-tag Unreleased tree moves that
+same runtime implementation into `ostadix-api` and retains `o-lang` as its
+compatibility/CLI shell; this ownership change does not alter the language
+semantics below and is represented by the synchronized 0.4.0 engine/shell
+package coordinate before publication.
+Protocol and evidence coordinates remain independently versioned. The earlier
+v0.2 bump reflected:
 - `OExpr` wire format and `quote^` / `O.eval` semantics are now implemented in both runtimes.
 - `OValue` wire format table expanded with all Rust-runtime types.
 - `let` binding and `$var` substitution work in both runtimes.

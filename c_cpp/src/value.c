@@ -2554,7 +2554,8 @@ OWireResponse *owire_resp_from_json(const char *json) {
 }
 
 /* ────────────────────────────────────────────────────────────────────── */
-/* Length-prefixed CBOR wire (matches src/wire.rs / o_shim_common.py)     */
+/* Length-prefixed CBOR wire (matches crates/ostadix-api/src/wire.rs /   */
+/* o_shim_common.py)                                                     */
 /* ────────────────────────────────────────────────────────────────────── */
 
 #define OWIRE_MAX_FRAME_LEN (128U * 1024U * 1024U)

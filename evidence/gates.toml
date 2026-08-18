@@ -160,7 +160,7 @@ nonclaims = [
   "OWVALUE v1 is inert portable data and admits no capability bearer, CSpace handle, delegation or session token, native capsule, live process, system, or device reference, executable request, or ambient identity; code and object references remain descriptive only",
   "Versioned extension envelopes do not auto-dispatch code, load schemas, rehydrate capsules, resolve authority, or authenticate peers",
   "Mode 29 is an offline codec and hash oracle, not a transport, live M9 crossing, PR5 receipt or signature implementation, execution or grounding convergence result, Governor, consensus, WorldFS, or Workstream A acceptance; it passes no G0-G13 gate, and QEMU TCG is not physical or hardware-isolation evidence",
-  "This gate does not make the full hosted src/value.rs OValue enum portable or replace the hosted canonical-CBOR shim wire format",
+  "This gate does not make the full hosted crates/ostadix-api/src/value.rs OValue enum portable or replace the hosted canonical-CBOR shim wire format",
 ]
 expected_markers = [
   "World value Rust/.oc exact-byte convergence: PASS",

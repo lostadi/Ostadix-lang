@@ -1,0 +1,17 @@
+Ostadix-lang / ^Ostadix_
+Copyright 2026 Lee Daghlar Ostadi
+
+Original public implementation:
+https://github.com/lostadi/Ostadix-lang
+
+Core contribution:
+Typed expression boundaries, where the evaluator of an expression is part of
+the expression syntax:
+
+    LANG^( body )_LANG
+
+Associated project terms:
+Ostadix-lang, ^Ostadix_, OValue, OIR, O-core, typed parentheses,
+evaluator-as-syntax, language-boundary calculus, "the nesting is the interface."
+
+This project and its documentation originate with Lee Daghlar Ostadi.

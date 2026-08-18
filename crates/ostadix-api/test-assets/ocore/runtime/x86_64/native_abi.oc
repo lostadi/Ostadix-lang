@@ -1,0 +1,85 @@
+module runtime::native_abi;
+
+// Versioned scalar ABI shared by the linked native payload and kernel router.
+// Reserved numbers stay stable even while their operations remain unavailable.
+pub const NATIVE_ABI_V1: u64 = 1;
+// Version of the bounded foreign ABI exercised by Mode 25's pinned ELF.  The
+// surface is intentionally limited to write, exit_group, and ENOSYS fallback.
+pub const LINUX_MINIMAL_ABI_V1: u64 = 1;
+// Version of the bounded 9P2000 client ABI. The wire protocol remains inside
+// the request view; this version names only its three common scalar syscalls
+// plus SYS_PERSONALITY_BOUNDED_CALL.
+pub const PLAN9_9P2000_ABI_V1: u64 = 1;
+
+pub const SYS_DEBUG_WRITE: u64 = 0;
+pub const SYS_CAP_CLOSE: u64 = 1;
+pub const SYS_CAP_COPY: u64 = 2;
+pub const SYS_PAGE_ALLOC: u64 = 3;
+pub const SYS_YIELD: u64 = 4;
+pub const SYS_TICKS: u64 = 5;
+pub const SYS_EXIT: u64 = 6;
+pub const SYS_SLEEP: u64 = 7;
+pub const SYS_ENDPOINT_CREATE: u64 = 8;
+pub const SYS_ENDPOINT_SEND: u64 = 9;
+pub const SYS_ENDPOINT_RECEIVE: u64 = 10;
+pub const SYS_ENDPOINT_CANCEL: u64 = 11;
+pub const SYS_SERIAL_READ: u64 = 12;
+pub const SYS_CONTROL_SUBMIT: u64 = 13;
+pub const SYS_PERSONALITY_CALL: u64 = 14;
+pub const SYS_PERSONALITY_REPLY: u64 = 15;
+pub const SYS_PERSONALITY_SUPERVISE: u64 = 16;
+// M6B live bounded-copy extension.  The client submits one request-scoped
+// range; the native daemon can discover and operate only the exact view
+// correlated with the M6A request received from its endpoint.
+pub const SYS_PERSONALITY_BOUNDED_CALL: u64 = 17;
+pub const SYS_PERSONALITY_VIEW_LOOKUP: u64 = 18;
+pub const SYS_PERSONALITY_VIEW_READ: u64 = 19;
+pub const SYS_PERSONALITY_VIEW_WRITE: u64 = 20;
+pub const SYS_PERSONALITY_BOUNDED_REPLY: u64 = 21;
+// Native daemon-only completion adapter for one Linux-minimal write request.
+// The caller must present its exact generation-bound reply capability.
+pub const SYS_LINUX_MINIMAL_COMPLETE: u64 = 22;
+
+pub const PERSONALITY_RPC_V1: u64 = 1;
+
+// Exact kernel object named by the delegated native control capability.
+// Object type and rights alone are insufficient to select a control plane.
+pub const NATIVE_CONTROL_OBJECT_ID: u64 = 0x4d35_434f_4e54_524c;
+
+// Kernel-private dispatcher result. Architectural entry glue consumes this
+// value and abandons the user return frame; it is never returned to CPL3.
+pub const SYSCALL_CONTROL_EXIT: u64 = 0xffff_ffff_ffff_ffe0;
+pub const SYSCALL_CONTROL_SCHEDULE: u64 = 0xffff_ffff_ffff_ffe1;
+
+pub const ERR_CAPABILITY_DENIED: u64 = 0xffff_ffff_ffff_fff1;
+pub const ERR_USER_POINTER_DENIED: u64 = 0xffff_ffff_ffff_fff2;
+pub const ERR_UNKNOWN_SYSCALL: u64 = 0xffff_ffff_ffff_fff3;
+pub const ERR_UNKNOWN_PERSONALITY: u64 = 0xffff_ffff_ffff_fff4;
+pub const ERR_NO_CURRENT_PROCESS: u64 = 0xffff_ffff_ffff_fff5;
+pub const ERR_USER_COPY_FAULT: u64 = 0xffff_ffff_ffff_fff6;
+pub const ERR_BUFFER_TOO_LARGE: u64 = 0xffff_ffff_ffff_fff7;
+pub const ERR_NOT_IMPLEMENTED: u64 = 0xffff_ffff_ffff_fff8;
+pub const ERR_OUT_OF_MEMORY: u64 = 0xffff_ffff_ffff_fff9;
+pub const ERR_QUOTA_EXCEEDED: u64 = 0xffff_ffff_ffff_fffa;
+pub const ERR_INVALID_MEMORY_KIND: u64 = 0xffff_ffff_ffff_fffb;
+pub const ERR_RESOURCE_TABLE_FULL: u64 = 0xffff_ffff_ffff_fffc;
+// Retry is installed in a blocked TCB's saved RAX.  It is observable only
+// after an endpoint event wakes that exact wait epoch; user wrappers reissue
+// the operation because request payloads and user pointers are never retained
+// by the kernel while a thread sleeps.
+pub const ERR_IPC_RETRY: u64 = 0xffff_ffff_ffff_ffe8;
+pub const ERR_ENDPOINT_CLOSED: u64 = 0xffff_ffff_ffff_ffe9;
+pub const ERR_INVALID_IPC_MESSAGE: u64 = 0xffff_ffff_ffff_ffea;
+pub const ERR_IPC_CANCELLED: u64 = 0xffff_ffff_ffff_ffeb;
+pub const ERR_PERSONALITY_UNAVAILABLE: u64 = 0xffff_ffff_ffff_ffd0;
+pub const ERR_PERSONALITY_CANCELLED: u64 = 0xffff_ffff_ffff_ffd1;
+pub const ERR_PERSONALITY_TIMEOUT: u64 = 0xffff_ffff_ffff_ffd2;
+pub const ERR_PERSONALITY_FAILED: u64 = 0xffff_ffff_ffff_ffd3;
+pub const ERR_PERSONALITY_STALE: u64 = 0xffff_ffff_ffff_ffd4;
+pub const ERR_PERSONALITY_DUPLICATE: u64 = 0xffff_ffff_ffff_ffd5;
+pub const ERR_PERSONALITY_BUSY: u64 = 0xffff_ffff_ffff_ffd6;
+pub const ERR_PERSONALITY_UNSUPPORTED: u64 = 0xffff_ffff_ffff_ffd7;
+
+pub const DEBUG_BUFFER_SIZE: usize = 256;
+pub const IPC_MESSAGE_V1_WORDS: usize = 4;
+pub const IPC_MESSAGE_V1_SIZE: usize = 32;

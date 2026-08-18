@@ -61,7 +61,7 @@ _EOF = object()
 
 def _current_catalog_schema(root: Path) -> str:
     """Read the one authoritative catalog-generation identifier."""
-    catalog = root / "src" / "backend_catalog.inc.rs"
+    catalog = root / "crates" / "ostadix-api" / "src" / "backend_catalog.inc.rs"
     match = re.search(
         r'backend_catalog_metadata!\s*\{\s*current_schema:\s*"([^"]+)"',
         catalog.read_text(encoding="utf-8"),

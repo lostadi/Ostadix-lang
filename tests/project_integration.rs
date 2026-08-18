@@ -1158,7 +1158,12 @@ fn project_runtime_cancellation_is_distinct_from_deadline() {
 fn project_runtime_leader_exit_cannot_be_held_open_by_descendant_pipe() {
     let route = shell_route("pipe-holder", "(trap '' HUP TERM; sleep 2) & exit 0");
     let bundle = bundle_with_routes(vec![route]);
-    let options = bounded_runtime_options(Duration::from_secs(3));
+    let mut options = bounded_runtime_options(Duration::from_secs(3));
+    // The shared 50 ms test bound is deliberately tighter than production's
+    // 2 s grace, but a killed descendant may remain visible briefly under a
+    // loaded macOS test runner. Keep this case bounded without making kernel
+    // process-table latency determine whether the fail-closed check flakes.
+    options.limits.termination_grace_period = Duration::from_millis(500);
     let started = Instant::now();
 
     let result = run_route(&bundle, "pipe-holder", &options).unwrap();

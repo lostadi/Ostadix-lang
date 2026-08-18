@@ -87,8 +87,20 @@ class GovernanceSurfaceTests(unittest.TestCase):
         self.assertIn("## [Unreleased]", changelog)
         self.assertIn("does not itself assert a tag", changelog)
         citation = read("CITATION.cff")
-        self.assertIn('version: "0.3.0"', citation)
+        self.assertIn('version: "0.4.0"', citation)
         self.assertNotIn("date-released:", citation)
+
+    def test_ci_builds_the_independent_engine_and_shell_publish_artifacts(self) -> None:
+        workflow = read(".github/workflows/ci.yml")
+        self.assertIn(
+            "cargo +1.97.1 package --locked --package ostadix-api",
+            workflow,
+        )
+        self.assertIn(
+            "cargo +1.97.1 package --locked --no-verify --package "
+            "ostadix-api --package o-lang",
+            workflow,
+        )
 
     def test_versioning_document_tracks_source_coordinates(self) -> None:
         versioning = read("docs/VERSIONING.md")
@@ -102,39 +114,39 @@ class GovernanceSurfaceTests(unittest.TestCase):
             self.assertIn(f"`{value}`", versioning)
 
         constants = (
-            ("src/evidence/intent.rs", "EXECUTION_INTENT_SCHEMA_V1"),
-            ("src/evidence/fact.rs", "EVIDENCE_SCHEMA_V5"),
-            ("src/evidence/fact.rs", "ADMISSION_SCHEMA_V5"),
-            ("src/evidence/fact.rs", "EVIDENCE_SCHEMA_V6"),
-            ("src/evidence/fact.rs", "ADMISSION_SCHEMA_V6"),
-            ("src/evidence/fact.rs", "ANALYZER_ID_V6"),
-            ("src/evidence/admit.rs", "SCHEDULE_EXPLANATION_SCHEMA_V1"),
-            ("src/evidence/admit.rs", "SCHEDULE_EXPLANATION_SCHEMA_V2"),
-            ("src/evidence/admit.rs", "SCHEDULE_WHY_SCHEMA_V1"),
-            ("src/evidence/admit.rs", "SCHEDULE_WHY_SCHEMA_V2"),
-            ("src/evidence/admit.rs", "PLACEMENT_ADMISSION_DIGEST_DOMAIN_V1"),
-            ("src/evidence/admit.rs", "PLACEMENT_ADMISSION_DIGEST_DOMAIN_V2"),
+            ("crates/ostadix-api/src/evidence/intent.rs", "EXECUTION_INTENT_SCHEMA_V1"),
+            ("crates/ostadix-api/src/evidence/fact.rs", "EVIDENCE_SCHEMA_V5"),
+            ("crates/ostadix-api/src/evidence/fact.rs", "ADMISSION_SCHEMA_V5"),
+            ("crates/ostadix-api/src/evidence/fact.rs", "EVIDENCE_SCHEMA_V6"),
+            ("crates/ostadix-api/src/evidence/fact.rs", "ADMISSION_SCHEMA_V6"),
+            ("crates/ostadix-api/src/evidence/fact.rs", "ANALYZER_ID_V6"),
+            ("crates/ostadix-api/src/evidence/admit.rs", "SCHEDULE_EXPLANATION_SCHEMA_V1"),
+            ("crates/ostadix-api/src/evidence/admit.rs", "SCHEDULE_EXPLANATION_SCHEMA_V2"),
+            ("crates/ostadix-api/src/evidence/admit.rs", "SCHEDULE_WHY_SCHEMA_V1"),
+            ("crates/ostadix-api/src/evidence/admit.rs", "SCHEDULE_WHY_SCHEMA_V2"),
+            ("crates/ostadix-api/src/evidence/admit.rs", "PLACEMENT_ADMISSION_DIGEST_DOMAIN_V1"),
+            ("crates/ostadix-api/src/evidence/admit.rs", "PLACEMENT_ADMISSION_DIGEST_DOMAIN_V2"),
             (
-                "src/hosted_remote/v2/store.rs",
+                "crates/ostadix-api/src/hosted_remote/v2/store.rs",
                 "HOSTED_STATE_AUTHORITY_SCHEMA_V1",
             ),
-            ("src/hosted_remote/protocol.rs", "HOSTED_PROTOCOL_V1"),
-            ("src/hosted_remote/v2/protocol.rs", "HOSTED_PROTOCOL_V2"),
-            ("src/information/mod.rs", "INFORMATION_SCHEMA_V1"),
-            ("src/information/model.rs", "INFORMATION_ATOM_SCHEMA_V1"),
-            ("src/information/model.rs", "ENTITY_DESCRIPTOR_SCHEMA_V1"),
-            ("src/information/root.rs", "INFORMATION_SNAPSHOT_SCHEMA_V1"),
-            ("src/information/root.rs", "INFORMATION_REVISION_SCHEMA_V1"),
-            ("src/information/delta.rs", "INFORMATION_DELTA_SCHEMA_V1"),
-            ("src/information/projection.rs", "PROJECTION_RECEIPT_SCHEMA_V1"),
-            ("src/information/exchange.rs", "INFORMATION_DELTA_PACK_SCHEMA_V1"),
+            ("crates/ostadix-api/src/hosted_remote/protocol.rs", "HOSTED_PROTOCOL_V1"),
+            ("crates/ostadix-api/src/hosted_remote/v2/protocol.rs", "HOSTED_PROTOCOL_V2"),
+            ("crates/ostadix-api/src/information/mod.rs", "INFORMATION_SCHEMA_V1"),
+            ("crates/ostadix-api/src/information/model.rs", "INFORMATION_ATOM_SCHEMA_V1"),
+            ("crates/ostadix-api/src/information/model.rs", "ENTITY_DESCRIPTOR_SCHEMA_V1"),
+            ("crates/ostadix-api/src/information/root.rs", "INFORMATION_SNAPSHOT_SCHEMA_V1"),
+            ("crates/ostadix-api/src/information/root.rs", "INFORMATION_REVISION_SCHEMA_V1"),
+            ("crates/ostadix-api/src/information/delta.rs", "INFORMATION_DELTA_SCHEMA_V1"),
+            ("crates/ostadix-api/src/information/projection.rs", "PROJECTION_RECEIPT_SCHEMA_V1"),
+            ("crates/ostadix-api/src/information/exchange.rs", "INFORMATION_DELTA_PACK_SCHEMA_V1"),
             (
-                "src/information/exchange.rs",
+                "crates/ostadix-api/src/information/exchange.rs",
                 "SIGNED_INFORMATION_DELTA_PACK_SCHEMA_V1",
             ),
-            ("src/information/decision.rs", "DECISION_RECEIPT_SCHEMA_V1"),
-            ("src/information/decision.rs", "OBSERVATION_RECORD_SCHEMA_V1"),
-            ("src/backend_morphism.rs", "BACKEND_MORPHISM_SCHEMA_V1"),
+            ("crates/ostadix-api/src/information/decision.rs", "DECISION_RECEIPT_SCHEMA_V1"),
+            ("crates/ostadix-api/src/information/decision.rs", "OBSERVATION_RECORD_SCHEMA_V1"),
+            ("crates/ostadix-api/src/backend_morphism.rs", "BACKEND_MORPHISM_SCHEMA_V1"),
         )
         for relative, name in constants:
             with self.subTest(name=name):
@@ -143,11 +155,11 @@ class GovernanceSurfaceTests(unittest.TestCase):
                 self.assertIn(string_constant(relative, name), versioning)
 
         world_constants = (
-            ("src/world/protocol.rs", "WORLD_SCHEMA_V1"),
-            ("src/world/codec.rs", "WORLD_WIRE_CODEC_VERSION"),
-            ("src/world/identity_wire.rs", "IDENTITY_WIRE_VERSION"),
-            ("src/world/value_codec.rs", "OVALUE_WIRE_SCHEMA_V1"),
-            ("src/world/receipt_codec.rs", "WORLD_RECEIPT_SCHEMA_V1"),
+            ("crates/ostadix-api/src/world/protocol.rs", "WORLD_SCHEMA_V1"),
+            ("crates/ostadix-api/src/world/codec.rs", "WORLD_WIRE_CODEC_VERSION"),
+            ("crates/ostadix-api/src/world/identity_wire.rs", "IDENTITY_WIRE_VERSION"),
+            ("crates/ostadix-api/src/world/value_codec.rs", "OVALUE_WIRE_SCHEMA_V1"),
+            ("crates/ostadix-api/src/world/receipt_codec.rs", "WORLD_RECEIPT_SCHEMA_V1"),
         )
         for relative, name in world_constants:
             with self.subTest(name=name):
@@ -157,7 +169,7 @@ class GovernanceSurfaceTests(unittest.TestCase):
 
         catalog = re.search(
             r'current_schema:\s*"([^"]+)"',
-            read("src/backend_catalog.inc.rs"),
+            read("crates/ostadix-api/src/backend_catalog.inc.rs"),
         )
         self.assertIsNotNone(catalog)
         assert catalog is not None

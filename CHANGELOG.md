@@ -7,6 +7,31 @@ Package SemVer is only one of the independent coordinates documented in
 
 ## [Unreleased]
 
+### Changed
+
+- `ostadix-api` is now the independent runtime engine rather than a wrapper
+  around `o-lang`. It owns the parser, IR, evaluator, HGraph,
+  evidence/admission, scheduler, hosted/project/World implementations, runtime
+  dependencies, bundled shims, package-local test assets, and AOT source
+  bundle. The root `o-lang` crate is a compatibility and CLI shell with a
+  one-way exact-version dependency on the engine.
+- Historical `o_lang::<module>` imports are explicit reexports of the engine's
+  exact nominal types, so callers do not get duplicate evaluator or value
+  implementations. Reflected defining paths such as `type_name` may now name
+  `ostadix_api`, and direct engine users may use the full advanced module
+  surface as well as the concise owned `Runtime` entry point.
+- Generated-runtime dependency and source closure now originate from the
+  packaged engine rather than workspace-relative root sources. Registry
+  publication order is reversed: publish and verify `ostadix-api` first, then
+  publish its exact-version `o-lang` shell dependent.
+
+### Release boundary
+
+This post-v0.3 extraction is a next-release source-contract change. Both Rust
+packages now use the synchronized `0.4.0` development coordinate; the immutable
+`v0.3.0` tag and its historical narrow-facade contract must not be moved or
+relabeled.
+
 ## [0.3.0] - 2026-08-17
 
 Release notes: [docs/releases/v0.3.0.md](docs/releases/v0.3.0.md).
