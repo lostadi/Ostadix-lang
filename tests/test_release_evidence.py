@@ -144,5 +144,24 @@ class G2Aarch64EvidenceTests(unittest.TestCase):
         self.assertIn("qemu-system-arm", workflow)
 
 
+class AggregateOwnershipTests(unittest.TestCase):
+    def test_ocore_reproducibility_gate_targets_the_engine_and_runs_one_test(self):
+        root_source = (ROOT / "boot-and-test.sh").read_text(encoding="utf-8")
+        mirror_source = (ROOT / "okernel-multikernel/boot-and-test.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(root_source, mirror_source)
+        self.assertNotIn("--package o-lang --lib", root_source)
+        self.assertEqual(root_source.count("--package ostadix-api --lib"), 1)
+        self.assertEqual(
+            root_source.count(
+                "ocore::driver::tests::"
+                "ocore_object_is_byte_reproducible_across_source_directories"
+            ),
+            1,
+        )
+        self.assertIn("test result: ok. 1 passed; 0 failed;", root_source)
+
+
 if __name__ == "__main__":
     unittest.main()

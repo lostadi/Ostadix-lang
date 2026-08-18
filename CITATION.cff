@@ -30,7 +30,7 @@ authors:
   - family-names: Ostadi
     given-names: Lee Daghlar
     orcid: "https://orcid.org/0009-0001-6380-9558"
-version: "0.3.0"
+version: "0.4.0"
 license: LGPL-2.1-only
 repository-code: "https://github.com/lostadi/Ostadix-lang"
 url: "https://github.com/lostadi/Ostadix-lang"

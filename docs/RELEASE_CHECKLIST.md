@@ -5,9 +5,9 @@ umbrella system release is named **OSTADIX Alpha**; an Ostadix-lang tag or DOI
 does not by itself qualify that system release. OSTADIX Alpha additionally
 requires G13 and the evidence bound by the qualification registry below.
 
-This checklist is grounded in the current repository state: `Cargo.toml` version
-`0.3.0`, `CITATION.cff` version `0.3.0`, the publishable
-`crates/ostadix-api` facade, the README citation example, the CI
+This checklist is grounded in the current repository state: the synchronized
+root and engine package versions, `CITATION.cff`, the independently packageable
+`crates/ostadix-api` runtime engine, the README citation example, the CI
 workflow in `.github/workflows/ci.yml`, and the active release-claim guard in
 `scripts/check_release_claims.sh`. The source-release builder and its tests
 also reject disagreement among the root LGPL-2.1-only license text, Cargo
@@ -41,7 +41,7 @@ bash scripts/smoke-world-resource-keys.sh
 bash scripts/smoke-project-hgraph.sh
 bash scripts/smoke-project-hgraph-exec.sh
 cargo test --package o-lang --test parser_proptest
-cargo test --package o-lang --lib ocore::driver::tests::ocore_object_is_byte_reproducible_across_source_directories -- --exact
+cargo test --package ostadix-api --lib ocore::driver::tests::ocore_object_is_byte_reproducible_across_source_directories -- --exact
 cargo check --manifest-path fuzz/Cargo.toml
 cargo build --release --locked --package o-lang --bin O --bin olangc --bin o-info
 cargo test --locked --manifest-path mcp/ostadix_lang_mcp_server/Cargo.toml
@@ -195,8 +195,10 @@ When derivation policy or validator code changes, use this order:
 
 1. finish the validator and rule changes;
 2. compute the final derivation and validator hashes;
-3. append every required `rederive` event, recording the exact claims lost and
-   gained without editing the original attestation;
+3. if the derivation identity changed, append every required `rederive` event,
+   recording the exact claims lost and gained without editing the original
+   attestation; if only validator/source ownership changed, mint a new
+   schema-v3 attestation and append a `supersede` event instead;
 4. validate the complete ledger and deterministic source release; and
 5. only then ask an external CI/reviewer to witness or countersign the final
    implementation hash.
@@ -283,10 +285,10 @@ bytes from the resolved Git commit, not from local build products:
 
 ```bash
 python3 scripts/build_source_release.py \
-  --ref v0.3.0 \
-  --output dist/Ostadix-lang-source-v0.3.0.zip
+  --ref v0.4.0 \
+  --output dist/Ostadix-lang-source-v0.4.0.zip
 python3 scripts/build_source_release.py \
-  --verify dist/Ostadix-lang-source-v0.3.0.zip
+  --verify dist/Ostadix-lang-source-v0.4.0.zip
 ```
 
 The ZIP is deterministic for one commit and prefix. It contains a canonical
@@ -319,35 +321,38 @@ and runs `scripts/smoke_ostadix_mcp.py` against the real transport.
 Before tagging, verify all public version references agree:
 
 - `Cargo.toml` `[package].version`.
-- `crates/ostadix-api/Cargo.toml` package version and exact `=VERSION`
-  dependency on the root `o-lang` package.
+- `crates/ostadix-api/Cargo.toml` package version and the root `o-lang`
+  manifest's exact `=VERSION` dependency on that engine package.
 - The root, fuzz, and isolated MCP lockfile entries for repository-owned
   packages.
 - `mcp/ostadix_lang_mcp_server/Cargo.toml` and its isolated lockfile.
 - `o_lang/__init__.py` `__version__`.
 - `CITATION.cff` `version`.
-- The Git tag name, for example `v0.3.0`.
+- The Git tag name, for example `v0.4.0`.
 - The README citation example in `README.md` under "How to cite".
 - `Cargo.toml` and `CITATION.cff` both declare `LGPL-2.1-only`, matching the root
   `LICENSE`; the attribution-only `NOTICE` does not grant an alternate license.
 
-For v0.3.0 these all point at `0.3.0`; do not tag while
-any one of them disagrees.
+The immutable v0.3.0 release points all historical coordinates at `0.3.0`.
+The engine-ownership inversion uses synchronized `0.4.0` development
+coordinates; keep package, citation, and future tag coordinates together and
+never retarget the v0.3.0 tag.
 
 ## Registry publication order
 
-The facade intentionally has one exact dependency on the root package. When
-publishing to crates.io, first publish and verify `o-lang 0.3.0`, then publish
-`ostadix-api 0.3.0`. A local path makes workspace development atomic, while the
-exact version makes the registry dependency deterministic. Never publish the
-facade first, relax the exact version to work around registry propagation, or
-add a reverse root dependency on `ostadix-api`. The isolated MCP package remains
+The root compatibility/CLI package intentionally has one exact dependency on
+the independent engine package. Publish and verify `ostadix-api VERSION` first,
+then publish `o-lang VERSION`. A local path makes workspace development atomic,
+while the exact version makes the registry dependency deterministic. Never
+publish the shell first, relax the exact version to work around registry
+propagation, or add an engine dependency back to `o-lang`; that would recreate
+the cycle this extraction removes. The isolated MCP package remains
 `publish = false` and is built from its own lockfile.
 
 ## Git tag and GitHub release
 
 1. Choose the exact commit that passed the pre-tag validation above.
-2. Create an annotated version tag, for example `git tag -a v0.3.0 -m "Ostadix-lang v0.3.0"`.
+2. Create an annotated version tag, for example `git tag -a v0.4.0 -m "Ostadix-lang v0.4.0"`.
 3. Push the tag only after verifying it points to the intended commit.
 4. Draft a GitHub release for that tag.
 5. Build and verify the allowlisted source ZIP from that tag. Attach that ZIP,
@@ -366,7 +371,7 @@ upload that ZIP as a workflow artifact. Use the successful tag run's
 The existing DOI `10.5281/zenodo.21544345` identifies the preprint/package
 record. It is not an archive of a tagged Ostadix-lang source release and must
 remain the `preferred-citation` DOI. The steps below mint a separate DOI for a
-tagged v0.3.0 source snapshot:
+future tagged v0.4.0 source snapshot:
 
 1. Enable the repository in Zenodo's GitHub integration.
 2. Confirm Zenodo sees `lostadi/Ostadix-lang` and is authorized to archive releases.
@@ -390,13 +395,13 @@ After DOI minting:
 
 1. Fill the top-level `doi` field in `CITATION.cff` with the separate tagged
    source-release DOI; do not replace the existing `preferred-citation` DOI.
-2. Set `date-released` to the actual v0.3.0 publication date; do not reuse the
+2. Set `date-released` to the actual v0.4.0 publication date; do not reuse the
    archived v0.2.0 date or replace it with a later DOI-minting date.
 3. Update the README citation section to cite the DOI-bearing archived release.
 4. Use a follow-up metadata commit and a subsequent release as appropriate for
    repository policy. Never move or recreate either archival `v0.2.0` or
-   `v0.3.0` tags after publication; preserve a clear public trail from source
-   tag to DOI.
+   `v0.3.0` or future `v0.4.0` tags after publication; preserve a clear public
+   trail from source tag to DOI.
 
 ## Generated artifacts must not be published
 

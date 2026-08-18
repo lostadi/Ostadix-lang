@@ -109,12 +109,16 @@ toolchain, admission, catalog, Hosted, and World schema versions. It is
 descriptive: it does not prove that optional backend runtimes are installed,
 that a placement is authorized, or that a World is live.
 
-### Rust embedding facade
+### Independent Rust runtime engine
 
-Package `0.3.0` keeps the implementation and CLI in the root `o-lang` crate and
-adds the narrow, publishable `ostadix-api` workspace crate for new embedders.
-The facade requires an explicit backend-shim directory and owns its stable
-parse/evaluate error surface:
+The current development tree makes `ostadix-api` the independently packageable
+runtime engine. It owns the parser, IR, evaluator, HGraph, evidence/admission,
+scheduler, hosted/project/World machinery, bundled backend shims, and generated
+runtime source bundle. The root `o-lang` package is now a compatibility and CLI
+shell with a one-way exact-version dependency on that engine.
+
+The concise owned entry point requires an explicit backend-shim directory and
+has an engine-owned parse/evaluate error surface:
 
 ```rust
 use ostadix_api::{OValue, Runtime};
@@ -123,12 +127,18 @@ let mut runtime = Runtime::new("/absolute/path/to/backends");
 let value: OValue = runtime.evaluate("text^(hello)_text")?;
 ```
 
-`ostadix-api` explicitly reexports the complete `OValue` payload vocabulary;
-it does not reexport the implementation `Evaluator`, `Parser`, or backend
-registry. Registry publication must publish `o-lang 0.3.0` before
-`ostadix-api 0.3.0` because the facade intentionally uses an exact same-version
-dependency. Ordinary workspace checks include both packages; fuzz and MCP keep
-their independent roots and lockfiles.
+Direct engine users may also import the public `parser`, `ir`, `hgraph`,
+`evidence`, `eval`, `executor`, `hosted_remote`, `project`, `world`, and other
+runtime modules from `ostadix_api`. Historical `o_lang::<module>` paths are
+explicit reexports of those same nominal types; there is no second evaluator or
+parallel value model. Reflected diagnostic paths such as `type_name` may name
+the defining `ostadix_api` crate even when code imports the compatibility path.
+
+Registry publication order is now `ostadix-api` first, verify that exact version
+is available, then publish its `o-lang` shell dependent. This dependency
+inversion is an unreleased source-contract change and must not be published by
+moving or replacing the immutable `v0.3.0` tag. Ordinary workspace checks
+include both packages; fuzz and MCP keep their independent roots and lockfiles.
 
 Choose the next path according to what you want to inspect:
 
@@ -556,14 +566,29 @@ base-plus-addition revision. Otherwise it retains the verified pack under
 Neither a signature nor head membership grants execution authority. See
 [Information Kernel V1](docs/INFORMATION_KERNEL_V1.md) for the exact boundary.
 
+The Unreleased 0.4 engine adds `ostadix_api::information_provenance` as a
+higher, authority-bearing adapter over a byte-stable V1 information substrate.
+It derives a V2 sidecar from an opaque V6 execution admission and a verified
+World receipt, then admits only an exact recomputation of that sidecar. Raw V2
+records remain descriptive. Recovery is relative to an explicit equivalence
+contract and domain, and the current adapter deliberately returns
+`Unestablished` while producer authentication, signer authorization, execution
+fidelity, receipt currentness, exact plan-node attribution, effect closure, and
+morphism fidelity remain unproved. Receipt verification proves a signature
+against the caller-supplied resolver; it does not establish that the signer was
+authorized for the provenance claim. The opaque handle therefore exposes the
+analyzer classification but no established origin. See
+[Image admission and codomain slack](docs/IMAGE_ADMISSION.md).
+
 Package 0.3 also exposes eight explicit `o_lang::information_bridge` metadata
 projections for parsed documents, caller-public scalars, unadmitted HGraphs,
 Evidence V6, verified registry/World inputs, logical project graphs, and
 self-signature-consistent Hosted journals. They are bounded, lossy, and
 non-authorizing; there is no generic native serializer or reverse conversion.
 `o info head` uses a separate existing-root reader that creates no lock or
-directory and performs no head update. The advanced root API exports these
-records; stable `ostadix-api` and generated AOT projects do not.
+directory and performs no head update. The independent `ostadix-api` engine
+exports these advanced records, and `o_lang::api` reexports that same module;
+generated AOT projects intentionally do not embed the Information roots.
 
 This hosted profile is not a World, Governor, G1/G10, physical-machine,
 exactly-once, global-effect-isolation, project-migration, cancellation, or mid-
@@ -648,7 +673,7 @@ the MCP server is not wanted. The deterministic source release includes `mcp/`,
 an incomplete MCP release surface without executing archive payloads. The
 separate crate uses the repository's LGPL-2.1-only license. The required hosted-
 placement closure also includes every V2 module, including the co-located
-development authority implementation in `src/hosted_remote/v2/dev.rs`; release
+development authority implementation in `crates/ostadix-api/src/hosted_remote/v2/dev.rs`; release
 validation rejects an archive that omits it.
 
 The checked-in `.mcp.json` registers the server as `ostadix` using the
@@ -1219,7 +1244,7 @@ the post-reply/pre-consume process-exit or unmap race, pinned windows,
 streaming, signals, Linux or Plan 9 boot, a general foreign ABI or guest agent,
 KVM, PCI, DMA, IOMMU, or physical-device isolation.
 
-The common foreign-kernel contract begins in `src/kernel_world.rs`. Strict
+The common foreign-kernel contract begins in `crates/ostadix-api/src/kernel_world.rs`. Strict
 `ocore.kernel-world/v1` manifests put
 source-integrated and binary-contained providers behind the same bounded world
 identity, generation, health, export, quota, request, replacement, and
@@ -1641,13 +1666,13 @@ direct Cargo build.
 Build the versioned image and run `hello.O` from a read-only source mount:
 
 ```bash
-docker build -t o-lang:0.3.0 .
+docker build -t o-lang:0.4.0-dev .
 
 docker run --rm \
     --mount type=bind,src="$PWD",dst=/work,readonly \
-    o-lang:0.3.0 examples/hello.O
+    o-lang:0.4.0-dev examples/hello.O
 
-docker run --rm -it o-lang:0.3.0 --repl
+docker run --rm -it o-lang:0.4.0-dev --repl
 ```
 
 Bare single-directory mode deliberately literal-links and immediately runs all
@@ -1659,7 +1684,7 @@ the entrypoint still finds the image's shims through `O_BACKENDS_DIR`:
 docker run --rm \
     --mount type=bind,src="$PWD/examples/docker_literal",dst=/work,readonly \
     --entrypoint o-link \
-    o-lang:0.3.0 . -o /tmp/app.O
+    o-lang:0.4.0-dev . -o /tmp/app.O
 # 42
 ```
 
@@ -1673,7 +1698,7 @@ mkdir -p target/docker
 docker run --rm \
     --mount type=bind,src="$PWD",dst=/work,readonly \
     --entrypoint o-link \
-    o-lang:0.3.0 --project . --stdout > target/docker/project.O
+    o-lang:0.4.0-dev --project . --stdout > target/docker/project.O
 ```
 
 The `Docker minimal runtime profile` lane is named in
@@ -4001,7 +4026,8 @@ type-checked scaffolding.
 
 ## Status
 
-**v0.3.0**, with the Rust hosted runtime authoritative, the C17 edition as the
+**v0.4.0 (Unreleased)**, with `ostadix-api` as the independent Rust runtime
+engine, `o-lang` as its compatibility/CLI shell, the C17 edition as the
 standalone native port, the Python edition as the semantic reference, and
 O-core as the freestanding systems language.
 
@@ -4021,7 +4047,7 @@ is a checked projection.
 | `world-g2-aarch64-native` | yes | World G2 / AArch64 native compiler | [ocore/kernel/smoke-aarch64-g2-qemu.sh](ocore/kernel/smoke-aarch64-g2-qemu.sh) (`qemu_tcg_aarch64`) | One O-core kernel compiled for AArch64 retains EL2, enters host EL1, completes one domain-separated HVC return with register and stack integrity, and in one live QEMU TCG run executes native EL0 process, IPC, capability, lifecycle, stale-generation, reclamation, and bounded post-lifecycle counter-progress checks | This single-vCPU QEMU TCG gate is not physical AArch64, KVM/SVM, SMP, or G3 evidence<br>It does not boot Linux or Plan 9 and does not establish a general foreign ABI<br>It provides no PCI or physical-device assignment, DMA isolation, or IOMMU/SMMU evidence |
 | `world-identity-v1` | yes | World identity PR2 / Mode 27 | [ocore/kernel/smoke-world-identity-qemu.sh](ocore/kernel/smoke-world-identity-qemu.sh) (`portable_tcg`) | All 20 constitutional World identity atoms have shared typed Rust and O-core definitions with strict nonzero generation, version, term, and index rules<br>A bounded OWIDENT v1 identity-only corpus converges byte-for-byte between the Rust oracle and native O-core under QEMU; strict decode rejects malformed or zero-valued records, and hierarchical current/reference comparison rejects stale generations and same-generation logical mismatches | Serialized capability IDs are descriptive non-authority; this gate creates no bearer, CSpace handle, delegation, or authenticated authority<br>OWIDENT v1 remains the identity-only nested format and does not itself provide OWPROTO framing, transport, schema negotiation, an OValue envelope, a receipt codec, a Governor, or consensus<br>This repository-conformance slice does not pass G0 or any G0-G13 gate, and QEMU TCG is not physical or hardware-isolation evidence |
 | `world-protocol-v1` | yes | World protocol PR3 / Mode 28 | [ocore/kernel/smoke-world-protocol-qemu.sh](ocore/kernel/smoke-world-protocol-qemu.sh) (`portable_tcg`) | The architecture-independent OWPROTO v1 record codec uses deterministic big-endian framing, four fixed record kinds, a 16 KiB hard maximum, caller/negotiated record bounds, and strict exact-length, reserved-field, kind, schema, and nested-identity validation<br>A fixed 20-record, 1254-byte corpus containing two offers, one canonical v1 selection, one disjoint rejection, and all 16 OWIDENT v1 conformance records converges byte-for-byte between the Rust oracle and native O-core under QEMU; version negotiation deterministically selects the highest common version and smaller record limit or an exact contextual rejection | OWPROTO v1 is a record codec with an offline bounded negotiation function, not a stream or network transport, live peer handshake, authenticated session, encryption, replay protection, membership protocol, or multiplexing layer<br>Identity and capability descriptions remain inert metadata; decoding or negotiating a record grants no bearer, CSpace handle, delegation, authenticated authority, or ambient process identity<br>This PR3 slice does not implement PR4 OValue or extension envelopes, PR5 receipts, a Governor, consensus, WorldFS, or Workstream A acceptance, and it passes no G0-G13 gate; QEMU TCG is not physical or hardware-isolation evidence |
-| `world-value-v1` | yes | World OValue PR4 / Mode 29 | [ocore/kernel/smoke-world-value-qemu.sh](ocore/kernel/smoke-world-value-qemu.sh) (`portable_tcg`) | The separate self-framed OWVALUE v1 format freezes an explicit portable allowlist with a 4096-byte record maximum, depth-16 and 128-node limits, deterministic architecture-independent framing, strictly ordered records and scalar-key maps, and a root-only inert versioned extension envelope whose payload must itself be portable<br>The fixed 19-record, 928-byte corpus (1856 lowercase hex digits; concatenated-corpus SHA-256 264e00550bbbe7561412d9a43f89036667ffbcf27add522131f8e650abef19bc) converges byte-for-byte between the Rust oracle and native O-core under QEMU, with matching SHA-256 over each complete record; canonical encode/decode/reencode is stable, strict decoding rejects malformed or noncanonical values, and hosted projection rejects authority-bearing, capsule, and effectful values | OWVALUE v1 is inert portable data and admits no capability bearer, CSpace handle, delegation or session token, native capsule, live process, system, or device reference, executable request, or ambient identity; code and object references remain descriptive only<br>Versioned extension envelopes do not auto-dispatch code, load schemas, rehydrate capsules, resolve authority, or authenticate peers<br>Mode 29 is an offline codec and hash oracle, not a transport, live M9 crossing, PR5 receipt or signature implementation, execution or grounding convergence result, Governor, consensus, WorldFS, or Workstream A acceptance; it passes no G0-G13 gate, and QEMU TCG is not physical or hardware-isolation evidence<br>This gate does not make the full hosted src/value.rs OValue enum portable or replace the hosted canonical-CBOR shim wire format |
+| `world-value-v1` | yes | World OValue PR4 / Mode 29 | [ocore/kernel/smoke-world-value-qemu.sh](ocore/kernel/smoke-world-value-qemu.sh) (`portable_tcg`) | The separate self-framed OWVALUE v1 format freezes an explicit portable allowlist with a 4096-byte record maximum, depth-16 and 128-node limits, deterministic architecture-independent framing, strictly ordered records and scalar-key maps, and a root-only inert versioned extension envelope whose payload must itself be portable<br>The fixed 19-record, 928-byte corpus (1856 lowercase hex digits; concatenated-corpus SHA-256 264e00550bbbe7561412d9a43f89036667ffbcf27add522131f8e650abef19bc) converges byte-for-byte between the Rust oracle and native O-core under QEMU, with matching SHA-256 over each complete record; canonical encode/decode/reencode is stable, strict decoding rejects malformed or noncanonical values, and hosted projection rejects authority-bearing, capsule, and effectful values | OWVALUE v1 is inert portable data and admits no capability bearer, CSpace handle, delegation or session token, native capsule, live process, system, or device reference, executable request, or ambient identity; code and object references remain descriptive only<br>Versioned extension envelopes do not auto-dispatch code, load schemas, rehydrate capsules, resolve authority, or authenticate peers<br>Mode 29 is an offline codec and hash oracle, not a transport, live M9 crossing, PR5 receipt or signature implementation, execution or grounding convergence result, Governor, consensus, WorldFS, or Workstream A acceptance; it passes no G0-G13 gate, and QEMU TCG is not physical or hardware-isolation evidence<br>This gate does not make the full hosted crates/ostadix-api/src/value.rs OValue enum portable or replace the hosted canonical-CBOR shim wire format |
 | `world-receipt-v1` | yes | World receipt PR5 / Mode 30 | [ocore/kernel/smoke-world-receipt-qemu.sh](ocore/kernel/smoke-world-receipt-qemu.sh) (`portable_tcg`) | The separate self-framed OWRECEIPT v1 format deterministically binds one bounded canonical execution receipt to exact World identities and generations, SHA-256 content references, descriptive capability rights, terminal and commit fields, evidence-gate identity, and an algorithm-tagged signature envelope<br>The fixed two-record, 3239-byte conformance corpus (6478 lowercase hex digits; concatenated-corpus SHA-256 1edd90bf881cd42d08e2031482baae4e7c9a95bd78cfa65f0cbe14147c0a2604) converges byte-for-byte between the Rust oracle and native O-core under QEMU, including its 1575-byte current and 1546-byte stale canonical signing preimages; hosted Ed25519 signs and verifies the exact domain-separated preimage and rejects tampering or a wrong key, while native O-core strictly validates the bounded receipt and signature-envelope structure | OWRECEIPT v1 carries signed descriptive evidence; receipt capability identities and rights are not bearers, CSpace handles, delegation certificates, session tokens, or grants of authority, and signature validity does not establish authorization or current World state<br>The pinned conformance key is public test material; this slice provides no production key generation, secure storage, hardware binding, enrollment, certificate chain, rotation, revocation, recovery, peer authentication, or trusted-signer policy<br>Mode 30 proves canonical receipt bytes and signing-preimage convergence under QEMU plus hosted Ed25519 sign/verify; native O-core structurally validates the signature envelope but does not implement or prove a general freestanding Ed25519 verifier<br>The Mode 30 corpus is constructed offline and does not itself prove live emission; the separate World-project hosted-reference path emits a caller-signed uncommitted OWRECEIPT and Mode 32 consumes it for bounded canonical/semantic comparison, while live-system, KernelWorld, object, capability, and evidence components remain outside that path and the existing O-Git semantic receipt remains a separate unsigned JSON demo<br>Local generation and commit-field checks are not an authoritative Governor snapshot, replay or commit-fencing service, transport, consensus, WorldFS, or Workstream A acceptance<br>This gate is not the typed OSTADIX Alpha attestation schema, does not admit evidence into evidence/world_alpha_gates.toml, passes no G0-G13 gate, and QEMU TCG is not physical, hardware-virtualization, or hardware-isolation evidence<br>OWRECEIPT remains separate from frozen four-kind OWPROTO v1 and OWVALUE v1 and does not change the hosted canonical-CBOR shim wire format |
 | `world-project-runtime-mode32` | yes | World project runtime / Mode 32 | [ocore/kernel/smoke-world-project-runtime-qemu.sh](ocore/kernel/smoke-world-project-runtime-qemu.sh) (`portable_tcg`) | One focused hosted test enters the coordinator through an exact caller-supplied current-view World launch before workspace or child creation, observes a terminal RuntimeGraph, and emits a caller-signed OWRECEIPT with an unconditional Uncommitted fence<br>Native Mode 32 fully decodes and exactly re-encodes that live generated receipt, reconstructs its validated signing preimage, independently matches the signer-independent semantic SHA-256, rejects a malformed envelope, clears reused success-only validation tags, and reaches a later timer | The launch/current view and coordinator observer are caller-supplied descriptive identities, not authenticated Governor membership, admission, authority, reservation, provider placement, dispatch, recovery, or commit<br>Mode 32 compares canonical receipt structure and semantic content only; it neither executes the project natively nor verifies Ed25519 in freestanding O-core<br>The hosted execution retains residual HostWorld effects and provides no exactly-once guarantee, remote execution, physical-hardware evidence, G1 passage, Workstream A acceptance, or passage of any G0-G13 gate |
 | `m02-fault-recovery` | yes | M0.2 | [ocore/kernel/smoke-faults-qemu.sh](ocore/kernel/smoke-faults-qemu.sh) (`portable_tcg`) | Eight fresh boots contain the bounded fatal CPL3 fault corpus<br>A ninth boot recovers a bounded user-copy fault and reaches a later heartbeat | The one-process fault corpus is not the current kernel ceiling<br>It does not establish arbitrary fault recovery or multi-process scheduling |
@@ -4427,7 +4453,8 @@ citing the current source before a separate tagged source-release DOI exists,
 identify the repository version and exact revision:
 
     Lee Daghlar Ostadi. Ostadix-lang: Recursive Evaluator Composition for
-    Whole-Program Polyglot Execution. Version 0.3.0.
+    Whole-Program Polyglot Execution. Version 0.4.0.
+    Unreleased development source; identify the exact commit used.
     Commit: `FULL_COMMIT_SHA_USED`.
     https://github.com/lostadi/Ostadix-lang
 

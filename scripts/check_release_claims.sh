@@ -580,13 +580,13 @@ require_fixed README.md \
 require_fixed docs/OSTADIX_WORLD.md \
     'Only active evidence-ledger heads whose' \
     'the typed World evidence admission boundary is missing'
-require_fixed src/project/executor.rs \
+require_fixed crates/ostadix-api/src/project/executor.rs \
     'pub fn new_world_bound(' \
     'the exact World launch no longer enters the project coordinator before execution'
-require_fixed src/project/world_execution.rs \
+require_fixed crates/ostadix-api/src/project/world_execution.rs \
     'ReceiptCommitFenceV1::Uncommitted' \
     'the live project receipt is no longer explicitly uncommitted'
-require_fixed src/project/runtime_graph.rs \
+require_fixed crates/ostadix-api/src/project/runtime_graph.rs \
     'pub struct RuntimeGraphV1' \
     'the terminal hosted project RuntimeGraph surface is missing'
 require_fixed ocore/kernel/smoke-world-project-receipt-qemu.sh \

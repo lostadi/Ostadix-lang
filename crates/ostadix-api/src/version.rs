@@ -17,6 +17,11 @@ use crate::world::{
 };
 
 pub const VERSION_REPORT_SCHEMA_V1: &str = "ostadix.version-report/v1";
+/// Package coordinate frozen into the V1 compatibility report.
+pub const VERSION_REPORT_PACKAGE_NAME_V1: &str = "o-lang";
+/// The crate that now owns the runtime implementation.
+pub const ENGINE_PACKAGE_NAME: &str = "ostadix-api";
+pub const RELEASE_RUST_TOOLCHAIN: &str = "1.97.1";
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct OstadixVersionReportV1 {
@@ -45,7 +50,7 @@ impl OstadixVersionReportV1 {
     pub fn current() -> Self {
         Self {
             schema: VERSION_REPORT_SCHEMA_V1,
-            package_name: env!("CARGO_PKG_NAME"),
+            package_name: VERSION_REPORT_PACKAGE_NAME_V1,
             package_version: env!("CARGO_PKG_VERSION"),
             minimum_rust_version: env!("CARGO_PKG_RUST_VERSION"),
             release_rust_toolchain: release_rust_toolchain(),
@@ -71,16 +76,7 @@ impl OstadixVersionReportV1 {
 }
 
 fn release_rust_toolchain() -> String {
-    let manifest = include_str!("../rust-toolchain.toml");
-    let parsed: toml::Value = manifest
-        .parse()
-        .expect("checked-in rust-toolchain.toml must remain valid TOML");
-    parsed
-        .get("toolchain")
-        .and_then(|toolchain| toolchain.get("channel"))
-        .and_then(toml::Value::as_str)
-        .expect("checked-in rust-toolchain.toml must define toolchain.channel")
-        .to_owned()
+    RELEASE_RUST_TOOLCHAIN.to_owned()
 }
 
 #[cfg(test)]
@@ -91,7 +87,9 @@ mod tests {
     fn report_keeps_independent_version_axes_explicit() {
         let report = OstadixVersionReportV1::current();
         assert_eq!(report.schema, VERSION_REPORT_SCHEMA_V1);
-        assert_eq!(report.package_version, "0.3.0");
+        assert_eq!(report.package_name, VERSION_REPORT_PACKAGE_NAME_V1);
+        assert_eq!(ENGINE_PACKAGE_NAME, env!("CARGO_PKG_NAME"));
+        assert_eq!(report.package_version, "0.4.0");
         assert_eq!(report.minimum_rust_version, "1.93.1");
         assert_eq!(report.release_rust_toolchain, "1.97.1");
         assert_ne!(report.admission_schema, report.execution_intent_schema);
