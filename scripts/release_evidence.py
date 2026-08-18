@@ -534,6 +534,9 @@ def validate_wiring(gates: list[dict[str, Any]]) -> None:
         "python3 scripts/release_evidence.py validate",
         "python3 scripts/release_evidence.py list-scripts",
         "python3 scripts/release_evidence.py verify-transcript",
+        "--package ostadix-api --lib",
+        "ocore::driver::tests::ocore_object_is_byte_reproducible_across_source_directories",
+        "test result: ok. 1 passed; 0 failed;",
     ]
     for path in aggregate_paths:
         if not path.is_file() or not os.access(path, os.X_OK):

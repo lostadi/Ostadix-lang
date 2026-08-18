@@ -1,0 +1,28 @@
+# Small staged pipeline: simulated fetch/parse, two transforms, aggregate.
+let fetched = python^(
+import json
+import time
+time.sleep(__SLEEP_SECONDS__)
+payload = json.loads('{"items":["alpha","beta","gamma"]}')
+__oval_result__ = "-".join(payload["items"])
+)_python
+
+let products = autonomous(batch(
+bash^(
+sleep __SLEEP_SECONDS__
+printf 'transform:%s\n' "${fetched}"
+)_bash,
+javascript^(
+const source = fetched;
+setTimeout(() => {
+  console.log("format:" + source.toUpperCase());
+}, __SLEEP_MILLISECONDS__);
+)_javascript
+))
+
+python^(
+import time
+time.sleep(__SLEEP_SECONDS__)
+parts = $products
+__oval_result__ = "aggregate|" + "|".join(parts)
+)_python

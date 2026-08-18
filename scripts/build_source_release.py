@@ -35,14 +35,24 @@ ROOT_LICENSE_SPDX = "LGPL-2.1-only"
 ROOT_REPOSITORY = "https://github.com/lostadi/Ostadix-lang"
 EXISTING_PREPRINT_DOI = "10.5281/zenodo.21544345"
 
-# `olangc` embeds its generated-runtime source closure with compile-time
-# include_str!/include_bytes! calls relative to src/bin.  Derive that closure
-# from the compiler source instead of copying another long source manifest
-# into this release script.  Restrict matches to parent-relative literals so
-# generated-code templates such as include_bytes!("project_bundle.json") are
-# not mistaken for compiler-time inputs.
-GENERATED_RUNTIME_INCLUDE = re.compile(
+# `olangc` owns the generated-project writer, while the independent engine
+# owns the source bytes it embeds.  The compiler still has a few workspace
+# compile-time inputs; the engine inventory has ordinary relative includes.
+# Derive both closures from their owning Rust source instead of copying a
+# second runtime manifest into this release script.
+PARENT_RELATIVE_INCLUDE = re.compile(
     r'include_(?:str|bytes)!\(\s*"(?P<path>(?:\.\./)+[^"\r\n]+)"\s*\)'
+)
+RELATIVE_LITERAL_INCLUDE = re.compile(
+    r'include_(?:str|bytes)!\(\s*"(?P<path>[^"\r\n]+)"\s*\)'
+)
+OSTADIX_API_ROOT = "crates/ostadix-api"
+OSTADIX_API_SOURCE_ROOT = f"{OSTADIX_API_ROOT}/src"
+OSTADIX_API_AOT_SOURCE = f"{OSTADIX_API_SOURCE_ROOT}/api/aot_source.rs"
+OSTADIX_API_ALLOWED_PREFIXES = (
+    f"{OSTADIX_API_SOURCE_ROOT}/",
+    f"{OSTADIX_API_ROOT}/backends/",
+    f"{OSTADIX_API_ROOT}/test-assets/",
 )
 
 # Keep this list intentionally narrow.  Adding a new top-level project surface
@@ -100,13 +110,102 @@ HOSTED_HGRAPH_BENCHMARK_RELEASE_PATHS = HOSTED_HGRAPH_BENCHMARK_PATHS | frozense
         "tests/test_benchmark_hgraph_hosted.py",
     }
 )
-OSTADIX_API_RELEASE_PATHS = frozenset(
+OSTADIX_API_RUNTIME_ASSET_PATHS = frozenset(
     {
-        "crates/ostadix-api/Cargo.toml",
-        "crates/ostadix-api/src/lib.rs",
-        "crates/ostadix-api/tests/public_surface.rs",
+        f"{OSTADIX_API_ROOT}/backends/{name}"
+        for name in (
+            "bash_shim.py",
+            "common_lisp_shim.py",
+            "cpp_shim.py",
+            "csharp_shim.py",
+            "haskell_shim.py",
+            "java_shim.py",
+            "javascript_shim.py",
+            "lisp_shim.py",
+            "mathematica_shim.py",
+            "matlab_shim.py",
+            "nix_shim.py",
+            "nix_store_shim.py",
+            "nixos_test_shim.py",
+            "o_shim_common.py",
+            "ocaml_shim.py",
+            "python_shim.py",
+            "racket_shim.py",
+            "ruby_shim.py",
+            "rust_shim.py",
+            "shell_shim.py",
+            "sql_shim.py",
+            "ubuntu_vm_shim.py",
+            "webassembly_shim.py",
+        )
+    }
+) | frozenset(
+    {
+        f"{OSTADIX_API_ROOT}/test-assets/benchmarks/hgraph_hosted/{name}.O"
+        for name in ("chained", "heterogeneous", "mixed_width", "realistic")
+    }
+) | frozenset(
+    {
+        f"{OSTADIX_API_ROOT}/test-assets/ocore/runtime/x86_64/capability.oc",
+        f"{OSTADIX_API_ROOT}/test-assets/ocore/runtime/x86_64/native_abi.oc",
     }
 )
+OSTADIX_API_RELEASE_PATHS = frozenset(
+    {
+        f"{OSTADIX_API_ROOT}/Cargo.toml",
+        f"{OSTADIX_API_ROOT}/LICENSE",
+        f"{OSTADIX_API_ROOT}/NOTICE",
+        f"{OSTADIX_API_ROOT}/README.md",
+        f"{OSTADIX_API_SOURCE_ROOT}/api.rs",
+        OSTADIX_API_AOT_SOURCE,
+        f"{OSTADIX_API_SOURCE_ROOT}/lib.rs",
+        f"{OSTADIX_API_SOURCE_ROOT}/shims.rs",
+        f"{OSTADIX_API_ROOT}/tests/public_surface.rs",
+    }
+) | OSTADIX_API_RUNTIME_ASSET_PATHS
+OSTADIX_API_ROOT_MODULE_PATHS = {
+    "api": f"{OSTADIX_API_SOURCE_ROOT}/api.rs",
+    "backend": f"{OSTADIX_API_SOURCE_ROOT}/backend.rs",
+    "backend_catalog": f"{OSTADIX_API_SOURCE_ROOT}/backend_catalog.rs",
+    "backend_morphism": f"{OSTADIX_API_SOURCE_ROOT}/backend_morphism.rs",
+    "backend_state": f"{OSTADIX_API_SOURCE_ROOT}/backend_state.rs",
+    "canonical_cbor": f"{OSTADIX_API_SOURCE_ROOT}/canonical_cbor.rs",
+    "capability": f"{OSTADIX_API_SOURCE_ROOT}/capability.rs",
+    "dispatch_model": f"{OSTADIX_API_SOURCE_ROOT}/dispatch_model.rs",
+    "effects": f"{OSTADIX_API_SOURCE_ROOT}/effects.rs",
+    "environment": f"{OSTADIX_API_SOURCE_ROOT}/environment.rs",
+    "eval": f"{OSTADIX_API_SOURCE_ROOT}/eval.rs",
+    "eval_core": f"{OSTADIX_API_SOURCE_ROOT}/eval_core.rs",
+    "evidence": f"{OSTADIX_API_SOURCE_ROOT}/evidence/mod.rs",
+    "execution_contract": f"{OSTADIX_API_SOURCE_ROOT}/execution_contract.rs",
+    "executor": f"{OSTADIX_API_SOURCE_ROOT}/executor/mod.rs",
+    "hgraph": f"{OSTADIX_API_SOURCE_ROOT}/hgraph/mod.rs",
+    "hosted_remote": f"{OSTADIX_API_SOURCE_ROOT}/hosted_remote/mod.rs",
+    "information": f"{OSTADIX_API_SOURCE_ROOT}/information/mod.rs",
+    "information_bridge": f"{OSTADIX_API_SOURCE_ROOT}/information_bridge/mod.rs",
+    "information_provenance": f"{OSTADIX_API_SOURCE_ROOT}/information_provenance/mod.rs",
+    "ir": f"{OSTADIX_API_SOURCE_ROOT}/ir.rs",
+    "kernel_world": f"{OSTADIX_API_SOURCE_ROOT}/kernel_world.rs",
+    "live_system": f"{OSTADIX_API_SOURCE_ROOT}/live_system/mod.rs",
+    "nix_ops": f"{OSTADIX_API_SOURCE_ROOT}/nix_ops.rs",
+    "nixos_ops": f"{OSTADIX_API_SOURCE_ROOT}/nixos_ops.rs",
+    "ocore": f"{OSTADIX_API_SOURCE_ROOT}/ocore/mod.rs",
+    "parser": f"{OSTADIX_API_SOURCE_ROOT}/parser.rs",
+    "placement": f"{OSTADIX_API_SOURCE_ROOT}/placement/mod.rs",
+    "placement_protocol": f"{OSTADIX_API_SOURCE_ROOT}/placement/protocol/mod.rs",
+    "process": f"{OSTADIX_API_SOURCE_ROOT}/process.rs",
+    "project": f"{OSTADIX_API_SOURCE_ROOT}/project/mod.rs",
+    "registry": f"{OSTADIX_API_SOURCE_ROOT}/registry/mod.rs",
+    "resource_identity": f"{OSTADIX_API_SOURCE_ROOT}/world/identity.rs",
+    "runtime_exec": f"{OSTADIX_API_SOURCE_ROOT}/runtime_exec.rs",
+    "scheduler": f"{OSTADIX_API_SOURCE_ROOT}/scheduler.rs",
+    "shims": f"{OSTADIX_API_SOURCE_ROOT}/shims.rs",
+    "syntax_dialect": f"{OSTADIX_API_SOURCE_ROOT}/syntax_dialect.rs",
+    "value": f"{OSTADIX_API_SOURCE_ROOT}/value.rs",
+    "version": f"{OSTADIX_API_SOURCE_ROOT}/version.rs",
+    "wire": f"{OSTADIX_API_SOURCE_ROOT}/wire.rs",
+    "world": f"{OSTADIX_API_SOURCE_ROOT}/world/mod.rs",
+}
 ALLOWED_EXACT_PATHS = frozenset(
     {
         "okernel-multikernel/boot-and-test.sh",
@@ -228,6 +327,7 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "docs/HOSTED_PLACEMENT_V6.md",
         "docs/HOSTED_WORLD_REFERENCE_PROFILE.md",
         "docs/CI_POSTURE.md",
+        "docs/IMAGE_ADMISSION.md",
         "docs/INFORMATION_KERNEL_V1.md",
         "docs/releases/v0.3.0.md",
         "docs/O_MACHINE_CONTRACT.md",
@@ -248,6 +348,8 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "evidence/world/g0-machine-contract-supersession-2026-08-03.toml",
         "evidence/world/g0-ostadix-alpha-branding-2026-08-09.toml",
         "evidence/world/g0-ostadix-alpha-branding-supersession-2026-08-09.toml",
+        "evidence/world/g0-independent-engine-2026-08-17.toml",
+        "evidence/world/g0-independent-engine-supersession-2026-08-17.toml",
         "evidence/world/g2-aarch64-qemu.toml",
         "evidence/world/g2-aarch64-qemu-2026-08-03.toml",
         "evidence/world/g2-derivation-rederive-2026-08-03.toml",
@@ -256,6 +358,7 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "evidence/world/transcripts/g0-repository-conformance-2026-08-03.log",
         "evidence/world/transcripts/g0-repository-conformance-2026-08-03-v2.log",
         "evidence/world/transcripts/g0-ostadix-alpha-branding-2026-08-09.log",
+        "evidence/world/transcripts/g0-independent-engine-2026-08-17.log",
         "evidence/world/transcripts/g2-aarch64-qemu.log",
         "evidence/world/transcripts/g2-aarch64-qemu-2026-08-03.log",
         "examples/manifest.json",
@@ -333,74 +436,76 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "scripts/release_evidence.py",
         "scripts/world_alpha_evidence.py",
         "backends/o_shim_common.py",
-        "src/backend.rs",
-        "src/backend_morphism.rs",
-        "src/api.rs",
-        "src/backend_catalog.rs",
-        "src/backend_catalog.inc.rs",
-        "src/backend_state.rs",
-        "src/canonical_cbor.rs",
-        "src/dispatch_model.rs",
-        "src/evidence/admit.rs",
-        "src/evidence/analyze.rs",
-        "src/evidence/fact.rs",
-        "src/evidence/intent.rs",
-        "src/evidence/mod.rs",
-        "src/evidence/profile.rs",
-        "src/effects.rs",
-        "src/eval.rs",
-        "src/eval_core.rs",
-        "src/execution_contract.rs",
-        "src/hosted_remote/client.rs",
-        "src/hosted_remote/mod.rs",
-        "src/hosted_remote/node.rs",
-        "src/hosted_remote/paths.rs",
-        "src/hosted_remote/protocol.rs",
-        "src/hosted_remote/tls.rs",
-        "src/hosted_remote/v2/auth.rs",
-        "src/hosted_remote/v2/client.rs",
-        "src/hosted_remote/v2/crypto.rs",
-        "src/hosted_remote/v2/dev.rs",
-        "src/hosted_remote/v2/mod.rs",
-        "src/hosted_remote/v2/protocol.rs",
-        "src/hosted_remote/v2/runtime.rs",
-        "src/hosted_remote/v2/server.rs",
-        "src/hosted_remote/v2/store.rs",
-        "src/information/acquisition.rs",
-        "src/information/decision.rs",
-        "src/information/delta.rs",
-        "src/information/exchange.rs",
-        "src/information/id.rs",
-        "src/information/invalidation.rs",
-        "src/information/loss.rs",
-        "src/information/mod.rs",
-        "src/information/model.rs",
-        "src/information/projection.rs",
-        "src/information/root.rs",
-        "src/information/store.rs",
-        "src/information_bridge/mod.rs",
-        "src/ir.rs",
+        "crates/ostadix-api/src/backend.rs",
+        "crates/ostadix-api/src/backend_morphism.rs",
+        "crates/ostadix-api/src/api.rs",
+        "crates/ostadix-api/src/backend_catalog.rs",
+        "crates/ostadix-api/src/backend_catalog.inc.rs",
+        "crates/ostadix-api/src/backend_state.rs",
+        "crates/ostadix-api/src/canonical_cbor.rs",
+        "crates/ostadix-api/src/dispatch_model.rs",
+        "crates/ostadix-api/src/evidence/admit.rs",
+        "crates/ostadix-api/src/evidence/analyze.rs",
+        "crates/ostadix-api/src/evidence/fact.rs",
+        "crates/ostadix-api/src/evidence/intent.rs",
+        "crates/ostadix-api/src/evidence/mod.rs",
+        "crates/ostadix-api/src/evidence/profile.rs",
+        "crates/ostadix-api/src/effects.rs",
+        "crates/ostadix-api/src/eval.rs",
+        "crates/ostadix-api/src/eval_core.rs",
+        "crates/ostadix-api/src/execution_contract.rs",
+        "crates/ostadix-api/src/hosted_remote/client.rs",
+        "crates/ostadix-api/src/hosted_remote/mod.rs",
+        "crates/ostadix-api/src/hosted_remote/node.rs",
+        "crates/ostadix-api/src/hosted_remote/paths.rs",
+        "crates/ostadix-api/src/hosted_remote/protocol.rs",
+        "crates/ostadix-api/src/hosted_remote/tls.rs",
+        "crates/ostadix-api/src/hosted_remote/v2/auth.rs",
+        "crates/ostadix-api/src/hosted_remote/v2/client.rs",
+        "crates/ostadix-api/src/hosted_remote/v2/crypto.rs",
+        "crates/ostadix-api/src/hosted_remote/v2/dev.rs",
+        "crates/ostadix-api/src/hosted_remote/v2/mod.rs",
+        "crates/ostadix-api/src/hosted_remote/v2/protocol.rs",
+        "crates/ostadix-api/src/hosted_remote/v2/runtime.rs",
+        "crates/ostadix-api/src/hosted_remote/v2/server.rs",
+        "crates/ostadix-api/src/hosted_remote/v2/store.rs",
+        "crates/ostadix-api/src/information/acquisition.rs",
+        "crates/ostadix-api/src/information/decision.rs",
+        "crates/ostadix-api/src/information/delta.rs",
+        "crates/ostadix-api/src/information/exchange.rs",
+        "crates/ostadix-api/src/information/id.rs",
+        "crates/ostadix-api/src/information/invalidation.rs",
+        "crates/ostadix-api/src/information/loss.rs",
+        "crates/ostadix-api/src/information/mod.rs",
+        "crates/ostadix-api/src/information/model.rs",
+        "crates/ostadix-api/src/information/projection.rs",
+        "crates/ostadix-api/src/information/provenance.rs",
+        "crates/ostadix-api/src/information/root.rs",
+        "crates/ostadix-api/src/information/store.rs",
+        "crates/ostadix-api/src/information_bridge/mod.rs",
+        "crates/ostadix-api/src/information_provenance/mod.rs",
+        "crates/ostadix-api/src/ir.rs",
         "src/lib.rs",
         "src/main.rs",
-        "src/placement/mod.rs",
-        "src/placement/projection.rs",
-        "src/placement/protocol/candidate.rs",
-        "src/placement/protocol/catalog.rs",
-        "src/placement/protocol/digest.rs",
-        "src/placement/protocol/error.rs",
-        "src/placement/protocol/mod.rs",
-        "src/placement/protocol/records.rs",
-        "src/placement/protocol/requirement.rs",
-        "src/placement/protocol/state.rs",
-        "src/placement/protocol/target.rs",
-        "src/placement/protocol/warrant.rs",
-        "src/process.rs",
-        "src/version.rs",
-        "src/registry/bundle/mod.rs",
-        "src/registry/placement_compat.rs",
-        "src/registry/store.rs",
-        "src/runtime_exec.rs",
-        "src/syntax_dialect.rs",
+        "crates/ostadix-api/src/placement/mod.rs",
+        "crates/ostadix-api/src/placement/projection.rs",
+        "crates/ostadix-api/src/placement/protocol/candidate.rs",
+        "crates/ostadix-api/src/placement/protocol/catalog.rs",
+        "crates/ostadix-api/src/placement/protocol/digest.rs",
+        "crates/ostadix-api/src/placement/protocol/error.rs",
+        "crates/ostadix-api/src/placement/protocol/mod.rs",
+        "crates/ostadix-api/src/placement/protocol/records.rs",
+        "crates/ostadix-api/src/placement/protocol/requirement.rs",
+        "crates/ostadix-api/src/placement/protocol/state.rs",
+        "crates/ostadix-api/src/placement/protocol/target.rs",
+        "crates/ostadix-api/src/placement/protocol/warrant.rs",
+        "crates/ostadix-api/src/process.rs",
+        "crates/ostadix-api/src/version.rs",
+        "crates/ostadix-api/src/registry/bundle/mod.rs",
+        "crates/ostadix-api/src/registry/placement_compat.rs",
+        "crates/ostadix-api/src/registry/store.rs",
+        "crates/ostadix-api/src/runtime_exec.rs",
+        "crates/ostadix-api/src/syntax_dialect.rs",
         "src/bin/o-node.rs",
         "src/bin/o-info.rs",
         "src/bin/o-registry.rs",
@@ -408,39 +513,39 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "src/bin/olink.rs",
         "src/bin/olangc.rs",
         "src/bin/ocorec.rs",
-        "src/ocore/codegen.rs",
-        "src/ocore/codegen_aarch64.rs",
-        "src/ocore/boot_info.rs",
-        "src/ocore/driver.rs",
-        "src/ocore/mod.rs",
-        "src/executor/mod.rs",
-        "src/executor/pool.rs",
-        "src/executor/task.rs",
-        "src/hgraph/graph.rs",
-        "src/hgraph/kinds.rs",
-        "src/hgraph/from_oir.rs",
-        "src/hgraph/solve.rs",
-        "src/project/mod.rs",
-        "src/project/model.rs",
-        "src/project/executor.rs",
-        "src/project/deployment.rs",
-        "src/project/launch.rs",
-        "src/project/logical.rs",
-        "src/project/plan.rs",
-        "src/project/runtime.rs",
-        "src/project/runtime_graph.rs",
-        "src/project/trace.rs",
-        "src/project/world_execution.rs",
-        "src/world/grounding.rs",
-        "src/world/identity.rs",
-        "src/world/identity_wire.rs",
-        "src/world/codec.rs",
-        "src/world/mod.rs",
-        "src/world/protocol.rs",
-        "src/world/receipt.rs",
-        "src/world/receipt_codec.rs",
-        "src/world/value.rs",
-        "src/world/value_codec.rs",
+        "crates/ostadix-api/src/ocore/codegen.rs",
+        "crates/ostadix-api/src/ocore/codegen_aarch64.rs",
+        "crates/ostadix-api/src/ocore/boot_info.rs",
+        "crates/ostadix-api/src/ocore/driver.rs",
+        "crates/ostadix-api/src/ocore/mod.rs",
+        "crates/ostadix-api/src/executor/mod.rs",
+        "crates/ostadix-api/src/executor/pool.rs",
+        "crates/ostadix-api/src/executor/task.rs",
+        "crates/ostadix-api/src/hgraph/graph.rs",
+        "crates/ostadix-api/src/hgraph/kinds.rs",
+        "crates/ostadix-api/src/hgraph/from_oir.rs",
+        "crates/ostadix-api/src/hgraph/solve.rs",
+        "crates/ostadix-api/src/project/mod.rs",
+        "crates/ostadix-api/src/project/model.rs",
+        "crates/ostadix-api/src/project/executor.rs",
+        "crates/ostadix-api/src/project/deployment.rs",
+        "crates/ostadix-api/src/project/launch.rs",
+        "crates/ostadix-api/src/project/logical.rs",
+        "crates/ostadix-api/src/project/plan.rs",
+        "crates/ostadix-api/src/project/runtime.rs",
+        "crates/ostadix-api/src/project/runtime_graph.rs",
+        "crates/ostadix-api/src/project/trace.rs",
+        "crates/ostadix-api/src/project/world_execution.rs",
+        "crates/ostadix-api/src/world/grounding.rs",
+        "crates/ostadix-api/src/world/identity.rs",
+        "crates/ostadix-api/src/world/identity_wire.rs",
+        "crates/ostadix-api/src/world/codec.rs",
+        "crates/ostadix-api/src/world/mod.rs",
+        "crates/ostadix-api/src/world/protocol.rs",
+        "crates/ostadix-api/src/world/receipt.rs",
+        "crates/ostadix-api/src/world/receipt_codec.rs",
+        "crates/ostadix-api/src/world/value.rs",
+        "crates/ostadix-api/src/world/value_codec.rs",
         "tests/example_manifest.py",
         "tests/fixtures/world_identity_v1.hex",
         "tests/fixtures/project_hgraph/input.txt",
@@ -486,7 +591,9 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "tests/world_receipt.rs",
         "tests/world_value.rs",
     }
-) | HOSTED_HGRAPH_BENCHMARK_RELEASE_PATHS | OSTADIX_API_RELEASE_PATHS
+) | HOSTED_HGRAPH_BENCHMARK_RELEASE_PATHS | OSTADIX_API_RELEASE_PATHS | frozenset(
+    OSTADIX_API_ROOT_MODULE_PATHS.values()
+)
 VALID_GIT_MODES = frozenset({"100644", "100755"})
 SAFE_PREFIX = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 HEX_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
@@ -581,7 +688,7 @@ WORLD_DERIVATION_HASH = (
     "sha256:3a017fee12f6cc7b3c9ef9ec099407f39b5bb143251c21b9937abe47409c9d06"
 )
 WORLD_VALIDATOR_SHA256 = (
-    "d8c5cc22bdbb9a0f854689fbb423731473b2da8976b36dd1244036fb3669c602"
+    "e3a5adab37962db94ccda38db9ac62570f6ba06dbb9995d16af233af63c8295f"
 )
 WORLD_REDERIVE_PAYLOAD_DOMAIN = "ostadix.world.evidence.rederive.v1"
 WORLD_WITNESS_PAYLOAD_DOMAIN = "ostadix.world.evidence.witness.v1"
@@ -595,6 +702,9 @@ WORLD_HISTORICAL_ATTESTATION_SHA256 = {
     "evidence/world/g0-repository-conformance-2026-08-03-v2.toml": (
         "0016e953bbd353f28b771e8e2d0cfe34867bc7f6561e06c7e1c86fb908a9a8c4"
     ),
+    "evidence/world/g0-ostadix-alpha-branding-2026-08-09.toml": (
+        "32b76b190aab1c51ba73beccee350ea2a20928798605e980173c86da916450df"
+    ),
     "evidence/world/g2-aarch64-qemu.toml": (
         "99414f1cf356b3666c163e0e28172eaf2b46e3f14c8f13f2ce12fa24cc9d30d7"
     ),
@@ -603,14 +713,17 @@ WORLD_HISTORICAL_ATTESTATION_SHA256 = {
     ),
 }
 WORLD_CURRENT_ATTESTATION_SHA256 = {
-    "evidence/world/g0-ostadix-alpha-branding-2026-08-09.toml": (
-        "32b76b190aab1c51ba73beccee350ea2a20928798605e980173c86da916450df"
+    "evidence/world/g0-independent-engine-2026-08-17.toml": (
+        "2c48ef0100bf944e2ce50a70162adff2078836e5e755c92177f366714e7b21be"
     ),
 }
 # Repository-authored lifecycle and derivation events are immutable ledger
 # records.  The release verifier seals their complete bytes independently of
 # the payload hash carried by a rederive event.
 WORLD_EVIDENCE_EVENT_SHA256 = {
+    "evidence/world/g0-independent-engine-supersession-2026-08-17.toml": (
+        "aeec68018bd7416cc7b24b1a4d8b102e3df31122a56856784796b73f4a1d90ce"
+    ),
     "evidence/world/g0-ostadix-alpha-branding-supersession-2026-08-09.toml": (
         "132a60bb1e42d6debfe68294276e3f8cdea47aa862e0c2f5ca657489191c2227"
     ),
@@ -771,7 +884,12 @@ def is_allowed_release_path(path: str) -> bool:
     pure = _validate_release_path(path)
     parts = pure.parts
     top = parts[0]
-    if path not in ALLOWED_EXACT_PATHS:
+    if top == "src" and not (
+        path in {"src/lib.rs", "src/main.rs"} or path.startswith("src/bin/")
+    ):
+        return False
+    api_scoped = any(path.startswith(prefix) for prefix in OSTADIX_API_ALLOWED_PREFIXES)
+    if path not in ALLOWED_EXACT_PATHS and not api_scoped:
         if len(parts) == 1:
             if top not in ALLOWED_TOP_LEVEL_FILES:
                 return False
@@ -807,30 +925,36 @@ def _decode_git_path(raw_path: bytes) -> str:
         ) from error
 
 
-def _resolve_generated_runtime_include(relative: str) -> str:
-    """Resolve one src/bin/olangc.rs parent-relative include inside the tree."""
+def _resolve_compile_time_include(owner: str, relative: str) -> str:
+    """Resolve one literal Rust include without allowing release-root escape."""
 
-    parts = ["src", "bin"]
+    if PurePosixPath(relative).is_absolute():
+        raise ReleaseError(
+            f"compile-time include in {owner} is absolute: {relative!r}"
+        )
+    parts = list(PurePosixPath(owner).parent.parts)
     for part in PurePosixPath(relative).parts:
         if part in {"", "."}:
             continue
         if part == "..":
             if not parts:
                 raise ReleaseError(
-                    f"olangc generated-runtime include escapes the release root: {relative!r}"
+                    f"compile-time include in {owner} escapes the release root: "
+                    f"{relative!r}"
                 )
             parts.pop()
         else:
             parts.append(part)
     if not parts:
         raise ReleaseError(
-            f"olangc generated-runtime include resolves to the release root: {relative!r}"
+            f"compile-time include in {owner} resolves to the release root: "
+            f"{relative!r}"
         )
     return PurePosixPath(*parts).as_posix()
 
 
 def validate_generated_runtime_source_closure(entries: Sequence[SourceEntry]) -> None:
-    """Require every compile-time source embedded by olangc in the release."""
+    """Require the shell compiler and engine-owned AOT source inventories."""
 
     files = {entry.path: entry.data for entry in entries}
     compiler_path = "src/bin/olangc.rs"
@@ -843,9 +967,29 @@ def validate_generated_runtime_source_closure(entries: Sequence[SourceEntry]) ->
         raise ReleaseError(f"{compiler_path} is not valid UTF-8") from error
 
     embedded = {
-        _resolve_generated_runtime_include(match.group("path"))
-        for match in GENERATED_RUNTIME_INCLUDE.finditer(compiler)
+        _resolve_compile_time_include(compiler_path, match.group("path"))
+        for match in PARENT_RELATIVE_INCLUDE.finditer(compiler)
     }
+
+    aot_bytes = files.get(OSTADIX_API_AOT_SOURCE)
+    if aot_bytes is None:
+        raise ReleaseError(
+            "release is missing engine-owned generated-runtime inventory "
+            f"{OSTADIX_API_AOT_SOURCE}"
+        )
+    try:
+        aot_source = aot_bytes.decode("utf-8", "strict")
+    except UnicodeDecodeError as error:
+        raise ReleaseError(f"{OSTADIX_API_AOT_SOURCE} is not valid UTF-8") from error
+    if "o_lang::api::aot_source" not in compiler:
+        raise ReleaseError(
+            f"{compiler_path} must consume the engine-owned api::aot_source inventory"
+        )
+    embedded.add(OSTADIX_API_AOT_SOURCE)
+    embedded.update(
+        _resolve_compile_time_include(OSTADIX_API_AOT_SOURCE, match.group("path"))
+        for match in RELATIVE_LITERAL_INCLUDE.finditer(aot_source)
+    )
     missing = sorted(embedded - files.keys())
     if missing:
         raise ReleaseError(
@@ -1551,19 +1695,30 @@ def _validate_root_release_metadata(files: dict[str, bytes]) -> None:
 
 
 def _validate_workspace_facade_release_surface(files: dict[str, bytes]) -> None:
-    """Validate the exact publishable workspace facade and dependency direction."""
+    """Validate the independent engine and its one-way compatibility shell."""
 
     required = {
         "Cargo.toml",
-        "src/api.rs",
+        "LICENSE",
+        "NOTICE",
+        "crates/ostadix-api/src/api.rs",
         *OSTADIX_API_RELEASE_PATHS,
     }
     missing = sorted(required - files.keys())
     if missing:
         raise ReleaseError(
-            "workspace facade release surface is incomplete; missing: "
+            "workspace engine release surface is incomplete; missing: "
             + ", ".join(missing)
         )
+
+    for engine_legal_path, root_legal_path in (
+        (f"{OSTADIX_API_ROOT}/LICENSE", "LICENSE"),
+        (f"{OSTADIX_API_ROOT}/NOTICE", "NOTICE"),
+    ):
+        if files[engine_legal_path] != files[root_legal_path]:
+            raise ReleaseError(
+                f"{engine_legal_path} must be byte-identical to {root_legal_path}"
+            )
 
     root = _strict_toml(files["Cargo.toml"], "Cargo.toml")
     package = root.get("package")
@@ -1584,26 +1739,55 @@ def _validate_workspace_facade_release_surface(files: dict[str, bytes]) -> None:
                 f"Cargo.toml workspace.{field} must equal {expected!r}"
             )
 
-    def reject_reverse_dependency(value: object, owner: str = "Cargo.toml") -> None:
+    def dependency_occurrences(
+        value: object,
+        dependency: str,
+        path: tuple[str, ...] = (),
+    ) -> list[tuple[tuple[str, ...], object]]:
+        found: list[tuple[tuple[str, ...], object]] = []
         if not isinstance(value, dict):
-            return
+            return found
         for key, nested in value.items():
             if key in {"dependencies", "dev-dependencies", "build-dependencies"}:
-                if isinstance(nested, dict) and "ostadix-api" in nested:
-                    raise ReleaseError(
-                        f"{owner} root package must not depend on ostadix-api"
-                    )
+                if isinstance(nested, dict) and dependency in nested:
+                    found.append((path + (key, dependency), nested[dependency]))
             if isinstance(nested, dict):
-                reject_reverse_dependency(nested, owner)
+                found.extend(dependency_occurrences(nested, dependency, path + (key,)))
+        return found
 
-    reject_reverse_dependency(root)
-
-    facade_path = "crates/ostadix-api/Cargo.toml"
-    facade = _strict_toml(files[facade_path], facade_path)
-    facade_package = facade.get("package")
-    if not isinstance(facade_package, dict):
-        raise ReleaseError(f"{facade_path} must contain a package table")
     root_version = _required_string(package.get("version"), "Cargo.toml package.version")
+    expected_engine_dependency = {
+        "path": "crates/ostadix-api",
+        "version": f"={root_version}",
+        "default-features": False,
+    }
+    root_engine_dependencies = dependency_occurrences(root, "ostadix-api")
+    if root_engine_dependencies != [
+        (("dependencies", "ostadix-api"), expected_engine_dependency)
+    ]:
+        raise ReleaseError(
+            "Cargo.toml must depend on ostadix-api exactly once through "
+            f"[dependencies] as {expected_engine_dependency!r}"
+        )
+    root_features = root.get("features")
+    if not isinstance(root_features, dict):
+        raise ReleaseError("Cargo.toml must contain a features table")
+    if root_features.get("graph_executor") != ["ostadix-api/graph_executor"]:
+        raise ReleaseError(
+            "Cargo.toml feature graph_executor must forward to "
+            "ostadix-api/graph_executor"
+        )
+    notebook = root_features.get("notebook")
+    if not isinstance(notebook, list) or "ostadix-api/notebook" not in notebook:
+        raise ReleaseError(
+            "Cargo.toml feature notebook must forward to ostadix-api/notebook"
+        )
+
+    engine_path = f"{OSTADIX_API_ROOT}/Cargo.toml"
+    engine = _strict_toml(files[engine_path], engine_path)
+    engine_package = engine.get("package")
+    if not isinstance(engine_package, dict):
+        raise ReleaseError(f"{engine_path} must contain a package table")
     expected_package = {
         "name": "ostadix-api",
         "version": root_version,
@@ -1612,141 +1796,127 @@ def _validate_workspace_facade_release_surface(files: dict[str, bytes]) -> None:
         "repository": package.get("repository"),
         "authors": package.get("authors"),
         "license": package.get("license"),
+        "readme": "README.md",
         "publish": True,
     }
     for field, expected in expected_package.items():
-        if facade_package.get(field) != expected:
+        if engine_package.get(field) != expected:
             raise ReleaseError(
-                f"{facade_path} package.{field} must equal {expected!r}"
+                f"{engine_path} package.{field} must equal {expected!r}"
             )
-    _required_string(facade_package.get("description"), f"{facade_path} package.description")
-
-    dependencies = facade.get("dependencies")
-    if not isinstance(dependencies, dict) or set(dependencies) != {"o-lang"}:
-        raise ReleaseError(f"{facade_path} must depend only on o-lang")
-    root_dependency = dependencies["o-lang"]
-    expected_dependency = {"path": "../..", "version": f"={root_version}"}
-    if root_dependency != expected_dependency:
+    _required_string(engine_package.get("description"), f"{engine_path} package.description")
+    reverse_dependencies = dependency_occurrences(engine, "o-lang")
+    if reverse_dependencies:
         raise ReleaseError(
-            f"{facade_path} o-lang dependency must equal {expected_dependency!r}"
+            f"{engine_path} must not depend on the o-lang compatibility shell"
+        )
+    dependencies = engine.get("dependencies")
+    if not isinstance(dependencies, dict) or not dependencies:
+        raise ReleaseError(f"{engine_path} must own its runtime dependencies")
+    engine_features = engine.get("features")
+    expected_engine_features = {
+        "default": ["graph_executor"],
+        "graph_executor": [],
+        "notebook": [],
+    }
+    if engine_features != expected_engine_features:
+        raise ReleaseError(
+            f"{engine_path} features must equal {expected_engine_features!r}"
         )
 
-    root_api = _utf8_text(files["src/api.rs"], "src/api.rs")
-    if not re.search(r"(?m)^pub use num_bigint::BigInt;\s*$", root_api):
-        raise ReleaseError("src/api.rs must explicitly reexport num_bigint::BigInt")
-
-    facade_source_path = "crates/ostadix-api/src/lib.rs"
-    source = _utf8_text(files[facade_source_path], facade_source_path)
-    if re.search(r"pub\s+use\s+[^;]*::\s*\*\s*;", source, re.DOTALL):
-        raise ReleaseError(f"{facade_source_path} must not contain a glob reexport")
-    if re.search(r"pub\s+(?:use|type)\s+[^;\n]*Evaluator", source):
-        raise ReleaseError(f"{facade_source_path} must not expose Evaluator")
-    if re.search(
-        r"pub\s+(?:use|type)\s+[^;]*\bBackendRegistry\b", source, re.DOTALL
-    ):
-        raise ReleaseError(f"{facade_source_path} must not expose BackendRegistry")
-    forbidden_bridge_symbols = (
-        "information_bridge",
-        "ParsedDocumentV1",
-        "ParsedDocumentInformationV1",
-        "PublicValueInformationV1",
-        "HGraphInformationV1",
-        "EvidenceInformationV1",
-        "RegistryProfileInformationV1",
-        "WorldReceiptInformationV1",
-        "ProjectGraphInformationV1",
-        "HostedJournalInformationV1",
-        "InformationBridgeErrorV1",
-        "project_parsed_document_v1",
-        "project_public_value_v1",
-        "project_hgraph_v1",
-        "project_evidence_v6",
-        "project_registry_profile_v1",
-        "project_world_receipt_v1",
-        "project_logical_hgraph_v1",
-        "project_hosted_journal_v2",
+    root_source_path = "src/lib.rs"
+    root_source = _utf8_text(files[root_source_path], root_source_path)
+    if re.search(r"(?m)^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+", root_source):
+        raise ReleaseError(f"{root_source_path} must not compile runtime modules")
+    if "#[path" in root_source or "o_lang::" in root_source:
+        raise ReleaseError(f"{root_source_path} is not a minimal compatibility shell")
+    compatibility_match = re.search(
+        r"pub\s+use\s+ostadix_api::\s*\{(?P<names>.*?)\};",
+        root_source,
+        re.DOTALL,
     )
-    for symbol in forbidden_bridge_symbols:
-        if symbol in source:
+    if compatibility_match is None:
+        raise ReleaseError(
+            f"{root_source_path} must explicitly reexport ostadix-api modules"
+        )
+    compatibility_names = {
+        name.strip()
+        for name in compatibility_match.group("names").split(",")
+        if name.strip()
+    }
+    private_engine_modules = {
+        "backend_catalog",
+        "canonical_cbor",
+        "capability",
+        "dispatch_model",
+        "eval_core",
+        "placement_protocol",
+    }
+    expected_compatibility_names = (
+        set(OSTADIX_API_ROOT_MODULE_PATHS) - private_engine_modules
+    )
+    if compatibility_names != expected_compatibility_names:
+        raise ReleaseError(
+            f"{root_source_path} compatibility module closure differs from the "
+            "engine public-module set"
+        )
+
+    engine_source_path = f"{OSTADIX_API_SOURCE_ROOT}/lib.rs"
+    source = _utf8_text(files[engine_source_path], engine_source_path)
+    module_names = set(
+        re.findall(
+            r"(?m)^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;",
+            source,
+        )
+    )
+    if module_names != set(OSTADIX_API_ROOT_MODULE_PATHS):
+        raise ReleaseError(
+            f"{engine_source_path} module closure differs from the complete "
+            "independent runtime engine"
+        )
+    for declaration in ("Runtime", "RuntimeError", "RuntimeStage"):
+        if declaration not in source:
             raise ReleaseError(
-                f"{facade_source_path} must not expose experimental Information bridge symbol {symbol}"
+                f"{engine_source_path} must reexport api::{declaration}"
             )
+
+    api_source_path = f"{OSTADIX_API_SOURCE_ROOT}/api.rs"
+    api_source = _utf8_text(files[api_source_path], api_source_path)
+    if "o_lang::" in api_source:
+        raise ReleaseError(f"{api_source_path} must not depend on o-lang source paths")
     for declaration in (
         "pub struct Runtime",
         "pub struct RuntimeError",
         "pub enum RuntimeStage",
         "pub fn evaluate",
     ):
-        if declaration not in source:
-            raise ReleaseError(f"{facade_source_path} must contain {declaration!r}")
-    if "use o_lang::api::Parser;" not in source:
-        raise ReleaseError(
-            f"{facade_source_path} must use the stable Parser facade"
-        )
-    if "use o_lang::ir::BackendRegistry;" not in source:
-        raise ReleaseError(
-            f"{facade_source_path} must privately use the canonical BackendRegistry path"
-        )
-    if "use o_lang::eval::Evaluator;" not in source:
-        raise ReleaseError(
-            f"{facade_source_path} must privately use Evaluator as its execution engine"
-        )
-
-    payload_match = re.search(
-        r"pub\s+use\s+o_lang::api::\s*\{(?P<names>.*?)\};",
-        source,
-        re.DOTALL,
-    )
-    if payload_match is None:
-        raise ReleaseError(
-            f"{facade_source_path} must explicitly reexport the OValue payload closure"
-        )
-    payload_names = {
-        name.strip()
-        for name in payload_match.group("names").split(",")
-        if name.strip()
-    }
-    expected_payload_names = {
-        "BackendAuthority",
-        "BigInt",
-        "CapabilityKind",
-        "DecimalSpecial",
-        "FloatFormat",
-        "FloatSpecial",
-        "GraphNode",
-        "GroupMode",
-        "NativeBoundary",
-        "NativeCodecSafety",
-        "NativeIdentity",
-        "NodeId",
-        "OBytes",
-        "OKeyword",
-        "ONative",
-        "ONumber",
-        "OSymbol",
-        "OText",
-        "OValue",
-        "RehydratePolicy",
-        "RequestKind",
-        "RuntimeBoundary",
-        "SeqKind",
-        "SetKind",
-        "SnapshotKind",
-    }
-    if payload_names != expected_payload_names:
-        raise ReleaseError(
-            f"{facade_source_path} OValue payload closure differs from the exact public set"
-        )
-
-    facade_tests_path = "crates/ostadix-api/tests/public_surface.rs"
-    facade_tests = _utf8_text(files[facade_tests_path], facade_tests_path)
-    for marker in (
-        "complete_ovalue_payload_vocabulary_is_nameable_from_the_facade",
-        "runtime_owns_success_parse_failure_and_evaluate_failure_stages",
-        "facade_source_has_no_glob_or_public_evaluator_reexport",
+        if declaration not in api_source:
+            raise ReleaseError(f"{api_source_path} must contain {declaration!r}")
+    for seam in (
+        "pub mod aot_source;",
+        "use crate::ir::BackendRegistry;",
+        "pub use crate::eval::{",
+        "pub use crate::parser::Parser;",
+        "pub use num_bigint::BigInt;",
     ):
-        if marker not in facade_tests:
-            raise ReleaseError(f"{facade_tests_path} must retain test {marker}")
+        if seam not in api_source:
+            raise ReleaseError(f"{api_source_path} must retain engine seam {seam!r}")
+
+    aot_source = _utf8_text(files[OSTADIX_API_AOT_SOURCE], OSTADIX_API_AOT_SOURCE)
+    if "include_str!" not in aot_source or "RUNTIME_VALUE_RS" not in aot_source:
+        raise ReleaseError(
+            f"{OSTADIX_API_AOT_SOURCE} must own generated-runtime source bytes"
+        )
+
+    engine_tests_path = f"{OSTADIX_API_ROOT}/tests/public_surface.rs"
+    engine_tests = _utf8_text(files[engine_tests_path], engine_tests_path)
+    for marker in (
+        "complete_ovalue_payload_vocabulary_is_nameable_from_the_engine_root",
+        "runtime_owns_success_parse_failure_and_evaluate_failure_stages",
+        "engine_owns_the_full_runtime_without_a_compatibility_dependency",
+    ):
+        if marker not in engine_tests:
+            raise ReleaseError(f"{engine_tests_path} must retain test {marker}")
 
 
 def _required_string_list(
@@ -1780,6 +1950,23 @@ def _normalized_reference(value: object, owner: str) -> str:
     except ReleaseError as error:
         raise ReleaseError(f"{owner} must be a normalized release-relative path") from error
     return reference
+
+
+def _released_path_for_historical_source(path: str) -> str:
+    """Resolve a pre-extraction engine coordinate to its released owner.
+
+    Exact-byte-sealed World records and the imported v1 vocabulary retain the
+    source coordinates that existed when they were minted. Moving the engine
+    cannot rewrite those records, so verification resolves only their archive
+    lookup while preserving the recorded path for claim derivation.
+    """
+    if (
+        path.startswith("src/")
+        and not path.startswith("src/bin/")
+        and path not in {"src/lib.rs", "src/main.rs"}
+    ):
+        return f"{OSTADIX_API_ROOT}/{path}"
+    return path
 
 
 def _validate_mcp_release_surface(
@@ -1821,6 +2008,28 @@ def _validate_mcp_release_surface(
         raise ReleaseError(f"{cargo_path} license must be 'LGPL-2.1-only'")
     if package.get("publish") is not False:
         raise ReleaseError(f"{cargo_path} package must remain publish = false")
+
+    lock_path = "mcp/ostadix_lang_mcp_server/Cargo.lock"
+    lock = _strict_toml(files[lock_path], lock_path)
+    lock_packages = lock.get("package")
+    if not isinstance(lock_packages, list):
+        raise ReleaseError(f"{lock_path} must contain a package array")
+    lock_roots = [
+        item
+        for item in lock_packages
+        if isinstance(item, dict) and item.get("name") == "ostadix-mcp-server"
+    ]
+    if len(lock_roots) != 1:
+        raise ReleaseError(
+            f"{lock_path} must contain exactly one ostadix-mcp-server package"
+        )
+    if lock_roots[0].get("version") != package.get("version"):
+        raise ReleaseError(
+            f"{lock_path} ostadix-mcp-server version must match {cargo_path} package.version"
+        )
+    if "source" in lock_roots[0]:
+        raise ReleaseError(f"{lock_path} ostadix-mcp-server must remain a local package")
+
     binaries = cargo.get("bin")
     if not isinstance(binaries, list):
         raise ReleaseError(f"{cargo_path} must contain an ostadix-mcp bin target")
@@ -2443,19 +2652,24 @@ def _validate_world_attestation_release_surface(
         if source_path in seen_sources:
             raise ReleaseError(f"{path}.source contains duplicate {source_path}")
         seen_sources.add(source_path)
+        released_source_path = _released_path_for_historical_source(source_path)
         digest = _required_string(source["sha256"], f"{owner}.sha256")
         if HEX_DIGEST.fullmatch(digest) is None:
             raise ReleaseError(f"{owner}.sha256 must be a SHA-256 digest")
-        if source_path not in files:
-            raise ReleaseError(f"{owner} references absent released {source_path}")
+        if released_source_path not in files:
+            raise ReleaseError(
+                f"{owner} references absent released {released_source_path}"
+            )
         source_digests[source_path] = digest
         # Historical records describe immutable prior working trees; their
         # source bytes are not falsely claimed to be the current ZIP members.
         # Only the exact-byte-sealed current attestation must bind released
         # members directly, regardless of the historical schema version.
         if current_attestation:
-            if hashlib.sha256(files[source_path]).hexdigest() != digest:
-                raise ReleaseError(f"{owner} does not match released {source_path}")
+            if hashlib.sha256(files[released_source_path]).hexdigest() != digest:
+                raise ReleaseError(
+                    f"{owner} does not match released {released_source_path}"
+                )
 
     artifacts = attestation["artifact"]
     if not isinstance(artifacts, list) or not artifacts:
@@ -3227,8 +3441,11 @@ def _validate_world_alpha_release_surface(
         "native_identity_schema": "ocore/world/identity.oc",
         "world_gate_registry": "evidence/world_alpha_gates.toml",
     }.items():
-        if contract[field] != expected or expected not in files:
-            raise ReleaseError(f"{contract_path}.{field} must reference released {expected}")
+        released_expected = _released_path_for_historical_source(expected)
+        if contract[field] != expected or released_expected not in files:
+            raise ReleaseError(
+                f"{contract_path}.{field} must reference released {released_expected}"
+            )
     for field, count in {
         "crossing": 3,
         "identity_atom": 20,

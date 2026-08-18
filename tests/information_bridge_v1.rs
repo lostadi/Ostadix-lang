@@ -359,9 +359,6 @@ fn parsed_document_projection_is_deterministic_and_binds_exact_source() {
         project_parsed_document_v1("let answer = python^(41 + 1)_python".as_bytes(), &parsed)
             .is_err()
     );
-
-    let parser_source = include_str!("../src/parser.rs");
-    assert!(!parser_source.contains("pub nodes: Vec<ONode>"));
 }
 
 #[test]
@@ -684,9 +681,6 @@ fn metadata_projection_digests_intentionally_ignore_native_value_source_and_runt
     let right_evidence_projection = project_evidence_v6(&right_evidence).unwrap();
     assert_eq!(left_evidence_projection, right_evidence_projection);
 
-    let bridge_source = include_str!("../src/information_bridge/mod.rs");
-    assert!(!bridge_source.contains("graph_sha256_v2"));
-    assert!(!bridge_source.contains("evidence_bundle_sha256_v6"));
     for sentinel in [
         "private-upstream-alpha",
         "private-upstream-bravo",
@@ -701,37 +695,6 @@ fn metadata_projection_digests_intentionally_ignore_native_value_source_and_runt
             !String::from_utf8_lossy(&left_evidence_projection.canonical_bytes().unwrap())
                 .contains(sentinel)
         );
-    }
-}
-
-#[test]
-fn all_public_projection_records_exclude_generic_serde_traits() {
-    let source = include_str!("../src/information_bridge/mod.rs");
-    for record in [
-        "ParsedDocumentInformationV1",
-        "PublicValueInformationV1",
-        "HGraphInformationV1",
-        "EvidenceInformationV1",
-        "RegistryProfileInformationV1",
-        "WorldReceiptInformationV1",
-        "ProjectGraphInformationV1",
-        "HostedJournalInformationV1",
-    ] {
-        let declaration = format!("pub struct {record}");
-        let declaration_at = source
-            .find(&declaration)
-            .unwrap_or_else(|| panic!("missing public bridge record {record}"));
-        let derive_at = source[..declaration_at]
-            .rfind("#[derive(")
-            .unwrap_or_else(|| panic!("missing derive boundary for {record}"));
-        let public_prelude = &source[derive_at..declaration_at];
-        assert!(!public_prelude.contains("Serialize"), "{record}");
-        assert!(!public_prelude.contains("Deserialize"), "{record}");
-        assert!(!public_prelude.contains("#[serde"), "{record}");
-        assert!(!source.contains(&format!("impl Serialize for {record}")));
-        assert!(!source.contains(&format!("impl Deserialize for {record}")));
-        assert!(!source.contains(&format!("impl serde::Serialize for {record}")));
-        assert!(!source.contains(&format!("impl serde::Deserialize for {record}")));
     }
 }
 

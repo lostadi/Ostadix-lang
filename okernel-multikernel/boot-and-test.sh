@@ -217,9 +217,18 @@ phase_tests() {
   cargo test -q --workspace --all-targets --all-features || die "cargo test failed"
   cargo test -q --package o-lang --test parser_proptest        || die "parser proptest failed"
   # Byte-reproducibility of ocore object emission across source dirs (CI gate).
-  cargo test -q --package o-lang --lib \
-    ocore::driver::tests::ocore_object_is_byte_reproducible_across_source_directories -- --exact \
-    && ok "ocore object emission is byte-reproducible"
+  local ocore_repro_output
+  if ! ocore_repro_output="$(cargo test -q --package ostadix-api --lib \
+    ocore::driver::tests::ocore_object_is_byte_reproducible_across_source_directories \
+    -- --exact 2>&1)"; then
+    printf '%s\n' "$ocore_repro_output" >&2
+    die "ocore object reproducibility test failed"
+  fi
+  printf '%s\n' "$ocore_repro_output"
+  case "$ocore_repro_output" in
+    *"test result: ok. 1 passed; 0 failed;"*) ok "ocore object emission is byte-reproducible" ;;
+    *) die "ocore object reproducibility gate did not execute exactly one test" ;;
+  esac
   [ -x ./test_o_lang_examples.sh ] && ./test_o_lang_examples.sh || skip "example sweep script absent"
   ok "tests complete"
 }
