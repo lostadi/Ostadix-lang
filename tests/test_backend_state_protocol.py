@@ -93,9 +93,13 @@ class BackendStateProtocolTests(unittest.TestCase):
                     shim.close()
 
     def test_catalog_state_identities_match_production_proxy_protocols(self):
-        catalog = (ROOT / "src" / "backend_catalog.inc.rs").read_text(
-            encoding="utf-8"
-        )
+        catalog = (
+            ROOT
+            / "crates"
+            / "ostadix-api"
+            / "src"
+            / "backend_catalog.inc.rs"
+        ).read_text(encoding="utf-8")
         for shim_name, catalog_field in (
             ("python_shim.py", "codec"),
             ("ubuntu_vm_shim.py", "manifest_schema"),

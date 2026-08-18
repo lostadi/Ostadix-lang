@@ -355,7 +355,7 @@ impl SpliceRenderer {
 pub enum BackendAdapterKind {
     /// Implemented entirely inside the evaluator; no backend process is used.
     Inline,
-    /// Implemented by `src/backend.rs` inside the current Ostadix executable.
+    /// Implemented by `backend.rs` inside this runtime engine.
     NativeRust,
     /// Implemented by a Python compatibility shim reached through the Rust
     /// backend proxy.

@@ -4,9 +4,9 @@
 
 - Expression-granular recursive evaluator composition is implemented by typed
   expression syntax described in `README.md`, lowered from parser nodes to OIR in
-  `src/ir.rs`, and executed by the Rust evaluator in `src/eval.rs`.
+  `crates/ostadix-api/src/ir.rs`, and executed by the Rust evaluator in `crates/ostadix-api/src/eval.rs`.
 - The accepted evaluator tags are registry-extensible at compile time through
-  the declarative catalog in `src/backend_catalog.inc.rs`. `BackendRegistry`,
+  the declarative catalog in `crates/ostadix-api/src/backend_catalog.inc.rs`. `BackendRegistry`,
   native-adapter dispatch, generated-runtime source emission, and MCP runtime
   discovery are compile-time projections of that one catalog; no runtime source
   parser or independently maintained MCP backend table is involved. The catalog
@@ -15,11 +15,11 @@
   number preservation capabilities, and descriptive executable alternatives.
   Executable presence and declared value capability are not health,
   authorization, capacity, or operation admission.
-- `OValue` is the language-neutral value boundary (`src/value.rs`) used by the
+- `OValue` is the language-neutral value boundary (`crates/ostadix-api/src/value.rs`) used by the
   Rust hosted runtime, the C17 edition in `c_cpp/`, and the Python reference in
   `o_lang/`.
 - The hosted process protocol uses a 4-byte big-endian length prefix followed
-  by canonical CBOR encoding in `src/wire.rs`; maps are sorted by encoded key
+  by canonical CBOR encoding in `crates/ostadix-api/src/wire.rs`; maps are sorted by encoded key
   length and bytes before transmission.
 - The experimental Information V1 bridge implements exactly eight typed,
   bounded, read-only native metadata projections. Tests cover real fixtures,
@@ -33,15 +33,16 @@
   inspection without directory/lock creation, mode repair, head mutation,
   cloud, or network access. The tested no-mutation surface covers entries,
   content, inode, mode, and mtime, not atime or concurrent hostile ancestor
-  replacement. The stable `ostadix-api` facade and generated AOT runtime do not
-  expose this bridge.
-- The repository contains three hosted implementations: the Rust authoritative
-  runtime (`src/`), the C17 interpreter and AOT `olangc` (`c_cpp/Makefile` and
+  replacement. The independent `ostadix-api` engine exposes this advanced
+  bridge, while generated AOT runtimes intentionally do not embed it.
+- The repository contains three hosted implementations: the authoritative Rust
+  engine (`crates/ostadix-api/`) with its root CLI/compatibility shell
+  (`src/`), the C17 interpreter and AOT `olangc` (`c_cpp/Makefile` and
   `c_cpp/CMakeLists.txt`, both using C17), and the Python reference edition
   (`o_lang/`). It also contains O-core freestanding x86_64 ELF object emission
-  through `ocorec` (`README.md`, `src/bin/ocorec.rs`, `src/ocore/driver.rs`).
+  through `ocorec` (`README.md`, `src/bin/ocorec.rs`, `crates/ostadix-api/src/ocore/driver.rs`).
   `ocorec` now also emits a conservative freestanding AArch64 scalar subset
-  through `src/ocore/codegen_aarch64.rs`; unsupported atomics, inline assembly,
+  through `crates/ostadix-api/src/ocore/codegen_aarch64.rs`; unsupported atomics, inline assembly,
   interrupt/naked functions, floating point, and calls exceeding eight integer
   arguments fail closed.
 - `examples/manifest.json` completely classifies the checked-in `.O` example
@@ -72,7 +73,7 @@
   regressions are required release members. The regression suite covers debris
   exclusion, link closure, reproducibility, committed-byte behavior, required
   release surfaces, metadata/schema tampering, and symlink denial.
-- The hosted Live-World reference in `src/live_system/` and
+- The hosted Live-World reference in `crates/ostadix-api/src/live_system/` and
   `src/bin/o-live-host.rs` implements strict bounded package ingestion, an
   immutable verified SHA-256 store, exact default-deny activation policy,
   per-service child supervision, health-gated transactional publication,
@@ -93,7 +94,7 @@
   trusted control-plane authority, and arbitrary host syscalls are not fully
   contained. It is a differential semantic oracle, not evidence for any native
   QEMU claim below; those claims have their own gates.
-- `src/kernel_world.rs` implements a strict, bounded
+- `crates/ostadix-api/src/kernel_world.rs` implements a strict, bounded
   `ocore.kernel-world/v1` manifest and a host-side lifecycle oracle shared by
   source-integrated and binary-contained foreign-kernel provider designs.
   `tests/kernel_world_contract.rs` proves unknown-field rejection, canonical
@@ -286,18 +287,18 @@
   generation. `StateSessionIdV2` is the separate logical durable-session
   identity, so a replacement generation cannot alias the actor it replaced.
 - Conservative `{lazy}` cache safety is enforced from backend metadata in
-  `src/ir.rs` and validation in `src/eval.rs`: inline `html`, `markdown`,
+  `crates/ostadix-api/src/ir.rs` and validation in `crates/ostadix-api/src/eval.rs`: inline `html`, `markdown`,
   `latex`, and `text` are cache-safe; unrestricted shim backends including
   `nix`, `sql`, `haskell`, `ocaml`, and `webassembly` are rejected before shim
   execution when `{lazy}` is requested.
 - Capability and authority checks exist for hosted backend execution and system
-  activation (`src/capability.rs`, `src/eval.rs`). Backend processes are keyed
-  by sandbox policy in `src/process.rs`, and backend dispatch checks requested
+  activation (`crates/ostadix-api/src/capability.rs`, `crates/ostadix-api/src/eval.rs`). Backend processes are keyed
+  by sandbox policy in `crates/ostadix-api/src/process.rs`, and backend dispatch checks requested
   authorities before execution.
 - Supported concurrent request classes are the scheduler's threadable Nix-family
   request kinds: instantiate, realise, and dry activation. Group modes
-  `batch`, `all`, `any`, and `race` are represented in `src/value.rs`, lowered
-  through `src/ir.rs`, and resolved by evaluator/scheduler code; Eval requests
+  `batch`, `all`, `any`, and `race` are represented in `crates/ostadix-api/src/value.rs`, lowered
+  through `crates/ostadix-api/src/ir.rs`, and resolved by evaluator/scheduler code; Eval requests
   remain serial.
 - Literal `o-link` wrappers use linker-isolated `[*]` environments rather than
   synthesized persistent numeric indices. Authored numeric environments remain
@@ -482,7 +483,7 @@
   independent runtime observation, production enrollment, or automatic recovery
   policy.
 - The deterministic source-release allowlist requires
-  `src/hosted_remote/v2/dev.rs` together with the V2 protocol, cryptography,
+  `crates/ostadix-api/src/hosted_remote/v2/dev.rs` together with the V2 protocol, cryptography,
   authorizer, client, server, runtime, and store modules, so the documented
   development bridge is not omitted from the source archive.
 - Hosted Placement V6 is not World membership, Governor admission/commit,
@@ -495,7 +496,7 @@
   exact boundary is documented in
   [`HOSTED_PLACEMENT_V6.md`](HOSTED_PLACEMENT_V6.md).
 - Native value crossings are conservative: `Fidelity::NativeCapsule` in
-  `src/value.rs` and `src/hgraph/solve.rs` prevents claiming general
+  `crates/ostadix-api/src/value.rs` and `crates/ostadix-api/src/hgraph/solve.rs` prevents claiming general
   cross-runtime native value soundness.
 - Hosted crossing fidelity is derived from typed `BackendValueCapabilities`
   embedded in the canonical backend specification, not from a language-name
@@ -1102,7 +1103,7 @@
 
 - Graph construction, multi-output validation, type/fidelity solving, explicit
   resource and completion lowering, scheduling, and readiness-driven dispatch
-  are implemented in `src/hgraph/`, `src/effects.rs`, and `src/executor/`.
+  are implemented in `crates/ostadix-api/src/hgraph/`, `crates/ostadix-api/src/effects.rs`, and `crates/ostadix-api/src/executor/`.
 - Strict-equivalent parallel dispatch is correctness-first: compiler-verified
   O-scope reads and verified pure, deterministic, infallible, state-free inline
   renderers run on workers. Ordinary Eval/shim operations stay on the evaluator
@@ -1152,13 +1153,13 @@
 - Parallel read leases and verified path-, endpoint-, and service-specific
   resource models that safely reduce `HostWorld` serialization.
 - Runtime plugin registration beyond the current static `BackendRegistry` table
-  in `src/ir.rs`.
+  in `crates/ostadix-api/src/ir.rs`.
 - Fingerprint-complete effect tracking, enforced sandboxes, and verified backend
   analyzers that could broaden strict-equivalent graph parallelism beyond the
   trusted inline/read-only set.
 - More precise backend morphism proofs and fidelity accounting for OValue
   crossings, extending the current `Fidelity` and `BackendMorphism` vocabulary
-  in `src/value.rs`.
+  in `crates/ostadix-api/src/value.rs`.
 - Deterministic cancellation and result-selection semantics for concurrent
   groups and future graph execution.
 - O-Domain evolution beyond the current bounded Mode 24--26 gates: add pinned

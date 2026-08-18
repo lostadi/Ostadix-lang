@@ -23,6 +23,27 @@ class WorldAlphaEvidenceTests(unittest.TestCase):
     def manifest(self):
         return world_alpha_evidence.load_manifest()
 
+    def test_sealed_engine_source_coordinates_resolve_without_rewriting(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            engine_source = root / "crates/ostadix-api/src/world/identity.rs"
+            engine_source.parent.mkdir(parents=True)
+            engine_source.write_text("pub struct WorldIdentity;\n", encoding="utf-8")
+
+            recorded, resolved = world_alpha_evidence._repo_file(
+                root, "src/world/identity.rs", "sealed source"
+            )
+            self.assertEqual(recorded, "src/world/identity.rs")
+            self.assertEqual(resolved, engine_source.resolve())
+
+            shell_main = root / "src/main.rs"
+            shell_main.parent.mkdir(parents=True)
+            shell_main.write_text("fn main() {}\n", encoding="utf-8")
+            _, resolved_main = world_alpha_evidence._repo_file(
+                root, "src/main.rs", "shell source"
+            )
+            self.assertEqual(resolved_main, shell_main.resolve())
+
     def test_checked_in_registry_passes_only_dependency_complete_g0_and_g2(self):
         gates = world_alpha_evidence.validated_gates(self.manifest(), ROOT)
         self.assertEqual(

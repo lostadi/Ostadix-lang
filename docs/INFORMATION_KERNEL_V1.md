@@ -86,11 +86,10 @@ primitives. Registry `stale` is descriptive only. World
 self-consistency proves neither signer trust, journal continuity, nor
 currentness.
 
-The broader advanced `o_lang::api` façade reexports the explicit bridge. The
-stable publishable `ostadix-api` façade exposes neither the bridge nor
-`ParsedDocumentV1`. Generated AOT projects intentionally embed neither
-`information` nor `information_bridge`; their existing one-copy runtime closure
-is unchanged.
+The independent `ostadix_api::api` engine surface exports the explicit bridge;
+`o_lang::api` is an exact compatibility reexport of that same module and type
+identity. Generated AOT projects intentionally embed neither `information` nor
+`information_bridge`; their one-copy runtime closure remains separate.
 
 ## Payload tiers
 

@@ -27,55 +27,55 @@ def run_checker(root: Path) -> subprocess.CompletedProcess[str]:
 
 def write_minimal_tree(root: Path) -> None:
     for relative in (
-        "src/parser.rs",
-        "src/syntax_dialect.rs",
-        "src/ir.rs",
-        "src/backend.rs",
-        "src/backend_catalog.rs",
-        "src/backend_state.rs",
-        "src/capability.rs",
-        "src/environment.rs",
-        "src/execution_contract.rs",
-        "src/eval_core.rs",
-        "src/effects.rs",
-        "src/value.rs",
-        "src/dispatch_model.rs",
-        "src/placement/mod.rs",
-        "src/placement/projection.rs",
-        "src/placement/protocol/candidate.rs",
-        "src/placement/protocol/catalog.rs",
-        "src/placement/protocol/digest.rs",
-        "src/placement/protocol/error.rs",
-        "src/placement/protocol/mod.rs",
-        "src/placement/protocol/records.rs",
-        "src/placement/protocol/requirement.rs",
-        "src/placement/protocol/state.rs",
-        "src/placement/protocol/target.rs",
-        "src/placement/protocol/warrant.rs",
-        "src/registry/bundle/mod.rs",
-        "src/registry/model.rs",
-        "src/registry/placement_compat.rs",
-        "src/registry/store.rs",
-        "src/eval.rs",
-        "src/executor/actor.rs",
-        "src/executor/cancellation.rs",
-        "src/executor/coordinator.rs",
-        "src/executor/effects.rs",
-        "src/executor/mod.rs",
-        "src/executor/parallel.rs",
-        "src/executor/pool.rs",
-        "src/executor/task.rs",
-        "src/executor/trace.rs",
-        "src/runtime_exec.rs",
-        "src/process.rs",
-        "src/wire.rs",
-        "src/evidence/admit.rs",
-        "src/evidence/analyze.rs",
-        "src/evidence/fact.rs",
-        "src/evidence/intent.rs",
-        "src/evidence/mod.rs",
-        "src/evidence/profile.rs",
-        "src/world/grounding.rs",
+        "crates/ostadix-api/src/parser.rs",
+        "crates/ostadix-api/src/syntax_dialect.rs",
+        "crates/ostadix-api/src/ir.rs",
+        "crates/ostadix-api/src/backend.rs",
+        "crates/ostadix-api/src/backend_catalog.rs",
+        "crates/ostadix-api/src/backend_state.rs",
+        "crates/ostadix-api/src/capability.rs",
+        "crates/ostadix-api/src/environment.rs",
+        "crates/ostadix-api/src/execution_contract.rs",
+        "crates/ostadix-api/src/eval_core.rs",
+        "crates/ostadix-api/src/effects.rs",
+        "crates/ostadix-api/src/value.rs",
+        "crates/ostadix-api/src/dispatch_model.rs",
+        "crates/ostadix-api/src/placement/mod.rs",
+        "crates/ostadix-api/src/placement/projection.rs",
+        "crates/ostadix-api/src/placement/protocol/candidate.rs",
+        "crates/ostadix-api/src/placement/protocol/catalog.rs",
+        "crates/ostadix-api/src/placement/protocol/digest.rs",
+        "crates/ostadix-api/src/placement/protocol/error.rs",
+        "crates/ostadix-api/src/placement/protocol/mod.rs",
+        "crates/ostadix-api/src/placement/protocol/records.rs",
+        "crates/ostadix-api/src/placement/protocol/requirement.rs",
+        "crates/ostadix-api/src/placement/protocol/state.rs",
+        "crates/ostadix-api/src/placement/protocol/target.rs",
+        "crates/ostadix-api/src/placement/protocol/warrant.rs",
+        "crates/ostadix-api/src/registry/bundle/mod.rs",
+        "crates/ostadix-api/src/registry/model.rs",
+        "crates/ostadix-api/src/registry/placement_compat.rs",
+        "crates/ostadix-api/src/registry/store.rs",
+        "crates/ostadix-api/src/eval.rs",
+        "crates/ostadix-api/src/executor/actor.rs",
+        "crates/ostadix-api/src/executor/cancellation.rs",
+        "crates/ostadix-api/src/executor/coordinator.rs",
+        "crates/ostadix-api/src/executor/effects.rs",
+        "crates/ostadix-api/src/executor/mod.rs",
+        "crates/ostadix-api/src/executor/parallel.rs",
+        "crates/ostadix-api/src/executor/pool.rs",
+        "crates/ostadix-api/src/executor/task.rs",
+        "crates/ostadix-api/src/executor/trace.rs",
+        "crates/ostadix-api/src/runtime_exec.rs",
+        "crates/ostadix-api/src/process.rs",
+        "crates/ostadix-api/src/wire.rs",
+        "crates/ostadix-api/src/evidence/admit.rs",
+        "crates/ostadix-api/src/evidence/analyze.rs",
+        "crates/ostadix-api/src/evidence/fact.rs",
+        "crates/ostadix-api/src/evidence/intent.rs",
+        "crates/ostadix-api/src/evidence/mod.rs",
+        "crates/ostadix-api/src/evidence/profile.rs",
+        "crates/ostadix-api/src/world/grounding.rs",
     ):
         path = root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -83,20 +83,24 @@ def write_minimal_tree(root: Path) -> None:
 
     manifest = tomllib.loads(MANIFEST.read_text(encoding="utf-8"))
     for root_spec in manifest["root"]:
-        path = root / "src" / f"{root_spec['name']}.rs"
+        path = (
+            root
+            / manifest["production"]["source_root"]
+            / f"{root_spec['name']}.rs"
+        )
         if not path.exists():
             path.write_text("pub struct Boundary;\n", encoding="utf-8")
 
     # The manifest validates compatibility facades as real owner-to-target
     # edges. Keep those edges in every synthetic repository as well.
     facade_sources = {
-        "src/backend.rs": "pub use crate::backend_state as state;\n",
-        "src/placement/mod.rs": (
+        "crates/ostadix-api/src/backend.rs": "pub use crate::backend_state as state;\n",
+        "crates/ostadix-api/src/placement/mod.rs": (
             "pub mod protocol { pub use crate::placement_protocol::*; }\n"
         ),
-        "src/registry.rs": "pub mod bundle;\n",
-        "src/registry/bundle/mod.rs": "pub use crate::backend_catalog::*;\n",
-        "src/world/mod.rs": "pub use crate::resource_identity as identity;\n",
+        "crates/ostadix-api/src/registry.rs": "pub mod bundle;\n",
+        "crates/ostadix-api/src/registry/bundle/mod.rs": "pub use crate::backend_catalog::*;\n",
+        "crates/ostadix-api/src/world/mod.rs": "pub use crate::resource_identity as identity;\n",
     }
     for relative, source in facade_sources.items():
         path = root / relative
@@ -104,20 +108,20 @@ def write_minimal_tree(root: Path) -> None:
         path.write_text(source, encoding="utf-8")
 
     for relative in (
-        "src/backend_catalog.inc.rs",
-        "src/lib.rs",
-        "src/main.rs",
-        "src/world/identity.rs",
+        "crates/ostadix-api/src/backend_catalog.inc.rs",
+        "crates/ostadix-api/src/lib.rs",
+        "crates/ostadix-api/src/world/identity.rs",
     ):
         path = root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         if not path.exists():
             path.write_text("pub struct Boundary;\n", encoding="utf-8")
+    source_prefix = manifest["production"]["source_root"] + "/"
     override_declarations = {
         entry["module_path"][0]: (
-            entry["path"].removeprefix("src/")
+            entry["path"].removeprefix(source_prefix)
             if entry["kind"] == "file"
-            else f"{entry['path'].removeprefix('src/')}/mod.rs"
+            else f"{entry['path'].removeprefix(source_prefix)}/mod.rs"
         )
         for entry in manifest["physical_override"]
     }
@@ -127,24 +131,38 @@ def write_minimal_tree(root: Path) -> None:
         if name in override_declarations:
             crate_root_lines.append(f'#[path = "{override_declarations[name]}"]')
         crate_root_lines.append(f"pub mod {name};")
-    (root / "src/lib.rs").write_text(
+    (root / "crates/ostadix-api/src/lib.rs").write_text(
         "\n".join(crate_root_lines) + "\n", encoding="utf-8"
     )
-    fragment_owner = root / "src/backend_catalog/fragment_owner.rs"
+    fragment_owner = root / "crates/ostadix-api/src/backend_catalog/fragment_owner.rs"
     fragment_owner.parent.mkdir(parents=True, exist_ok=True)
     fragment_owner.write_text(
         'include!("../backend_catalog.inc.rs");\n', encoding="utf-8"
     )
+    engine_manifest = root / manifest["production"]["package_manifest"]
+    engine_manifest.parent.mkdir(parents=True, exist_ok=True)
+    engine_manifest.write_text(
+        '[package]\nname = "ostadix-api"\nversion = "0.0.0"\n',
+        encoding="utf-8",
+    )
     (root / "src/bin").mkdir(parents=True, exist_ok=True)
+    (root / "src/main.rs").write_text("fn main() {}\n", encoding="utf-8")
+    public_roots = [root_spec["name"] for root_spec in manifest["root"]]
+    (root / "src/lib.rs").write_text(
+        "pub use ostadix_api::{" + ", ".join(public_roots) + "};\n",
+        encoding="utf-8",
+    )
     (root / "Cargo.toml").write_text(
-        '[package]\nname = "architecture-fixture"\nversion = "0.0.0"\n',
+        '[package]\nname = "o-lang"\nversion = "0.0.0"\n'
+        '\n[dependencies]\nostadix-api = { path = "crates/ostadix-api", '
+        'version = "=0.0.0" }\n',
         encoding="utf-8",
     )
     (root / "ci").mkdir(parents=True, exist_ok=True)
     (root / "ci/architecture-roots.toml").write_text(
         MANIFEST.read_text(encoding="utf-8").replace(
-            'included_from = "src/backend_catalog.rs"',
-            'included_from = "src/backend_catalog/fragment_owner.rs"',
+            'included_from = "crates/ostadix-api/src/backend_catalog.rs"',
+            'included_from = "crates/ostadix-api/src/backend_catalog/fragment_owner.rs"',
             1,
         ),
         encoding="utf-8",
@@ -158,27 +176,33 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         self.assertEqual(
             result.stdout,
             "architecture dependency boundaries: PASS "
-            "(149 production files, 40 roots, 174 cross-root edges)\n",
+            "(150 production files, 40 roots, 175 cross-root edges)\n",
         )
 
     def test_manifest_inventories_every_current_root_edge_override_and_facade(self) -> None:
         manifest = tomllib.loads(MANIFEST.read_text(encoding="utf-8"))
         roots = manifest["root"]
-        self.assertEqual(manifest["production"]["crate_root"], "src/lib.rs")
+        self.assertEqual(
+            manifest["production"]["package_manifest"],
+            "crates/ostadix-api/Cargo.toml",
+        )
+        self.assertEqual(manifest["production"]["crate_root"], "crates/ostadix-api/src/lib.rs")
         self.assertEqual(
             manifest["compiled_fragment"],
             [
                 {
-                    "path": "src/backend_catalog.inc.rs",
+                    "path": "crates/ostadix-api/src/backend_catalog.inc.rs",
                     "owner": "backend_catalog",
-                    "included_from": "src/backend_catalog.rs",
+                    "included_from": "crates/ostadix-api/src/backend_catalog.rs",
                 }
             ],
         )
         self.assertEqual(len(roots), 40)
         self.assertEqual(
-            sum(len(root["allowed_dependencies"]) for root in roots), 174
+            sum(len(root["allowed_dependencies"]) for root in roots), 175
         )
+        api_root = next(root for root in roots if root["name"] == "api")
+        self.assertIn("ir", api_root["allowed_dependencies"])
         self.assertEqual(
             {
                 (entry["path"], entry["kind"], tuple(entry["module_path"]))
@@ -186,11 +210,11 @@ class ArchitectureBoundaryTests(unittest.TestCase):
             },
             {
                 (
-                    "src/placement/protocol",
+                    "crates/ostadix-api/src/placement/protocol",
                     "directory",
                     ("placement_protocol",),
                 ),
-                ("src/world/identity.rs", "file", ("resource_identity",)),
+                ("crates/ostadix-api/src/world/identity.rs", "file", ("resource_identity",)),
             },
         )
         self.assertEqual(
@@ -235,9 +259,8 @@ class ArchitectureBoundaryTests(unittest.TestCase):
 
     def test_physical_overrides_cannot_overlap_production_exclusions(self) -> None:
         overrides = (
-            ("src/lib.rs", "file"),
-            ("src/backend_catalog.inc.rs", "file"),
-            ("src/bin", "directory"),
+            ("crates/ostadix-api/src/lib.rs", "file"),
+            ("crates/ostadix-api/src/backend_catalog.inc.rs", "file"),
         )
         for path, kind in overrides:
             with self.subTest(path=path, kind=kind):
@@ -262,12 +285,12 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/ghost_api").mkdir()
+            (root / "crates/ostadix-api/src/ghost_api").mkdir()
             manifest_path = root / "ci/architecture-roots.toml"
             with manifest_path.open("a", encoding="utf-8") as manifest:
                 manifest.write(
                     "\n[[physical_override]]\n"
-                    'path = "src/ghost_api"\n'
+                    'path = "crates/ostadix-api/src/ghost_api"\n'
                     'kind = "directory"\n'
                     'module_path = ["api"]\n'
                 )
@@ -281,9 +304,9 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         self,
     ) -> None:
         cases = (
-            ("src/evidence/fact.rs", "file", "fact", "evidence/fact.rs"),
+            ("crates/ostadix-api/src/evidence/fact.rs", "file", "fact", "evidence/fact.rs"),
             (
-                "src/evidence/nested",
+                "crates/ostadix-api/src/evidence/nested",
                 "directory",
                 "nested",
                 "evidence/nested/mod.rs",
@@ -294,8 +317,8 @@ class ArchitectureBoundaryTests(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
                     write_minimal_tree(root)
-                    (root / "src/evidence.rs").unlink()
-                    (root / "src/evidence/mod.rs").write_text(
+                    (root / "crates/ostadix-api/src/evidence.rs").unlink()
+                    (root / "crates/ostadix-api/src/evidence/mod.rs").write_text(
                         f"pub mod {child};\n", encoding="utf-8"
                     )
                     entrypoint = root / override_path
@@ -313,7 +336,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
                             f'kind = "{kind}"\n'
                             'module_path = ["api"]\n'
                         )
-                    crate_root = root / "src/lib.rs"
+                    crate_root = root / "crates/ostadix-api/src/lib.rs"
                     crate_root.write_text(
                         crate_root.read_text(encoding="utf-8").replace(
                             "pub mod api;",
@@ -326,7 +349,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 1)
                 self.assertIn(
                     f"also has conventional module ownership through "
-                    f"`src/evidence/mod.rs` (`mod {child};`)",
+                    f"`crates/ostadix-api/src/evidence/mod.rs` (`mod {child};`)",
                     result.stderr,
                 )
 
@@ -336,19 +359,19 @@ class ArchitectureBoundaryTests(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
                     write_minimal_tree(root)
-                    override_path = root / f"src/world/identity.{suffix}"
+                    override_path = root / f"crates/ostadix-api/src/world/identity.{suffix}"
                     if suffix != "rs":
-                        (root / "src/world/identity.rs").rename(override_path)
+                        (root / "crates/ostadix-api/src/world/identity.rs").rename(override_path)
                         manifest_path = root / "ci/architecture-roots.toml"
                         manifest_path.write_text(
                             manifest_path.read_text(encoding="utf-8").replace(
-                                'path = "src/world/identity.rs"',
-                                f'path = "src/world/identity.{suffix}"',
+                                'path = "crates/ostadix-api/src/world/identity.rs"',
+                                f'path = "crates/ostadix-api/src/world/identity.{suffix}"',
                                 1,
                             ),
                             encoding="utf-8",
                         )
-                        crate_root = root / "src/lib.rs"
+                        crate_root = root / "crates/ostadix-api/src/lib.rs"
                         crate_root.write_text(
                             crate_root.read_text(encoding="utf-8").replace(
                                 'path = "world/identity.rs"',
@@ -358,7 +381,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
                             encoding="utf-8",
                         )
                     override_path.write_text("pub mod child;\n", encoding="utf-8")
-                    child = root / "src/world/identity/child.rs"
+                    child = root / "crates/ostadix-api/src/world/identity/child.rs"
                     child.parent.mkdir(parents=True, exist_ok=True)
                     child.write_text(
                         "use crate::effects::Boundary;\n", encoding="utf-8"
@@ -366,16 +389,16 @@ class ArchitectureBoundaryTests(unittest.TestCase):
                     result = run_checker(root)
                 self.assertEqual(result.returncode, 1)
                 self.assertIn(
-                    f"physical file override `src/world/identity.{suffix}` "
+                    f"physical file override `crates/ostadix-api/src/world/identity.{suffix}` "
                     "declares external modules ['child']",
                     result.stderr,
                 )
 
     def test_inline_modules_cannot_declare_external_source_children(self) -> None:
         cases = (
-            ("src/evidence/outer/fact.rs", "file", "fact", "evidence/outer/fact.rs"),
+            ("crates/ostadix-api/src/evidence/outer/fact.rs", "file", "fact", "evidence/outer/fact.rs"),
             (
-                "src/evidence/outer/nested",
+                "crates/ostadix-api/src/evidence/outer/nested",
                 "directory",
                 "nested",
                 "evidence/outer/nested/mod.rs",
@@ -386,8 +409,8 @@ class ArchitectureBoundaryTests(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
                     write_minimal_tree(root)
-                    (root / "src/evidence.rs").unlink()
-                    (root / "src/evidence/mod.rs").write_text(
+                    (root / "crates/ostadix-api/src/evidence.rs").unlink()
+                    (root / "crates/ostadix-api/src/evidence/mod.rs").write_text(
                         f"pub mod outer {{ pub mod {child}; }}\n", encoding="utf-8"
                     )
                     entrypoint = root / override_path
@@ -405,7 +428,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
                             f'kind = "{kind}"\n'
                             'module_path = ["api"]\n'
                         )
-                    crate_root = root / "src/lib.rs"
+                    crate_root = root / "crates/ostadix-api/src/lib.rs"
                     crate_root.write_text(
                         crate_root.read_text(encoding="utf-8").replace(
                             "pub mod api;",
@@ -425,9 +448,9 @@ class ArchitectureBoundaryTests(unittest.TestCase):
 
     def test_block_items_cannot_declare_external_source_children(self) -> None:
         cases = (
-            ("src/evidence/outer/fact.rs", "file", "fact", "evidence/outer/fact.rs"),
+            ("crates/ostadix-api/src/evidence/outer/fact.rs", "file", "fact", "evidence/outer/fact.rs"),
             (
-                "src/evidence/outer/nested",
+                "crates/ostadix-api/src/evidence/outer/nested",
                 "directory",
                 "nested",
                 "evidence/outer/nested/mod.rs",
@@ -438,8 +461,8 @@ class ArchitectureBoundaryTests(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
                     write_minimal_tree(root)
-                    (root / "src/evidence.rs").unlink()
-                    (root / "src/evidence/mod.rs").write_text(
+                    (root / "crates/ostadix-api/src/evidence.rs").unlink()
+                    (root / "crates/ostadix-api/src/evidence/mod.rs").write_text(
                         f"pub fn container() {{ mod outer {{ pub mod {child}; }} }}\n",
                         encoding="utf-8",
                     )
@@ -458,7 +481,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
                             f'kind = "{kind}"\n'
                             'module_path = ["api"]\n'
                         )
-                    crate_root = root / "src/lib.rs"
+                    crate_root = root / "crates/ostadix-api/src/lib.rs"
                     crate_root.write_text(
                         crate_root.read_text(encoding="utf-8").replace(
                             "pub mod api;",
@@ -483,11 +506,11 @@ class ArchitectureBoundaryTests(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
                     write_minimal_tree(root)
-                    (root / "src/evidence.rs").unlink()
-                    (root / "src/evidence/mod.rs").write_text(
+                    (root / "crates/ostadix-api/src/evidence.rs").unlink()
+                    (root / "crates/ostadix-api/src/evidence/mod.rs").write_text(
                         source, encoding="utf-8"
                     )
-                    target = root / "src/evidence/outer/fact.rs"
+                    target = root / "crates/ostadix-api/src/evidence/outer/fact.rs"
                     target.parent.mkdir(parents=True, exist_ok=True)
                     target.write_text(
                         "use crate::version::Boundary;\n", encoding="utf-8"
@@ -496,11 +519,11 @@ class ArchitectureBoundaryTests(unittest.TestCase):
                     with manifest_path.open("a", encoding="utf-8") as manifest:
                         manifest.write(
                             "\n[[physical_override]]\n"
-                            'path = "src/evidence/outer/fact.rs"\n'
+                            'path = "crates/ostadix-api/src/evidence/outer/fact.rs"\n'
                             'kind = "file"\n'
                             'module_path = ["api"]\n'
                         )
-                    crate_root = root / "src/lib.rs"
+                    crate_root = root / "crates/ostadix-api/src/lib.rs"
                     crate_root.write_text(
                         crate_root.read_text(encoding="utf-8").replace(
                             "pub mod api;",
@@ -518,24 +541,24 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/evidence.rs").unlink()
-            (root / "src/evidence/mod.rs").write_text(
+            (root / "crates/ostadix-api/src/evidence.rs").unlink()
+            (root / "crates/ostadix-api/src/evidence/mod.rs").write_text(
                 "macro_rules! declare_fact { () => { pub mod fact; } }\n"
                 "declare_fact!();\n",
                 encoding="utf-8",
             )
-            (root / "src/evidence/fact.rs").write_text(
+            (root / "crates/ostadix-api/src/evidence/fact.rs").write_text(
                 "use crate::version::Boundary;\n", encoding="utf-8"
             )
             manifest_path = root / "ci/architecture-roots.toml"
             with manifest_path.open("a", encoding="utf-8") as manifest:
                 manifest.write(
                     "\n[[physical_override]]\n"
-                    'path = "src/evidence/fact.rs"\n'
+                    'path = "crates/ostadix-api/src/evidence/fact.rs"\n'
                     'kind = "file"\n'
                     'module_path = ["api"]\n'
                 )
-            crate_root = root / "src/lib.rs"
+            crate_root = root / "crates/ostadix-api/src/lib.rs"
             crate_root.write_text(
                 crate_root.read_text(encoding="utf-8").replace(
                     "pub mod api;",
@@ -556,7 +579,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/parser.rs").write_text(
+            (root / "crates/ostadix-api/src/parser.rs").write_text(
                 "macro_rules! keep { ($mod:ident) => { stringify!($mod); } }\n"
                 "keep!(harmless);\n"
                 "macro_rules! accept { (mod $name:ident) => "
@@ -595,22 +618,22 @@ class ArchitectureBoundaryTests(unittest.TestCase):
     def test_projection_facades_require_an_exact_public_glob(self) -> None:
         cases = (
             (
-                "src/registry/bundle/mod.rs",
+                "crates/ostadix-api/src/registry/bundle/mod.rs",
                 "pub use crate::backend_catalog as renamed;\n",
                 "facade `registry::bundle` source does not publicly project",
             ),
             (
-                "src/registry/bundle/mod.rs",
+                "crates/ostadix-api/src/registry/bundle/mod.rs",
                 "pub use crate::backend_catalog::Boundary;\n",
                 "facade `registry::bundle` source does not publicly project",
             ),
             (
-                "src/placement/mod.rs",
+                "crates/ostadix-api/src/placement/mod.rs",
                 "pub mod protocol { pub use crate::placement_protocol as renamed; }\n",
                 "does not contain a public inline module projecting",
             ),
             (
-                "src/placement/mod.rs",
+                "crates/ostadix-api/src/placement/mod.rs",
                 "pub mod protocol { pub use crate::placement_protocol::Boundary; }\n",
                 "does not contain a public inline module projecting",
             ),
@@ -628,7 +651,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            registry = root / "src/registry.rs"
+            registry = root / "crates/ostadix-api/src/registry.rs"
             registry.write_text(
                 registry.read_text(encoding="utf-8").replace(
                     "pub mod bundle;\n", "", 1
@@ -647,7 +670,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/backend_catalog.inc.rs").write_text(
+            (root / "crates/ostadix-api/src/backend_catalog.inc.rs").write_text(
                 "use crate::api::Boundary;\n", encoding="utf-8"
             )
             result = run_checker(root)
@@ -662,7 +685,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/backend_catalog.inc.rs").write_text(
+            (root / "crates/ostadix-api/src/backend_catalog.inc.rs").write_text(
                 "mod outer { mod fact; }\n", encoding="utf-8"
             )
             result = run_checker(root)
@@ -678,7 +701,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            crate_root = root / "src/lib.rs"
+            crate_root = root / "crates/ostadix-api/src/lib.rs"
             crate_root.write_text(
                 crate_root.read_text(encoding="utf-8").replace(
                     "pub mod api;",
@@ -690,14 +713,14 @@ class ArchitectureBoundaryTests(unittest.TestCase):
             result = run_checker(root)
         self.assertEqual(result.returncode, 1)
         self.assertIn(
-            "must remain normalized beneath `src`", result.stderr
+            "must remain normalized beneath `crates/ostadix-api/src`", result.stderr
         )
 
     def test_crate_root_cannot_hide_edges_in_an_inline_root_module(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            crate_root = root / "src/lib.rs"
+            crate_root = root / "crates/ostadix-api/src/lib.rs"
             crate_root.write_text(
                 crate_root.read_text(encoding="utf-8").replace(
                     "pub mod parser;",
@@ -717,7 +740,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            crate_root = root / "src/lib.rs"
+            crate_root = root / "crates/ostadix-api/src/lib.rs"
             crate_root.write_text(
                 crate_root.read_text(encoding="utf-8")
                 + "use crate::ir::PlanNodeId;\n",
@@ -734,18 +757,18 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            crate_root = root / "src/lib.rs"
+            crate_root = root / "crates/ostadix-api/src/lib.rs"
             crate_root.write_text(
                 crate_root.read_text(encoding="utf-8").replace(
                     "pub mod ir;", "#[macro_use]\npub mod ir;", 1
                 ),
                 encoding="utf-8",
             )
-            (root / "src/ir.rs").write_text(
+            (root / "crates/ostadix-api/src/ir.rs").write_text(
                 "macro_rules! from_ir { () => { pub struct ExpandedFromIr; }; }\n",
                 encoding="utf-8",
             )
-            (root / "src/parser.rs").write_text("from_ir!();\n", encoding="utf-8")
+            (root / "crates/ostadix-api/src/parser.rs").write_text("from_ir!();\n", encoding="utf-8")
             result = run_checker(root)
         self.assertEqual(result.returncode, 1)
         self.assertIn(
@@ -758,7 +781,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
             with self.subTest(owner=owner), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 write_minimal_tree(root)
-                crate_root = root / "src/lib.rs"
+                crate_root = root / "crates/ostadix-api/src/lib.rs"
                 crate_root.write_text(
                     crate_root.read_text(encoding="utf-8").replace(
                         f"pub mod {owner};", f"mod {owner};", 1
@@ -776,13 +799,13 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            hidden = root / "hidden/lib.rs"
+            hidden = root / "crates/ostadix-api/hidden/lib.rs"
             hidden.parent.mkdir(parents=True)
             hidden.write_text(
                 "pub mod parser { use crate::ir::Boundary; }\npub mod ir {}\n",
                 encoding="utf-8",
             )
-            cargo = root / "Cargo.toml"
+            cargo = root / "crates/ostadix-api/Cargo.toml"
             cargo.write_text(
                 cargo.read_text(encoding="utf-8")
                 + '\n[lib]\npath = "hidden/lib.rs"\n',
@@ -791,16 +814,221 @@ class ArchitectureBoundaryTests(unittest.TestCase):
             result = run_checker(root)
         self.assertEqual(result.returncode, 1)
         self.assertIn(
-            "library target `hidden/lib.rs` does not match governed crate root "
-            "`src/lib.rs`",
+            "library target `crates/ostadix-api/hidden/lib.rs` does not match governed crate root "
+            "`crates/ostadix-api/src/lib.rs`",
             result.stderr,
         )
+
+    def test_engine_cannot_depend_on_the_compatibility_shell_in_any_scope(self) -> None:
+        dependency_cases = (
+            '\n[dependencies]\no-lang = "0.0.0"\n',
+            '\n[dev-dependencies]\nshell = { package = "o-lang", version = "0" }\n',
+            (
+                "\n[target.'cfg(unix)'.build-dependencies]\n"
+                'shell = { package = "o-lang", version = "0" }\n'
+            ),
+            '\n[build-dependencies]\nshell = { path = "../.." }\n',
+        )
+        for addition in dependency_cases:
+            with self.subTest(addition=addition), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                write_minimal_tree(root)
+                cargo = root / "crates/ostadix-api/Cargo.toml"
+                cargo.write_text(
+                    cargo.read_text(encoding="utf-8") + addition,
+                    encoding="utf-8",
+                )
+                result = run_checker(root)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn(
+                "must not depend on the `o-lang` compatibility shell",
+                result.stderr,
+            )
+
+    def test_engine_cannot_reenter_root_through_a_workspace_path_dependency(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            root_cargo = root / "Cargo.toml"
+            root_cargo.write_text(
+                root_cargo.read_text(encoding="utf-8")
+                + '\n[workspace.dependencies]\nshell = { path = "." }\n',
+                encoding="utf-8",
+            )
+            engine_cargo = root / "crates/ostadix-api/Cargo.toml"
+            engine_cargo.write_text(
+                engine_cargo.read_text(encoding="utf-8")
+                + '\n[dependencies]\nshell = { workspace = true }\n',
+                encoding="utf-8",
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "must not depend on the `o-lang` compatibility shell",
+            result.stderr,
+        )
+
+    def test_shell_dependency_must_be_canonical_path_and_exact_same_version(self) -> None:
+        cases = (
+            (
+                'ostadix-api = { path = "crates/ostadix-api", version = "=0.0.0" }',
+                "",
+                "must directly depend on `ostadix-api`",
+            ),
+            (
+                'path = "crates/ostadix-api"',
+                'path = "crates/other-api"',
+                "dependency path must exactly match `crates/ostadix-api`",
+            ),
+            (
+                'version = "=0.0.0"',
+                'version = "0.0.0"',
+                "must use exact same-version requirement `=0.0.0`",
+            ),
+            (
+                'path = "crates/ostadix-api"',
+                'package = "other-api", path = "crates/ostadix-api"',
+                "must name package `ostadix-api`",
+            ),
+            (
+                'version = "=0.0.0"',
+                'version = "=0.0.0", optional = true',
+                "dependency must be unconditional, not optional",
+            ),
+        )
+        for original, replacement, expected in cases:
+            with self.subTest(expected=expected), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                write_minimal_tree(root)
+                cargo = root / "Cargo.toml"
+                cargo.write_text(
+                    cargo.read_text(encoding="utf-8").replace(
+                        original, replacement, 1
+                    ),
+                    encoding="utf-8",
+                )
+                result = run_checker(root)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn(expected, result.stderr)
+
+    def test_shell_and_engine_package_versions_must_match(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            engine = root / "crates/ostadix-api/Cargo.toml"
+            engine.write_text(
+                engine.read_text(encoding="utf-8").replace(
+                    'version = "0.0.0"', 'version = "0.0.1"', 1
+                ),
+                encoding="utf-8",
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("package versions must match exactly", result.stderr)
+
+    def test_shell_cannot_add_a_renamed_engine_dependency(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            cargo = root / "Cargo.toml"
+            cargo.write_text(
+                cargo.read_text(encoding="utf-8")
+                + '\nengine-alias = { package = "ostadix-api", '
+                'path = "crates/ostadix-api", version = "=0.0.0" }\n',
+                encoding="utf-8",
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "must not add renamed `ostadix-api` dependencies: engine-alias",
+            result.stderr,
+        )
+
+    def test_root_shell_cannot_duplicate_runtime_implementation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/value.rs").write_text(
+                "pub struct DuplicateRuntimeValue;\n", encoding="utf-8"
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "runtime implementation source outside its entrypoints: src/value.rs",
+            result.stderr,
+        )
+
+    def test_root_shell_library_is_only_the_exact_public_module_projection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            shell = root / "src/lib.rs"
+            shell.write_text(
+                shell.read_text(encoding="utf-8") + "pub fn duplicate() {}\n",
+                encoding="utf-8",
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "must contain only one explicit `pub use ostadix_api::{...};`",
+            result.stderr,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            shell = root / "src/lib.rs"
+            shell.write_text(
+                shell.read_text(encoding="utf-8").replace("api, ", "", 1),
+                encoding="utf-8",
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("public roots (missing api)", result.stderr)
+
+    def test_root_shell_library_target_and_source_geometry_are_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            cargo = root / "Cargo.toml"
+            cargo.write_text(
+                cargo.read_text(encoding="utf-8")
+                + '\n[lib]\npath = "src/bin/alternate.rs"\n',
+                encoding="utf-8",
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "compatibility shell library target must remain `src/lib.rs`",
+            result.stderr,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/hidden.rs").symlink_to(
+                root / "crates/ostadix-api/src/value.rs"
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "compatibility shell source geometry must not contain symlinks: src/hidden.rs",
+            result.stderr,
+        )
+
+    def test_root_cli_sources_remain_outside_the_engine_implementation_guard(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/bin/tool.rs").write_text("fn main() {}\n", encoding="utf-8")
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_nested_module_cannot_escape_through_an_undeclared_path_attribute(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/parser.rs").write_text(
+            (root / "crates/ostadix-api/src/parser.rs").write_text(
                 '#[path = "../outside.rs"]\nmod hidden;\n', encoding="utf-8"
             )
             result = run_checker(root)
@@ -811,16 +1039,16 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/parser.rs").write_text(
+            (root / "crates/ostadix-api/src/parser.rs").write_text(
                 'include!("parser_extra.rs");\n', encoding="utf-8"
             )
-            (root / "src/parser_extra.rs").write_text(
+            (root / "crates/ostadix-api/src/parser_extra.rs").write_text(
                 "use crate::ir::PlanNodeId;\n", encoding="utf-8"
             )
             result = run_checker(root)
         self.assertEqual(result.returncode, 1)
         self.assertIn(
-            "include! source `src/parser_extra.rs` is not declared", result.stderr
+            "include! source `crates/ostadix-api/src/parser_extra.rs` is not declared", result.stderr
         )
 
     def test_undeclared_include_macro_delimiters_cannot_escape_source_geometry(self) -> None:
@@ -831,21 +1059,22 @@ class ArchitectureBoundaryTests(unittest.TestCase):
             with self.subTest(invocation=invocation), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 write_minimal_tree(root)
-                (root / "src/parser.rs").write_text(invocation, encoding="utf-8")
+                (root / "crates/ostadix-api/src/parser.rs").write_text(invocation, encoding="utf-8")
                 (root / "outside.rs").write_text(
                     "use crate::ir::PlanNodeId;\n", encoding="utf-8"
                 )
                 result = run_checker(root)
             self.assertEqual(result.returncode, 1)
             self.assertIn(
-                "include! source `outside.rs` is not declared", result.stderr
+                "include! source `crates/ostadix-api/outside.rs` is not declared",
+                result.stderr,
             )
 
     def test_raw_identifier_include_macro_is_still_source_inclusion(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/parser.rs").write_text(
+            (root / "crates/ostadix-api/src/parser.rs").write_text(
                 'r#include!("../outside.rs");\n', encoding="utf-8"
             )
             (root / "outside.rs").write_text(
@@ -853,7 +1082,10 @@ class ArchitectureBoundaryTests(unittest.TestCase):
             )
             result = run_checker(root)
         self.assertEqual(result.returncode, 1)
-        self.assertIn("include! source `outside.rs` is not declared", result.stderr)
+        self.assertIn(
+            "include! source `crates/ostadix-api/outside.rs` is not declared",
+            result.stderr,
+        )
 
     def test_include_macro_aliases_cannot_escape_source_analysis(self) -> None:
         for import_source in (
@@ -863,7 +1095,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
             with self.subTest(import_source=import_source), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 write_minimal_tree(root)
-                (root / "src/parser.rs").write_text(
+                (root / "crates/ostadix-api/src/parser.rs").write_text(
                     import_source + 'inc!("../outside.rs");\n',
                     encoding="utf-8",
                 )
@@ -881,7 +1113,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/parser.rs").write_text(
+            (root / "crates/ostadix-api/src/parser.rs").write_text(
                 '#[cfg_attr(all(), path = "../outside.rs")]\nmod hidden;\n',
                 encoding="utf-8",
             )
@@ -896,12 +1128,12 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            parser = root / "src/parser.rs"
+            parser = root / "crates/ostadix-api/src/parser.rs"
             parser.write_text(
                 '#[cfg_attr(test, path = "../outside.rs")]\nmod hidden;\n',
                 encoding="utf-8",
             )
-            hidden = root / "src/parser/hidden.rs"
+            hidden = root / "crates/ostadix-api/src/parser/hidden.rs"
             hidden.parent.mkdir(parents=True, exist_ok=True)
             hidden.write_text("pub struct Hidden;\n", encoding="utf-8")
             result = run_checker(root)
@@ -911,7 +1143,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/placement/mod.rs").write_text(
+            (root / "crates/ostadix-api/src/placement/mod.rs").write_text(
                 "pub mod protocol {\n"
                 "    #[cfg(test)]\n"
                 "    pub use crate::placement_protocol::*;\n"
@@ -928,7 +1160,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/placement/mod.rs").write_text(
+            (root / "crates/ostadix-api/src/placement/mod.rs").write_text(
                 "pub mod protocol {\n"
                 "    #[cfg_attr(all(), cfg(test))]\n"
                 "    pub use crate::placement_protocol::*;\n"
@@ -945,7 +1177,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/placement/mod.rs").write_text(
+            (root / "crates/ostadix-api/src/placement/mod.rs").write_text(
                 "pub mod protocol {\n"
                 '    #[cfg(test = "only")]\n'
                 "    pub use crate::placement_protocol::*;\n"
@@ -962,7 +1194,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/placement/mod.rs").write_text(
+            (root / "crates/ostadix-api/src/placement/mod.rs").write_text(
                 "pub mod protocol {\n"
                 "    mod hidden {\n"
                 "        pub use crate::placement_protocol::*;\n"
@@ -980,10 +1212,10 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/information.rs").write_text(
+            (root / "crates/ostadix-api/src/information.rs").write_text(
                 "use crate::canonical_cbor::Boundary;\n", encoding="utf-8"
             )
-            (root / "src/canonical_cbor.rs").write_text(
+            (root / "crates/ostadix-api/src/canonical_cbor.rs").write_text(
                 "use crate::information::Boundary;\n", encoding="utf-8"
             )
             result = run_checker(root)
@@ -998,10 +1230,10 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/information.rs").write_text(
+            (root / "crates/ostadix-api/src/information.rs").write_text(
                 "use crate::world::identity::ArtifactId;\n", encoding="utf-8"
             )
-            (root / "src/world/mod.rs").write_text(
+            (root / "crates/ostadix-api/src/world/mod.rs").write_text(
                 "pub use crate::resource_identity as identity;\n"
                 "use crate::information::Boundary;\n",
                 encoding="utf-8",
@@ -1018,7 +1250,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/canonical_cbor.rs").write_text(
+            (root / "crates/ostadix-api/src/canonical_cbor.rs").write_text(
                 "use crate::value::OValue;\n", encoding="utf-8"
             )
             result = run_checker(root)
@@ -1043,7 +1275,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
                     write_minimal_tree(root)
-                    path = root / "src" / native_root
+                    path = root / "crates/ostadix-api/src" / native_root
                     source = path / "mod.rs" if path.is_dir() else path.with_suffix(".rs")
                     source.write_text(
                         "use crate::information_bridge::Boundary;\n", encoding="utf-8"
@@ -1061,7 +1293,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
                     write_minimal_tree(root)
-                    (root / "src/information_bridge.rs").write_text(
+                    (root / "crates/ostadix-api/src/information_bridge.rs").write_text(
                         f"use crate::{forbidden}::Boundary;\n", encoding="utf-8"
                     )
                     result = run_checker(root)
@@ -1075,7 +1307,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/future_private_model.rs").write_text(
+            (root / "crates/ostadix-api/src/future_private_model.rs").write_text(
                 "pub struct PrivateModel;\n", encoding="utf-8"
             )
             result = run_checker(root)
@@ -1089,7 +1321,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/shims.rs").unlink()
+            (root / "crates/ostadix-api/src/shims.rs").unlink()
             result = run_checker(root)
         self.assertEqual(result.returncode, 1)
         self.assertIn(
@@ -1100,8 +1332,8 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/parser.rs").write_text("mod hidden;\n", encoding="utf-8")
-            hidden = root / "src/parser/hidden.rs"
+            (root / "crates/ostadix-api/src/parser.rs").write_text("mod hidden;\n", encoding="utf-8")
+            hidden = root / "crates/ostadix-api/src/parser/hidden.rs"
             hidden.parent.mkdir(parents=True, exist_ok=True)
             hidden.write_text(
                 "use crate::ir::PlanNodeId;\n", encoding="utf-8"
@@ -1109,9 +1341,9 @@ class ArchitectureBoundaryTests(unittest.TestCase):
             manifest_path = root / "ci/architecture-roots.toml"
             manifest_path.write_text(
                 manifest_path.read_text(encoding="utf-8").replace(
-                    'excluded_files = ["src/backend_catalog.inc.rs", "src/lib.rs", "src/main.rs"]',
-                    'excluded_files = ["src/backend_catalog.inc.rs", "src/lib.rs", '
-                    '"src/main.rs", "src/parser/hidden.rs"]',
+                    'excluded_files = ["crates/ostadix-api/src/backend_catalog.inc.rs", "crates/ostadix-api/src/lib.rs"]',
+                    'excluded_files = ["crates/ostadix-api/src/backend_catalog.inc.rs", "crates/ostadix-api/src/lib.rs", '
+                    '"crates/ostadix-api/src/parser/hidden.rs"]',
                     1,
                 ),
                 encoding="utf-8",
@@ -1121,13 +1353,13 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         self.assertIn(
             "production.excluded_files must contain exactly", result.stderr
         )
-        self.assertIn("unexpected src/parser/hidden.rs", result.stderr)
+        self.assertIn("unexpected crates/ostadix-api/src/parser/hidden.rs", result.stderr)
 
     def test_manifest_cannot_exclude_an_arbitrary_compiled_module_directory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            hidden = root / "src/parser/hidden.rs"
+            hidden = root / "crates/ostadix-api/src/parser/hidden.rs"
             hidden.parent.mkdir(parents=True, exist_ok=True)
             hidden.write_text(
                 "use crate::ir::PlanNodeId;\n", encoding="utf-8"
@@ -1135,8 +1367,8 @@ class ArchitectureBoundaryTests(unittest.TestCase):
             manifest_path = root / "ci/architecture-roots.toml"
             manifest_path.write_text(
                 manifest_path.read_text(encoding="utf-8").replace(
-                    'excluded_directories = ["src/bin"]',
-                    'excluded_directories = ["src/bin", "src/parser"]',
+                    'excluded_directories = []',
+                    'excluded_directories = ["crates/ostadix-api/src/parser"]',
                     1,
                 ),
                 encoding="utf-8",
@@ -1144,25 +1376,25 @@ class ArchitectureBoundaryTests(unittest.TestCase):
             result = run_checker(root)
         self.assertEqual(result.returncode, 1)
         self.assertIn(
-            "production.excluded_directories must contain exactly", result.stderr
+            "production.excluded_directories must be empty", result.stderr
         )
-        self.assertIn("unexpected src/parser", result.stderr)
+        self.assertIn("unexpected crates/ostadix-api/src/parser", result.stderr)
 
     def test_symlinked_module_directory_cannot_escape_source_enumeration(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/parser.rs").write_text("mod hidden;\n", encoding="utf-8")
+            (root / "crates/ostadix-api/src/parser.rs").write_text("mod hidden;\n", encoding="utf-8")
             outside = root / "outside_parser"
             outside.mkdir()
             (outside / "hidden.rs").write_text(
                 "use crate::ir::PlanNodeId;\n", encoding="utf-8"
             )
-            (root / "src/parser").symlink_to(outside, target_is_directory=True)
+            (root / "crates/ostadix-api/src/parser").symlink_to(outside, target_is_directory=True)
             result = run_checker(root)
         self.assertEqual(result.returncode, 1)
         self.assertIn(
-            "production source path `src/parser` must not be a symlink",
+            "production source path `crates/ostadix-api/src/parser` must not be a symlink",
             result.stderr,
         )
 
@@ -1170,7 +1402,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/canonical_cbor.rs").write_text(
+            (root / "crates/ostadix-api/src/canonical_cbor.rs").write_text(
                 '// use crate::api::Boundary;\n'
                 'const COOKED: &str = "crate::api::Boundary";\n'
                 'const RAW: &str = r###"use crate::api::Boundary;"###;\n'
@@ -1185,7 +1417,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/canonical_cbor.rs").write_text(
+            (root / "crates/ostadix-api/src/canonical_cbor.rs").write_text(
                 "use crate::world::identity::ArtifactId;\n", encoding="utf-8"
             )
             result = run_checker(root)
@@ -1199,7 +1431,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/placement/protocol/future.rs").write_text(
+            (root / "crates/ostadix-api/src/placement/protocol/future.rs").write_text(
                 "use crate::resource_identity::Boundary;\n", encoding="utf-8"
             )
             result = run_checker(root)
@@ -1209,7 +1441,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/world/identity.rs").write_text(
+            (root / "crates/ostadix-api/src/world/identity.rs").write_text(
                 "use crate::value::OValue;\n", encoding="utf-8"
             )
             result = run_checker(root)
@@ -1223,8 +1455,8 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            old_path = root / "src/world/identity.rs"
-            override_path = root / "src/world/identity.source"
+            old_path = root / "crates/ostadix-api/src/world/identity.rs"
+            override_path = root / "crates/ostadix-api/src/world/identity.source"
             old_path.rename(override_path)
             override_path.write_text(
                 "use crate::api::Boundary;\n", encoding="utf-8"
@@ -1232,13 +1464,13 @@ class ArchitectureBoundaryTests(unittest.TestCase):
             manifest_path = root / "ci/architecture-roots.toml"
             manifest_path.write_text(
                 manifest_path.read_text(encoding="utf-8").replace(
-                    'path = "src/world/identity.rs"',
-                    'path = "src/world/identity.source"',
+                    'path = "crates/ostadix-api/src/world/identity.rs"',
+                    'path = "crates/ostadix-api/src/world/identity.source"',
                     1,
                 ),
                 encoding="utf-8",
             )
-            crate_root = root / "src/lib.rs"
+            crate_root = root / "crates/ostadix-api/src/lib.rs"
             crate_root.write_text(
                 crate_root.read_text(encoding="utf-8").replace(
                     'path = "world/identity.rs"',
@@ -1257,7 +1489,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/parser.rs").write_text(
+            (root / "crates/ostadix-api/src/parser.rs").write_text(
                 "use crate::ir::PlanNodeId;\n", encoding="utf-8"
             )
             result = run_checker(root)
@@ -1268,7 +1500,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/ir.rs").write_text(
+            (root / "crates/ostadix-api/src/ir.rs").write_text(
                 "use crate::registry::bundle::BackendRegistry;\n", encoding="utf-8"
             )
             result = run_checker(root)
@@ -1279,7 +1511,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/ir.rs").write_text(
+            (root / "crates/ostadix-api/src/ir.rs").write_text(
                 "use crate::execution_contract::Policy;\n", encoding="utf-8"
             )
             result = run_checker(root)
@@ -1306,7 +1538,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
                     write_minimal_tree(root)
-                    (root / "src/backend_catalog.rs").write_text(
+                    (root / "crates/ostadix-api/src/backend_catalog.rs").write_text(
                         f"use crate::{module}::Boundary;\n", encoding="utf-8"
                     )
                     result = run_checker(root)
@@ -1323,7 +1555,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/backend_catalog.rs").write_text(
+            (root / "crates/ostadix-api/src/backend_catalog.rs").write_text(
                 "".join(f"use crate::{module}::Boundary;\n" for module in allowed),
                 encoding="utf-8",
             )
@@ -1331,8 +1563,8 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_backend_state_is_compiled_once_with_a_legacy_alias(self) -> None:
-        lib_source = (ROOT / "src/lib.rs").read_text(encoding="utf-8")
-        backend_source = (ROOT / "src/backend.rs").read_text(encoding="utf-8")
+        lib_source = (ROOT / "crates/ostadix-api/src/lib.rs").read_text(encoding="utf-8")
+        backend_source = (ROOT / "crates/ostadix-api/src/backend.rs").read_text(encoding="utf-8")
 
         self.assertEqual(lib_source.count("pub mod backend_state;"), 1)
         self.assertIn("pub use crate::backend_state as state;", backend_source)
@@ -1344,7 +1576,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
                     write_minimal_tree(root)
-                    (root / "src/backend_state.rs").write_text(
+                    (root / "crates/ostadix-api/src/backend_state.rs").write_text(
                         f"use crate::{module}::Boundary;\n", encoding="utf-8"
                     )
                     result = run_checker(root)
@@ -1368,7 +1600,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
                     write_minimal_tree(root)
-                    (root / "src/backend_state.rs").write_text(
+                    (root / "crates/ostadix-api/src/backend_state.rs").write_text(
                         source, encoding="utf-8"
                     )
                     result = run_checker(root)
@@ -1380,7 +1612,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/backend_state.rs").write_text(
+            (root / "crates/ostadix-api/src/backend_state.rs").write_text(
                 "".join(f"use crate::{module}::Boundary;\n" for module in allowed),
                 encoding="utf-8",
             )
@@ -1388,7 +1620,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_backend_state_lower_dependencies_predeny_reverse_edges(self) -> None:
-        for relative in ("src/environment.rs", "src/value.rs", "src/wire.rs"):
+        for relative in ("crates/ostadix-api/src/environment.rs", "crates/ostadix-api/src/value.rs", "crates/ostadix-api/src/wire.rs"):
             with self.subTest(relative=relative):
                 with tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
@@ -1407,7 +1639,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/process.rs").write_text(
+            (root / "crates/ostadix-api/src/process.rs").write_text(
                 "use crate::backend::RustBackend;\n", encoding="utf-8"
             )
             result = run_checker(root)
@@ -1418,7 +1650,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/process.rs").write_text(
+            (root / "crates/ostadix-api/src/process.rs").write_text(
                 "use crate::backend_state::BackendStateTierV1;\n", encoding="utf-8"
             )
             result = run_checker(root)
@@ -1465,7 +1697,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
                     write_minimal_tree(root)
-                    (root / "src/execution_contract.rs").write_text(
+                    (root / "crates/ostadix-api/src/execution_contract.rs").write_text(
                         f"use crate::{module}::Boundary;\n", encoding="utf-8"
                     )
                     result = run_checker(root)
@@ -1487,7 +1719,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
                     write_minimal_tree(root)
-                    (root / "src/execution_contract.rs").write_text(
+                    (root / "crates/ostadix-api/src/execution_contract.rs").write_text(
                         source, encoding="utf-8"
                     )
                     result = run_checker(root)
@@ -1511,7 +1743,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
                     write_minimal_tree(root)
-                    (root / "src/execution_contract.rs").write_text(
+                    (root / "crates/ostadix-api/src/execution_contract.rs").write_text(
                         source, encoding="utf-8"
                     )
                     result = run_checker(root)
@@ -1522,7 +1754,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/parser.rs").write_text(
+            (root / "crates/ostadix-api/src/parser.rs").write_text(
                 "use crate::future_low_layer::Boundary;\n", encoding="utf-8"
             )
             result = run_checker(root)
@@ -1534,7 +1766,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/execution_contract.rs").write_text(
+            (root / "crates/ostadix-api/src/execution_contract.rs").write_text(
                 "".join(f"use crate::{module}::Boundary;\n" for module in allowed),
                 encoding="utf-8",
             )
@@ -1543,11 +1775,11 @@ class ArchitectureBoundaryTests(unittest.TestCase):
 
     def test_execution_contract_lower_seams_cannot_form_reverse_cycles(self) -> None:
         for relative in (
-            "src/parser.rs",
-            "src/syntax_dialect.rs",
-            "src/effects.rs",
-            "src/value.rs",
-            "src/placement/protocol/target.rs",
+            "crates/ostadix-api/src/parser.rs",
+            "crates/ostadix-api/src/syntax_dialect.rs",
+            "crates/ostadix-api/src/effects.rs",
+            "crates/ostadix-api/src/value.rs",
+            "crates/ostadix-api/src/placement/protocol/target.rs",
         ):
             with self.subTest(relative=relative):
                 with tempfile.TemporaryDirectory() as directory:
@@ -1568,7 +1800,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
                     write_minimal_tree(root)
-                    (root / "src/eval_core.rs").write_text(
+                    (root / "crates/ostadix-api/src/eval_core.rs").write_text(
                         f"use crate::{module}::Boundary;\n", encoding="utf-8"
                     )
                     result = run_checker(root)
@@ -1579,7 +1811,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/eval_core.rs").write_text(
+            (root / "crates/ostadix-api/src/eval_core.rs").write_text(
                 "use crate::information::InformationRootV1;\n", encoding="utf-8"
             )
             result = run_checker(root)
@@ -1598,7 +1830,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/eval_core.rs").write_text(
+            (root / "crates/ostadix-api/src/eval_core.rs").write_text(
                 "".join(f"use crate::{module}::Boundary;\n" for module in allowed),
                 encoding="utf-8",
             )
@@ -1607,15 +1839,15 @@ class ArchitectureBoundaryTests(unittest.TestCase):
 
     def test_every_executor_module_requires_eval_core_instead_of_evaluator(self) -> None:
         for relative in (
-            "src/executor/actor.rs",
-            "src/executor/cancellation.rs",
-            "src/executor/coordinator.rs",
-            "src/executor/effects.rs",
-            "src/executor/mod.rs",
-            "src/executor/parallel.rs",
-            "src/executor/pool.rs",
-            "src/executor/task.rs",
-            "src/executor/trace.rs",
+            "crates/ostadix-api/src/executor/actor.rs",
+            "crates/ostadix-api/src/executor/cancellation.rs",
+            "crates/ostadix-api/src/executor/coordinator.rs",
+            "crates/ostadix-api/src/executor/effects.rs",
+            "crates/ostadix-api/src/executor/mod.rs",
+            "crates/ostadix-api/src/executor/parallel.rs",
+            "crates/ostadix-api/src/executor/pool.rs",
+            "crates/ostadix-api/src/executor/task.rs",
+            "crates/ostadix-api/src/executor/trace.rs",
         ):
             with self.subTest(relative=relative):
                 with tempfile.TemporaryDirectory() as directory:
@@ -1632,7 +1864,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/executor/coordinator.rs").write_text(
+            (root / "crates/ostadix-api/src/executor/coordinator.rs").write_text(
                 "use crate::eval_core::GraphEvaluationHost;\n", encoding="utf-8"
             )
             result = run_checker(root)
@@ -1640,13 +1872,13 @@ class ArchitectureBoundaryTests(unittest.TestCase):
 
     def test_eval_core_lower_dependencies_predeny_reverse_edges(self) -> None:
         for relative in (
-            "src/backend_catalog.rs",
-            "src/capability.rs",
-            "src/execution_contract.rs",
-            "src/ir.rs",
-            "src/value.rs",
-            "src/evidence/analyze.rs",
-            "src/evidence/mod.rs",
+            "crates/ostadix-api/src/backend_catalog.rs",
+            "crates/ostadix-api/src/capability.rs",
+            "crates/ostadix-api/src/execution_contract.rs",
+            "crates/ostadix-api/src/ir.rs",
+            "crates/ostadix-api/src/value.rs",
+            "crates/ostadix-api/src/evidence/analyze.rs",
+            "crates/ostadix-api/src/evidence/mod.rs",
         ):
             with self.subTest(relative=relative):
                 with tempfile.TemporaryDirectory() as directory:
@@ -1661,10 +1893,10 @@ class ArchitectureBoundaryTests(unittest.TestCase):
 
     def test_evidence_and_world_cannot_reenter_evaluator_for_contract_types(self) -> None:
         for relative in (
-            "src/evidence/admit.rs",
-            "src/evidence/analyze.rs",
-            "src/evidence/intent.rs",
-            "src/world/grounding.rs",
+            "crates/ostadix-api/src/evidence/admit.rs",
+            "crates/ostadix-api/src/evidence/analyze.rs",
+            "crates/ostadix-api/src/evidence/intent.rs",
+            "crates/ostadix-api/src/world/grounding.rs",
         ):
             with self.subTest(relative=relative):
                 with tempfile.TemporaryDirectory() as directory:
@@ -1681,10 +1913,10 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/evidence/analyze.rs").write_text(
+            (root / "crates/ostadix-api/src/evidence/analyze.rs").write_text(
                 "use crate::execution_contract::Policy;\n", encoding="utf-8"
             )
-            (root / "src/world/grounding.rs").write_text(
+            (root / "crates/ostadix-api/src/world/grounding.rs").write_text(
                 "use crate::execution_contract::BlockOptions;\n", encoding="utf-8"
             )
             result = run_checker(root)
@@ -1694,7 +1926,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/parser.rs").write_text(
+            (root / "crates/ostadix-api/src/parser.rs").write_text(
                 "pub struct Syntax;\n# [ cfg ( test ) ]\n"
                 "mod tests {\n"
                 "    const MARKER: &str = r###\"} #[cfg(test)] {\"###;\n"
@@ -1710,7 +1942,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/parser.rs").write_text(
+            (root / "crates/ostadix-api/src/parser.rs").write_text(
                 "#[cfg(test)]\n"
                 "mod tests { use crate::ir::PlanNodeId; }\n"
                 "use crate::registry::BackendRegistry;\n",
@@ -1724,7 +1956,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/parser.rs").write_text(
+            (root / "crates/ostadix-api/src/parser.rs").write_text(
                 "#[cfg(test)]\n"
                 "const unsafe fn helper() { use crate::ir::PlanNodeId; }\n"
                 "use crate::registry::BackendRegistry;\n",
@@ -1739,7 +1971,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/parser.rs").write_text(
+            (root / "crates/ostadix-api/src/parser.rs").write_text(
                 "#[cfg(test)]\n"
                 "impl Trait for Foo<{ 1 + { 2 } }> { use crate::ir::PlanNodeId; }\n"
                 "use crate::registry::BackendRegistry;\n",
@@ -1754,7 +1986,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/parser.rs").write_text(
+            (root / "crates/ostadix-api/src/parser.rs").write_text(
                 "#[cfg(test)]\n"
                 "fn helper() -> ty!{} { use crate::ir::PlanNodeId; }\n"
                 "use crate::registry::BackendRegistry;\n",
@@ -1769,7 +2001,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/parser.rs").write_text(
+            (root / "crates/ostadix-api/src/parser.rs").write_text(
                 'const COOKED: &str = "#[cfg(test)]";\n'
                 "const RAW: &str = r###\"#[cfg(test)]\"###;\n"
                 "// #[cfg(test)]\n"
@@ -1786,7 +2018,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/parser.rs").write_text(
+            (root / "crates/ostadix-api/src/parser.rs").write_text(
                 'const NOTE: &str = "use crate::ir::PlanNodeId;";\n'
                 "const RAW: &str = r#\"crate::registry::BackendRegistry\"#;\n"
                 "// use crate::ir::PlanNodeId;\n"
@@ -1801,7 +2033,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/parser.rs").write_text(
+            (root / "crates/ostadix-api/src/parser.rs").write_text(
                 "use crate :: { ir :: PlanNodeId, value::OValue };\n",
                 encoding="utf-8",
             )
@@ -1813,7 +2045,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/parser.rs").write_text(
+            (root / "crates/ostadix-api/src/parser.rs").write_text(
                 "macro_rules! dep {\n"
                 "    ($root:tt, $module:ident) => {\n"
                 "        use $root::$module::Boundary;\n"
@@ -1834,7 +2066,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
             with self.subTest(invocation=invocation), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 write_minimal_tree(root)
-                (root / "src/parser.rs").write_text(
+                (root / "crates/ostadix-api/src/parser.rs").write_text(
                     "macro_rules! dep {\n"
                     "    (pub($root:tt), $module:ident) => {\n"
                     "        pub($root) struct Local;\n"
@@ -1855,7 +2087,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/parser.rs").write_text(
+            (root / "crates/ostadix-api/src/parser.rs").write_text(
                 "macro_rules! dep {\n"
                 "    ($root:tt :: $visible:ident, $hidden:ident) => {\n"
                 "        use $root::$hidden::Boundary;\n"
@@ -1875,7 +2107,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/placement/protocol/target.rs").write_text(
+            (root / "crates/ostadix-api/src/placement/protocol/target.rs").write_text(
                 "use super::{super::ir::Boundary};\n", encoding="utf-8"
             )
             result = run_checker(root)
@@ -1887,9 +2119,9 @@ class ArchitectureBoundaryTests(unittest.TestCase):
 
     def test_raw_identifiers_cannot_obscure_forbidden_root_modules(self) -> None:
         cases = (
-            ("src/parser.rs", "use crate::r#ir::PlanNodeId;\n", "crate::ir"),
+            ("crates/ostadix-api/src/parser.rs", "use crate::r#ir::PlanNodeId;\n", "crate::ir"),
             (
-                "src/placement/protocol/target.rs",
+                "crates/ostadix-api/src/placement/protocol/target.rs",
                 "use crate::{r#world::ArtifactId};\n",
                 "crate::{world::...}",
             ),
@@ -1908,7 +2140,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/parser.rs").write_text(
+            (root / "crates/ostadix-api/src/parser.rs").write_text(
                 '#[cfg(any(test, feature = "fixture"))]\n'
                 "mod maybe_production { use crate::ir::PlanNodeId; }\n",
                 encoding="utf-8",
@@ -1921,7 +2153,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/parser.rs").write_text(
+            (root / "crates/ostadix-api/src/parser.rs").write_text(
                 "#[cfg(all(test, unix))]\n"
                 "mod tests { use crate::ir::PlanNodeId; }\n"
                 "pub struct Production;\n",
@@ -1934,7 +2166,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/parser.rs").write_text(
+            (root / "crates/ostadix-api/src/parser.rs").write_text(
                 "#[cfg(not(test))]\nuse crate::ir::PlanNodeId;\n",
                 encoding="utf-8",
             )
@@ -1949,7 +2181,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
                     write_minimal_tree(root)
-                    (root / "src/parser.rs").write_text(
+                    (root / "crates/ostadix-api/src/parser.rs").write_text(
                         f"#[cfg(feature = {literal})]\n"
                         "mod maybe_production { use crate::ir::PlanNodeId; }\n",
                         encoding="utf-8",
@@ -1965,7 +2197,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
                     write_minimal_tree(root)
-                    (root / "src/parser.rs").write_text(
+                    (root / "crates/ostadix-api/src/parser.rs").write_text(
                         f"#[cfg(all(test, feature = {literal}))]\n"
                         "mod tests { use crate::ir::PlanNodeId; }\n",
                         encoding="utf-8",
@@ -1984,7 +2216,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
                     with tempfile.TemporaryDirectory() as directory:
                         root = Path(directory)
                         write_minimal_tree(root)
-                        (root / "src/parser.rs").write_text(
+                        (root / "crates/ostadix-api/src/parser.rs").write_text(
                             f"#[cfg({predicate})]\nmod invalid {{}}\n",
                             encoding="utf-8",
                         )
@@ -1999,7 +2231,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/parser.rs").write_text(
+            (root / "crates/ostadix-api/src/parser.rs").write_text(
                 "#[cfg(all(test, feature = \0))]\n"
                 "mod hidden { use crate::ir::PlanNodeId; }\n",
                 encoding="utf-8",
@@ -2013,7 +2245,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/parser.rs").write_text(
+            (root / "crates/ostadix-api/src/parser.rs").write_text(
                 "#[cfg(all(unix, any(test, all(windows, test))))]\n"
                 "mod tests { use crate::ir::PlanNodeId; }\n",
                 encoding="utf-8",
@@ -2025,7 +2257,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/parser.rs").write_text(
+            (root / "crates/ostadix-api/src/parser.rs").write_text(
                 "#[cfg(not(any(test, all(test, unix))))]\n"
                 "mod production { use crate::ir::PlanNodeId; }\n",
                 encoding="utf-8",
@@ -2038,7 +2270,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/parser.rs").write_text(
+            (root / "crates/ostadix-api/src/parser.rs").write_text(
                 '#[cfg(not(any(test, all(unix, feature = "fixture"))))]\n'
                 "mod maybe_production { use crate::ir::PlanNodeId; }\n",
                 encoding="utf-8",
@@ -2064,7 +2296,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
                     write_minimal_tree(root)
-                    (root / "src/parser.rs").write_text(source, encoding="utf-8")
+                    (root / "crates/ostadix-api/src/parser.rs").write_text(source, encoding="utf-8")
                     result = run_checker(root)
                 self.assertEqual(result.returncode, 1)
                 self.assertIn("is not analyzable", result.stderr)
@@ -2085,7 +2317,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
                     write_minimal_tree(root)
-                    (root / "src/evidence/admit.rs").write_text(source, encoding="utf-8")
+                    (root / "crates/ostadix-api/src/evidence/admit.rs").write_text(source, encoding="utf-8")
                     result = run_checker(root)
                 self.assertEqual(result.returncode, 1)
                 self.assertIn(expected, result.stderr)
@@ -2095,7 +2327,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/parser.rs").write_text(
+            (root / "crates/ostadix-api/src/parser.rs").write_text(
                 "extern crate dependency;\n"
                 "pub(crate) struct CrateVisible;\n"
                 "pub(super) struct ParentVisible;\n"
@@ -2117,7 +2349,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
                     write_minimal_tree(root)
-                    (root / "src/evidence/admit.rs").write_text(
+                    (root / "crates/ostadix-api/src/evidence/admit.rs").write_text(
                         source, encoding="utf-8"
                     )
                     result = run_checker(root)
@@ -2127,7 +2359,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/evidence/admit.rs").write_text(
+            (root / "crates/ostadix-api/src/evidence/admit.rs").write_text(
                 "fn f<'a>(x: &'a ()) -> impl Sized + use<'a> { x }\n"
                 "pub(crate) struct CrateVisible;\n",
                 encoding="utf-8",
@@ -2139,7 +2371,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/evidence/admit.rs").write_text(
+            (root / "crates/ostadix-api/src/evidence/admit.rs").write_text(
                 "macro_rules! keyword { () => { use } }\n"
                 "pub(crate) struct CrateVisible;\n",
                 encoding="utf-8",
@@ -2149,10 +2381,10 @@ class ArchitectureBoundaryTests(unittest.TestCase):
 
     def test_direct_super_chains_expose_forbidden_modules(self) -> None:
         cases = (
-            ("src/parser.rs", "use super::ir::PlanNodeId;\n", "super::ir"),
-            ("src/eval.rs", "use super::world::ArtifactId;\n", "super::world"),
+            ("crates/ostadix-api/src/parser.rs", "use super::ir::PlanNodeId;\n", "super::ir"),
+            ("crates/ostadix-api/src/eval.rs", "use super::world::ArtifactId;\n", "super::world"),
             (
-                "src/placement/protocol/target.rs",
+                "crates/ostadix-api/src/placement/protocol/target.rs",
                 "use super::super::world::ArtifactId;\n",
                 "super::super::world",
             ),
@@ -2171,7 +2403,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/placement/protocol/target.rs").write_text(
+            (root / "crates/ostadix-api/src/placement/protocol/target.rs").write_text(
                 "use super::digest::validate_token;\n",
                 encoding="utf-8",
             )
@@ -2182,7 +2414,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/placement/protocol/target.rs").write_text(
+            (root / "crates/ostadix-api/src/placement/protocol/target.rs").write_text(
                 "use super::super::super::world::ArtifactId;\n",
                 encoding="utf-8",
             )
@@ -2194,7 +2426,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/placement/protocol/target.rs").write_text(
+            (root / "crates/ostadix-api/src/placement/protocol/target.rs").write_text(
                 "mod nested { use super::world::ArtifactId; }\n",
                 encoding="utf-8",
             )
@@ -2206,10 +2438,10 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/placement/protocol/target.rs").write_text(
+            (root / "crates/ostadix-api/src/placement/protocol/target.rs").write_text(
                 "use super::digest::validate_token;\n", encoding="utf-8"
             )
-            (root / "src/evidence/admit.rs").write_text(
+            (root / "crates/ostadix-api/src/evidence/admit.rs").write_text(
                 "use super::fact::EvidenceFact;\n", encoding="utf-8"
             )
             result = run_checker(root)
@@ -2219,7 +2451,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/parser.rs").write_text(
+            (root / "crates/ostadix-api/src/parser.rs").write_text(
                 "#[cfg(test)]\nmod tests {\n", encoding="utf-8"
             )
             result = run_checker(root)
@@ -2230,7 +2462,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/parser.rs").write_text(
+            (root / "crates/ostadix-api/src/parser.rs").write_text(
                 "#[cfg(not(test, unix))]\nmod invalid {}\n", encoding="utf-8"
             )
             result = run_checker(root)
@@ -2249,7 +2481,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
                     write_minimal_tree(root)
-                    (root / "src/parser.rs").write_text(source, encoding="utf-8")
+                    (root / "crates/ostadix-api/src/parser.rs").write_text(source, encoding="utf-8")
                     result = run_checker(root)
                 self.assertEqual(result.returncode, 1)
                 self.assertIn("could not analyze Rust tokens", result.stderr)
@@ -2258,7 +2490,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/parser.rs").write_text(
+            (root / "crates/ostadix-api/src/parser.rs").write_text(
                 'const BROKEN: &str = "#[cfg(test)]\n'
                 "use crate::ir::PlanNodeId;\n",
                 encoding="utf-8",
@@ -2271,7 +2503,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/placement/protocol/target.rs").write_text(
+            (root / "crates/ostadix-api/src/placement/protocol/target.rs").write_text(
                 "use crate::{world::ArtifactId};\n", encoding="utf-8"
             )
             result = run_checker(root)
@@ -2301,7 +2533,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
                     write_minimal_tree(root)
-                    (root / "src/placement/protocol/catalog.rs").write_text(
+                    (root / "crates/ostadix-api/src/placement/protocol/catalog.rs").write_text(
                         source, encoding="utf-8"
                     )
                     result = run_checker(root)
@@ -2312,7 +2544,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/placement/protocol/catalog.rs").write_text(
+            (root / "crates/ostadix-api/src/placement/protocol/catalog.rs").write_text(
                 "use crate::resource_identity::ArtifactId;\n", encoding="utf-8"
             )
             result = run_checker(root)
@@ -2322,7 +2554,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/registry/model.rs").write_text(
+            (root / "crates/ostadix-api/src/registry/model.rs").write_text(
                 "use crate::placement::NodeProfileV1;\n", encoding="utf-8"
             )
             result = run_checker(root)
@@ -2333,7 +2565,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_tree(root)
-            (root / "src/registry/model.rs").write_text(
+            (root / "crates/ostadix-api/src/registry/model.rs").write_text(
                 "use crate::placement_protocol::NodeProfileV1;\n", encoding="utf-8"
             )
             result = run_checker(root)
@@ -2345,7 +2577,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
                     write_minimal_tree(root)
-                    (root / "src/ir.rs").write_text(
+                    (root / "crates/ostadix-api/src/ir.rs").write_text(
                         f"use crate::{module}::SemanticDigestV1;\n", encoding="utf-8"
                     )
                     result = run_checker(root)

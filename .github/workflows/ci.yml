@@ -88,6 +88,10 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo +1.97.1 doc --locked --workspace --all-features --no-deps
+      - name: Verify independent engine and compatibility shell packages
+        run: |
+          cargo +1.97.1 package --locked --package ostadix-api
+          cargo +1.97.1 package --locked --no-verify --package ostadix-api --package o-lang
       - name: Verify every declared binary target
         run: bash scripts/check_declared_bins.sh
       - name: Check parser fuzz target
@@ -124,7 +128,7 @@ jobs:
       - name: Run deterministic parser properties
         run: cargo +1.97.1 test --locked --package o-lang --test parser_proptest
       - name: Verify byte-reproducible O-core objects
-        run: cargo +1.97.1 test --locked --package o-lang --lib ocore::driver::tests::ocore_object_is_byte_reproducible_across_source_directories -- --exact
+        run: cargo +1.97.1 test --locked --package ostadix-api --lib ocore::driver::tests::ocore_object_is_byte_reproducible_across_source_directories -- --exact
       - name: Run manifest-selected Rust example semantics
         run: O_BIN="$PWD/target/debug/O" ./test_o_lang_examples.sh
 

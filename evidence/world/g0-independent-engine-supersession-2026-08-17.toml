@@ -1,0 +1,9 @@
+schema_version = 1
+id = "g0-independent-engine-supersession-2026-08-17"
+event = "supersede"
+subject = "g0-ostadix-alpha-branding-2026-08-09"
+replacement = "g0-independent-engine-2026-08-17"
+reason_code = "runtime-engine-ownership-migration"
+reason = "The complete runtime implementation moved into the independently packaged ostadix-api engine while o-lang became its compatibility and CLI shell; the prior G0 record remains immutable and is superseded by conformance evidence over the new physical source ownership."
+source_commit = "6c1e45edaa22a1bbbcd27084a158986510489066"
+signatures = []
