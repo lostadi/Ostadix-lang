@@ -11,33 +11,18 @@ html^( <p>Result: python^( 2 + 2 )_python</p> )_html
 
 ```
 Ostadix-lang/
-├── src/              # Rust implementation (primary, active)
-│   ├── main.rs       #   CLI entry point
-│   ├── lib.rs        #   Library crate root
-│   ├── parser.rs     #   Tokenizer & expression parser
-│   ├── ir.rs         #   OIR intermediate representation & backend registry
-│   ├── eval.rs       #   Recursive evaluator
-│   ├── effects.rs    #   Semantic effect/resource summaries
-│   ├── dispatch_model.rs # Pure evidence/executor dispatch classification
-│   ├── evidence/     #   Pre-execution analysis and admission compiler
-│   ├── executor/     #   Graph coordinator and serial oracle
-│   ├── hgraph/       #   Directed value/state/control hypergraph
-│   ├── value.rs      #   OValue universal type system
-│   ├── information/  #   Authority-free identity/projection sidecar
-│   ├── placement/    #   Protocol source tree plus public projection facade
-│   ├── process.rs    #   Subprocess management for backends
-│   ├── nix_ops.rs    #   Nix build/realise operations
-│   ├── nixos_ops.rs  #   NixOS-specific operations
-│   ├── scheduler.rs  #   Parallel evaluation scheduler
-│   ├── ocore/        #   O-core compiler (lexer, typeck, HIR, MIR, codegen)
-│   ├── live_system/  #   Hosted Live-World package/service oracle
-│   ├── kernel_world.rs #  KernelWorld foreign-kernel manifest contract & oracle
-│   ├── world/        #   Shared governed identities/effects foundation
-│   ├── project/      #   Project bundles, route runtime, and logical HGraph plans
-│   └── bin/          #   Additional binary targets (olangc, ocorec, olink, …)
+├── crates/ostadix-api/ # Independently packageable runtime engine
+│   ├── src/          #   Parser, IR, values, evaluator, HGraph, admission,
+│   │                 #   scheduler, hosted/project/World, information, O-core
+│   ├── backends/     #   Authoritative embedded backend shim assets
+│   └── test-assets/  #   Package-local benchmark and native ABI fixtures
+├── src/              # `o-lang` compatibility and CLI shell
+│   ├── lib.rs        #   Explicit historical-module reexports from the engine
+│   ├── main.rs       #   O interpreter entry point
+│   └── bin/          #   Additional binaries (olangc, ocorec, o-link, …)
 ├── ocore/            # Native systems runtime and bootable x86_64 kernel proof
 ├── okernel-multikernel/ # Foreign-kernel personality proposal & boot-and-test entrypoint
-├── backends/         # Language shims (Python, Bash, Nix, Racket, Rust, … — see README backend table)
+├── backends/         # Byte-identical CLI/source compatibility shim mirror
 ├── examples/         # .O example programs
 ├── c_cpp/            # Complete C17 port (standalone)
 ├── o_lang/           # Legacy Python prototype (reference only)
@@ -53,32 +38,37 @@ Ostadix-lang/
 
 ## Frozen dependency direction
 
-The first cycle-breaking boundaries are executable repository contracts:
+Runtime dependency flow is one-way: the root `o-lang` package depends on
+`ostadix-api`; the engine never depends on the shell. Historical
+`o_lang::<module>` paths are explicit reexports of the engine's same nominal
+types, so the extraction creates no second evaluator, registry, value model, or
+admission compiler. Inside that engine, the cycle-breaking boundaries remain
+executable repository contracts:
 
 - parser production code depends only on `syntax_dialect.rs`, a narrow view
   answering registration, canonical spelling, and quoted-body ownership;
-- `src/ir.rs` owns OIR and plans but does not import HGraph or placement;
+- `crates/ostadix-api/src/ir.rs` owns OIR and plans but does not import HGraph or placement;
   those higher projections consume IR, and the historical inherent HGraph
-  convenience methods are implemented in `src/hgraph/from_oir.rs`;
+  convenience methods are implemented in `crates/ostadix-api/src/hgraph/from_oir.rs`;
 - `dispatch_model.rs` is a pure classification layer shared by evidence and
   executor, so evidence no longer imports worker implementation;
 - governed identity is rooted below both Effects and World (the historical
   `world::identity` path is a compatibility re-export);
-- the physical `src/placement/protocol/` tree is loaded exactly once as the
+- the physical `crates/ostadix-api/src/placement/protocol/` tree is loaded exactly once as the
   crate-private `placement_protocol` module. It remains below IR projections,
   Registry integration, execution, and World. Public
   `placement::SemanticDigestV1` and
   `placement::protocol::SemanticDigestV1` are compatibility aliases of that
   same Rust type, not separately compiled protocol copies;
-- `src/backend_catalog.rs` is compiled exactly once as the crate-private
+- `crates/ostadix-api/src/backend_catalog.rs` is compiled exactly once as the crate-private
   canonical catalog implementation. IR's historical named exports and
   `registry::bundle` are public compatibility projections of those same Rust
   types; internal library code imports the canonical module directly. Catalog
   integration depends on the registry-independent `placement_protocol` module,
   while registry storage and compatibility adapters remain above it. Generated
   AOT runtimes preserve the same single-identity geometry;
-- `src/execution_contract.rs`, `src/eval_core.rs`, and
-  `src/backend_state.rs` are canonical lower seams for execution policy,
+- `crates/ostadix-api/src/execution_contract.rs`, `crates/ostadix-api/src/eval_core.rs`, and
+  `crates/ostadix-api/src/backend_state.rs` are canonical lower seams for execution policy,
   evaluator-independent graph execution, and backend lifecycle state. Their
   historical public paths preserve type identity without recompiling the
   implementation or reopening the higher realization roots.
@@ -88,12 +78,14 @@ root-dependency contract. It declares every current production root, allowed
 cross-root edge and layer, the non-conventional `resource_identity` and
 `placement_protocol` physical mappings, and compatibility facades. The
 token-aware `python3 scripts/check_architecture_boundaries.py` enumerates all
-production library module files, verifies the crate-root declarations and
-their physical paths as a pure external-module aggregator bound to Cargo's
-actual library target, scans the compiled `backend_catalog.inc.rs` token
-fragment under its owning root, rejects symlink geometry, and rejects every
-undeclared direct or production-active conditional `#[path]` and every direct
-or aliased `include!` source escape. Physical overrides are explicitly
+production engine module files under `crates/ostadix-api/src`, verifies the
+crate-root declarations and their physical paths against the library target in
+`crates/ostadix-api/Cargo.toml`, and permits only its exact public
+`api::{...}` value projection beyond external module declarations. It scans the
+compiled `backend_catalog.inc.rs` token fragment under its owning root, rejects
+symlink geometry, and rejects every undeclared direct or production-active
+conditional `#[path]` and every direct or aliased `include!` source escape.
+Physical overrides are explicitly
 enumerated even when their filename does not end in `.rs`; each maps exactly
 one crate root, cannot overlap an exclusion, and cannot retain a second
 conventional `mod child;` owner. Directory overrides require a regular
@@ -101,20 +93,24 @@ conventional `mod child;` owner. Directory overrides require a regular
 descendant filesystem convention would re-enter the displaced root. External
 child declarations nested inside inline modules or block items are rejected
 because that physical module stack is not part of the manifest model. The
-exclusion set is closed to the library and binary
-entrypoints, conventional binary directory, and declared compiled fragments.
+exclusion set is closed to the engine library entrypoint and declared compiled
+fragments; it contains no shell binary or directory exclusion. The checker also
+enforces the package direction: `ostadix-api` cannot depend on `o-lang`, while
+the root compatibility shell must use the exact same package version and exact
+path dependency, re-export every public engine module, and contain no duplicate
+runtime implementation outside its CLI entrypoints.
 Facades bind an unconditionally public owner and exact public alias or glob
 projection. The checker then rejects undeclared roots and edges, retains
 the narrow semantic rules above, and runs Tarjan's algorithm over the observed
-root graph. The frozen baseline contains 149 production library module files,
-40 roots, 174 cross-root edges, and zero multi-root strongly connected
+root graph. The frozen baseline contains 152 production engine module files,
+41 roots, 179 cross-root edges, and zero multi-root strongly connected
 components. The separately scanned include fragment has no cross-root edge.
 
 That is a root-level acyclicity claim only. Dependencies and bounded strongly
 connected components may remain among files or modules inside one declared
-root; the guard deliberately collapses them to that root. A future multi-crate
-extraction therefore still needs root-internal ownership work rather than
-treating this DAG result as file-level acyclicity.
+root; the guard deliberately collapses them to that root. Moving the graph into
+an independent crate therefore does not turn this result into a file-level
+acyclicity claim.
 
 The proof surface is the enumerated, token-level production source plus each
 declared compiled fragment; it is not a `rustc` expansion trace. External
@@ -129,6 +125,16 @@ inactive—because macro-generated physical module ownership is unsupported.
 The experimental authority-free information substrate is described in
 [`docs/INFORMATION_KERNEL_V1.md`](docs/INFORMATION_KERNEL_V1.md). It references
 existing native records without changing their bytes or execution authority.
+Its raw V2 provenance witnesses are additive sidecars over V1 atom identities;
+V1 atom, snapshot, revision, delta, pack, and digest bytes remain unchanged.
+Contextual provenance analysis is isolated in the layer-13
+`information_provenance` root, whose complete direct dependency image is
+`evidence`, `information`, `ir`, and `world`. It returns opaque admitted handles
+and cannot depend on `information_bridge`. Conversely, the authority-free
+bridge retains its prior dependency budget and cannot import the provenance
+admission root. The distinction between raw predicate validation and contextual
+image admission is specified in
+[`docs/IMAGE_ADMISSION.md`](docs/IMAGE_ADMISSION.md).
 
 ## Evaluation Pipeline
 
@@ -172,7 +178,7 @@ Ostadix-lang processes hosted code through a 7-stage pipeline:
 
 ## Intermediate Representation (OIR)
 
-`src/ir.rs` is the canonical hosted execution surface. It is the seam between
+`crates/ostadix-api/src/ir.rs` is the canonical hosted execution surface. It is the seam between
 syntax (`ONode`), executable instructions (`OIr`), dependency planning
 (`ExecutionPlan`), runtime values (`OValue`), and typed backend interfaces
 (`BackendSpec` / `BackendInterface`):
@@ -220,13 +226,13 @@ dependency order, while runtime Request values carry fingerprints into the
 eager executor or autonomous scheduler.
 
 O-core does not lower into this representation. Native `.oc` files use the
-separate `AST -> typed HIR -> SSA MIR -> object` pipeline under `src/ocore/`.
+separate `AST -> typed HIR -> SSA MIR -> object` pipeline under `crates/ostadix-api/src/ocore/`.
 This separation prevents machine-level mutation, layout, and control-flow
 semantics from being conflated with OIR's backend dependency graph.
 
 ## Directed HGraph execution
 
-`src/hgraph/from_oir.rs` derives one semantic effect summary before constructing
+`crates/ostadix-api/src/hgraph/from_oir.rs` derives one semantic effect summary before constructing
 each executable edge. Every executable edge has one distinguished OValue output,
 one successful-completion output, and zero or more successor resource-state
 outputs. Its inputs include ordinary child/data values, materialized admission
@@ -252,7 +258,7 @@ and actor-state serialization.
 
 ### Evidence-bound admission
 
-`src/evidence/` separates pre-execution certificates from post-execution
+`crates/ostadix-api/src/evidence/` separates pre-execution certificates from post-execution
 observations. `EvidenceBundleV5` records per-operation type, effect, dispatch,
 capability, placement, failure, resource-demand, and cost contracts together
 with provenance. Hard contracts determine whether execution is legal. Cost
@@ -339,7 +345,7 @@ Post-execution `RuntimeGraphV1` and `ExecutionReceiptV1` artifacts remain typed
 observations with no scheduling authority. A historical receipt may inform a
 future soft profile, but it cannot admit a later execution.
 
-The governed-world identity foundation in `src/world/` now shares all 20
+The governed-world identity foundation in `crates/ostadix-api/src/world/` now shares all 20
 constitutional identity atoms with `ocore/world/identity.oc`. It separates a
 World snapshot epoch from independently generated node, domain, process,
 resource, object, and task-attempt identity. The bounded `OWIDENT` v1 corpus is
@@ -488,7 +494,7 @@ Project inputs use a second, direct planning path because routes are not OIR:
 ProjectBundle -> shared ResolvedSelection -> ProjectExecutionPlan -> HGraph
 ```
 
-`src/project/plan.rs` binds the logical plan to the exact deterministic bundle
+`crates/ostadix-api/src/project/plan.rs` binds the logical plan to the exact deterministic bundle
 digest and route policy, constructs logically separate materialization branches with
 prerequisites, and projects real `MaterializeProject`, `BuildRoute`,
 `RunRoute`, `SelectRoute`, and policy-dependent `CompareRouteResults`
@@ -677,8 +683,8 @@ Every value crossing language boundaries is represented as one of these types:
 | `OCapability`  | Authority-bearing resource handle                   |
 | `OSnapshot`    | Persistable captured world state                    |
 
-This table describes the rich hosted `src/value.rs::OValue` carrier. It is not
-the Mode 29 portable allowlist. Conversion into `src/world/value.rs` is
+This table describes the rich hosted `crates/ostadix-api/src/value.rs::OValue` carrier. It is not
+the Mode 29 portable allowlist. Conversion into `crates/ostadix-api/src/world/value.rs` is
 fallible and rejects authority, capsules, live references, executable or
 deferred work, and other effectful hosted variants. The hosted canonical-CBOR
 shim protocol is unchanged by `OWVALUE` v1.
@@ -782,7 +788,7 @@ and invoking a function pointer.  No intermediate build step or disk binary
 is produced.
 
 **Target D — IR**: parses the program with the same front end, lowers the
-`ONode` forest to OIR (`src/ir.rs`), and prints the lowered program to
+`ONode` forest to OIR (`crates/ostadix-api/src/ir.rs`), and prints the lowered program to
 stdout. A debugging/inspection target — nothing is executed and no output
 file is produced. For an ordinary `.O` file, `--explain-schedule` additionally
 solves the graph, compiles evidence-bound admission, and prints its digests,
@@ -811,7 +817,7 @@ exact-provenance
 explanation is deferred.
 
 **Target E — Dot**: parses and lowers to OIR, then builds the full
-`HGraph` hypergraph (`src/hgraph/`) from that OIR, runs the type solver, and
+`HGraph` hypergraph (`crates/ostadix-api/src/hgraph/`) from that OIR, runs the type solver, and
 serialises the result as a Graphviz DOT digraph on stdout. Ordinary values,
 resource versions, actor-state versions, and completion/control values have
 distinct styles. Executable and constraint hyperedges are explicit vertices,
@@ -843,6 +849,7 @@ cargo run --bin olangc -- examples/hello.O --target dot | dot -Tpng -o graph.png
 
 | Edition | Directory | Status     |
 |---------|-----------|------------|
-| Rust    | `src/`    | **Active** |
+| Rust engine | `crates/ostadix-api/` | **Active** |
+| Rust CLI/compatibility shell | `src/` | **Active** |
 | C17     | `c_cpp/`  | Complete   |
 | Python  | `o_lang/` | Reference  |

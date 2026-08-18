@@ -77,7 +77,7 @@ digest-derived GPT GUIDs remain the stronger complete-image identities.
 
 ### BootInfoV1 boundary
 
-`src/ocore/boot_info.rs` defines the architecture-neutral `BootInfoV1`
+`crates/ostadix-api/src/ocore/boot_info.rs` defines the architecture-neutral `BootInfoV1`
 contract and a strict, bounded Multiboot2 normalizer. It validates memory-map,
 module, ACPI RSDP, EFI, framebuffer, command-line, bootloader, serial, kernel
 span, CPU, and artifact-digest inputs; it reserves kernel, module, and

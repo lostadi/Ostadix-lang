@@ -282,7 +282,7 @@ can advance the resource once.
 
 ## Effect and state model
 
-`src/effects.rs` derives summaries before executable edges are built. The
+`crates/ostadix-api/src/effects.rs` derives summaries before executable edges are built. The
 currently modeled resource keys are:
 
 - `HostWorld`

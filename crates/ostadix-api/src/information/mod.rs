@@ -15,6 +15,7 @@ mod invalidation;
 mod loss;
 mod model;
 mod projection;
+mod provenance;
 mod root;
 mod store;
 
@@ -42,6 +43,14 @@ pub use model::{
     ManagedPayloadRefV1, NativeRecordRefV1, ParticipantV1, PayloadRefV1, PublicScalarV1, ScopeV1,
 };
 pub use projection::{ProjectionDirectionV1, ProjectionReceiptV1};
+pub use provenance::{
+    AcquisitionOriginV2, AcquisitionOriginWitnessV2, AssuranceWitnessV2,
+    ClaimStandingDispositionV2, ClaimStandingV2, DerivationInputBindingV2, DerivationInputV2,
+    InformationProvenanceV2, ProvenanceClaimV2, ProvenanceRecordIdV2, RecoveryAnalyzerV1,
+    RecoveryAssessmentV2, RecoveryDischargeV2, RecoveryObjectV1, RecoveryObligationV2,
+    RecoveryQuestionV1, RecoveryStatusV2, CLAIM_STANDING_SCHEMA_V2,
+    INFORMATION_PROVENANCE_SCHEMA_V2, RECOVERY_QUESTION_SCHEMA_V1,
+};
 pub use root::{InformationRevisionV1, InformationSnapshotV1};
 pub use store::{InformationObjectKindV1, InformationStoreReaderV1, InformationStoreV1};
 

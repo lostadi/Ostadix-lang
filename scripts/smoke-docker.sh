@@ -64,8 +64,8 @@ printf 'Docker minimal image build: PASS\n'
 printf 'Docker minimal runtime profile: PASS\n'
 
 version_output="$("$docker_bin" run --rm "$image" --version)"
-require_exact "O package version" "O 0.3.0" "$version_output"
-printf 'Docker O 0.3.0 package coordinate: PASS\n'
+require_exact "O package version" "O 0.4.0" "$version_output"
+printf 'Docker O 0.4.0 package coordinate: PASS\n'
 
 version_json="$work_dir/version.json"
 "$docker_bin" run --rm "$image" version --json >"$version_json"
@@ -76,7 +76,7 @@ from pathlib import Path
 
 report = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 expected = {
-    "package_version": "0.3.0",
+    "package_version": "0.4.0",
     "evidence_schema": "oexec.evidence/v6",
     "admission_schema": "oexec.admission/v6",
     "evidence_analyzer": "ostadix-oir-evidence-compiler/v6",

@@ -2216,12 +2216,12 @@ pub fn admit_execution<'a>(
 /// V5 evidence cannot be silently uplifted:
 ///
 /// ```compile_fail
-/// use o_lang::evidence::{
+/// use ostadix_api::evidence::{
 ///     admit_execution_v6, AdmittedExecutionV6, EvidenceBundleV5, RuntimeBindingV1,
 /// };
-/// use o_lang::execution_contract::Policy;
-/// use o_lang::hgraph::HGraph;
-/// use o_lang::ir::{ExecutionPlan, OIrProgram};
+/// use ostadix_api::execution_contract::Policy;
+/// use ostadix_api::hgraph::HGraph;
+/// use ostadix_api::ir::{ExecutionPlan, OIrProgram};
 ///
 /// fn forbidden_uplift<'a>(
 ///     program: &'a OIrProgram,
@@ -3982,28 +3982,28 @@ python^(__oval_result__ = sum(branches))_python
         let fixtures = [
             (
                 "heterogeneous",
-                include_str!("../../benchmarks/hgraph_hosted/heterogeneous.O"),
+                include_str!("../../test-assets/benchmarks/hgraph_hosted/heterogeneous.O"),
                 3,
                 3,
                 1,
             ),
             (
                 "chained",
-                include_str!("../../benchmarks/hgraph_hosted/chained.O"),
+                include_str!("../../test-assets/benchmarks/hgraph_hosted/chained.O"),
                 4,
                 1,
                 4,
             ),
             (
                 "mixed_width",
-                include_str!("../../benchmarks/hgraph_hosted/mixed_width.O"),
+                include_str!("../../test-assets/benchmarks/hgraph_hosted/mixed_width.O"),
                 6,
                 4,
                 3,
             ),
             (
                 "realistic",
-                include_str!("../../benchmarks/hgraph_hosted/realistic.O"),
+                include_str!("../../test-assets/benchmarks/hgraph_hosted/realistic.O"),
                 4,
                 2,
                 3,

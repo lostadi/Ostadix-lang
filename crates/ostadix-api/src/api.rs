@@ -1,9 +1,20 @@
-//! Curated external entry points for embedding Ostadix.
+//! Concise embedding entry points for the independent Ostadix runtime engine.
 //!
-//! Existing top-level modules remain available for compatibility, but new
-//! embedders should start here. The facade intentionally exposes semantic
-//! requests, values, admission identities, and runtime handles rather than
-//! every implementation module.
+//! [`Runtime`] is the smallest owned parse-and-evaluate entry point. Advanced
+//! embedders may instead use the engine's public parser, IR, HGraph, evidence,
+//! admission, scheduler, evaluator, hosted, project, World, and information
+//! modules directly; none of those implementations live in the `o-lang`
+//! compatibility shell.
+
+use std::collections::HashSet;
+use std::error::Error;
+use std::fmt;
+use std::path::PathBuf;
+
+use crate::ir::BackendRegistry;
+
+#[doc(hidden)]
+pub mod aot_source;
 
 pub use crate::backend_morphism::{
     render_rust_scalar_stdout_program_v1, shadow_assess_backend_morphism_v1,
@@ -65,6 +76,103 @@ pub use crate::value::{
 pub use crate::version::{OstadixVersionReportV1, VERSION_REPORT_SCHEMA_V1};
 pub use crate::world::PortableOValue;
 pub use num_bigint::BigInt;
+
+/// The stable stage at which an owned runtime evaluation failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RuntimeStage {
+    Parse,
+    Evaluate,
+}
+
+impl fmt::Display for RuntimeStage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Parse => "parse",
+            Self::Evaluate => "evaluate",
+        })
+    }
+}
+
+/// A stable engine-owned diagnostic that does not expose implementation
+/// error types.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RuntimeError {
+    stage: RuntimeStage,
+    message: String,
+}
+
+impl RuntimeError {
+    fn new(stage: RuntimeStage, message: impl Into<String>) -> Self {
+        Self {
+            stage,
+            message: message.into(),
+        }
+    }
+
+    pub const fn stage(&self) -> RuntimeStage {
+        self.stage
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl fmt::Display for RuntimeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{} failed: {}", self.stage, self.message)
+    }
+}
+
+impl Error for RuntimeError {}
+
+/// An owned Ostadix runtime configured for one explicit backend-shim
+/// directory.
+///
+/// This is the concise embedding entry point. Advanced callers may use the
+/// package's parser, IR, graph, evidence, scheduler, and evaluator modules
+/// directly without crossing a compatibility crate.
+pub struct Runtime {
+    backends: HashSet<String>,
+    evaluator: Evaluator,
+}
+
+impl Runtime {
+    /// Construct a runtime over the caller-selected backend-shim directory.
+    pub fn new(shim_dir: impl Into<PathBuf>) -> Self {
+        let backends = BackendRegistry::global().registered_backend_tags();
+        let evaluator = Evaluator::new(shim_dir.into()).with_registered_backends(backends.clone());
+        Self {
+            backends,
+            evaluator,
+        }
+    }
+
+    /// Parse and evaluate one complete O source document. A leading shebang
+    /// is excluded from executable syntax by the same rule as the O CLI. Each
+    /// call receives a fresh lexical scope, while this owned runtime retains
+    /// the evaluator's process registry and persistent backend actors.
+    pub fn evaluate(&mut self, source: &str) -> Result<OValue, RuntimeError> {
+        let source = strip_initial_shebang(source);
+        let nodes = Parser::new(source, &self.backends)
+            .parse()
+            .map_err(|error| RuntimeError::new(RuntimeStage::Parse, format!("{error:#}")))?;
+        self.evaluator
+            .eval_document(nodes)
+            .map_err(|error| RuntimeError::new(RuntimeStage::Evaluate, format!("{error:#}")))
+    }
+}
+
+fn strip_initial_shebang(source: &str) -> &str {
+    if !source.starts_with("#!") {
+        return source;
+    }
+    source
+        .find('\n')
+        .map_or("", |newline| &source[newline + 1..])
+}
 
 #[cfg(test)]
 mod tests {
