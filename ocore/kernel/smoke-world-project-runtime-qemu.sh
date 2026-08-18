@@ -16,7 +16,7 @@ trap cleanup EXIT
 cd "$REPO_ROOT"
 O_PROJECT_WORLD_RECEIPT_HEX_OUT="$RECEIPT_PATH" \
 O_PROJECT_WORLD_RECEIPT_SEMANTIC_OUT="$SEMANTIC_PATH" \
-  cargo test --locked --test project_world_runtime \
+  cargo test --locked --package o-lang --test project_world_runtime \
     world_bound_success_observes_runtime_graph_and_emits_uncommitted_receipt -- --exact
 
 if [[ ! -s "$RECEIPT_PATH" || ! -s "$SEMANTIC_PATH" ]]; then

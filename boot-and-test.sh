@@ -81,13 +81,13 @@ phase_hosted() {
   say "Layer 1 — hosted .O runtime"
   need cargo
   # Authoritative Rust interpreter. default-run is the `O` binary.
-  cargo run -q -- examples/hello.O                         || die "hosted hello.O failed"
-  cargo run -q -- examples/hello.O backends                || die "hosted hello.O (backends) failed"
+  cargo run -q --package o-lang -- examples/hello.O                         || die "hosted hello.O failed"
+  cargo run -q --package o-lang -- examples/hello.O backends                || die "hosted hello.O (backends) failed"
   ok "graph executor (default) ran hello.O"
 
   # Differential conformance: the serial topological OIR interpreter is the
   # reference oracle. Its output must agree with the default graph coordinator.
-  O_EXECUTOR=serial cargo run -q -- examples/hello.O        || die "serial oracle failed"
+  O_EXECUTOR=serial cargo run -q --package o-lang -- examples/hello.O        || die "serial oracle failed"
   ok "serial oracle agrees (differential check)"
 
   # Python reference edition (readable semantics cross-check).
@@ -107,7 +107,7 @@ phase_hosted() {
 phase_ocore() {
   say "Layer 2 — O-core compiler (ocorec)"
   need cargo
-  cargo build -q --bin ocorec || die "ocorec build failed"
+  cargo build -q --package o-lang --bin ocorec || die "ocorec build failed"
   local OCOREC=target/debug/ocorec
   # Inspect the typed pipeline on the minimal example: AST -> HIR -> MIR -> ELF obj.
   "$OCOREC" ocore/examples/minimal.oc --emit hir -o - >/dev/null && ok "typed HIR emitted"
@@ -214,10 +214,10 @@ phase_smoke() {
 phase_tests() {
   say "Layer 5 — host test suite"
   need cargo
-  cargo test -q --all-targets --all-features || die "cargo test failed"
-  cargo test -q --test parser_proptest        || die "parser proptest failed"
+  cargo test -q --workspace --all-targets --all-features || die "cargo test failed"
+  cargo test -q --package o-lang --test parser_proptest        || die "parser proptest failed"
   # Byte-reproducibility of ocore object emission across source dirs (CI gate).
-  cargo test -q --lib \
+  cargo test -q --package o-lang --lib \
     ocore::driver::tests::ocore_object_is_byte_reproducible_across_source_directories -- --exact \
     && ok "ocore object emission is byte-reproducible"
   [ -x ./test_o_lang_examples.sh ] && ./test_o_lang_examples.sh || skip "example sweep script absent"

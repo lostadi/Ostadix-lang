@@ -11,7 +11,7 @@ excluded_directories = ["src/bin"]
 
 # This token fragment is compiled into backend_catalog.rs with include!(). It
 # is scanned under that owning root but is not counted as a standalone module
-# file in the 148-file production-module inventory.
+# file in the 149-file production-module inventory.
 [[compiled_fragment]]
 path = "src/backend_catalog.inc.rs"
 owner = "backend_catalog"
@@ -64,7 +64,7 @@ target = "resource_identity"
 [[root]]
 name = "api"
 layer = 14
-allowed_dependencies = ["backend_morphism", "eval", "evidence", "execution_contract", "hosted_remote", "parser", "value", "version", "world"]
+allowed_dependencies = ["backend_morphism", "eval", "evidence", "execution_contract", "hosted_remote", "information_bridge", "parser", "value", "version", "world"]
 
 [[root]]
 name = "backend"
@@ -150,6 +150,11 @@ allowed_dependencies = ["backend_catalog", "backend_state", "environment", "eval
 name = "information"
 layer = 1
 allowed_dependencies = ["canonical_cbor"]
+
+[[root]]
+name = "information_bridge"
+layer = 13
+allowed_dependencies = ["canonical_cbor", "evidence", "hgraph", "hosted_remote", "information", "parser", "project", "registry", "value", "world"]
 
 [[root]]
 name = "ir"

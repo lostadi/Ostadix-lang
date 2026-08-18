@@ -818,7 +818,15 @@ def _file_module_path(
     """Derive the declared library-module path for one governed Rust file."""
 
     parts = Path(relative).parts
-    if len(parts) < 2 or parts[0] != "src" or not parts[-1].endswith(".rs"):
+    explicit_file_override = any(
+        override.kind == "file" and parts == Path(override.path).parts
+        for override in physical_overrides
+    )
+    if (
+        len(parts) < 2
+        or parts[0] != "src"
+        or (not parts[-1].endswith(".rs") and not explicit_file_override)
+    ):
         raise ValueError(f"`{relative}` is not a conventional Rust source path beneath src/")
     if len(parts) > 2 and parts[1] == "bin":
         raise ValueError(f"`{relative}` is a binary-crate path, not a library-module path")
@@ -934,6 +942,23 @@ def _is_keyword(source: str, token: Token, keyword: str) -> bool:
     return token.text == keyword and source[token.start : token.end] == keyword
 
 
+def _is_macro_rules_body_opening(
+    source: str, tokens: list[Token], opening: int
+) -> bool:
+    ordinary_name = (
+        opening >= 3
+        and tokens[opening - 2].text == "!"
+        and _is_keyword(source, tokens[opening - 3], "macro_rules")
+    )
+    transcribed_name = (
+        opening >= 4
+        and tokens[opening - 2].text == "$"
+        and tokens[opening - 3].text == "!"
+        and _is_keyword(source, tokens[opening - 4], "macro_rules")
+    )
+    return ordinary_name or transcribed_name
+
+
 def _macro_token_ranges(
     source: str, tokens: list[Token], matches: dict[int, int]
 ) -> list[tuple[int, int]]:
@@ -944,14 +969,75 @@ def _macro_token_ranges(
         if token.text not in OPEN_TO_CLOSE:
             continue
         direct_invocation = opening > 0 and tokens[opening - 1].text == "!"
-        macro_rules_definition = (
-            opening >= 3
-            and tokens[opening - 2].text == "!"
-            and _is_keyword(source, tokens[opening - 3], "macro_rules")
+        macro_rules_definition = _is_macro_rules_body_opening(
+            source, tokens, opening
         )
         if direct_invocation or macro_rules_definition:
             ranges.append((opening, matches[opening]))
     return ranges
+
+
+def _macro_rules_regions(
+    source: str, tokens: list[Token], matches: dict[int, int]
+) -> tuple[set[int], list[tuple[int, int]], list[tuple[int, int]]]:
+    """Return macro_rules body openings plus matcher/transcriber token trees."""
+
+    definitions: set[int] = set()
+    matchers: list[tuple[int, int]] = []
+    transcribers: list[tuple[int, int]] = []
+    invocation_ranges = [
+        (opening, matches[opening])
+        for opening, token in enumerate(tokens)
+        if token.text in OPEN_TO_CLOSE
+        and opening > 0
+        and tokens[opening - 1].text == "!"
+    ]
+
+    def inside(index: int, ranges: list[tuple[int, int]]) -> bool:
+        return any(start < index < end for start, end in ranges)
+
+    for opening, token in enumerate(tokens):
+        if token.text not in OPEN_TO_CLOSE:
+            continue
+        if not _is_macro_rules_body_opening(source, tokens, opening):
+            continue
+        # A macro_rules-looking token sequence inside another matcher's or a
+        # direct invocation's token tree is data for that macro, not a live
+        # nested definition in this source geometry.
+        if inside(opening, matchers) or inside(opening, invocation_ranges):
+            continue
+        definitions.add(opening)
+        closing = matches[opening]
+        cursor = opening + 1
+        while cursor < closing:
+            if tokens[cursor].text not in OPEN_TO_CLOSE:
+                raise ValueError(
+                    f"macro_rules matcher at source offset {tokens[cursor].start} "
+                    "must be delimiter-bounded"
+                )
+            matcher_closing = matches[cursor]
+            if matcher_closing >= closing:
+                raise ValueError("macro_rules matcher crosses its definition boundary")
+            matchers.append((cursor, matcher_closing))
+            cursor = matcher_closing + 1
+            if not (
+                cursor + 2 < closing
+                and tokens[cursor].text == "="
+                and tokens[cursor + 1].text == ">"
+                and tokens[cursor + 2].text in OPEN_TO_CLOSE
+            ):
+                raise ValueError("macro_rules arm requires a delimiter-bounded transcriber")
+            transcriber_opening = cursor + 2
+            transcriber_closing = matches[transcriber_opening]
+            if transcriber_closing >= closing:
+                raise ValueError("macro_rules transcriber crosses its definition boundary")
+            transcribers.append((transcriber_opening, transcriber_closing))
+            cursor = transcriber_closing + 1
+            if cursor < closing:
+                if tokens[cursor].text not in {";", ","}:
+                    raise ValueError("macro_rules arms require a semicolon or comma separator")
+                cursor += 1
+    return definitions, matchers, transcribers
 
 
 def _macro_invocation_ranges(
@@ -1497,6 +1583,13 @@ def load_manifest(root: Path, manifest_path: Path | None = None) -> Architecture
         override_path = _relative_manifest_path(table["path"], f"{label}.path")
         if override_path != source_root and not override_path.startswith(f"{source_root}/"):
             raise ValueError(f"{label}.path is outside `{source_root}`")
+        if override_path in excluded_files or any(
+            override_path == directory or override_path.startswith(f"{directory}/")
+            for directory in excluded_directories
+        ):
+            raise ValueError(
+                f"{label}.path overlaps an excluded production source"
+            )
         if override_path in override_paths:
             raise ValueError(f"duplicate physical override path `{override_path}`")
         override_paths.add(override_path)
@@ -1504,8 +1597,10 @@ def load_manifest(root: Path, manifest_path: Path | None = None) -> Architecture
         if kind not in {"file", "directory"}:
             raise ValueError(f"{label}.kind must be `file` or `directory`")
         module_path = _string_list(table["module_path"], f"{label}.module_path")
-        if not module_path or any(not IDENTIFIER_RE.fullmatch(part) for part in module_path):
-            raise ValueError(f"{label}.module_path must contain Rust identifiers")
+        if len(module_path) != 1 or not IDENTIFIER_RE.fullmatch(module_path[0]):
+            raise ValueError(
+                f"{label}.module_path must contain exactly one Rust root identifier"
+            )
         physical_overrides.append(PhysicalOverride(override_path, kind, module_path))
 
     roots: dict[str, RootSpec] = {}
@@ -1652,6 +1747,13 @@ def load_manifest(root: Path, manifest_path: Path | None = None) -> Architecture
             raise ValueError(
                 f"physical override `{override.path}` is not an existing {override.kind}"
             )
+        if override.kind == "directory":
+            module_file = target / "mod.rs"
+            if module_file.is_symlink() or not module_file.is_file():
+                raise ValueError(
+                    f"physical directory override `{override.path}` has no regular "
+                    "non-symlink mod.rs entrypoint"
+                )
         if override.module_path[0] not in roots:
             raise ValueError(
                 f"physical override `{override.path}` maps to unknown root "
@@ -2171,6 +2273,219 @@ def _crate_root_findings(root: Path, manifest: ArchitectureManifest) -> list[str
     return failures
 
 
+def _top_level_external_modules(path: Path) -> set[str]:
+    """Return production-active `mod name;` declarations in one source file.
+
+    Rust permits item declarations inside ordinary blocks as well as inline
+    modules. An external child declaration in either location has a physical
+    path derived from a lexical module stack that this manifest does not model,
+    so it fails closed. Parentheses and brackets are traversed because they can
+    contain brace blocks. Macro matchers remain opaque, while a literal module
+    keyword in a transcriber or invocation is an explicit unsupported geometry
+    even when that macro is not reached under the current build configuration.
+    """
+
+    source = production_source(path)
+    tokens = _tokens(source)
+    matches = _delimiter_matches(tokens)
+    macro_ranges = _macro_token_ranges(source, tokens, matches)
+    macro_openings = {opening for opening, _closing in macro_ranges}
+    definition_openings, matcher_ranges, transcriber_ranges = _macro_rules_regions(
+        source, tokens, matches
+    )
+
+    def inside(index: int, ranges: list[tuple[int, int]]) -> bool:
+        return any(opening < index < closing for opening, closing in ranges)
+
+    macro_geometry_ranges = list(transcriber_ranges)
+    macro_geometry_ranges.extend(
+        (opening, closing)
+        for opening, closing in macro_ranges
+        if opening not in definition_openings and not inside(opening, matcher_ranges)
+    )
+    for opening, closing in macro_geometry_ranges:
+        for index in range(opening + 1, closing):
+            token = tokens[index]
+            if inside(index, matcher_ranges):
+                continue
+            if (
+                _is_keyword(source, token, "mod")
+                and (index == 0 or tokens[index - 1].text != "$")
+            ):
+                raise ValueError(
+                    f"module keyword at source offset {token.start} appears inside a "
+                    "macro transcriber or invocation; macro-generated physical "
+                    "module geometry is unsupported"
+                )
+    modules: set[str] = set()
+
+    def scan(start: int, end: int, inside_nested_scope: bool) -> None:
+        index = start
+        while index < end:
+            token = tokens[index]
+            if _is_keyword(source, token, "mod"):
+                if index + 2 >= end:
+                    raise ValueError(
+                        f"module declaration at source offset {token.start} is incomplete"
+                    )
+                name = tokens[index + 1].text
+                if not IDENTIFIER_RE.fullmatch(name):
+                    raise ValueError(
+                        f"module declaration at source offset {token.start} "
+                        "has no analyzable identifier"
+                    )
+                terminator = tokens[index + 2]
+                if terminator.text == ";":
+                    if inside_nested_scope:
+                        raise ValueError(
+                            f"external module `{name}` at source offset {token.start} "
+                            "is nested inside an inline module or block; this physical "
+                            "source geometry is unsupported"
+                        )
+                    modules.add(name)
+                    index += 3
+                    continue
+                if terminator.text == "{":
+                    closing = matches[index + 2]
+                    scan(index + 3, closing, True)
+                    index = closing + 1
+                    continue
+            if token.text in OPEN_TO_CLOSE:
+                closing = matches[index]
+                if index not in macro_openings:
+                    scan(
+                        index + 1,
+                        closing,
+                        inside_nested_scope or token.text == "{",
+                    )
+                index = closing + 1
+                continue
+            index += 1
+
+    scan(0, len(tokens), False)
+    return modules
+
+
+def _physical_override_ownership_findings(
+    root: Path,
+    manifest: ArchitectureManifest,
+    production_paths: list[Path],
+) -> list[str]:
+    """Reject an override entrypoint that also has conventional ownership.
+
+    Rust may compile the same bytes twice when a `#[path]` crate-root module
+    points at a file that a parent module also reaches through `mod child;`.
+    A pathname-keyed analysis would then certify only one of the two module
+    identities. The supported overrides intentionally replace, rather than
+    supplement, conventional ownership, so dual ownership is fail-closed.
+    """
+
+    failures: list[str] = []
+    production_by_relative = {
+        path.relative_to(root).as_posix(): path for path in production_paths
+    }
+    module_declarations: dict[str, set[str]] = {}
+    for relative, path in production_by_relative.items():
+        try:
+            module_declarations[relative] = _top_level_external_modules(path)
+        except (OSError, UnicodeError, ValueError) as error:
+            failures.append(
+                f"{relative}: could not analyze module ownership: {error}"
+            )
+    crate_root = root / manifest.production.crate_root
+    try:
+        crate_declarations = _crate_root_declarations(crate_root)
+    except (OSError, UnicodeError, ValueError) as error:
+        return [
+            f"{manifest.production.crate_root}: could not analyze override ownership: "
+            f"{error}"
+        ]
+
+    for override in manifest.physical_overrides:
+        entrypoint = Path(override.path)
+        if override.kind == "directory":
+            entrypoint /= "mod.rs"
+        else:
+            declared_children = module_declarations.get(override.path, set())
+            if declared_children:
+                failures.append(
+                    f"physical file override `{override.path}` declares external "
+                    f"modules {sorted(declared_children)}; child module ownership "
+                    "is unsupported"
+                )
+
+        if entrypoint.name == "mod.rs":
+            child_name = entrypoint.parent.name
+            parent_directory = entrypoint.parent.parent
+        else:
+            # A non-.rs #[path] target has no conventional `mod child;`
+            # spelling; any second ownership would require another #[path],
+            # which the source-inclusion closure rejects independently.
+            if entrypoint.suffix != ".rs":
+                continue
+            child_name = entrypoint.stem
+            parent_directory = entrypoint.parent
+        if not IDENTIFIER_RE.fullmatch(child_name):
+            continue
+
+        parent_candidates: list[str] = []
+        source_root = Path(manifest.production.source_root)
+        if parent_directory == source_root:
+            declaration = crate_declarations.get(child_name)
+            if declaration is not None and declaration.path is None:
+                parent_candidates.append(manifest.production.crate_root)
+        else:
+            parent_candidates.extend(
+                (
+                    parent_directory.with_suffix(".rs").as_posix(),
+                    (parent_directory / "mod.rs").as_posix(),
+                )
+            )
+
+        for parent_relative in parent_candidates:
+            parent = production_by_relative.get(parent_relative)
+            if parent is None and parent_relative == manifest.production.crate_root:
+                parent = crate_root
+            if parent is None:
+                continue
+            declared_children = module_declarations.get(parent_relative)
+            if declared_children is None and parent_relative == manifest.production.crate_root:
+                try:
+                    declared_children = _top_level_external_modules(parent)
+                except (OSError, UnicodeError, ValueError) as error:
+                    failures.append(
+                        f"{parent_relative}: could not analyze module ownership: {error}"
+                    )
+                    continue
+            if declared_children is None:
+                continue
+            if child_name in declared_children:
+                failures.append(
+                    f"physical override `{override.path}` also has conventional module "
+                    f"ownership through `{parent_relative}` (`mod {child_name};`)"
+                )
+
+    # An include! fragment is compiled in its owner's module identity. External
+    # module declarations inside one have path-resolution semantics tied to the
+    # include site rather than the fragment pathname, which this lexical root
+    # graph intentionally does not model.
+    for fragment in manifest.compiled_fragments:
+        fragment_path = root / fragment.path
+        try:
+            declared_children = _top_level_external_modules(fragment_path)
+        except (OSError, UnicodeError, ValueError) as error:
+            failures.append(
+                f"{fragment.path}: could not analyze fragment module ownership: {error}"
+            )
+            continue
+        if declared_children:
+            failures.append(
+                f"compiled fragment `{fragment.path}` declares external modules "
+                f"{sorted(declared_children)}; fragment module ownership is unsupported"
+            )
+    return failures
+
+
 def _production_paths(root: Path, manifest: ArchitectureManifest) -> list[Path]:
     source_root = root / manifest.production.source_root
     if not source_root.is_dir():
@@ -2185,7 +2500,7 @@ def _production_paths(root: Path, manifest: ArchitectureManifest) -> list[Path]:
         if candidate.is_symlink():
             relative = candidate.relative_to(root).as_posix()
             raise ValueError(f"production source path `{relative}` must not be a symlink")
-    paths: list[Path] = []
+    paths: dict[str, Path] = {}
     for path in sorted(source_root.rglob("*.rs")):
         relative = path.relative_to(root).as_posix()
         if relative in manifest.production.excluded_files:
@@ -2199,8 +2514,23 @@ def _production_paths(root: Path, manifest: ArchitectureManifest) -> list[Path]:
             raise ValueError(f"production Rust path `{relative}` must not be a symlink")
         if not path.is_file():
             raise ValueError(f"production Rust path `{relative}` is not a regular file")
-        paths.append(path)
-    return paths
+        paths[relative] = path
+
+    # Rust accepts any filename in a #[path = "..."] module declaration. A
+    # file override is therefore production source even when its name does not
+    # end in `.rs`; the manifest declaration, not the conventional glob, is
+    # authoritative for this closed source geometry.
+    for override in manifest.physical_overrides:
+        if override.kind != "file":
+            continue
+        path = root / override.path
+        relative = path.relative_to(root).as_posix()
+        if path.is_symlink():
+            raise ValueError(f"production Rust path `{relative}` must not be a symlink")
+        if not path.is_file():
+            raise ValueError(f"production Rust path `{relative}` is not a regular file")
+        paths[relative] = path
+    return [paths[relative] for relative in sorted(paths)]
 
 
 def _source_inclusion_findings(
@@ -2333,6 +2663,7 @@ def audit_architecture(
 
     failures.extend(_crate_root_findings(root, manifest))
     failures.extend(_cargo_library_findings(root, manifest))
+    failures.extend(_physical_override_ownership_findings(root, manifest, paths))
 
     source_entries: list[tuple[Path, tuple[str, ...] | None]] = [
         (path, None) for path in paths

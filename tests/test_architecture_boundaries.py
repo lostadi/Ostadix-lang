@@ -158,7 +158,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         self.assertEqual(
             result.stdout,
             "architecture dependency boundaries: PASS "
-            "(148 production files, 39 roots, 163 cross-root edges)\n",
+            "(149 production files, 40 roots, 174 cross-root edges)\n",
         )
 
     def test_manifest_inventories_every_current_root_edge_override_and_facade(self) -> None:
@@ -175,9 +175,9 @@ class ArchitectureBoundaryTests(unittest.TestCase):
                 }
             ],
         )
-        self.assertEqual(len(roots), 39)
+        self.assertEqual(len(roots), 40)
         self.assertEqual(
-            sum(len(root["allowed_dependencies"]) for root in roots), 163
+            sum(len(root["allowed_dependencies"]) for root in roots), 174
         )
         self.assertEqual(
             {
@@ -202,6 +202,376 @@ class ArchitectureBoundaryTests(unittest.TestCase):
                 ("world::identity", "alias"),
             },
         )
+
+    def test_physical_overrides_must_map_one_crate_root(self) -> None:
+        replacements = (
+            (
+                'module_path = ["placement_protocol"]',
+                'module_path = ["placement_protocol", "nested"]',
+            ),
+            (
+                'module_path = ["resource_identity"]',
+                'module_path = ["resource_identity", "nested"]',
+            ),
+        )
+        for original, replacement in replacements:
+            with self.subTest(replacement=replacement):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    write_minimal_tree(root)
+                    manifest_path = root / "ci/architecture-roots.toml"
+                    manifest_path.write_text(
+                        manifest_path.read_text(encoding="utf-8").replace(
+                            original, replacement, 1
+                        ),
+                        encoding="utf-8",
+                    )
+                    result = run_checker(root)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(
+                    "module_path must contain exactly one Rust root identifier",
+                    result.stderr,
+                )
+
+    def test_physical_overrides_cannot_overlap_production_exclusions(self) -> None:
+        overrides = (
+            ("src/lib.rs", "file"),
+            ("src/backend_catalog.inc.rs", "file"),
+            ("src/bin", "directory"),
+        )
+        for path, kind in overrides:
+            with self.subTest(path=path, kind=kind):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    write_minimal_tree(root)
+                    manifest_path = root / "ci/architecture-roots.toml"
+                    with manifest_path.open("a", encoding="utf-8") as manifest:
+                        manifest.write(
+                            "\n[[physical_override]]\n"
+                            f'path = "{path}"\n'
+                            f'kind = "{kind}"\n'
+                            'module_path = ["api"]\n'
+                        )
+                    result = run_checker(root)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(
+                    "path overlaps an excluded production source", result.stderr
+                )
+
+    def test_physical_directory_override_requires_mod_rs_entrypoint(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/ghost_api").mkdir()
+            manifest_path = root / "ci/architecture-roots.toml"
+            with manifest_path.open("a", encoding="utf-8") as manifest:
+                manifest.write(
+                    "\n[[physical_override]]\n"
+                    'path = "src/ghost_api"\n'
+                    'kind = "directory"\n'
+                    'module_path = ["api"]\n'
+                )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "has no regular non-symlink mod.rs entrypoint", result.stderr
+        )
+
+    def test_physical_overrides_cannot_duplicate_conventional_module_ownership(
+        self,
+    ) -> None:
+        cases = (
+            ("src/evidence/fact.rs", "file", "fact", "evidence/fact.rs"),
+            (
+                "src/evidence/nested",
+                "directory",
+                "nested",
+                "evidence/nested/mod.rs",
+            ),
+        )
+        for override_path, kind, child, crate_path in cases:
+            with self.subTest(kind=kind):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    write_minimal_tree(root)
+                    (root / "src/evidence.rs").unlink()
+                    (root / "src/evidence/mod.rs").write_text(
+                        f"pub mod {child};\n", encoding="utf-8"
+                    )
+                    entrypoint = root / override_path
+                    if kind == "directory":
+                        entrypoint /= "mod.rs"
+                    entrypoint.parent.mkdir(parents=True, exist_ok=True)
+                    entrypoint.write_text(
+                        "use crate::version::Boundary;\n", encoding="utf-8"
+                    )
+                    manifest_path = root / "ci/architecture-roots.toml"
+                    with manifest_path.open("a", encoding="utf-8") as manifest:
+                        manifest.write(
+                            "\n[[physical_override]]\n"
+                            f'path = "{override_path}"\n'
+                            f'kind = "{kind}"\n'
+                            'module_path = ["api"]\n'
+                        )
+                    crate_root = root / "src/lib.rs"
+                    crate_root.write_text(
+                        crate_root.read_text(encoding="utf-8").replace(
+                            "pub mod api;",
+                            f'#[path = "{crate_path}"]\npub mod api;',
+                            1,
+                        ),
+                        encoding="utf-8",
+                    )
+                    result = run_checker(root)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(
+                    f"also has conventional module ownership through "
+                    f"`src/evidence/mod.rs` (`mod {child};`)",
+                    result.stderr,
+                )
+
+    def test_physical_file_overrides_cannot_declare_external_children(self) -> None:
+        for suffix in ("rs", "source"):
+            with self.subTest(suffix=suffix):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    write_minimal_tree(root)
+                    override_path = root / f"src/world/identity.{suffix}"
+                    if suffix != "rs":
+                        (root / "src/world/identity.rs").rename(override_path)
+                        manifest_path = root / "ci/architecture-roots.toml"
+                        manifest_path.write_text(
+                            manifest_path.read_text(encoding="utf-8").replace(
+                                'path = "src/world/identity.rs"',
+                                f'path = "src/world/identity.{suffix}"',
+                                1,
+                            ),
+                            encoding="utf-8",
+                        )
+                        crate_root = root / "src/lib.rs"
+                        crate_root.write_text(
+                            crate_root.read_text(encoding="utf-8").replace(
+                                'path = "world/identity.rs"',
+                                f'path = "world/identity.{suffix}"',
+                                1,
+                            ),
+                            encoding="utf-8",
+                        )
+                    override_path.write_text("pub mod child;\n", encoding="utf-8")
+                    child = root / "src/world/identity/child.rs"
+                    child.parent.mkdir(parents=True, exist_ok=True)
+                    child.write_text(
+                        "use crate::effects::Boundary;\n", encoding="utf-8"
+                    )
+                    result = run_checker(root)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(
+                    f"physical file override `src/world/identity.{suffix}` "
+                    "declares external modules ['child']",
+                    result.stderr,
+                )
+
+    def test_inline_modules_cannot_declare_external_source_children(self) -> None:
+        cases = (
+            ("src/evidence/outer/fact.rs", "file", "fact", "evidence/outer/fact.rs"),
+            (
+                "src/evidence/outer/nested",
+                "directory",
+                "nested",
+                "evidence/outer/nested/mod.rs",
+            ),
+        )
+        for override_path, kind, child, crate_path in cases:
+            with self.subTest(kind=kind):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    write_minimal_tree(root)
+                    (root / "src/evidence.rs").unlink()
+                    (root / "src/evidence/mod.rs").write_text(
+                        f"pub mod outer {{ pub mod {child}; }}\n", encoding="utf-8"
+                    )
+                    entrypoint = root / override_path
+                    if kind == "directory":
+                        entrypoint /= "mod.rs"
+                    entrypoint.parent.mkdir(parents=True, exist_ok=True)
+                    entrypoint.write_text(
+                        "use crate::version::Boundary;\n", encoding="utf-8"
+                    )
+                    manifest_path = root / "ci/architecture-roots.toml"
+                    with manifest_path.open("a", encoding="utf-8") as manifest:
+                        manifest.write(
+                            "\n[[physical_override]]\n"
+                            f'path = "{override_path}"\n'
+                            f'kind = "{kind}"\n'
+                            'module_path = ["api"]\n'
+                        )
+                    crate_root = root / "src/lib.rs"
+                    crate_root.write_text(
+                        crate_root.read_text(encoding="utf-8").replace(
+                            "pub mod api;",
+                            f'#[path = "{crate_path}"]\npub mod api;',
+                            1,
+                        ),
+                        encoding="utf-8",
+                    )
+                    result = run_checker(root)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(
+                    f"external module `{child}`", result.stderr
+                )
+                self.assertIn(
+                    "is nested inside an inline module", result.stderr
+                )
+
+    def test_block_items_cannot_declare_external_source_children(self) -> None:
+        cases = (
+            ("src/evidence/outer/fact.rs", "file", "fact", "evidence/outer/fact.rs"),
+            (
+                "src/evidence/outer/nested",
+                "directory",
+                "nested",
+                "evidence/outer/nested/mod.rs",
+            ),
+        )
+        for override_path, kind, child, crate_path in cases:
+            with self.subTest(kind=kind):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    write_minimal_tree(root)
+                    (root / "src/evidence.rs").unlink()
+                    (root / "src/evidence/mod.rs").write_text(
+                        f"pub fn container() {{ mod outer {{ pub mod {child}; }} }}\n",
+                        encoding="utf-8",
+                    )
+                    entrypoint = root / override_path
+                    if kind == "directory":
+                        entrypoint /= "mod.rs"
+                    entrypoint.parent.mkdir(parents=True, exist_ok=True)
+                    entrypoint.write_text(
+                        "use crate::version::Boundary;\n", encoding="utf-8"
+                    )
+                    manifest_path = root / "ci/architecture-roots.toml"
+                    with manifest_path.open("a", encoding="utf-8") as manifest:
+                        manifest.write(
+                            "\n[[physical_override]]\n"
+                            f'path = "{override_path}"\n'
+                            f'kind = "{kind}"\n'
+                            'module_path = ["api"]\n'
+                        )
+                    crate_root = root / "src/lib.rs"
+                    crate_root.write_text(
+                        crate_root.read_text(encoding="utf-8").replace(
+                            "pub mod api;",
+                            f'#[path = "{crate_path}"]\npub mod api;',
+                            1,
+                        ),
+                        encoding="utf-8",
+                    )
+                    result = run_checker(root)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(f"external module `{child}`", result.stderr)
+                self.assertIn("inline module or block", result.stderr)
+
+    def test_delimiter_wrappers_cannot_hide_nested_module_blocks(self) -> None:
+        sources = (
+            "pub const X: () = ({ mod outer { pub mod fact; } });\n",
+            "pub static X: [(); 1] = [{ mod outer { pub mod fact; } }];\n",
+            "pub fn f() { consume({ mod outer { pub mod fact; } }); }\n",
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    write_minimal_tree(root)
+                    (root / "src/evidence.rs").unlink()
+                    (root / "src/evidence/mod.rs").write_text(
+                        source, encoding="utf-8"
+                    )
+                    target = root / "src/evidence/outer/fact.rs"
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text(
+                        "use crate::version::Boundary;\n", encoding="utf-8"
+                    )
+                    manifest_path = root / "ci/architecture-roots.toml"
+                    with manifest_path.open("a", encoding="utf-8") as manifest:
+                        manifest.write(
+                            "\n[[physical_override]]\n"
+                            'path = "src/evidence/outer/fact.rs"\n'
+                            'kind = "file"\n'
+                            'module_path = ["api"]\n'
+                        )
+                    crate_root = root / "src/lib.rs"
+                    crate_root.write_text(
+                        crate_root.read_text(encoding="utf-8").replace(
+                            "pub mod api;",
+                            '#[path = "evidence/outer/fact.rs"]\npub mod api;',
+                            1,
+                        ),
+                        encoding="utf-8",
+                    )
+                    result = run_checker(root)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("external module `fact`", result.stderr)
+                self.assertIn("inline module or block", result.stderr)
+
+    def test_macro_tokens_cannot_generate_physical_module_ownership(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/evidence.rs").unlink()
+            (root / "src/evidence/mod.rs").write_text(
+                "macro_rules! declare_fact { () => { pub mod fact; } }\n"
+                "declare_fact!();\n",
+                encoding="utf-8",
+            )
+            (root / "src/evidence/fact.rs").write_text(
+                "use crate::version::Boundary;\n", encoding="utf-8"
+            )
+            manifest_path = root / "ci/architecture-roots.toml"
+            with manifest_path.open("a", encoding="utf-8") as manifest:
+                manifest.write(
+                    "\n[[physical_override]]\n"
+                    'path = "src/evidence/fact.rs"\n'
+                    'kind = "file"\n'
+                    'module_path = ["api"]\n'
+                )
+            crate_root = root / "src/lib.rs"
+            crate_root.write_text(
+                crate_root.read_text(encoding="utf-8").replace(
+                    "pub mod api;",
+                    '#[path = "evidence/fact.rs"]\npub mod api;',
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "macro-generated physical module geometry is unsupported", result.stderr
+        )
+
+    def test_ordinary_macros_and_test_only_nested_modules_preserve_ownership(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/parser.rs").write_text(
+                "macro_rules! keep { ($mod:ident) => { stringify!($mod); } }\n"
+                "keep!(harmless);\n"
+                "macro_rules! accept { (mod $name:ident) => "
+                "{ pub struct Accepted; } }\n"
+                "macro_rules! inspect { (macro_rules! inner { mod }) => "
+                "{ pub struct Harmless; }; }\n"
+                "macro_rules! outer { ($name:ident) => "
+                "{ macro_rules! $name { (mod) => {} } }; }\n"
+                "outer!(inner);\n"
+                "mod inline { #[cfg(test)] mod test_child; }\n"
+                "pub struct Syntax;\n",
+                encoding="utf-8",
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_facade_manifest_path_must_match_the_public_projection(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -284,6 +654,24 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn(
             "root edge `backend_catalog -> api` is not declared", result.stderr
+        )
+
+    def test_compiled_fragment_cannot_declare_external_modules_in_inline_body(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "src/backend_catalog.inc.rs").write_text(
+                "mod outer { mod fact; }\n", encoding="utf-8"
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "could not analyze fragment module ownership", result.stderr
+        )
+        self.assertIn(
+            "external module `fact`", result.stderr
         )
 
     def test_crate_root_cannot_compile_a_module_outside_declared_geometry(self) -> None:
@@ -639,6 +1027,50 @@ class ArchitectureBoundaryTests(unittest.TestCase):
             "root edge `canonical_cbor -> value` is not declared", result.stderr
         )
 
+    def test_native_roots_cannot_depend_back_on_information_bridge(self) -> None:
+        for native_root in (
+            "information",
+            "parser",
+            "value",
+            "hgraph",
+            "evidence",
+            "registry",
+            "world",
+            "project",
+            "hosted_remote",
+        ):
+            with self.subTest(native_root=native_root):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    write_minimal_tree(root)
+                    path = root / "src" / native_root
+                    source = path / "mod.rs" if path.is_dir() else path.with_suffix(".rs")
+                    source.write_text(
+                        "use crate::information_bridge::Boundary;\n", encoding="utf-8"
+                    )
+                    result = run_checker(root)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(
+                    f"root edge `{native_root} -> information_bridge` is not declared",
+                    result.stderr,
+                )
+
+    def test_information_bridge_cannot_import_authority_or_execution_roots(self) -> None:
+        for forbidden in ("capability", "eval", "executor", "placement", "runtime_exec"):
+            with self.subTest(forbidden=forbidden):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    write_minimal_tree(root)
+                    (root / "src/information_bridge.rs").write_text(
+                        f"use crate::{forbidden}::Boundary;\n", encoding="utf-8"
+                    )
+                    result = run_checker(root)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(
+                    f"root edge `information_bridge -> {forbidden}` is not declared",
+                    result.stderr,
+                )
+
     def test_new_production_root_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -786,6 +1218,40 @@ class ArchitectureBoundaryTests(unittest.TestCase):
             "root edge `resource_identity -> value` is not declared", result.stderr
         )
         self.assertNotIn("root edge `world -> value`", result.stderr)
+
+    def test_non_rs_physical_file_override_is_still_production_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            old_path = root / "src/world/identity.rs"
+            override_path = root / "src/world/identity.source"
+            old_path.rename(override_path)
+            override_path.write_text(
+                "use crate::api::Boundary;\n", encoding="utf-8"
+            )
+            manifest_path = root / "ci/architecture-roots.toml"
+            manifest_path.write_text(
+                manifest_path.read_text(encoding="utf-8").replace(
+                    'path = "src/world/identity.rs"',
+                    'path = "src/world/identity.source"',
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            crate_root = root / "src/lib.rs"
+            crate_root.write_text(
+                crate_root.read_text(encoding="utf-8").replace(
+                    'path = "world/identity.rs"',
+                    'path = "world/identity.source"',
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "root edge `resource_identity -> api` is not declared", result.stderr
+        )
 
     def test_wrong_way_production_dependency_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

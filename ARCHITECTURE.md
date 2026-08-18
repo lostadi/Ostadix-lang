@@ -93,15 +93,21 @@ their physical paths as a pure external-module aggregator bound to Cargo's
 actual library target, scans the compiled `backend_catalog.inc.rs` token
 fragment under its owning root, rejects symlink geometry, and rejects every
 undeclared direct or production-active conditional `#[path]` and every direct
-or aliased `include!` source escape. Macro invocations containing `crate` or
-`super` fail closed because their token arguments can be retargeted during
-expansion. The exclusion set is closed to the library and binary entrypoints,
-conventional binary directory, and declared compiled fragments. Facades bind
-an unconditionally public owner and exact public alias or glob projection. The
-checker then rejects undeclared roots and edges, retains
+or aliased `include!` source escape. Physical overrides are explicitly
+enumerated even when their filename does not end in `.rs`; each maps exactly
+one crate root, cannot overlap an exclusion, and cannot retain a second
+conventional `mod child;` owner. Directory overrides require a regular
+`mod.rs`; file overrides cannot declare external children because their
+descendant filesystem convention would re-enter the displaced root. External
+child declarations nested inside inline modules or block items are rejected
+because that physical module stack is not part of the manifest model. The
+exclusion set is closed to the library and binary
+entrypoints, conventional binary directory, and declared compiled fragments.
+Facades bind an unconditionally public owner and exact public alias or glob
+projection. The checker then rejects undeclared roots and edges, retains
 the narrow semantic rules above, and runs Tarjan's algorithm over the observed
-root graph. The frozen baseline contains 148 production library module files,
-39 roots, 163 cross-root edges, and zero multi-root strongly connected
+root graph. The frozen baseline contains 149 production library module files,
+40 roots, 174 cross-root edges, and zero multi-root strongly connected
 components. The separately scanned include fragment has no cross-root edge.
 
 That is a root-level acyclicity claim only. Dependencies and bounded strongly
@@ -115,7 +121,10 @@ declared compiled fragment; it is not a `rustc` expansion trace. External
 procedural or declarative macros that synthesize paths without a lexical
 `crate`/`super` token remain outside this claim. Locally visible macro
 invocations carrying either root token fail closed instead of being interpreted
-as ordinary paths.
+as ordinary paths. Macro matchers and `$name` metavariable references are
+treated as non-emitted syntax, but a literal `mod` keyword in a transcriber or
+direct invocation fails closed—even when that macro is unused or conditionally
+inactive—because macro-generated physical module ownership is unsupported.
 
 The experimental authority-free information substrate is described in
 [`docs/INFORMATION_KERNEL_V1.md`](docs/INFORMATION_KERNEL_V1.md). It references

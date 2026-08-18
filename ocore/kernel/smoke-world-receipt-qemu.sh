@@ -24,7 +24,7 @@ fi
 # The hosted implementation owns the signed fixture and real Ed25519 proof.
 # Native Mode 30 independently reconstructs and parses those exact bytes but
 # deliberately makes no native signature-verification claim.
-cargo test --quiet --manifest-path "$ROOT/Cargo.toml" --test world_receipt
+cargo test --quiet --manifest-path "$ROOT/Cargo.toml" --package o-lang --test world_receipt
 echo "World receipt hosted Ed25519 sign/verify: PASS"
 OCORE_PROBE_MODE=30 OCORE_BUILD_DIR="$BUILD_DIR" \
   "$ROOT/ocore/kernel/build.sh" >/dev/null
