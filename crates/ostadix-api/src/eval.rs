@@ -612,8 +612,8 @@ impl PlacementFragmentBindingsV2 {
 ///
 /// ```compile_fail
 /// use std::collections::HashMap;
-/// use o_lang::eval::{Evaluator, PreparedPlacementFragmentV1};
-/// use o_lang::value::OValue;
+/// use ostadix_api::eval::{Evaluator, PreparedPlacementFragmentV1};
+/// use ostadix_api::value::OValue;
 ///
 /// fn cannot_execute_archival_fragment(
 ///     evaluator: &mut Evaluator,

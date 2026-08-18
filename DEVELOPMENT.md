@@ -6,10 +6,13 @@ Practical notes for contributors to [Ostadix-lang](https://github.com/lostadi/Os
 
 There are three active, supported hosted `.O` implementations plus O-core:
 
-- **Rust hosted implementation** (`src/`) is authoritative. It provides the `O` interpreter, OIR planner/evaluator, backend registry, scheduler, linker tools, notebook server, `olangc`, and `ocorec`.
+- **Rust hosted engine** (`crates/ostadix-api/`) is authoritative for the
+  parser, OIR planner/evaluator, backend registry, scheduler, runtime assets,
+  and advanced APIs. The root `src/` package is its compatibility/CLI shell and
+  provides `O`, linker tools, notebook server, `olangc`, and `ocorec`.
 - **C17 hosted implementation** (`c_cpp/`) is active and supported. `make` or CMake build the interpreter `O` and AOT compiler `olangc` from C sources.
 - **Python hosted implementation** (`o_lang/`) is active and supported as a readable semantic reference and cross-check target.
-- **O-core** (`src/ocore/`, `docs/OCORE.md`) is a freestanding native systems
+- **O-core** (`crates/ostadix-api/src/ocore/`, `docs/OCORE.md`) is a freestanding native systems
   language. It compiles `.oc` source through AST, typed HIR, and SSA MIR to
   ELF64 object files for its primary x86_64 target and bounded, conservative
   AArch64 G2 subset. Those native target boundaries do not apply to hosted `.O`
@@ -41,21 +44,21 @@ c_cpp/O examples/hello.O backends
 
 ## Rust architecture map
 
-- `src/parser.rs` parses typed parentheses into `ONode` trees. An identifier is an opener only if the registry accepts that language tag or alias.
-- `src/ir.rs` lowers syntax to OIR and contains `BackendSpec` / `BackendRegistry`, the single source of truth for accepted evaluator tags, aliases, cache-safety, splice renderers, execution mode, required authorities, and shim path resolution.
-- `src/eval.rs` executes validated OIR plans. It projects OIR to the directed HGraph and uses the state-complete graph coordinator by default. `O_EXECUTOR=serial` selects `execute_plan_serial` as the semantic differential oracle.
-- `src/effects.rs` defines shared effect confidence, fallibility, typed resources, checked source declarations, and conservative backend classification. Unknown hosted operations use `HostWorld`.
-- `src/executor/` contains the readiness coordinator and the worker path for verified pure inline renderers. The coordinator owns evaluator-local mutable state; it never sends the process registry across worker threads.
-- `src/value.rs` defines `OValue`, the shared value vocabulary crossing language boundaries.
-- `src/wire.rs` implements the hosted evaluator protocol: **4-byte length-prefixed canonical CBOR** frames.
-- `src/hgraph/` builds and validates the directed execution HGraph. OValue, completion, resource-state, and actor-state values are nodes; evaluator invocations are multi-output hyperedges. `ReadySchedule` derives blockers only from input producers.
-- `src/scheduler.rs` schedules autonomous request forcing and cache interaction.
-- `src/capability.rs` models runtime authority-bearing capabilities and snapshots.
-- `src/process.rs` manages backend shim subprocess lifetimes and requests.
-- `src/backend.rs` contains backend protocol types shared with shims.
-- `src/shims.rs` supports embedded/extracted shim assets for compiled hosted programs.
-- `src/nix_ops.rs` and `src/nixos_ops.rs` implement Nix and NixOS operations used by builtins.
-- `src/ocore/` contains the O-core lexer, parser, AST, HIR, type checker, MIR, codegen, driver, and capability bridge.
+- `crates/ostadix-api/src/parser.rs` parses typed parentheses into `ONode` trees. An identifier is an opener only if the registry accepts that language tag or alias.
+- `crates/ostadix-api/src/ir.rs` lowers syntax to OIR and contains `BackendSpec` / `BackendRegistry`, the single source of truth for accepted evaluator tags, aliases, cache-safety, splice renderers, execution mode, required authorities, and shim path resolution.
+- `crates/ostadix-api/src/eval.rs` executes validated OIR plans. It projects OIR to the directed HGraph and uses the state-complete graph coordinator by default. `O_EXECUTOR=serial` selects `execute_plan_serial` as the semantic differential oracle.
+- `crates/ostadix-api/src/effects.rs` defines shared effect confidence, fallibility, typed resources, checked source declarations, and conservative backend classification. Unknown hosted operations use `HostWorld`.
+- `crates/ostadix-api/src/executor/` contains the readiness coordinator and the worker path for verified pure inline renderers. The coordinator owns evaluator-local mutable state; it never sends the process registry across worker threads.
+- `crates/ostadix-api/src/value.rs` defines `OValue`, the shared value vocabulary crossing language boundaries.
+- `crates/ostadix-api/src/wire.rs` implements the hosted evaluator protocol: **4-byte length-prefixed canonical CBOR** frames.
+- `crates/ostadix-api/src/hgraph/` builds and validates the directed execution HGraph. OValue, completion, resource-state, and actor-state values are nodes; evaluator invocations are multi-output hyperedges. `ReadySchedule` derives blockers only from input producers.
+- `crates/ostadix-api/src/scheduler.rs` schedules autonomous request forcing and cache interaction.
+- `crates/ostadix-api/src/capability.rs` models runtime authority-bearing capabilities and snapshots.
+- `crates/ostadix-api/src/process.rs` manages backend shim subprocess lifetimes and requests.
+- `crates/ostadix-api/src/backend.rs` contains backend protocol types shared with shims.
+- `crates/ostadix-api/src/shims.rs` supports embedded/extracted shim assets for compiled hosted programs.
+- `crates/ostadix-api/src/nix_ops.rs` and `crates/ostadix-api/src/nixos_ops.rs` implement Nix and NixOS operations used by builtins.
+- `crates/ostadix-api/src/ocore/` contains the O-core lexer, parser, AST, HIR, type checker, MIR, codegen, driver, and capability bridge.
 - Binaries: `src/main.rs` is `O`; `src/bin/olangc.rs`, `ocorec.rs`, `olink.rs` (`o-link`), `ounlink.rs` (`o-unlink`), `ogit.rs`, and `o-notebook.rs` provide compiler, native, linker, Git, and notebook entry points.
 
 ## Environment semantics
@@ -66,8 +69,12 @@ Bare hosted blocks are ephemeral: `lang^(...)_lang` gets a fresh evaluator insta
 
 To add a Rust-hosted language backend:
 
-1. Add a static `BackendSpec` entry to `BACKEND_SPECS` in `src/ir.rs`: canonical name, aliases, cache-safety flag, splice renderer, execution mode, and required authorities.
-2. Add a shim under `backends/` when the backend is `ExecutionMode::Shim`. Shims speak the 4-byte length-prefixed canonical CBOR command/response protocol.
+1. Add a static `BackendSpec` entry to `BACKEND_SPECS` in `crates/ostadix-api/src/ir.rs`: canonical name, aliases, cache-safety flag, splice renderer, execution mode, and required authorities.
+2. Add the authoritative shim under `crates/ostadix-api/backends/` when the
+   backend is `ExecutionMode::Shim`, then update the root `backends/`
+   compatibility mirror byte-for-byte. Shims speak the 4-byte length-prefixed
+   canonical CBOR command/response protocol; the mirror-drift test rejects a
+   mismatch.
 3. Rebuild. Registration is compile-time/static and registry-extensible; it is not a runtime plugin system.
 4. Add tests or examples that exercise parsing, rendering, execution, environment lifetime, and any authority requirements.
 
@@ -96,7 +103,7 @@ CI (`.github/workflows/ci.yml`) runs all of these paths:
 # Rust authoritative runtime
 cargo test --all-targets --all-features
 cargo test --test parser_proptest
-cargo test --lib ocore::driver::tests::ocore_object_is_byte_reproducible_across_source_directories -- --exact
+cargo test --package ostadix-api --lib ocore::driver::tests::ocore_object_is_byte_reproducible_across_source_directories -- --exact
 cargo check --manifest-path fuzz/Cargo.toml
 cargo fmt -- --check
 cargo clippy --all-targets --all-features -- -D warnings
@@ -186,7 +193,7 @@ snapshot-plan execution, actual placement, runtime/recovery graphs,
 Governor/receipt integration, exactly-once effects, native or QEMU evidence,
 hardware isolation, G1, or G0--G13 passage.
 
-`src/project/logical.rs` is the World PR8-1 project profile. It derives
+`crates/ostadix-api/src/project/logical.rs` is the World PR8-1 project profile. It derives
 `LogicalHGraphV1` after validating the exact plan-to-HGraph projection,
 preserves residual `HostWorld`, rejects unknown schema data, offers a separate
 strict canonical decoder, and supplies the logical digest used by trace v5.
@@ -195,7 +202,7 @@ JSON encoding, not source or manifest formatting. It does not itself define
 placement, runtime, recovery, World task identity, authority grants, receipts,
 or G1 evidence.
 
-`src/project/deployment.rs` is the bounded World PR8-2 intention layer. Its
+`crates/ostadix-api/src/project/deployment.rs` is the bounded World PR8-2 intention layer. Its
 ordinary hosted constructor binds supported coordinator operations only to
 `HostedCoordinator` or `AmbientHost`, carries no World/task/provider identity,
 and leaves unsupported hosted policies `Unresolved`. Requirements actively
@@ -215,7 +222,7 @@ executor binds the canonical hosted-unbound plan into unsigned trace v5. The
 separate hosted-reference World path instead consumes the exact
 snapshot-derived plan through `ProjectCoordinator::new_world_bound`.
 
-`src/project/launch.rs` defines the non-authorizing `HostedWorldLaunchV1` and
+`crates/ostadix-api/src/project/launch.rs` defines the non-authorizing `HostedWorldLaunchV1` and
 caller-supplied `HostedWorldCurrentV1` boundary. It re-derives the logical,
 deployment, snapshot, provider, and operation task bindings and fences the exact
 World/Governor; caller-supplied coordinator observer
@@ -228,7 +235,7 @@ execution-attempt identity. These identity comparisons do not authenticate
 membership, prove the host process owns the observer identity, grant a
 capability or lease, reserve a provider, or record Governor admission.
 
-`src/project/runtime_graph.rs` builds terminal `RuntimeGraphV1` from the exact
+`crates/ostadix-api/src/project/runtime_graph.rs` builds terminal `RuntimeGraphV1` from the exact
 launch artifacts only after plan-aware causal replay of the normalized
 `ProjectAttemptTrace` against the trusted HGraph and exact deployment. It
 retains empty observations for never-started operations and records lifecycle
@@ -236,7 +243,7 @@ ordinals, settlement/output hashes, and per-operation residual `HostWorld`.
 The neutral `RouteSettlement` terminal covers success, nonzero settlement, and
 guard skip; aggregate terminal residual `HostWorld` is true when any actually
 observed started/terminal operation retains it. The
-`src/project/world_execution.rs` adapter emits one canonical OWRECEIPT using the
+`crates/ostadix-api/src/project/world_execution.rs` adapter emits one canonical OWRECEIPT using the
 caller's Ed25519 signer and always sets
 `ReceiptCommitFenceV1::Uncommitted`. Receipt placement is the coordinator
 observer and the receipt context uses the dedicated coordinator attempt, not the

@@ -54,7 +54,7 @@ mark 'World ResourceKey source-forgery rejection: PASS'
 
 hgraph_test="$work_dir/world-resource-keys-hgraph.log"
 hgraph_name='hgraph::from_oir::world_resource_key_tests::world_resource_keys_share_the_generic_hgraph_state_chain'
-run_logged "$hgraph_test" env CARGO_TERM_COLOR=never cargo test --locked --package o-lang --lib \
+run_logged "$hgraph_test" env CARGO_TERM_COLOR=never cargo test --locked --package ostadix-api --lib \
     hgraph::from_oir::world_resource_key_tests::world_resource_keys_share_the_generic_hgraph_state_chain \
     -- --exact
 require_test_count "$hgraph_test" 1
@@ -63,7 +63,7 @@ mark 'World ResourceKey HGraph state-transition corpus: PASS'
 
 grounding_test="$work_dir/world-resource-keys-grounding.log"
 grounding_name='world::grounding::tests::governed_resource_keys_project_into_governed_and_ambient_fields'
-run_logged "$grounding_test" env CARGO_TERM_COLOR=never cargo test --locked --package o-lang --lib \
+run_logged "$grounding_test" env CARGO_TERM_COLOR=never cargo test --locked --package ostadix-api --lib \
     world::grounding::tests::governed_resource_keys_project_into_governed_and_ambient_fields \
     -- --exact
 require_test_count "$grounding_test" 1

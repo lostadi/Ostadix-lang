@@ -34,6 +34,7 @@ WORLD_ATTESTATION_PATHS = (
     "evidence/world/g0-repository-conformance-2026-08-03.toml",
     "evidence/world/g0-repository-conformance-2026-08-03-v2.toml",
     "evidence/world/g0-ostadix-alpha-branding-2026-08-09.toml",
+    "evidence/world/g0-independent-engine-2026-08-17.toml",
     "evidence/world/g2-aarch64-qemu.toml",
     "evidence/world/g2-aarch64-qemu-2026-08-03.toml",
 )
@@ -41,6 +42,7 @@ WORLD_EVIDENCE_EVENT_PATHS = {
     "evidence/world/g0-derivation-rederive-2026-08-03.toml",
     "evidence/world/g0-machine-contract-supersession-2026-08-03.toml",
     "evidence/world/g0-ostadix-alpha-branding-supersession-2026-08-09.toml",
+    "evidence/world/g0-independent-engine-supersession-2026-08-17.toml",
     "evidence/world/g0-schema-v3-supersession-2026-08-03.toml",
     "evidence/world/g2-derivation-rederive-2026-08-03.toml",
     "evidence/world/g2-counter-wording-supersession-2026-08-03.toml",
@@ -53,7 +55,8 @@ for _attestation_path in WORLD_ATTESTATION_PATHS:
     WORLD_EVIDENCE_RELEASE_PATHS.add(_attestation["transcript"])
     WORLD_EVIDENCE_RELEASE_PATHS.add(_attestation["command"][0][2:])
     WORLD_EVIDENCE_RELEASE_PATHS.update(
-        source["path"] for source in _attestation["source"]
+        release._released_path_for_historical_source(source["path"])
+        for source in _attestation["source"]
     )
     WORLD_EVIDENCE_RELEASE_PATHS.update(
         artifact["path"]
@@ -91,6 +94,14 @@ members = [".", "crates/ostadix-api"]
 default-members = [".", "crates/ostadix-api"]
 exclude = ["fuzz", "mcp/ostadix_lang_mcp_server"]
 resolver = "2"
+
+[features]
+default = ["graph_executor"]
+graph_executor = ["ostadix-api/graph_executor"]
+notebook = ["ostadix-api/notebook"]
+
+[dependencies]
+ostadix-api = {{ path = "crates/ostadix-api", version = "=0.1.0", default-features = false }}
 """
 FIXTURE_API_CARGO = f"""\
 [package]
@@ -98,26 +109,49 @@ name = "ostadix-api"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.93.1"
-description = "Fixture stable embedding facade"
+description = "Fixture independent runtime engine"
 repository = "{release.ROOT_REPOSITORY}"
 authors = ["Lee Daghlar Ostadi"]
 license = "{release.ROOT_LICENSE_SPDX}"
+readme = "README.md"
 publish = true
 
+[features]
+default = ["graph_executor"]
+graph_executor = []
+notebook = []
+
 [dependencies]
-o-lang = {{ path = "../..", version = "=0.1.0" }}
+anyhow = "1"
 """
-FIXTURE_API_SOURCE = """\
-use o_lang::api::Parser;
-use o_lang::eval::Evaluator;
-use o_lang::ir::BackendRegistry;
-pub use o_lang::api::{
-    BackendAuthority, BigInt, CapabilityKind, DecimalSpecial, FloatFormat,
-    FloatSpecial, GraphNode, GroupMode, NativeBoundary, NativeCodecSafety,
-    NativeIdentity, NodeId, OBytes, OKeyword, ONative, ONumber, OSymbol, OText,
-    OValue, RehydratePolicy, RequestKind, RuntimeBoundary, SeqKind, SetKind,
-    SnapshotKind,
-};
+FIXTURE_PRIVATE_ENGINE_MODULES = {
+    "backend_catalog",
+    "canonical_cbor",
+    "capability",
+    "dispatch_model",
+    "eval_core",
+    "placement_protocol",
+}
+FIXTURE_PUBLIC_ENGINE_MODULES = (
+    set(release.OSTADIX_API_ROOT_MODULE_PATHS) - FIXTURE_PRIVATE_ENGINE_MODULES
+)
+FIXTURE_ROOT_LIB_SOURCE = (
+    "pub use ostadix_api::{\n    "
+    + ", ".join(sorted(FIXTURE_PUBLIC_ENGINE_MODULES))
+    + ",\n};\n"
+)
+FIXTURE_API_SOURCE = (
+    "\n".join(
+        f"pub mod {name};" for name in release.OSTADIX_API_ROOT_MODULE_PATHS
+    )
+    + "\npub use api::{Runtime, RuntimeError, RuntimeStage};\n"
+)
+FIXTURE_ENGINE_API_SOURCE = """\
+pub mod aot_source;
+use crate::ir::BackendRegistry;
+pub use crate::eval::{Evaluator};
+pub use crate::parser::Parser;
+pub use num_bigint::BigInt;
 pub enum RuntimeStage { Parse, Evaluate }
 pub struct RuntimeError;
 pub struct Runtime { evaluator: Evaluator }
@@ -125,13 +159,16 @@ impl Runtime {
     pub fn evaluate(&mut self, _source: &str) {}
 }
 """
+FIXTURE_AOT_SOURCE = """\
+pub const RUNTIME_VALUE_RS: &str = include_str!("../value.rs");
+"""
 FIXTURE_API_TEST = """\
 #[test]
-fn complete_ovalue_payload_vocabulary_is_nameable_from_the_facade() {}
+fn complete_ovalue_payload_vocabulary_is_nameable_from_the_engine_root() {}
 #[test]
 fn runtime_owns_success_parse_failure_and_evaluate_failure_stages() {}
 #[test]
-fn facade_source_has_no_glob_or_public_evaluator_reexport() {}
+fn engine_owns_the_full_runtime_without_a_compatibility_dependency() {}
 """
 FIXTURE_CITATION = f"""\
 cff-version: 1.2.0
@@ -151,6 +188,10 @@ FIXTURE_LICENSE = """\
 GNU LESSER GENERAL PUBLIC LICENSE
 Version 2.1, February 1999
 fixture copy of the license text
+"""
+FIXTURE_NOTICE = """\
+Ostadix-lang fixture notice
+Copyright fixture contributors
 """
 
 
@@ -390,18 +431,36 @@ class RootReleaseMetadataValidationTests(unittest.TestCase):
 class WorkspaceFacadeReleaseValidationTests(unittest.TestCase):
     @staticmethod
     def fixture_files() -> dict[str, bytes]:
-        return {
+        files = {path: b"fixture\n" for path in release.OSTADIX_API_RELEASE_PATHS}
+        files.update(
+            {path: b"// fixture engine module\n" for path in release.OSTADIX_API_ROOT_MODULE_PATHS.values()}
+        )
+        files.update({
             "Cargo.toml": FIXTURE_CARGO.encode(),
-            "src/api.rs": b"pub use num_bigint::BigInt;\n",
+            "LICENSE": FIXTURE_LICENSE.encode(),
+            "NOTICE": FIXTURE_NOTICE.encode(),
+            "src/lib.rs": FIXTURE_ROOT_LIB_SOURCE.encode(),
+            "crates/ostadix-api/LICENSE": FIXTURE_LICENSE.encode(),
+            "crates/ostadix-api/NOTICE": FIXTURE_NOTICE.encode(),
+            "crates/ostadix-api/src/api.rs": FIXTURE_ENGINE_API_SOURCE.encode(),
+            "crates/ostadix-api/src/api/aot_source.rs": FIXTURE_AOT_SOURCE.encode(),
             "crates/ostadix-api/Cargo.toml": FIXTURE_API_CARGO.encode(),
             "crates/ostadix-api/src/lib.rs": FIXTURE_API_SOURCE.encode(),
             "crates/ostadix-api/tests/public_surface.rs": FIXTURE_API_TEST.encode(),
-        }
+        })
+        return files
 
-    def test_live_workspace_facade_is_structurally_closed(self) -> None:
+    def test_live_workspace_engine_is_structurally_closed(self) -> None:
         files = {
             path: (PROJECT_ROOT / path).read_bytes()
-            for path in {"Cargo.toml", "src/api.rs", *release.OSTADIX_API_RELEASE_PATHS}
+            for path in {
+                "Cargo.toml",
+                "LICENSE",
+                "NOTICE",
+                "src/lib.rs",
+                *release.OSTADIX_API_RELEASE_PATHS,
+                *release.OSTADIX_API_ROOT_MODULE_PATHS.values(),
+            }
         }
         release._validate_workspace_facade_release_surface(files)
 
@@ -439,62 +498,79 @@ class WorkspaceFacadeReleaseValidationTests(unittest.TestCase):
                 FIXTURE_CARGO.replace('resolver = "2"', 'resolver = "1"', 1),
                 r"workspace\.resolver",
             ),
-            "reverse dependency": (
+            "duplicate shell dependency": (
                 "Cargo.toml",
                 FIXTURE_CARGO
                 + '\n[dev-dependencies]\nostadix-api = { path = "crates/ostadix-api" }\n',
-                r"must not depend on ostadix-api",
+                r"depend on ostadix-api exactly once",
             ),
-            "facade version": (
+            "engine version": (
                 "crates/ostadix-api/Cargo.toml",
                 FIXTURE_API_CARGO.replace('version = "0.1.0"', 'version = "9.9.9"', 1),
                 r"package\.version",
             ),
-            "dependency coordinate": (
+            "shell dependency coordinate": (
+                "Cargo.toml",
+                FIXTURE_CARGO.replace('version = "=0.1.0"', 'version = "0.1"'),
+                r"depend on ostadix-api exactly once",
+            ),
+            "engine reverse dependency": (
                 "crates/ostadix-api/Cargo.toml",
-                FIXTURE_API_CARGO.replace('version = "=0.1.0"', 'version = "0.1"'),
-                r"o-lang dependency",
+                FIXTURE_API_CARGO
+                + '\n[dev-dependencies]\no-lang = { path = "../.." }\n',
+                r"must not depend on the o-lang compatibility shell",
             ),
             "not publishable": (
                 "crates/ostadix-api/Cargo.toml",
                 FIXTURE_API_CARGO.replace("publish = true", "publish = false"),
                 r"package\.publish",
             ),
-            "glob": (
-                "crates/ostadix-api/src/lib.rs",
-                FIXTURE_API_SOURCE + "\npub use o_lang::api::*;\n",
-                r"must not contain a glob reexport",
+            "engine README binding": (
+                "crates/ostadix-api/Cargo.toml",
+                FIXTURE_API_CARGO.replace('readme = "README.md"', 'readme = "../README.md"'),
+                r"package\.readme",
             ),
-            "evaluator leakage": (
-                "crates/ostadix-api/src/lib.rs",
-                FIXTURE_API_SOURCE + "\npub use o_lang::eval::Evaluator;\n",
-                r"must not expose Evaluator",
+            "engine license bytes": (
+                "crates/ostadix-api/LICENSE",
+                FIXTURE_LICENSE + "engine-only drift\n",
+                r"LICENSE must be byte-identical to LICENSE",
             ),
-            "registry leakage": (
-                "crates/ostadix-api/src/lib.rs",
-                FIXTURE_API_SOURCE + "\npub use o_lang::ir::BackendRegistry;\n",
-                r"must not expose BackendRegistry",
+            "engine notice bytes": (
+                "crates/ostadix-api/NOTICE",
+                FIXTURE_NOTICE + "engine-only drift\n",
+                r"NOTICE must be byte-identical to NOTICE",
             ),
-            "information bridge leakage": (
-                "crates/ostadix-api/src/lib.rs",
-                FIXTURE_API_SOURCE
-                + "\npub use o_lang::api::{HGraphInformationV1, project_hgraph_v1};\n",
-                r"must not expose experimental Information bridge symbol",
+            "shell compiles a module": (
+                "src/lib.rs",
+                FIXTURE_ROOT_LIB_SOURCE + "\npub mod eval;\n",
+                r"must not compile runtime modules",
             ),
-            "parser seam": (
+            "shell module closure": (
+                "src/lib.rs",
+                FIXTURE_ROOT_LIB_SOURCE.replace("backend, ", ""),
+                r"compatibility module closure differs",
+            ),
+            "engine module closure": (
                 "crates/ostadix-api/src/lib.rs",
-                FIXTURE_API_SOURCE.replace("use o_lang::api::Parser;\n", ""),
-                r"stable Parser facade",
+                FIXTURE_API_SOURCE.replace("pub mod backend;\n", ""),
+                r"module closure differs",
+            ),
+            "API reverse source path": (
+                "crates/ostadix-api/src/api.rs",
+                FIXTURE_ENGINE_API_SOURCE + "\nuse o_lang::value::OValue;\n",
+                r"must not depend on o-lang source paths",
             ),
             "registry seam": (
-                "crates/ostadix-api/src/lib.rs",
-                FIXTURE_API_SOURCE.replace("use o_lang::ir::BackendRegistry;\n", ""),
-                r"canonical BackendRegistry path",
+                "crates/ostadix-api/src/api.rs",
+                FIXTURE_ENGINE_API_SOURCE.replace(
+                    "use crate::ir::BackendRegistry;\n", ""
+                ),
+                r"must retain engine seam",
             ),
-            "payload closure": (
-                "crates/ostadix-api/src/lib.rs",
-                FIXTURE_API_SOURCE.replace("    SnapshotKind,\n", ""),
-                r"payload closure differs",
+            "AOT inventory": (
+                "crates/ostadix-api/src/api/aot_source.rs",
+                "pub const EMPTY: &str = \"\";\n",
+                r"must own generated-runtime source bytes",
             ),
         }
         for label, (path, replacement, message) in mutations.items():
@@ -504,11 +580,39 @@ class WorkspaceFacadeReleaseValidationTests(unittest.TestCase):
                 with self.assertRaisesRegex(release.ReleaseError, message):
                     release._validate_workspace_facade_release_surface(files)
 
-    def test_facade_release_allowlist_is_exact_not_directory_wide(self) -> None:
+    def test_engine_legal_metadata_is_required(self) -> None:
+        for path in ("crates/ostadix-api/LICENSE", "crates/ostadix-api/NOTICE"):
+            with self.subTest(path=path):
+                files = self.fixture_files()
+                del files[path]
+                with self.assertRaisesRegex(
+                    release.ReleaseError,
+                    rf"workspace engine release surface is incomplete; missing: {path}",
+                ):
+                    release._validate_workspace_facade_release_surface(files)
+
+    def test_engine_package_readme_is_required(self) -> None:
+        path = "crates/ostadix-api/README.md"
+        files = self.fixture_files()
+        del files[path]
+        with self.assertRaisesRegex(
+            release.ReleaseError,
+            rf"workspace engine release surface is incomplete; missing: {path}",
+        ):
+            release._validate_workspace_facade_release_surface(files)
+
+    def test_engine_release_allowlist_is_scoped_not_crates_wide(self) -> None:
         for path in release.OSTADIX_API_RELEASE_PATHS:
             self.assertTrue(release.is_allowed_release_path(path))
+        self.assertTrue(
+            release.is_allowed_release_path("crates/ostadix-api/src/new_module.rs")
+        )
         self.assertFalse(release.is_allowed_release_path("crates/private/Cargo.toml"))
         self.assertFalse(release.is_allowed_release_path("crates/ostadix-api/notes.txt"))
+        self.assertTrue(release.is_allowed_release_path("src/lib.rs"))
+        self.assertTrue(release.is_allowed_release_path("src/bin/olangc.rs"))
+        self.assertFalse(release.is_allowed_release_path("src/eval.rs"))
+        self.assertFalse(release.is_allowed_release_path("src/world/identity.rs"))
 
 
 class SourceReleaseTests(unittest.TestCase):
@@ -552,6 +656,16 @@ class SourceReleaseTests(unittest.TestCase):
         if executable:
             destination.chmod(0o755)
 
+    def _assert_missing_required_paths(
+        self, archive: str, paths: tuple[str, ...]
+    ) -> None:
+        with self.assertRaises(release.ReleaseError) as raised:
+            self._build(archive)
+        message = str(raised.exception)
+        self.assertIn("missing required path(s)", message)
+        for path in paths:
+            self.assertIn(path, message)
+
     def _commit(self, files: dict[str, str | bytes] | None = None) -> str:
         contents = {
             ".dockerignore": "target\nOstadix-lang\n",
@@ -574,10 +688,16 @@ class SourceReleaseTests(unittest.TestCase):
             "Cargo.lock": "# fixture root lock\n",
             "Cargo.toml": FIXTURE_CARGO,
             "crates/ostadix-api/Cargo.toml": FIXTURE_API_CARGO,
+            "crates/ostadix-api/LICENSE": FIXTURE_LICENSE,
+            "crates/ostadix-api/NOTICE": FIXTURE_NOTICE,
+            "crates/ostadix-api/README.md": "# Fixture independent engine\n",
+            "crates/ostadix-api/src/api.rs": FIXTURE_ENGINE_API_SOURCE,
+            "crates/ostadix-api/src/api/aot_source.rs": FIXTURE_AOT_SOURCE,
             "crates/ostadix-api/src/lib.rs": FIXTURE_API_SOURCE,
             "crates/ostadix-api/tests/public_surface.rs": FIXTURE_API_TEST,
             "Dockerfile": "FROM scratch\n",
             "LICENSE": FIXTURE_LICENSE,
+            "NOTICE": FIXTURE_NOTICE,
             "README.md": fixture_readme(),
             "SECURITY.md": "# Security\n",
             "boot-and-test.sh": "#!/bin/sh\nexit 0\n",
@@ -654,7 +774,13 @@ class SourceReleaseTests(unittest.TestCase):
             "examples/docker_literal/main.py": "__oval_result__ = 42\n",
             "examples/semantic_custody.O": "text^(fixture)_text\n",
             "llms.txt": "release index\n",
-            "mcp/ostadix_lang_mcp_server/Cargo.lock": "# fixture lock\n",
+            "mcp/ostadix_lang_mcp_server/Cargo.lock": (
+                "# This file is automatically @generated by Cargo.\n"
+                "version = 4\n\n"
+                "[[package]]\n"
+                'name = "ostadix-mcp-server"\n'
+                'version = "0.1.0"\n'
+            ),
             "mcp/ostadix_lang_mcp_server/Cargo.toml": (
                 "[package]\n"
                 'name = "ostadix-mcp-server"\n'
@@ -764,116 +890,115 @@ class SourceReleaseTests(unittest.TestCase):
             "scripts/smoke-world-g0-conformance.sh": "#!/usr/bin/env bash\n",
             "scripts/release_evidence.py": "#!/usr/bin/env python3\n",
             "scripts/world_alpha_evidence.py": "#!/usr/bin/env python3\n",
-            "src/backend_catalog.rs": "// fixture canonical backend catalog implementation\n",
-            "src/backend_catalog.inc.rs": "// fixture canonical backend catalog data\n",
-            "src/api.rs": "pub use num_bigint::BigInt;\n",
-            "src/backend.rs": "// fixture backend runtime\n",
-            "src/backend_morphism.rs": "// fixture shadow backend morphism kernel\n",
-            "src/backend_state.rs": "// fixture versioned backend state protocol\n",
-            "src/canonical_cbor.rs": "// fixture canonical CBOR codec\n",
-            "src/dispatch_model.rs": "// fixture pure dispatch contract\n",
-            "src/evidence/admit.rs": "// fixture evidence admission compiler\n",
-            "src/evidence/analyze.rs": "// fixture pre-execution evidence analyzer\n",
-            "src/evidence/fact.rs": "// fixture evidence contract vocabulary\n",
-            "src/evidence/intent.rs": "// fixture stable execution-intent projection\n",
-            "src/evidence/mod.rs": "pub mod admit;\n",
-            "src/evidence/profile.rs": "// fixture non-authoritative cost profiles\n",
-            "src/effects.rs": "// fixture governed effect vocabulary\n",
-            "src/eval.rs": "// fixture evaluator state bridge\n",
-            "src/eval_core.rs": "// fixture evaluator-independent graph contract\n",
-            "src/execution_contract.rs": "// fixture canonical execution contract\n",
-            "src/runtime_exec.rs": "// fixture direct-launch executable authority\n",
-            "src/syntax_dialect.rs": "// fixture parser syntax dialect\n",
+            "crates/ostadix-api/src/backend_catalog.rs": "// fixture canonical backend catalog implementation\n",
+            "crates/ostadix-api/src/backend_catalog.inc.rs": "// fixture canonical backend catalog data\n",
+            "crates/ostadix-api/src/backend.rs": "// fixture backend runtime\n",
+            "crates/ostadix-api/src/backend_morphism.rs": "// fixture shadow backend morphism kernel\n",
+            "crates/ostadix-api/src/backend_state.rs": "// fixture versioned backend state protocol\n",
+            "crates/ostadix-api/src/canonical_cbor.rs": "// fixture canonical CBOR codec\n",
+            "crates/ostadix-api/src/dispatch_model.rs": "// fixture pure dispatch contract\n",
+            "crates/ostadix-api/src/evidence/admit.rs": "// fixture evidence admission compiler\n",
+            "crates/ostadix-api/src/evidence/analyze.rs": "// fixture pre-execution evidence analyzer\n",
+            "crates/ostadix-api/src/evidence/fact.rs": "// fixture evidence contract vocabulary\n",
+            "crates/ostadix-api/src/evidence/intent.rs": "// fixture stable execution-intent projection\n",
+            "crates/ostadix-api/src/evidence/mod.rs": "pub mod admit;\n",
+            "crates/ostadix-api/src/evidence/profile.rs": "// fixture non-authoritative cost profiles\n",
+            "crates/ostadix-api/src/effects.rs": "// fixture governed effect vocabulary\n",
+            "crates/ostadix-api/src/eval.rs": "// fixture evaluator state bridge\n",
+            "crates/ostadix-api/src/eval_core.rs": "// fixture evaluator-independent graph contract\n",
+            "crates/ostadix-api/src/execution_contract.rs": "// fixture canonical execution contract\n",
+            "crates/ostadix-api/src/runtime_exec.rs": "// fixture direct-launch executable authority\n",
+            "crates/ostadix-api/src/syntax_dialect.rs": "// fixture parser syntax dialect\n",
             "src/bin/o-info.rs": "// fixture local information CLI\n",
             "src/bin/o-node.rs": "// fixture direct hosted-node CLI\n",
             "src/bin/o-registry.rs": "// fixture signed local registry CLI\n",
             "src/bin/octl.rs": "// fixture direct hosted-node client CLI\n",
             "src/bin/olink.rs": "// fixture project linker CLI\n",
-            "src/bin/olangc.rs": "// fixture olangc project planner CLI\n",
+            "src/bin/olangc.rs": "use o_lang::api::aot_source::*;\n",
             "src/bin/ocorec.rs": "// fixture O-core compiler CLI\n",
-            "src/ocore/codegen.rs": "// fixture x86_64 O-core code generator\n",
-            "src/ocore/codegen_aarch64.rs": "// fixture AArch64 O-core code generator\n",
-            "src/ocore/boot_info.rs": "// fixture BootInfoV1 contract\n",
-            "src/ocore/driver.rs": "// fixture O-core target driver\n",
-            "src/ocore/mod.rs": "// fixture O-core module exports\n",
-            "src/executor/mod.rs": "// fixture public executor effects surface\n",
-            "src/executor/pool.rs": "// fixture persistent local-worker pool\n",
-            "src/executor/task.rs": "// fixture prepared-task contract\n",
-            "src/hgraph/graph.rs": "// fixture HGraph validation\n",
-            "src/hgraph/kinds.rs": "// fixture HGraph operation vocabulary\n",
-            "src/hgraph/from_oir.rs": "// fixture HGraph effect lowering\n",
-            "src/hgraph/solve.rs": "// fixture HGraph fidelity transfer\n",
-            "src/hosted_remote/client.rs": "// fixture hosted client\n",
-            "src/hosted_remote/mod.rs": "pub mod protocol;\n",
-            "src/hosted_remote/node.rs": "// fixture hosted node runtime\n",
-            "src/hosted_remote/paths.rs": "// fixture hosted paths\n",
-            "src/hosted_remote/protocol.rs": "// fixture hosted V1 protocol\n",
-            "src/hosted_remote/tls.rs": "// fixture hosted TLS\n",
-            "src/hosted_remote/v2/auth.rs": "// fixture hosted V2 authority adapter\n",
-            "src/hosted_remote/v2/client.rs": "// fixture hosted V2 client\n",
-            "src/hosted_remote/v2/crypto.rs": "// fixture hosted V2 signatures\n",
-            "src/hosted_remote/v2/dev.rs": "// fixture hosted V2 development authority\n",
-            "src/hosted_remote/v2/mod.rs": "pub mod protocol;\n",
-            "src/hosted_remote/v2/protocol.rs": "// fixture hosted V2 wire protocol\n",
-            "src/hosted_remote/v2/runtime.rs": "// fixture hosted V2 state machine\n",
-            "src/hosted_remote/v2/server.rs": "// fixture hosted V2 server\n",
-            "src/hosted_remote/v2/store.rs": "// fixture hosted V2 durable store\n",
-            "src/information/acquisition.rs": "// fixture bounded information acquisition\n",
-            "src/information/decision.rs": "// fixture information decisions\n",
-            "src/information/delta.rs": "// fixture information deltas\n",
-            "src/information/exchange.rs": "// fixture signed offline information packs\n",
-            "src/information/id.rs": "// fixture information identities\n",
-            "src/information/invalidation.rs": "// fixture information invalidation\n",
-            "src/information/loss.rs": "// fixture projection loss contract\n",
-            "src/information/mod.rs": "// fixture information module\n",
-            "src/information/model.rs": "// fixture information atoms\n",
-            "src/information/projection.rs": "// fixture information projections\n",
-            "src/information/root.rs": "// fixture information roots\n",
-            "src/information/store.rs": "// fixture local information store\n",
-            "src/information_bridge/mod.rs": "// fixture read-only information bridge\n",
-            "src/ir.rs": "// fixture canonical backend catalog projection\n",
-            "src/lib.rs": "pub mod placement;\n",
+            "crates/ostadix-api/src/ocore/codegen.rs": "// fixture x86_64 O-core code generator\n",
+            "crates/ostadix-api/src/ocore/codegen_aarch64.rs": "// fixture AArch64 O-core code generator\n",
+            "crates/ostadix-api/src/ocore/boot_info.rs": "// fixture BootInfoV1 contract\n",
+            "crates/ostadix-api/src/ocore/driver.rs": "// fixture O-core target driver\n",
+            "crates/ostadix-api/src/ocore/mod.rs": "// fixture O-core module exports\n",
+            "crates/ostadix-api/src/executor/mod.rs": "// fixture public executor effects surface\n",
+            "crates/ostadix-api/src/executor/pool.rs": "// fixture persistent local-worker pool\n",
+            "crates/ostadix-api/src/executor/task.rs": "// fixture prepared-task contract\n",
+            "crates/ostadix-api/src/hgraph/graph.rs": "// fixture HGraph validation\n",
+            "crates/ostadix-api/src/hgraph/kinds.rs": "// fixture HGraph operation vocabulary\n",
+            "crates/ostadix-api/src/hgraph/from_oir.rs": "// fixture HGraph effect lowering\n",
+            "crates/ostadix-api/src/hgraph/solve.rs": "// fixture HGraph fidelity transfer\n",
+            "crates/ostadix-api/src/hosted_remote/client.rs": "// fixture hosted client\n",
+            "crates/ostadix-api/src/hosted_remote/mod.rs": "pub mod protocol;\n",
+            "crates/ostadix-api/src/hosted_remote/node.rs": "// fixture hosted node runtime\n",
+            "crates/ostadix-api/src/hosted_remote/paths.rs": "// fixture hosted paths\n",
+            "crates/ostadix-api/src/hosted_remote/protocol.rs": "// fixture hosted V1 protocol\n",
+            "crates/ostadix-api/src/hosted_remote/tls.rs": "// fixture hosted TLS\n",
+            "crates/ostadix-api/src/hosted_remote/v2/auth.rs": "// fixture hosted V2 authority adapter\n",
+            "crates/ostadix-api/src/hosted_remote/v2/client.rs": "// fixture hosted V2 client\n",
+            "crates/ostadix-api/src/hosted_remote/v2/crypto.rs": "// fixture hosted V2 signatures\n",
+            "crates/ostadix-api/src/hosted_remote/v2/dev.rs": "// fixture hosted V2 development authority\n",
+            "crates/ostadix-api/src/hosted_remote/v2/mod.rs": "pub mod protocol;\n",
+            "crates/ostadix-api/src/hosted_remote/v2/protocol.rs": "// fixture hosted V2 wire protocol\n",
+            "crates/ostadix-api/src/hosted_remote/v2/runtime.rs": "// fixture hosted V2 state machine\n",
+            "crates/ostadix-api/src/hosted_remote/v2/server.rs": "// fixture hosted V2 server\n",
+            "crates/ostadix-api/src/hosted_remote/v2/store.rs": "// fixture hosted V2 durable store\n",
+            "crates/ostadix-api/src/information/acquisition.rs": "// fixture bounded information acquisition\n",
+            "crates/ostadix-api/src/information/decision.rs": "// fixture information decisions\n",
+            "crates/ostadix-api/src/information/delta.rs": "// fixture information deltas\n",
+            "crates/ostadix-api/src/information/exchange.rs": "// fixture signed offline information packs\n",
+            "crates/ostadix-api/src/information/id.rs": "// fixture information identities\n",
+            "crates/ostadix-api/src/information/invalidation.rs": "// fixture information invalidation\n",
+            "crates/ostadix-api/src/information/loss.rs": "// fixture projection loss contract\n",
+            "crates/ostadix-api/src/information/mod.rs": "// fixture information module\n",
+            "crates/ostadix-api/src/information/model.rs": "// fixture information atoms\n",
+            "crates/ostadix-api/src/information/projection.rs": "// fixture information projections\n",
+            "crates/ostadix-api/src/information/root.rs": "// fixture information roots\n",
+            "crates/ostadix-api/src/information/store.rs": "// fixture local information store\n",
+            "crates/ostadix-api/src/information_bridge/mod.rs": "// fixture read-only information bridge\n",
+            "crates/ostadix-api/src/ir.rs": "// fixture canonical backend catalog projection\n",
+            "src/lib.rs": FIXTURE_ROOT_LIB_SOURCE,
             "src/main.rs": "fn main() {}\n",
-            "src/placement/mod.rs": "pub mod protocol;\n",
-            "src/placement/projection.rs": "// fixture OIR requirement projection\n",
-            "src/placement/protocol/candidate.rs": "// fixture candidate validation\n",
-            "src/placement/protocol/catalog.rs": "// fixture catalog authority trait\n",
-            "src/placement/protocol/digest.rs": "// fixture semantic digest\n",
-            "src/placement/protocol/error.rs": "// fixture placement validation errors\n",
-            "src/placement/protocol/mod.rs": "pub mod records;\n",
-            "src/placement/protocol/records.rs": "// fixture placement validity records\n",
-            "src/placement/protocol/requirement.rs": "// fixture placement requirements\n",
-            "src/placement/protocol/state.rs": "// fixture state and quota protocol\n",
-            "src/placement/protocol/target.rs": "// fixture placement target descriptors\n",
-            "src/placement/protocol/warrant.rs": "// fixture placement warrants\n",
-            "src/process.rs": "// fixture persistent backend lifecycle\n",
-            "src/version.rs": "// fixture machine-readable version report\n",
-            "src/project/executor.rs": "// fixture project HGraph executor\n",
-            "src/project/deployment.rs": "// fixture canonical project deployment plan\n",
-            "src/project/launch.rs": "// fixture World-bound project launch\n",
-            "src/project/logical.rs": "// fixture canonical project logical HGraph\n",
-            "src/project/mod.rs": "pub mod plan;\n",
-            "src/project/model.rs": "// fixture project model\n",
-            "src/project/plan.rs": "// fixture project HGraph planner\n",
-            "src/project/runtime.rs": "// fixture shared project selection\n",
-            "src/project/runtime_graph.rs": "// fixture observed project RuntimeGraph\n",
-            "src/project/trace.rs": "// fixture project HGraph trace\n",
-            "src/project/world_execution.rs": (
+            "crates/ostadix-api/src/placement/mod.rs": "pub mod protocol;\n",
+            "crates/ostadix-api/src/placement/projection.rs": "// fixture OIR requirement projection\n",
+            "crates/ostadix-api/src/placement/protocol/candidate.rs": "// fixture candidate validation\n",
+            "crates/ostadix-api/src/placement/protocol/catalog.rs": "// fixture catalog authority trait\n",
+            "crates/ostadix-api/src/placement/protocol/digest.rs": "// fixture semantic digest\n",
+            "crates/ostadix-api/src/placement/protocol/error.rs": "// fixture placement validation errors\n",
+            "crates/ostadix-api/src/placement/protocol/mod.rs": "pub mod records;\n",
+            "crates/ostadix-api/src/placement/protocol/records.rs": "// fixture placement validity records\n",
+            "crates/ostadix-api/src/placement/protocol/requirement.rs": "// fixture placement requirements\n",
+            "crates/ostadix-api/src/placement/protocol/state.rs": "// fixture state and quota protocol\n",
+            "crates/ostadix-api/src/placement/protocol/target.rs": "// fixture placement target descriptors\n",
+            "crates/ostadix-api/src/placement/protocol/warrant.rs": "// fixture placement warrants\n",
+            "crates/ostadix-api/src/process.rs": "// fixture persistent backend lifecycle\n",
+            "crates/ostadix-api/src/version.rs": "// fixture machine-readable version report\n",
+            "crates/ostadix-api/src/project/executor.rs": "// fixture project HGraph executor\n",
+            "crates/ostadix-api/src/project/deployment.rs": "// fixture canonical project deployment plan\n",
+            "crates/ostadix-api/src/project/launch.rs": "// fixture World-bound project launch\n",
+            "crates/ostadix-api/src/project/logical.rs": "// fixture canonical project logical HGraph\n",
+            "crates/ostadix-api/src/project/mod.rs": "pub mod plan;\n",
+            "crates/ostadix-api/src/project/model.rs": "// fixture project model\n",
+            "crates/ostadix-api/src/project/plan.rs": "// fixture project HGraph planner\n",
+            "crates/ostadix-api/src/project/runtime.rs": "// fixture shared project selection\n",
+            "crates/ostadix-api/src/project/runtime_graph.rs": "// fixture observed project RuntimeGraph\n",
+            "crates/ostadix-api/src/project/trace.rs": "// fixture project HGraph trace\n",
+            "crates/ostadix-api/src/project/world_execution.rs": (
                 "// fixture bounded World-project execution and receipt emission\n"
             ),
-            "src/registry/store.rs": "// fixture transactional signed registry store\n",
-            "src/registry/bundle/mod.rs": "// fixture canonical backend bundle\n",
-            "src/registry/placement_compat.rs": "// fixture registry placement compatibility\n",
-            "src/world/grounding.rs": "// fixture World grounding projection\n",
-            "src/world/identity.rs": "// fixture World identities\n",
-            "src/world/identity_wire.rs": "// fixture World identity wire oracle\n",
-            "src/world/codec.rs": "// fixture World protocol codec oracle\n",
-            "src/world/mod.rs": "pub mod identity;\n",
-            "src/world/protocol.rs": "// fixture World protocol vocabulary\n",
-            "src/world/receipt.rs": "// fixture canonical World receipt vocabulary\n",
-            "src/world/receipt_codec.rs": "// fixture canonical World receipt codec\n",
-            "src/world/value.rs": "// fixture portable World value vocabulary\n",
-            "src/world/value_codec.rs": "// fixture portable World value codec\n",
+            "crates/ostadix-api/src/registry/store.rs": "// fixture transactional signed registry store\n",
+            "crates/ostadix-api/src/registry/bundle/mod.rs": "// fixture canonical backend bundle\n",
+            "crates/ostadix-api/src/registry/placement_compat.rs": "// fixture registry placement compatibility\n",
+            "crates/ostadix-api/src/world/grounding.rs": "// fixture World grounding projection\n",
+            "crates/ostadix-api/src/world/identity.rs": "// fixture World identities\n",
+            "crates/ostadix-api/src/world/identity_wire.rs": "// fixture World identity wire oracle\n",
+            "crates/ostadix-api/src/world/codec.rs": "// fixture World protocol codec oracle\n",
+            "crates/ostadix-api/src/world/mod.rs": "pub mod identity;\n",
+            "crates/ostadix-api/src/world/protocol.rs": "// fixture World protocol vocabulary\n",
+            "crates/ostadix-api/src/world/receipt.rs": "// fixture canonical World receipt vocabulary\n",
+            "crates/ostadix-api/src/world/receipt_codec.rs": "// fixture canonical World receipt codec\n",
+            "crates/ostadix-api/src/world/value.rs": "// fixture portable World value vocabulary\n",
+            "crates/ostadix-api/src/world/value_codec.rs": "// fixture portable World value codec\n",
             "tests/example_manifest.py": "# fixture example manifest consumer\n",
             "tests/hosted_remote_v2.rs": "// fixture hosted V2 integration tests\n",
             "tests/fixtures/world_identity_v1.hex": "4f574944454e5431\n",
@@ -924,6 +1049,10 @@ class SourceReleaseTests(unittest.TestCase):
             contents[path] = (PROJECT_ROOT / path).read_bytes()
         for path in release.HOSTED_HGRAPH_BENCHMARK_RELEASE_PATHS:
             contents[path] = (PROJECT_ROOT / path).read_bytes()
+        for path in release.OSTADIX_API_ROOT_MODULE_PATHS.values():
+            contents.setdefault(path, "// fixture engine root module\n")
+        for path in release.OSTADIX_API_RUNTIME_ASSET_PATHS:
+            contents.setdefault(path, b"fixture runtime asset\n")
         if files:
             contents.update(files)
         for index in range(FIXTURE_EVIDENCE_GATE_COUNT):
@@ -1065,7 +1194,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "okernel-multikernel/MULTIKERNEL_PERSONALITY_PROPOSAL.md": "published proposal\n",
                 "scratch.txt": "not an allowlisted top-level surface\n",
                 "scripts/tool.sh": "#!/bin/sh\nexit 0\n",
-                "src/lib.rs": "pub fn fixture() {}\n",
+                "src/lib.rs": FIXTURE_ROOT_LIB_SOURCE + "// fixture marker\n",
                 "tests/fixture.rs": "#[test] fn fixture() {}\n",
             }
         )
@@ -1098,6 +1227,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "crates/ostadix-api/tests/public_surface.rs",
                 "Dockerfile",
                 "LICENSE",
+                "NOTICE",
                 "README.md",
                 "SECURITY.md",
                 "boot-and-test.sh",
@@ -1128,6 +1258,8 @@ class SourceReleaseTests(unittest.TestCase):
                 "evidence/world/g0-machine-contract-supersession-2026-08-03.toml",
                 "evidence/world/g0-ostadix-alpha-branding-2026-08-09.toml",
                 "evidence/world/g0-ostadix-alpha-branding-supersession-2026-08-09.toml",
+                "evidence/world/g0-independent-engine-2026-08-17.toml",
+                "evidence/world/g0-independent-engine-supersession-2026-08-17.toml",
                 "evidence/world/g0-repository-conformance.toml",
                 "evidence/world/g0-repository-conformance-2026-08-03.toml",
                 "evidence/world/g0-repository-conformance-2026-08-03-v2.toml",
@@ -1140,6 +1272,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "evidence/world/transcripts/g0-repository-conformance-2026-08-03.log",
                 "evidence/world/transcripts/g0-repository-conformance-2026-08-03-v2.log",
                 "evidence/world/transcripts/g0-ostadix-alpha-branding-2026-08-09.log",
+                "evidence/world/transcripts/g0-independent-engine-2026-08-17.log",
                 "evidence/world/transcripts/g2-aarch64-qemu.log",
                 "evidence/world/transcripts/g2-aarch64-qemu-2026-08-03.log",
                 "examples/manifest.json",
@@ -1221,26 +1354,26 @@ class SourceReleaseTests(unittest.TestCase):
                 "scripts/smoke-world-g0-conformance.sh",
                 "scripts/release_evidence.py",
                 "scripts/world_alpha_evidence.py",
-                "src/backend.rs",
-                "src/backend_morphism.rs",
-                "src/api.rs",
-                "src/backend_catalog.rs",
-                "src/backend_catalog.inc.rs",
-                "src/backend_state.rs",
-                "src/canonical_cbor.rs",
-                "src/dispatch_model.rs",
-                "src/evidence/admit.rs",
-                "src/evidence/analyze.rs",
-                "src/evidence/fact.rs",
-                "src/evidence/intent.rs",
-                "src/evidence/mod.rs",
-                "src/evidence/profile.rs",
-                "src/effects.rs",
-                "src/eval.rs",
-                "src/eval_core.rs",
-                "src/execution_contract.rs",
-                "src/runtime_exec.rs",
-                "src/syntax_dialect.rs",
+                "crates/ostadix-api/src/backend.rs",
+                "crates/ostadix-api/src/backend_morphism.rs",
+                "crates/ostadix-api/src/api.rs",
+                "crates/ostadix-api/src/backend_catalog.rs",
+                "crates/ostadix-api/src/backend_catalog.inc.rs",
+                "crates/ostadix-api/src/backend_state.rs",
+                "crates/ostadix-api/src/canonical_cbor.rs",
+                "crates/ostadix-api/src/dispatch_model.rs",
+                "crates/ostadix-api/src/evidence/admit.rs",
+                "crates/ostadix-api/src/evidence/analyze.rs",
+                "crates/ostadix-api/src/evidence/fact.rs",
+                "crates/ostadix-api/src/evidence/intent.rs",
+                "crates/ostadix-api/src/evidence/mod.rs",
+                "crates/ostadix-api/src/evidence/profile.rs",
+                "crates/ostadix-api/src/effects.rs",
+                "crates/ostadix-api/src/eval.rs",
+                "crates/ostadix-api/src/eval_core.rs",
+                "crates/ostadix-api/src/execution_contract.rs",
+                "crates/ostadix-api/src/runtime_exec.rs",
+                "crates/ostadix-api/src/syntax_dialect.rs",
                 "src/bin/o-info.rs",
                 "src/bin/o-node.rs",
                 "src/bin/o-registry.rs",
@@ -1248,87 +1381,87 @@ class SourceReleaseTests(unittest.TestCase):
                 "src/bin/olink.rs",
                 "src/bin/olangc.rs",
                 "src/bin/ocorec.rs",
-                "src/ocore/codegen.rs",
-                "src/ocore/codegen_aarch64.rs",
-                "src/ocore/boot_info.rs",
-                "src/ocore/driver.rs",
-                "src/ocore/mod.rs",
-                "src/executor/mod.rs",
-                "src/executor/pool.rs",
-                "src/executor/task.rs",
-                "src/hgraph/graph.rs",
-                "src/hgraph/kinds.rs",
-                "src/hgraph/from_oir.rs",
-                "src/hgraph/solve.rs",
-                "src/hosted_remote/client.rs",
-                "src/hosted_remote/mod.rs",
-                "src/hosted_remote/node.rs",
-                "src/hosted_remote/paths.rs",
-                "src/hosted_remote/protocol.rs",
-                "src/hosted_remote/tls.rs",
-                "src/hosted_remote/v2/auth.rs",
-                "src/hosted_remote/v2/client.rs",
-                "src/hosted_remote/v2/crypto.rs",
-                "src/hosted_remote/v2/dev.rs",
-                "src/hosted_remote/v2/mod.rs",
-                "src/hosted_remote/v2/protocol.rs",
-                "src/hosted_remote/v2/runtime.rs",
-                "src/hosted_remote/v2/server.rs",
-                "src/hosted_remote/v2/store.rs",
-                "src/information/acquisition.rs",
-                "src/information/decision.rs",
-                "src/information/delta.rs",
-                "src/information/exchange.rs",
-                "src/information/id.rs",
-                "src/information/invalidation.rs",
-                "src/information/loss.rs",
-                "src/information/mod.rs",
-                "src/information/model.rs",
-                "src/information/projection.rs",
-                "src/information/root.rs",
-                "src/information/store.rs",
-                "src/information_bridge/mod.rs",
-                "src/ir.rs",
+                "crates/ostadix-api/src/ocore/codegen.rs",
+                "crates/ostadix-api/src/ocore/codegen_aarch64.rs",
+                "crates/ostadix-api/src/ocore/boot_info.rs",
+                "crates/ostadix-api/src/ocore/driver.rs",
+                "crates/ostadix-api/src/ocore/mod.rs",
+                "crates/ostadix-api/src/executor/mod.rs",
+                "crates/ostadix-api/src/executor/pool.rs",
+                "crates/ostadix-api/src/executor/task.rs",
+                "crates/ostadix-api/src/hgraph/graph.rs",
+                "crates/ostadix-api/src/hgraph/kinds.rs",
+                "crates/ostadix-api/src/hgraph/from_oir.rs",
+                "crates/ostadix-api/src/hgraph/solve.rs",
+                "crates/ostadix-api/src/hosted_remote/client.rs",
+                "crates/ostadix-api/src/hosted_remote/mod.rs",
+                "crates/ostadix-api/src/hosted_remote/node.rs",
+                "crates/ostadix-api/src/hosted_remote/paths.rs",
+                "crates/ostadix-api/src/hosted_remote/protocol.rs",
+                "crates/ostadix-api/src/hosted_remote/tls.rs",
+                "crates/ostadix-api/src/hosted_remote/v2/auth.rs",
+                "crates/ostadix-api/src/hosted_remote/v2/client.rs",
+                "crates/ostadix-api/src/hosted_remote/v2/crypto.rs",
+                "crates/ostadix-api/src/hosted_remote/v2/dev.rs",
+                "crates/ostadix-api/src/hosted_remote/v2/mod.rs",
+                "crates/ostadix-api/src/hosted_remote/v2/protocol.rs",
+                "crates/ostadix-api/src/hosted_remote/v2/runtime.rs",
+                "crates/ostadix-api/src/hosted_remote/v2/server.rs",
+                "crates/ostadix-api/src/hosted_remote/v2/store.rs",
+                "crates/ostadix-api/src/information/acquisition.rs",
+                "crates/ostadix-api/src/information/decision.rs",
+                "crates/ostadix-api/src/information/delta.rs",
+                "crates/ostadix-api/src/information/exchange.rs",
+                "crates/ostadix-api/src/information/id.rs",
+                "crates/ostadix-api/src/information/invalidation.rs",
+                "crates/ostadix-api/src/information/loss.rs",
+                "crates/ostadix-api/src/information/mod.rs",
+                "crates/ostadix-api/src/information/model.rs",
+                "crates/ostadix-api/src/information/projection.rs",
+                "crates/ostadix-api/src/information/root.rs",
+                "crates/ostadix-api/src/information/store.rs",
+                "crates/ostadix-api/src/information_bridge/mod.rs",
+                "crates/ostadix-api/src/ir.rs",
                 "src/lib.rs",
                 "src/main.rs",
-                "src/placement/mod.rs",
-                "src/placement/projection.rs",
-                "src/placement/protocol/candidate.rs",
-                "src/placement/protocol/catalog.rs",
-                "src/placement/protocol/digest.rs",
-                "src/placement/protocol/error.rs",
-                "src/placement/protocol/mod.rs",
-                "src/placement/protocol/records.rs",
-                "src/placement/protocol/requirement.rs",
-                "src/placement/protocol/state.rs",
-                "src/placement/protocol/target.rs",
-                "src/placement/protocol/warrant.rs",
-                "src/process.rs",
-                "src/version.rs",
-                "src/project/executor.rs",
-                "src/project/deployment.rs",
-                "src/project/launch.rs",
-                "src/project/logical.rs",
-                "src/project/mod.rs",
-                "src/project/model.rs",
-                "src/project/plan.rs",
-                "src/project/runtime.rs",
-                "src/project/runtime_graph.rs",
-                "src/project/trace.rs",
-                "src/project/world_execution.rs",
-                "src/registry/bundle/mod.rs",
-                "src/registry/placement_compat.rs",
-                "src/registry/store.rs",
-                "src/world/grounding.rs",
-                "src/world/identity.rs",
-                "src/world/identity_wire.rs",
-                "src/world/codec.rs",
-                "src/world/mod.rs",
-                "src/world/protocol.rs",
-                "src/world/receipt.rs",
-                "src/world/receipt_codec.rs",
-                "src/world/value.rs",
-                "src/world/value_codec.rs",
+                "crates/ostadix-api/src/placement/mod.rs",
+                "crates/ostadix-api/src/placement/projection.rs",
+                "crates/ostadix-api/src/placement/protocol/candidate.rs",
+                "crates/ostadix-api/src/placement/protocol/catalog.rs",
+                "crates/ostadix-api/src/placement/protocol/digest.rs",
+                "crates/ostadix-api/src/placement/protocol/error.rs",
+                "crates/ostadix-api/src/placement/protocol/mod.rs",
+                "crates/ostadix-api/src/placement/protocol/records.rs",
+                "crates/ostadix-api/src/placement/protocol/requirement.rs",
+                "crates/ostadix-api/src/placement/protocol/state.rs",
+                "crates/ostadix-api/src/placement/protocol/target.rs",
+                "crates/ostadix-api/src/placement/protocol/warrant.rs",
+                "crates/ostadix-api/src/process.rs",
+                "crates/ostadix-api/src/version.rs",
+                "crates/ostadix-api/src/project/executor.rs",
+                "crates/ostadix-api/src/project/deployment.rs",
+                "crates/ostadix-api/src/project/launch.rs",
+                "crates/ostadix-api/src/project/logical.rs",
+                "crates/ostadix-api/src/project/mod.rs",
+                "crates/ostadix-api/src/project/model.rs",
+                "crates/ostadix-api/src/project/plan.rs",
+                "crates/ostadix-api/src/project/runtime.rs",
+                "crates/ostadix-api/src/project/runtime_graph.rs",
+                "crates/ostadix-api/src/project/trace.rs",
+                "crates/ostadix-api/src/project/world_execution.rs",
+                "crates/ostadix-api/src/registry/bundle/mod.rs",
+                "crates/ostadix-api/src/registry/placement_compat.rs",
+                "crates/ostadix-api/src/registry/store.rs",
+                "crates/ostadix-api/src/world/grounding.rs",
+                "crates/ostadix-api/src/world/identity.rs",
+                "crates/ostadix-api/src/world/identity_wire.rs",
+                "crates/ostadix-api/src/world/codec.rs",
+                "crates/ostadix-api/src/world/mod.rs",
+                "crates/ostadix-api/src/world/protocol.rs",
+                "crates/ostadix-api/src/world/receipt.rs",
+                "crates/ostadix-api/src/world/receipt_codec.rs",
+                "crates/ostadix-api/src/world/value.rs",
+                "crates/ostadix-api/src/world/value_codec.rs",
                 "tests/example_manifest.py",
                 "tests/fixtures/world_identity_v1.hex",
                 "tests/fixtures/project_hgraph/input.txt",
@@ -1391,6 +1524,8 @@ class SourceReleaseTests(unittest.TestCase):
                 for index in range(FIXTURE_EVIDENCE_GATE_COUNT)
             )
             included.update(release.HOSTED_HGRAPH_BENCHMARK_RELEASE_PATHS)
+            included.update(release.OSTADIX_API_RELEASE_PATHS)
+            included.update(release.OSTADIX_API_ROOT_MODULE_PATHS.values())
             excluded = {
                 ".DS_Store",
                 ".ocore-repair-backups/run/typeck.rs",
@@ -1442,7 +1577,7 @@ class SourceReleaseTests(unittest.TestCase):
             self.assertEqual(modes["ocore/kernel/x86_64/grub.cfg"], "100644")
             self.assertEqual(modes["ocore/kernel/x86_64/boot_info.oc"], "100644")
             self.assertEqual(modes["ocore/kernel/x86_64/boot_info_stub.oc"], "100644")
-            self.assertEqual(modes["src/ocore/boot_info.rs"], "100644")
+            self.assertEqual(modes["crates/ostadix-api/src/ocore/boot_info.rs"], "100644")
             self.assertEqual(modes["tests/fixtures/project_hgraph_tools/sh"], "100755")
             self.assertEqual(
                 modes["scripts/benchmark_hgraph_hosted.sh"], "100755"
@@ -1700,6 +1835,24 @@ class SourceReleaseTests(unittest.TestCase):
         ):
             self._build("missing-license.zip")
 
+    def test_engine_legal_metadata_is_required_release_closure(self) -> None:
+        self._commit()
+        required = ("crates/ostadix-api/LICENSE", "crates/ostadix-api/NOTICE")
+        self._git("rm", *required)
+        self._git("commit", "-q", "-m", "remove engine legal metadata")
+
+        self._assert_missing_required_paths(
+            "missing-engine-legal-metadata.zip", required
+        )
+
+    def test_engine_package_readme_is_required_release_member(self) -> None:
+        self._commit()
+        path = "crates/ostadix-api/README.md"
+        self._git("rm", path)
+        self._git("commit", "-q", "-m", "remove engine package README")
+
+        self._assert_missing_required_paths("missing-engine-readme.zip", (path,))
+
     def test_root_citation_is_a_required_release_member(self) -> None:
         self._commit()
         self._git("rm", "CITATION.cff")
@@ -1786,21 +1939,21 @@ class SourceReleaseTests(unittest.TestCase):
     def test_information_kernel_and_local_cli_surface_are_required(self) -> None:
         required = (
             "docs/INFORMATION_KERNEL_V1.md",
-            "src/canonical_cbor.rs",
+            "crates/ostadix-api/src/canonical_cbor.rs",
             "src/bin/o-info.rs",
-            "src/information/acquisition.rs",
-            "src/information/decision.rs",
-            "src/information/delta.rs",
-            "src/information/exchange.rs",
-            "src/information/id.rs",
-            "src/information/invalidation.rs",
-            "src/information/loss.rs",
-            "src/information/mod.rs",
-            "src/information/model.rs",
-            "src/information/projection.rs",
-            "src/information/root.rs",
-            "src/information/store.rs",
-            "src/information_bridge/mod.rs",
+            "crates/ostadix-api/src/information/acquisition.rs",
+            "crates/ostadix-api/src/information/decision.rs",
+            "crates/ostadix-api/src/information/delta.rs",
+            "crates/ostadix-api/src/information/exchange.rs",
+            "crates/ostadix-api/src/information/id.rs",
+            "crates/ostadix-api/src/information/invalidation.rs",
+            "crates/ostadix-api/src/information/loss.rs",
+            "crates/ostadix-api/src/information/mod.rs",
+            "crates/ostadix-api/src/information/model.rs",
+            "crates/ostadix-api/src/information/projection.rs",
+            "crates/ostadix-api/src/information/root.rs",
+            "crates/ostadix-api/src/information/store.rs",
+            "crates/ostadix-api/src/information_bridge/mod.rs",
             "tests/o_info_cli.rs",
             "tests/information_bridge_v1.rs",
         )
@@ -1843,51 +1996,51 @@ class SourceReleaseTests(unittest.TestCase):
     def test_hosted_placement_v6_commands_and_contract_are_required(self) -> None:
         required = (
             "backends/o_shim_common.py",
-            "src/backend.rs",
-            "src/backend_morphism.rs",
-            "src/backend_state.rs",
-            "src/backend_catalog.rs",
-            "src/eval.rs",
-            "src/eval_core.rs",
-            "src/execution_contract.rs",
+            "crates/ostadix-api/src/backend.rs",
+            "crates/ostadix-api/src/backend_morphism.rs",
+            "crates/ostadix-api/src/backend_state.rs",
+            "crates/ostadix-api/src/backend_catalog.rs",
+            "crates/ostadix-api/src/eval.rs",
+            "crates/ostadix-api/src/eval_core.rs",
+            "crates/ostadix-api/src/execution_contract.rs",
             "docs/HOSTED_PLACEMENT_V6.md",
             "setup.sh",
             "src/bin/o-node.rs",
             "src/bin/o-registry.rs",
             "src/bin/octl.rs",
-            "src/hosted_remote/client.rs",
-            "src/hosted_remote/mod.rs",
-            "src/hosted_remote/node.rs",
-            "src/hosted_remote/paths.rs",
-            "src/hosted_remote/protocol.rs",
-            "src/hosted_remote/tls.rs",
-            "src/hosted_remote/v2/auth.rs",
-            "src/hosted_remote/v2/client.rs",
-            "src/hosted_remote/v2/crypto.rs",
-            "src/hosted_remote/v2/dev.rs",
-            "src/hosted_remote/v2/mod.rs",
-            "src/hosted_remote/v2/protocol.rs",
-            "src/hosted_remote/v2/runtime.rs",
-            "src/hosted_remote/v2/server.rs",
-            "src/hosted_remote/v2/store.rs",
-            "src/hgraph/solve.rs",
-            "src/ir.rs",
-            "src/registry/placement_compat.rs",
-            "src/placement/mod.rs",
-            "src/placement/projection.rs",
-            "src/placement/protocol/candidate.rs",
-            "src/placement/protocol/catalog.rs",
-            "src/placement/protocol/digest.rs",
-            "src/placement/protocol/error.rs",
-            "src/placement/protocol/mod.rs",
-            "src/placement/protocol/records.rs",
-            "src/placement/protocol/requirement.rs",
-            "src/placement/protocol/state.rs",
-            "src/placement/protocol/target.rs",
-            "src/placement/protocol/warrant.rs",
-            "src/process.rs",
-            "src/registry/bundle/mod.rs",
-            "src/registry/store.rs",
+            "crates/ostadix-api/src/hosted_remote/client.rs",
+            "crates/ostadix-api/src/hosted_remote/mod.rs",
+            "crates/ostadix-api/src/hosted_remote/node.rs",
+            "crates/ostadix-api/src/hosted_remote/paths.rs",
+            "crates/ostadix-api/src/hosted_remote/protocol.rs",
+            "crates/ostadix-api/src/hosted_remote/tls.rs",
+            "crates/ostadix-api/src/hosted_remote/v2/auth.rs",
+            "crates/ostadix-api/src/hosted_remote/v2/client.rs",
+            "crates/ostadix-api/src/hosted_remote/v2/crypto.rs",
+            "crates/ostadix-api/src/hosted_remote/v2/dev.rs",
+            "crates/ostadix-api/src/hosted_remote/v2/mod.rs",
+            "crates/ostadix-api/src/hosted_remote/v2/protocol.rs",
+            "crates/ostadix-api/src/hosted_remote/v2/runtime.rs",
+            "crates/ostadix-api/src/hosted_remote/v2/server.rs",
+            "crates/ostadix-api/src/hosted_remote/v2/store.rs",
+            "crates/ostadix-api/src/hgraph/solve.rs",
+            "crates/ostadix-api/src/ir.rs",
+            "crates/ostadix-api/src/registry/placement_compat.rs",
+            "crates/ostadix-api/src/placement/mod.rs",
+            "crates/ostadix-api/src/placement/projection.rs",
+            "crates/ostadix-api/src/placement/protocol/candidate.rs",
+            "crates/ostadix-api/src/placement/protocol/catalog.rs",
+            "crates/ostadix-api/src/placement/protocol/digest.rs",
+            "crates/ostadix-api/src/placement/protocol/error.rs",
+            "crates/ostadix-api/src/placement/protocol/mod.rs",
+            "crates/ostadix-api/src/placement/protocol/records.rs",
+            "crates/ostadix-api/src/placement/protocol/requirement.rs",
+            "crates/ostadix-api/src/placement/protocol/state.rs",
+            "crates/ostadix-api/src/placement/protocol/target.rs",
+            "crates/ostadix-api/src/placement/protocol/warrant.rs",
+            "crates/ostadix-api/src/process.rs",
+            "crates/ostadix-api/src/registry/bundle/mod.rs",
+            "crates/ostadix-api/src/registry/store.rs",
             "tests/backend_morphism_v1.rs",
             "tests/hosted_remote_cli.rs",
             "tests/hosted_remote_v2.rs",
@@ -1933,6 +2086,26 @@ class SourceReleaseTests(unittest.TestCase):
         ):
             self._build("invalid-mcp-license.zip")
 
+    def test_mcp_lock_root_version_must_match_its_manifest(self) -> None:
+        self._commit()
+        lock_path = "mcp/ostadix_lang_mcp_server/Cargo.lock"
+        lock = (self.repo / lock_path).read_text(encoding="utf-8")
+        self._write(
+            lock_path,
+            lock.replace(
+                'name = "ostadix-mcp-server"\nversion = "0.1.0"',
+                'name = "ostadix-mcp-server"\nversion = "9.9.9"',
+                1,
+            ),
+        )
+        self._git("add", lock_path)
+        self._git("commit", "-q", "-m", "drift isolated MCP lock version")
+        with self.assertRaisesRegex(
+            release.ReleaseError,
+            r"Cargo\.lock ostadix-mcp-server version must match .*Cargo\.toml",
+        ):
+            self._build("invalid-mcp-lock-version.zip")
+
     def test_evidence_manifest_and_projector_are_required(self) -> None:
         self._commit()
         self._git(
@@ -1968,7 +2141,7 @@ class SourceReleaseTests(unittest.TestCase):
             "scripts/ostadix_boot_info_qemu.py",
             "scripts/ostadix_media_writer.py",
             "scripts/ostadix_physical_evidence.py",
-            "src/ocore/boot_info.rs",
+            "crates/ostadix-api/src/ocore/boot_info.rs",
             "tests/test_ostadix_boot_media.py",
             "tests/test_ostadix_boot_info_qemu.py",
             "tests/test_ostadix_media_writer.py",
@@ -1999,8 +2172,8 @@ class SourceReleaseTests(unittest.TestCase):
             "ocore/runtime/aarch64/g2_user_a.oc",
             "ocore/runtime/aarch64/g2_user_b.oc",
             "src/bin/ocorec.rs",
-            "src/ocore/codegen_aarch64.rs",
-            "src/ocore/driver.rs",
+            "crates/ostadix-api/src/ocore/codegen_aarch64.rs",
+            "crates/ostadix-api/src/ocore/driver.rs",
             "tests/test_release_evidence.py",
             "evidence/world/g2-aarch64-qemu.toml",
             "evidence/world/transcripts/g2-aarch64-qemu.log",
@@ -2017,7 +2190,7 @@ class SourceReleaseTests(unittest.TestCase):
             "ocore/kernel/build-aarch64-g2.sh",
             "ocore/kernel/smoke-aarch64-g2-qemu.sh",
             "ocore/runtime/aarch64/g2_kernel.oc",
-            "src/ocore/codegen_aarch64.rs",
+            "crates/ostadix-api/src/ocore/codegen_aarch64.rs",
             "tests/test_release_evidence.py",
         ):
             self.assertIn(path, message)
@@ -2059,20 +2232,24 @@ class SourceReleaseTests(unittest.TestCase):
             "rm",
             "ocore/kernel/smoke-world-identity-qemu.sh",
             "ocore/world/identity.oc",
-            "src/world/identity.rs",
-            "src/world/identity_wire.rs",
+            "crates/ostadix-api/src/world/identity.rs",
+            "crates/ostadix-api/src/world/identity_wire.rs",
             "tests/fixtures/world_identity_v1.hex",
             "tests/world_identity_wire.rs",
         )
         self._git("commit", "-q", "-m", "remove World identity surface")
 
-        with self.assertRaisesRegex(
-            release.ReleaseError,
-            r"missing required path\(s\): .*smoke-world-identity-qemu\.sh.*"
-            r"ocore/world/identity\.oc.*src/world/identity\.rs.*identity_wire\.rs.*"
-            r"world_identity_v1\.hex.*world_identity_wire\.rs",
-        ):
-            self._build("missing-world-identity.zip")
+        self._assert_missing_required_paths(
+            "missing-world-identity.zip",
+            (
+                "ocore/kernel/smoke-world-identity-qemu.sh",
+                "ocore/world/identity.oc",
+                "crates/ostadix-api/src/world/identity.rs",
+                "crates/ostadix-api/src/world/identity_wire.rs",
+                "tests/fixtures/world_identity_v1.hex",
+                "tests/world_identity_wire.rs",
+            ),
+        )
 
     def test_world_protocol_cross_language_surface_is_required(self) -> None:
         self._commit()
@@ -2083,22 +2260,27 @@ class SourceReleaseTests(unittest.TestCase):
             "ocore/kernel/world_protocol_semantics_stub.oc",
             "ocore/world/codec.oc",
             "ocore/world/protocol.oc",
-            "src/world/codec.rs",
-            "src/world/protocol.rs",
+            "crates/ostadix-api/src/world/codec.rs",
+            "crates/ostadix-api/src/world/protocol.rs",
             "tests/fixtures/world_protocol_v1.hex",
             "tests/world_protocol.rs",
         )
         self._git("commit", "-q", "-m", "remove World protocol surface")
 
-        with self.assertRaisesRegex(
-            release.ReleaseError,
-            r"missing required path\(s\): .*smoke-world-protocol-qemu\.sh.*"
-            r"world_protocol_semantics\.oc.*world_protocol_semantics_stub\.oc.*"
-            r"ocore/world/codec\.oc.*ocore/world/protocol\.oc.*"
-            r"src/world/codec\.rs.*src/world/protocol\.rs.*"
-            r"world_protocol_v1\.hex.*world_protocol\.rs",
-        ):
-            self._build("missing-world-protocol.zip")
+        self._assert_missing_required_paths(
+            "missing-world-protocol.zip",
+            (
+                "ocore/kernel/smoke-world-protocol-qemu.sh",
+                "ocore/kernel/world_protocol_semantics.oc",
+                "ocore/kernel/world_protocol_semantics_stub.oc",
+                "ocore/world/codec.oc",
+                "ocore/world/protocol.oc",
+                "crates/ostadix-api/src/world/codec.rs",
+                "crates/ostadix-api/src/world/protocol.rs",
+                "tests/fixtures/world_protocol_v1.hex",
+                "tests/world_protocol.rs",
+            ),
+        )
 
     def test_world_value_cross_language_surface_is_required(self) -> None:
         self._commit()
@@ -2110,22 +2292,28 @@ class SourceReleaseTests(unittest.TestCase):
             "ocore/world/sha256.oc",
             "ocore/world/value.oc",
             "ocore/world/value_codec.oc",
-            "src/world/value.rs",
-            "src/world/value_codec.rs",
+            "crates/ostadix-api/src/world/value.rs",
+            "crates/ostadix-api/src/world/value_codec.rs",
             "tests/fixtures/world_value_v1.hex",
             "tests/world_value.rs",
         )
         self._git("commit", "-q", "-m", "remove World value surface")
 
-        with self.assertRaisesRegex(
-            release.ReleaseError,
-            r"missing required path\(s\): .*smoke-world-value-qemu\.sh.*"
-            r"world_value_semantics\.oc.*world_value_semantics_stub\.oc.*"
-            r"ocore/world/sha256\.oc.*ocore/world/value\.oc.*"
-            r"ocore/world/value_codec\.oc.*src/world/value\.rs.*"
-            r"src/world/value_codec\.rs.*world_value_v1\.hex.*world_value\.rs",
-        ):
-            self._build("missing-world-value.zip")
+        self._assert_missing_required_paths(
+            "missing-world-value.zip",
+            (
+                "ocore/kernel/smoke-world-value-qemu.sh",
+                "ocore/kernel/world_value_semantics.oc",
+                "ocore/kernel/world_value_semantics_stub.oc",
+                "ocore/world/sha256.oc",
+                "ocore/world/value.oc",
+                "ocore/world/value_codec.oc",
+                "crates/ostadix-api/src/world/value.rs",
+                "crates/ostadix-api/src/world/value_codec.rs",
+                "tests/fixtures/world_value_v1.hex",
+                "tests/world_value.rs",
+            ),
+        )
 
     def test_world_receipt_cross_language_surface_is_required(self) -> None:
         self._commit()
@@ -2136,88 +2324,100 @@ class SourceReleaseTests(unittest.TestCase):
             "ocore/kernel/world_receipt_semantics_stub.oc",
             "ocore/world/receipt.oc",
             "ocore/world/receipt_codec.oc",
-            "src/world/receipt.rs",
-            "src/world/receipt_codec.rs",
+            "crates/ostadix-api/src/world/receipt.rs",
+            "crates/ostadix-api/src/world/receipt_codec.rs",
             "tests/fixtures/world_receipt_v1.hex",
             "tests/world_receipt.rs",
         )
         self._git("commit", "-q", "-m", "remove World receipt surface")
 
-        with self.assertRaisesRegex(
-            release.ReleaseError,
-            r"missing required path\(s\): .*smoke-world-receipt-qemu\.sh.*"
-            r"world_receipt_semantics\.oc.*world_receipt_semantics_stub\.oc.*"
-            r"ocore/world/receipt\.oc.*ocore/world/receipt_codec\.oc.*"
-            r"src/world/receipt\.rs.*src/world/receipt_codec\.rs.*"
-            r"world_receipt_v1\.hex.*world_receipt\.rs",
-        ):
-            self._build("missing-world-receipt.zip")
+        self._assert_missing_required_paths(
+            "missing-world-receipt.zip",
+            (
+                "ocore/kernel/smoke-world-receipt-qemu.sh",
+                "ocore/kernel/world_receipt_semantics.oc",
+                "ocore/kernel/world_receipt_semantics_stub.oc",
+                "ocore/world/receipt.oc",
+                "ocore/world/receipt_codec.oc",
+                "crates/ostadix-api/src/world/receipt.rs",
+                "crates/ostadix-api/src/world/receipt_codec.rs",
+                "tests/fixtures/world_receipt_v1.hex",
+                "tests/world_receipt.rs",
+            ),
+        )
 
     def test_world_resource_key_hosted_surface_is_required(self) -> None:
         self._commit()
         self._git(
             "rm",
             "scripts/smoke-world-resource-keys.sh",
-            "src/effects.rs",
-            "src/executor/mod.rs",
-            "src/hgraph/from_oir.rs",
-            "src/world/grounding.rs",
+            "crates/ostadix-api/src/effects.rs",
+            "crates/ostadix-api/src/executor/mod.rs",
+            "crates/ostadix-api/src/hgraph/from_oir.rs",
+            "crates/ostadix-api/src/world/grounding.rs",
             "tests/world_resource_keys.rs",
         )
         self._git("commit", "-q", "-m", "remove World ResourceKey surface")
 
-        with self.assertRaisesRegex(
-            release.ReleaseError,
-            r"missing required path\(s\): .*smoke-world-resource-keys\.sh.*"
-            r"src/effects\.rs.*src/executor/mod\.rs.*src/hgraph/from_oir\.rs.*"
-            r"src/world/grounding\.rs.*tests/world_resource_keys\.rs",
-        ):
-            self._build("missing-world-resource-keys.zip")
+        self._assert_missing_required_paths(
+            "missing-world-resource-keys.zip",
+            (
+                "scripts/smoke-world-resource-keys.sh",
+                "crates/ostadix-api/src/effects.rs",
+                "crates/ostadix-api/src/executor/mod.rs",
+                "crates/ostadix-api/src/hgraph/from_oir.rs",
+                "crates/ostadix-api/src/world/grounding.rs",
+                "tests/world_resource_keys.rs",
+            ),
+        )
 
     def test_evidence_bound_admission_surface_is_required(self) -> None:
         self._commit()
         self._git(
             "rm",
-            "src/evidence/admit.rs",
-            "src/evidence/analyze.rs",
-            "src/evidence/fact.rs",
-            "src/evidence/intent.rs",
-            "src/evidence/mod.rs",
-            "src/evidence/profile.rs",
-            "src/backend_catalog.rs",
-            "src/backend_catalog.inc.rs",
-            "src/execution_contract.rs",
-            "src/runtime_exec.rs",
+            "crates/ostadix-api/src/evidence/admit.rs",
+            "crates/ostadix-api/src/evidence/analyze.rs",
+            "crates/ostadix-api/src/evidence/fact.rs",
+            "crates/ostadix-api/src/evidence/intent.rs",
+            "crates/ostadix-api/src/evidence/mod.rs",
+            "crates/ostadix-api/src/evidence/profile.rs",
+            "crates/ostadix-api/src/backend_catalog.rs",
+            "crates/ostadix-api/src/backend_catalog.inc.rs",
+            "crates/ostadix-api/src/execution_contract.rs",
+            "crates/ostadix-api/src/runtime_exec.rs",
         )
         self._git("commit", "-q", "-m", "remove evidence-bound admission surface")
 
         with self.assertRaisesRegex(
             release.ReleaseError,
-            r"missing required path\(s\): .*src/backend_catalog\.inc\.rs.*"
-            r"src/backend_catalog\.rs.*"
-            r"src/evidence/admit\.rs.*"
-            r"src/evidence/analyze\.rs.*src/evidence/fact\.rs.*"
-            r"src/evidence/intent\.rs.*src/evidence/mod\.rs.*src/evidence/profile\.rs.*"
-            r"src/execution_contract\.rs.*"
-            r"src/runtime_exec\.rs",
+            r"missing required path\(s\): .*crates/ostadix-api/src/backend_catalog\.inc\.rs.*"
+            r"crates/ostadix-api/src/backend_catalog\.rs.*"
+            r"crates/ostadix-api/src/evidence/admit\.rs.*"
+            r"crates/ostadix-api/src/evidence/analyze\.rs.*crates/ostadix-api/src/evidence/fact\.rs.*"
+            r"crates/ostadix-api/src/evidence/intent\.rs.*crates/ostadix-api/src/evidence/mod\.rs.*crates/ostadix-api/src/evidence/profile\.rs.*"
+            r"crates/ostadix-api/src/execution_contract\.rs.*"
+            r"crates/ostadix-api/src/runtime_exec\.rs",
         ):
             self._build("missing-evidence-bound-admission.zip")
 
     def test_olangc_embedded_runtime_source_closure_is_derived_from_compiler(self) -> None:
         self._commit(
             {
-                "src/bin/olangc.rs": (
-                    'const RUNTIME_VALUE_RS: &str = include_str!("../value.rs");\n'
+                "crates/ostadix-api/src/api/aot_source.rs": (
+                    'pub const RUNTIME_VALUE_RS: &str = include_str!("../value.rs");\n'
+                    'pub const AOT_ONLY: &str = include_str!("../aot_only.rs");\n'
                 ),
-                "src/value.rs": "// generated-runtime fixture value model\n",
+                "crates/ostadix-api/src/aot_only.rs": (
+                    "// generated-runtime fixture input\n"
+                ),
             }
         )
-        self._git("rm", "src/value.rs")
+        self._git("rm", "crates/ostadix-api/src/aot_only.rs")
         self._git("commit", "-q", "-m", "remove generated runtime input")
 
         with self.assertRaisesRegex(
             release.ReleaseError,
-            r"generated-runtime source closure path\(s\): src/value\.rs",
+            r"generated-runtime source closure path\(s\): crates/ostadix-api/src/aot_only\.rs",
         ):
             self._build("missing-generated-runtime-input.zip")
 
@@ -2226,16 +2426,13 @@ class SourceReleaseTests(unittest.TestCase):
             "valid-before-runtime-closure-tamper.zip",
             ref=self._commit(
                 {
-                    "src/bin/olangc.rs": (
-                        'const RUNTIME_VALUE_RS: &str = include_str!("../value.rs");\n'
-                    ),
-                    "src/value.rs": "// generated-runtime fixture value model\n",
+                    "crates/ostadix-api/src/value.rs": "// generated-runtime fixture value model\n",
                 }
             ),
         )
 
         def redirect_runtime_include(entry):
-            if entry.path == "src/bin/olangc.rs":
+            if entry.path == "crates/ostadix-api/src/api/aot_source.rs":
                 return release.SourceEntry(
                     entry.path,
                     entry.mode,
@@ -2250,7 +2447,7 @@ class SourceReleaseTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(
             release.ReleaseError,
-            r"generated-runtime source closure path\(s\): src/missing-runtime\.rs",
+            r"generated-runtime source closure path\(s\): crates/ostadix-api/src/missing-runtime\.rs",
         ):
             release.verify_archive(tampered)
 
@@ -2258,15 +2455,15 @@ class SourceReleaseTests(unittest.TestCase):
         self._commit()
         self._git(
             "rm",
-            "src/executor/pool.rs",
-            "src/executor/task.rs",
+            "crates/ostadix-api/src/executor/pool.rs",
+            "crates/ostadix-api/src/executor/task.rs",
         )
         self._git("commit", "-q", "-m", "remove prepared-task pool surface")
 
         with self.assertRaisesRegex(
             release.ReleaseError,
-            r"missing required path\(s\): .*src/executor/pool\.rs.*"
-            r"src/executor/task\.rs",
+            r"missing required path\(s\): .*crates/ostadix-api/src/executor/pool\.rs.*"
+            r"crates/ostadix-api/src/executor/task\.rs",
         ):
             self._build("missing-prepared-task-pool.zip")
 
@@ -2282,16 +2479,16 @@ class SourceReleaseTests(unittest.TestCase):
             ".github/workflows/ci.yml",
             "src/bin/olangc.rs",
             "src/bin/olink.rs",
-            "src/hgraph/graph.rs",
-            "src/hgraph/kinds.rs",
-            "src/project/executor.rs",
-            "src/project/deployment.rs",
-            "src/project/logical.rs",
-            "src/project/mod.rs",
-            "src/project/model.rs",
-            "src/project/plan.rs",
-            "src/project/runtime.rs",
-            "src/project/trace.rs",
+            "crates/ostadix-api/src/hgraph/graph.rs",
+            "crates/ostadix-api/src/hgraph/kinds.rs",
+            "crates/ostadix-api/src/project/executor.rs",
+            "crates/ostadix-api/src/project/deployment.rs",
+            "crates/ostadix-api/src/project/logical.rs",
+            "crates/ostadix-api/src/project/mod.rs",
+            "crates/ostadix-api/src/project/model.rs",
+            "crates/ostadix-api/src/project/plan.rs",
+            "crates/ostadix-api/src/project/runtime.rs",
+            "crates/ostadix-api/src/project/trace.rs",
             "tests/fixtures/project_hgraph/input.txt",
             "tests/fixtures/project_hgraph/olang.project.toml",
             "tests/fixtures/project_hgraph_exec/input.txt",
@@ -2304,22 +2501,38 @@ class SourceReleaseTests(unittest.TestCase):
         )
         self._git("commit", "-q", "-m", "remove hosted project HGraph surface")
 
-        with self.assertRaisesRegex(
-            release.ReleaseError,
-            r"missing required path\(s\): .*\.github/workflows/ci\.yml.*"
-            r"install-o-cli-wrapper\.sh.*o-cli\.sh.*"
-            r"smoke-project-hgraph-exec\.sh.*smoke-project-hgraph\.sh.*"
-            r"src/bin/olangc\.rs.*src/bin/olink\.rs.*src/hgraph/graph\.rs.*src/hgraph/kinds\.rs.*"
-            r"src/project/deployment\.rs.*src/project/executor\.rs.*src/project/logical\.rs.*"
-            r"src/project/mod\.rs.*src/project/model\.rs.*"
-            r"src/project/plan\.rs.*src/project/runtime\.rs.*src/project/trace\.rs.*"
-            r"project_hgraph/input\.txt.*project_hgraph/olang\.project\.toml.*"
-            r"project_hgraph_exec/input\.txt.*project_hgraph_exec/olang\.project\.toml.*"
-            r"project_hgraph_tools/sh.*"
-            r"tests/project_deployment_plan\.rs.*tests/project_hgraph\.rs.*"
-            r"tests/project_hgraph_exec\.rs.*tests/project_logical_hgraph\.rs",
-        ):
-            self._build("missing-project-hgraph.zip")
+        self._assert_missing_required_paths(
+            "missing-project-hgraph.zip",
+            (
+                ".github/workflows/ci.yml",
+                "scripts/o-cli.sh",
+                "scripts/o-kernel.sh",
+                "scripts/install-o-cli-wrapper.sh",
+                "scripts/smoke-project-hgraph-exec.sh",
+                "scripts/smoke-project-hgraph.sh",
+                "src/bin/olangc.rs",
+                "src/bin/olink.rs",
+                "crates/ostadix-api/src/hgraph/graph.rs",
+                "crates/ostadix-api/src/hgraph/kinds.rs",
+                "crates/ostadix-api/src/project/executor.rs",
+                "crates/ostadix-api/src/project/deployment.rs",
+                "crates/ostadix-api/src/project/logical.rs",
+                "crates/ostadix-api/src/project/mod.rs",
+                "crates/ostadix-api/src/project/model.rs",
+                "crates/ostadix-api/src/project/plan.rs",
+                "crates/ostadix-api/src/project/runtime.rs",
+                "crates/ostadix-api/src/project/trace.rs",
+                "tests/fixtures/project_hgraph/input.txt",
+                "tests/fixtures/project_hgraph/olang.project.toml",
+                "tests/fixtures/project_hgraph_exec/input.txt",
+                "tests/fixtures/project_hgraph_exec/olang.project.toml",
+                "tests/fixtures/project_hgraph_tools/sh",
+                "tests/project_hgraph.rs",
+                "tests/project_hgraph_exec.rs",
+                "tests/project_deployment_plan.rs",
+                "tests/project_logical_hgraph.rs",
+            ),
+        )
 
     def test_project_world_runtime_surface_is_required(self) -> None:
         self._commit()
@@ -2329,23 +2542,26 @@ class SourceReleaseTests(unittest.TestCase):
             "ocore/kernel/smoke-world-project-runtime-qemu.sh",
             "ocore/kernel/world_project_receipt_semantics.oc",
             "ocore/kernel/world_project_receipt_semantics_stub.oc",
-            "src/project/launch.rs",
-            "src/project/runtime_graph.rs",
-            "src/project/world_execution.rs",
+            "crates/ostadix-api/src/project/launch.rs",
+            "crates/ostadix-api/src/project/runtime_graph.rs",
+            "crates/ostadix-api/src/project/world_execution.rs",
             "tests/project_world_runtime.rs",
         )
         self._git("commit", "-q", "-m", "remove bounded World-project runtime")
 
-        with self.assertRaisesRegex(
-            release.ReleaseError,
-            r"missing required path\(s\): .*smoke-world-project-receipt-qemu\.sh.*"
-            r"smoke-world-project-runtime-qemu\.sh.*"
-            r"world_project_receipt_semantics\.oc.*"
-            r"world_project_receipt_semantics_stub\.oc.*"
-            r"src/project/launch\.rs.*src/project/runtime_graph\.rs.*"
-            r"src/project/world_execution\.rs.*tests/project_world_runtime\.rs",
-        ):
-            self._build("missing-project-world-runtime.zip")
+        self._assert_missing_required_paths(
+            "missing-project-world-runtime.zip",
+            (
+                "ocore/kernel/smoke-world-project-receipt-qemu.sh",
+                "ocore/kernel/smoke-world-project-runtime-qemu.sh",
+                "ocore/kernel/world_project_receipt_semantics.oc",
+                "ocore/kernel/world_project_receipt_semantics_stub.oc",
+                "crates/ostadix-api/src/project/launch.rs",
+                "crates/ostadix-api/src/project/runtime_graph.rs",
+                "crates/ostadix-api/src/project/world_execution.rs",
+                "tests/project_world_runtime.rs",
+            ),
+        )
 
     def test_world_normative_bytes_are_sealed_before_packaging(self) -> None:
         for path, data in WORLD_NORMATIVE_BYTES.items():
@@ -2396,7 +2612,7 @@ class SourceReleaseTests(unittest.TestCase):
             self._build("tampered-g2-transcript.zip")
 
     def test_historical_world_attestation_does_not_claim_current_archive_sources(self) -> None:
-        path = "src/ocore/codegen_aarch64.rs"
+        path = "crates/ostadix-api/src/ocore/codegen_aarch64.rs"
         commit = self._commit({path: (PROJECT_ROOT / path).read_bytes() + b"\n"})
         result = self._build("historical-g2-source.zip", ref=commit)
         self.assertTrue(result.output.is_file())
@@ -2624,7 +2840,7 @@ class SourceReleaseTests(unittest.TestCase):
             release._validate_release_rederive_ledger([attestation], [])
 
     def test_fresh_attestation_cannot_couple_replace_the_trusted_validator(self) -> None:
-        path = "evidence/world/g0-ostadix-alpha-branding-2026-08-09.toml"
+        path = "evidence/world/g0-independent-engine-2026-08-17.toml"
         source_path = PROJECT_ROOT / path
         if not source_path.is_file():
             self.skipTest("fresh schema-v3 G0 attestation has not been minted yet")
@@ -2633,7 +2849,10 @@ class SourceReleaseTests(unittest.TestCase):
             path,
             attestation["transcript"],
             attestation["command"][0][2:],
-            *(item["path"] for item in attestation["source"]),
+            *(
+                release._released_path_for_historical_source(item["path"])
+                for item in attestation["source"]
+            ),
             *(
                 item["path"]
                 for item in attestation["artifact"]
@@ -2659,7 +2878,7 @@ class SourceReleaseTests(unittest.TestCase):
             )
 
     def test_fresh_attestation_seal_rejects_coupled_transcript_rewrite(self) -> None:
-        path = "evidence/world/g0-ostadix-alpha-branding-2026-08-09.toml"
+        path = "evidence/world/g0-independent-engine-2026-08-17.toml"
         source_path = PROJECT_ROOT / path
         if not source_path.is_file():
             self.skipTest("fresh schema-v3 G0 attestation has not been minted yet")
@@ -2826,7 +3045,7 @@ class SourceReleaseTests(unittest.TestCase):
             {
                 "assets/data.bin": b"\x00\x01\x02",
                 "scripts/release-helper.sh": "#!/bin/sh\nexit 0\n",
-                "src/lib.rs": "pub const ANSWER: u8 = 42;\n",
+                "src/lib.rs": FIXTURE_ROOT_LIB_SOURCE + "// answer=42\n",
             }
         )
         first = self._build("first.zip", ref="HEAD")
@@ -2836,7 +3055,7 @@ class SourceReleaseTests(unittest.TestCase):
         self.assertEqual(first.output.read_bytes(), second.output.read_bytes())
 
     def test_dirty_tree_requires_override_and_override_uses_commit_bytes(self) -> None:
-        self._commit({"src/lib.rs": "pub fn clean() {}\n"})
+        self._commit({"src/lib.rs": FIXTURE_ROOT_LIB_SOURCE + "// clean\n"})
         self._write("README.md", "uncommitted readme\n")
         self._write("untracked.txt", "untracked\n")
 
@@ -2853,7 +3072,7 @@ class SourceReleaseTests(unittest.TestCase):
             )
 
     def test_verifier_rejects_payload_tampering(self) -> None:
-        self._commit({"src/lib.rs": "pub fn intact() {}\n"})
+        self._commit({"src/lib.rs": FIXTURE_ROOT_LIB_SOURCE + "// intact\n"})
         result = self._build("valid.zip")
         tampered = self.root / "tampered.zip"
 

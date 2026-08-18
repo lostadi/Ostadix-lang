@@ -728,7 +728,7 @@ pub fn backend_executable_set_v2_from_manifest(
     project_backend_executable_set_v2(rows).map_err(Into::into)
 }
 
-/// Child-process projection used by `src/backend.rs`.  It independently
+/// Child-process projection used by this crate's `backend.rs`. It independently
 /// revalidates the admitted rows immediately before every direct launch.
 #[derive(Debug)]
 pub struct BackendToolchain {

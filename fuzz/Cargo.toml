@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-o-lang = { path = ".." }
+ostadix-api = { path = "../crates/ostadix-api", version = "=0.4.0" }
 
 [[bin]]
 name = "parser"
