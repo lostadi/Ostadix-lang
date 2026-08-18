@@ -895,11 +895,11 @@ macro_rules! backend_catalog {
     };
 }
 
-// Compile-time projection of the root catalog. The MCP crate remains
+// Compile-time projection of the engine-owned catalog. The MCP crate remains
 // dependency-isolated while consuming the identical backend declarations.
 include!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../src/backend_catalog.inc.rs"
+    "/../../crates/ostadix-api/src/backend_catalog.inc.rs"
 ));
 
 fn catalog_backends_for(requirement_key: &str) -> Vec<&'static str> {

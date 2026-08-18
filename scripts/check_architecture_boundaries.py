@@ -125,6 +125,7 @@ RULES = (
             "hgraph",
             "hosted_remote",
             "information",
+            "information_provenance",
             "kernel_world",
             "live_system",
             "nix_ops",
@@ -732,6 +733,7 @@ class PathViolation:
 
 @dataclasses.dataclass(frozen=True)
 class ProductionSpec:
+    package_manifest: str
     source_root: str
     crate_root: str
     excluded_files: frozenset[str]
@@ -813,23 +815,32 @@ class ArchitectureAudit:
 
 
 def _file_module_path(
-    relative: str, physical_overrides: tuple[PhysicalOverride, ...] = ()
+    relative: str,
+    source_root: str = "src",
+    physical_overrides: tuple[PhysicalOverride, ...] = (),
 ) -> tuple[str, ...]:
     """Derive the declared library-module path for one governed Rust file."""
 
     parts = Path(relative).parts
+    source_parts = Path(source_root).parts
+    if parts[: len(source_parts)] != source_parts:
+        raise ValueError(
+            f"`{relative}` is not a conventional Rust source path beneath "
+            f"`{source_root}`"
+        )
+    local_parts = parts[len(source_parts) :]
     explicit_file_override = any(
         override.kind == "file" and parts == Path(override.path).parts
         for override in physical_overrides
     )
     if (
-        len(parts) < 2
-        or parts[0] != "src"
-        or (not parts[-1].endswith(".rs") and not explicit_file_override)
+        not local_parts
+        or (not local_parts[-1].endswith(".rs") and not explicit_file_override)
     ):
-        raise ValueError(f"`{relative}` is not a conventional Rust source path beneath src/")
-    if len(parts) > 2 and parts[1] == "bin":
-        raise ValueError(f"`{relative}` is a binary-crate path, not a library-module path")
+        raise ValueError(
+            f"`{relative}` is not a conventional Rust source path beneath "
+            f"`{source_root}`"
+        )
 
     explicit_root: tuple[str, ...] | None = None
     explicit_suffix: tuple[str, ...] = ()
@@ -855,12 +866,12 @@ def _file_module_path(
             modules = (*explicit_root, *explicit_suffix[:-1])
         else:
             modules = (*explicit_root, *explicit_suffix[:-1], explicit_suffix[-1][:-3])
-    elif parts[-1] in {"lib.rs", "main.rs"}:
+    elif local_parts[-1] in {"lib.rs", "main.rs"}:
         modules: tuple[str, ...] = ()
-    elif parts[-1] == "mod.rs":
-        modules = tuple(parts[1:-1])
+    elif local_parts[-1] == "mod.rs":
+        modules = tuple(local_parts[:-1])
     else:
-        modules = (*parts[1:-1], parts[-1][:-3])
+        modules = (*local_parts[:-1], local_parts[-1][:-3])
     if any(not IDENTIFIER_RE.fullmatch(module) for module in modules):
         raise ValueError(f"`{relative}` has an invalid declared module path")
     return modules
@@ -1483,6 +1494,23 @@ def _relative_manifest_path(value: object, label: str) -> str:
     return value
 
 
+def _package_target_path(package_manifest: str, value: object, label: str) -> str:
+    """Resolve a Cargo target path relative to its package manifest."""
+
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{label} must be a non-empty relative path")
+    candidate = Path(value)
+    if candidate.is_absolute() or "\\" in value or candidate.as_posix() != value:
+        raise ValueError(f"{label} must remain repository-relative")
+    manifest_parent = Path(package_manifest).parent.as_posix()
+    joined = posixpath.normpath(
+        value if manifest_parent == "." else f"{manifest_parent}/{value}"
+    )
+    if joined in {"", ".", ".."} or joined.startswith("../"):
+        raise ValueError(f"{label} escapes the repository")
+    return _relative_manifest_path(joined, label)
+
+
 def _string_list(value: object, label: str) -> tuple[str, ...]:
     if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
         raise ValueError(f"{label} must be an array of strings")
@@ -1539,9 +1567,19 @@ def load_manifest(root: Path, manifest_path: Path | None = None) -> Architecture
     _exact_keys(
         production_table,
         frozenset(
-            {"source_root", "crate_root", "excluded_files", "excluded_directories"}
+            {
+                "package_manifest",
+                "source_root",
+                "crate_root",
+                "excluded_files",
+                "excluded_directories",
+            }
         ),
         "manifest `production`",
+    )
+    package_manifest = _relative_manifest_path(
+        production_table["package_manifest"],
+        "manifest production.package_manifest",
     )
     source_root = _relative_manifest_path(
         production_table["source_root"], "manifest production.source_root"
@@ -1572,7 +1610,7 @@ def load_manifest(root: Path, manifest_path: Path | None = None) -> Architecture
     if crate_root not in excluded_files:
         raise ValueError("manifest production.crate_root must be an excluded module entrypoint")
     production = ProductionSpec(
-        source_root, crate_root, excluded_files, excluded_directories
+        package_manifest, source_root, crate_root, excluded_files, excluded_directories
     )
 
     physical_overrides: list[PhysicalOverride] = []
@@ -1673,7 +1711,6 @@ def load_manifest(root: Path, manifest_path: Path | None = None) -> Architecture
 
     expected_excluded_files = {
         crate_root,
-        f"{source_root}/main.rs",
         *(fragment.path for fragment in compiled_fragments),
     }
     if excluded_files != expected_excluded_files:
@@ -1686,9 +1723,9 @@ def load_manifest(root: Path, manifest_path: Path | None = None) -> Architecture
             details.append(f"unexpected {', '.join(unexpected)}")
         raise ValueError(
             "manifest production.excluded_files must contain exactly the crate "
-            "entrypoints and declared compiled fragments (" + "; ".join(details) + ")"
+            "entrypoint and declared compiled fragments (" + "; ".join(details) + ")"
         )
-    expected_excluded_directories = {f"{source_root}/bin"}
+    expected_excluded_directories: set[str] = set()
     if set(excluded_directories) != expected_excluded_directories:
         missing = sorted(expected_excluded_directories - set(excluded_directories))
         unexpected = sorted(set(excluded_directories) - expected_excluded_directories)
@@ -1698,8 +1735,8 @@ def load_manifest(root: Path, manifest_path: Path | None = None) -> Architecture
         if unexpected:
             details.append(f"unexpected {', '.join(unexpected)}")
         raise ValueError(
-            "manifest production.excluded_directories must contain exactly the "
-            "conventional binary source directory (" + "; ".join(details) + ")"
+            "manifest production.excluded_directories must be empty; the governed "
+            "library package cannot hide a source directory (" + "; ".join(details) + ")"
         )
 
     facades: list[FacadeSpec] = []
@@ -1860,6 +1897,49 @@ def _crate_root_declarations(path: Path) -> dict[str, CrateRootDeclaration]:
             if cursor < len(tokens) and tokens[cursor].text == "(":
                 public = False
                 cursor = matches[cursor] + 1
+        if public and cursor + 3 < len(tokens) and _is_keyword(
+            source, tokens[cursor], "use"
+        ):
+            if pending_path is not None:
+                raise ValueError("path attribute is not attached to a module declaration")
+            if not (
+                tokens[cursor + 1].text == "api"
+                and tokens[cursor + 2].text == "::"
+                and tokens[cursor + 3].text == "{"
+            ):
+                raise ValueError(
+                    "crate-root public uses are limited to an explicit `api::{...}` "
+                    "value projection"
+                )
+            closing = matches[cursor + 3]
+            projection_tokens = tokens[cursor + 4 : closing]
+            expect_name = True
+            names: set[str] = set()
+            for projection in projection_tokens:
+                if expect_name:
+                    if not IDENTIFIER_RE.fullmatch(projection.text):
+                        raise ValueError(
+                            "crate-root `api` value projection must contain plain identifiers"
+                        )
+                    if projection.text in names:
+                        raise ValueError(
+                            "crate-root `api` value projection contains a duplicate"
+                        )
+                    names.add(projection.text)
+                    expect_name = False
+                else:
+                    if projection.text != ",":
+                        raise ValueError(
+                            "crate-root `api` value projection must be comma separated"
+                        )
+                    expect_name = True
+            if not names:
+                raise ValueError("crate-root `api` value projection is empty")
+            terminator = closing + 1
+            if terminator >= len(tokens) or tokens[terminator].text != ";":
+                raise ValueError("crate-root `api` value projection must end with `;`")
+            index = terminator + 1
+            continue
         if cursor + 1 < len(tokens) and _is_keyword(source, tokens[cursor], "mod"):
             name = tokens[cursor + 1].text
             if not IDENTIFIER_RE.fullmatch(name):
@@ -2179,43 +2259,338 @@ def _source_inclusion_surface(
 def _cargo_library_findings(
     root: Path, manifest: ArchitectureManifest
 ) -> list[str]:
-    cargo_path = root / "Cargo.toml"
+    cargo_relative = manifest.production.package_manifest
+    cargo_path = root / cargo_relative
     if not cargo_path.is_file() or cargo_path.is_symlink():
-        return ["Cargo.toml: required regular package manifest is missing"]
+        return [f"{cargo_relative}: required regular package manifest is missing"]
     try:
         cargo = tomllib.loads(cargo_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, tomllib.TOMLDecodeError) as error:
-        return [f"Cargo.toml: could not parse package manifest: {error}"]
+        return [f"{cargo_relative}: could not parse package manifest: {error}"]
 
     package = cargo.get("package")
     if not isinstance(package, dict):
-        return ["Cargo.toml: architecture root requires a package table"]
+        return [f"{cargo_relative}: architecture root requires a package table"]
     autolib = package.get("autolib", True)
     if not isinstance(autolib, bool):
-        return ["Cargo.toml: package.autolib must be boolean when present"]
+        return [f"{cargo_relative}: package.autolib must be boolean when present"]
 
     lib = cargo.get("lib")
     if lib is None:
         if not autolib:
             return [
-                "Cargo.toml: package.autolib=false removes the governed library target"
+                f"{cargo_relative}: package.autolib=false removes the governed "
+                "library target"
             ]
-        declared = "src/lib.rs"
+        raw_path: object = "src/lib.rs"
     else:
         if not isinstance(lib, dict):
-            return ["Cargo.toml: lib target must be a table"]
+            return [f"{cargo_relative}: lib target must be a table"]
         raw_path = lib.get("path", "src/lib.rs")
-        try:
-            declared = _relative_manifest_path(raw_path, "Cargo.toml lib.path")
-        except ValueError as error:
-            return [str(error)]
+    try:
+        declared = _package_target_path(
+            cargo_relative, raw_path, f"{cargo_relative} lib.path"
+        )
+    except ValueError as error:
+        return [str(error)]
 
     if declared != manifest.production.crate_root:
         return [
-            f"Cargo.toml: library target `{declared}` does not match governed crate "
+            f"{cargo_relative}: library target `{declared}` does not match governed crate "
             f"root `{manifest.production.crate_root}`"
         ]
     return []
+
+
+def _cargo_dependency_entries(
+    cargo: dict[str, object], workspace_dependencies: dict[str, object] | None = None
+) -> list[tuple[str, str, str, object]]:
+    """Return (scope, key, package identity, specification) for direct deps."""
+
+    entries: list[tuple[str, str, str, object]] = []
+
+    def collect(scope: str, table: object) -> None:
+        if not isinstance(table, dict):
+            return
+        for key, raw_spec in table.items():
+            if not isinstance(key, str):
+                continue
+            resolved = raw_spec
+            if (
+                isinstance(raw_spec, dict)
+                and raw_spec.get("workspace") is True
+                and workspace_dependencies is not None
+            ):
+                resolved = workspace_dependencies.get(key, raw_spec)
+            package = key
+            if isinstance(resolved, dict) and isinstance(
+                resolved.get("package"), str
+            ):
+                package = resolved["package"]
+            entries.append((scope, key, package, resolved))
+
+    for scope in ("dependencies", "dev-dependencies", "build-dependencies"):
+        collect(scope, cargo.get(scope))
+    targets = cargo.get("target")
+    if isinstance(targets, dict):
+        for target_name, target in targets.items():
+            if not isinstance(target, dict):
+                continue
+            for scope in ("dependencies", "dev-dependencies", "build-dependencies"):
+                collect(f"target.{target_name}.{scope}", target.get(scope))
+    return entries
+
+
+def _compatibility_shell_reexports(path: Path) -> tuple[set[str] | None, str | None]:
+    """Parse the shell's one permitted explicit engine-module re-export."""
+
+    try:
+        source = production_source(path)
+        tokens = _tokens(source)
+        matches = _delimiter_matches(tokens)
+    except (OSError, UnicodeError, ValueError) as error:
+        return None, str(error)
+    if len(tokens) < 7 or [token.text for token in tokens[:5]] != [
+        "pub",
+        "use",
+        "ostadix_api",
+        "::",
+        "{",
+    ]:
+        return None, "must contain only one explicit `pub use ostadix_api::{...};`"
+    closing = matches.get(4)
+    if closing is None or closing + 2 != len(tokens) or tokens[closing + 1].text != ";":
+        return None, "must contain only one explicit `pub use ostadix_api::{...};`"
+    names: list[str] = []
+    expect_name = True
+    for token in tokens[5:closing]:
+        if expect_name:
+            if token.text == "," and not names:
+                return None, "engine module re-export list starts with a comma"
+            if not IDENTIFIER_RE.fullmatch(token.text):
+                return None, "engine module re-export list must contain plain identifiers"
+            names.append(token.text)
+            expect_name = False
+        else:
+            if token.text != ",":
+                return None, "engine module re-export list must be comma separated"
+            expect_name = True
+    if not names:
+        return None, "engine module re-export list is empty"
+    if len(names) != len(set(names)):
+        return None, "engine module re-export list contains a duplicate"
+    return set(names), None
+
+
+def _engine_shell_direction_findings(
+    root: Path, manifest: ArchitectureManifest
+) -> list[str]:
+    """Enforce one-way engine ownership and a non-implementing root shell."""
+
+    failures: list[str] = []
+    root_manifest_relative = "Cargo.toml"
+    root_manifest_path = root / root_manifest_relative
+    engine_manifest_relative = manifest.production.package_manifest
+    engine_manifest_path = root / engine_manifest_relative
+    cargos: dict[str, dict[str, object]] = {}
+    for relative, path in (
+        (root_manifest_relative, root_manifest_path),
+        (engine_manifest_relative, engine_manifest_path),
+    ):
+        if not path.is_file() or path.is_symlink():
+            failures.append(f"{relative}: required regular package manifest is missing")
+            continue
+        try:
+            parsed = tomllib.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, tomllib.TOMLDecodeError) as error:
+            failures.append(f"{relative}: could not parse package manifest: {error}")
+            continue
+        cargos[relative] = parsed
+    if len(cargos) != 2:
+        return failures
+
+    root_cargo = cargos[root_manifest_relative]
+    engine_cargo = cargos[engine_manifest_relative]
+    root_package = root_cargo.get("package")
+    engine_package = engine_cargo.get("package")
+    if not isinstance(root_package, dict) or not isinstance(engine_package, dict):
+        failures.append("root and governed engine manifests must each declare a package")
+        return failures
+    if root_package.get("name") != "o-lang":
+        failures.append("Cargo.toml: compatibility shell package must be named `o-lang`")
+    if engine_package.get("name") != "ostadix-api":
+        failures.append(
+            f"{engine_manifest_relative}: governed engine package must be named `ostadix-api`"
+        )
+    root_version = root_package.get("version")
+    engine_version = engine_package.get("version")
+    if not isinstance(root_version, str) or root_version != engine_version:
+        failures.append(
+            "Cargo.toml: `o-lang` and `ostadix-api` package versions must match exactly"
+        )
+
+    root_autolib = root_package.get("autolib", True)
+    root_lib = root_cargo.get("lib")
+    if root_autolib is False:
+        failures.append("Cargo.toml: compatibility shell library target is required")
+    elif not isinstance(root_autolib, bool):
+        failures.append("Cargo.toml: package.autolib must be boolean when present")
+    else:
+        root_lib_path: object = "src/lib.rs"
+        if root_lib is not None:
+            if not isinstance(root_lib, dict):
+                failures.append("Cargo.toml: compatibility shell lib target must be a table")
+                root_lib_path = None
+            else:
+                root_lib_path = root_lib.get("path", "src/lib.rs")
+        if root_lib_path is not None:
+            try:
+                declared_root_lib = _package_target_path(
+                    root_manifest_relative,
+                    root_lib_path,
+                    "Cargo.toml lib.path",
+                )
+            except ValueError as error:
+                failures.append(str(error))
+            else:
+                if declared_root_lib != "src/lib.rs":
+                    failures.append(
+                        "Cargo.toml: compatibility shell library target must remain "
+                        "`src/lib.rs`"
+                    )
+
+    workspace = root_cargo.get("workspace")
+    workspace_dependencies = None
+    if isinstance(workspace, dict) and isinstance(workspace.get("dependencies"), dict):
+        workspace_dependencies = workspace["dependencies"]
+    for scope, key, package, spec in _cargo_dependency_entries(
+        engine_cargo, workspace_dependencies
+    ):
+        identity = package
+        points_to_root = False
+        if isinstance(spec, dict) and isinstance(spec.get("path"), str):
+            workspace_owned = (
+                workspace_dependencies is not None
+                and spec is workspace_dependencies.get(key)
+            )
+            manifest_parent = (
+                "."
+                if workspace_owned
+                else Path(engine_manifest_relative).parent.as_posix()
+            )
+            dependency_path = posixpath.normpath(
+                f"{manifest_parent}/{spec['path']}"
+            )
+            points_to_root = dependency_path == "."
+        if identity == "o-lang" or points_to_root:
+            failures.append(
+                f"{engine_manifest_relative}: {scope}.{key} must not depend on the "
+                "`o-lang` compatibility shell"
+            )
+
+    dependencies = root_cargo.get("dependencies")
+    engine_dependency = (
+        dependencies.get("ostadix-api") if isinstance(dependencies, dict) else None
+    )
+    expected_path = Path(engine_manifest_relative).parent.as_posix()
+    expected_version = f"={engine_version}" if isinstance(engine_version, str) else None
+    if not isinstance(engine_dependency, dict):
+        failures.append(
+            "Cargo.toml: compatibility shell must directly depend on `ostadix-api`"
+        )
+    else:
+        if engine_dependency.get("package", "ostadix-api") != "ostadix-api":
+            failures.append(
+                "Cargo.toml: canonical `ostadix-api` dependency must name package "
+                "`ostadix-api`"
+            )
+        if engine_dependency.get("path") != expected_path:
+            failures.append(
+                "Cargo.toml: `ostadix-api` dependency path must exactly match "
+                f"`{expected_path}`"
+            )
+        if engine_dependency.get("version") != expected_version:
+            failures.append(
+                "Cargo.toml: `ostadix-api` dependency must use exact same-version "
+                f"requirement `{expected_version}`"
+            )
+        if engine_dependency.get("optional", False) is not False:
+            failures.append(
+                "Cargo.toml: `ostadix-api` dependency must be unconditional, not optional"
+            )
+    aliases = [
+        key
+        for _scope, key, package, _spec in _cargo_dependency_entries(
+            root_cargo, workspace_dependencies
+        )
+        if package == "ostadix-api" and key != "ostadix-api"
+    ]
+    if aliases:
+        failures.append(
+            "Cargo.toml: compatibility shell must not add renamed `ostadix-api` "
+            f"dependencies: {', '.join(sorted(aliases))}"
+        )
+
+    shell_source = root / "src"
+    if not shell_source.is_dir() or shell_source.is_symlink():
+        failures.append("src: compatibility shell source root is missing or symlinked")
+        return failures
+    shell_symlinks = sorted(
+        path.relative_to(root).as_posix()
+        for path in shell_source.rglob("*")
+        if path.is_symlink()
+    )
+    if shell_symlinks:
+        failures.append(
+            "root compatibility shell source geometry must not contain symlinks: "
+            + ", ".join(shell_symlinks)
+        )
+    duplicate_sources = sorted(
+        path.relative_to(root).as_posix()
+        for path in shell_source.rglob("*.rs")
+        if path.is_file()
+        and not path.is_symlink()
+        and path.relative_to(shell_source).as_posix() not in {"lib.rs", "main.rs"}
+        and not path.relative_to(shell_source).as_posix().startswith("bin/")
+    )
+    if duplicate_sources:
+        failures.append(
+            "root compatibility shell contains runtime implementation source outside "
+            f"its entrypoints: {', '.join(duplicate_sources)}"
+        )
+
+    root_lib_path = root / "src/lib.rs"
+    if not root_lib_path.is_file() or root_lib_path.is_symlink():
+        failures.append("src/lib.rs: required regular compatibility library is missing")
+        return failures
+    reexports, error = _compatibility_shell_reexports(root_lib_path)
+    if error is not None:
+        failures.append(f"src/lib.rs: {error}")
+        return failures
+    try:
+        declarations = _crate_root_declarations(root / manifest.production.crate_root)
+    except (OSError, UnicodeError, ValueError) as declaration_error:
+        failures.append(
+            f"{manifest.production.crate_root}: could not determine public engine modules: "
+            f"{declaration_error}"
+        )
+        return failures
+    expected_reexports = {
+        name for name, declaration in declarations.items() if declaration.public
+    }
+    if reexports != expected_reexports:
+        missing = sorted(expected_reexports - (reexports or set()))
+        extra = sorted((reexports or set()) - expected_reexports)
+        details = []
+        if missing:
+            details.append(f"missing {', '.join(missing)}")
+        if extra:
+            details.append(f"unexpected {', '.join(extra)}")
+        failures.append(
+            "src/lib.rs: compatibility module reexports must exactly match the "
+            "governed engine's public roots (" + "; ".join(details) + ")"
+        )
+    return failures
 
 
 def _crate_root_findings(root: Path, manifest: ArchitectureManifest) -> list[str]:
@@ -2663,6 +3038,7 @@ def audit_architecture(
 
     failures.extend(_crate_root_findings(root, manifest))
     failures.extend(_cargo_library_findings(root, manifest))
+    failures.extend(_engine_shell_direction_findings(root, manifest))
     failures.extend(_physical_override_ownership_findings(root, manifest, paths))
 
     source_entries: list[tuple[Path, tuple[str, ...] | None]] = [
@@ -2679,7 +3055,9 @@ def audit_architecture(
         relative = path.relative_to(root).as_posix()
         try:
             module_path = declared_module_path or _file_module_path(
-                relative, manifest.physical_overrides
+                relative,
+                source_root=manifest.production.source_root,
+                physical_overrides=manifest.physical_overrides,
             )
             source = production_source(path)
             dependencies, path_violations = dependency_paths(source, module_path)
@@ -2796,7 +3174,16 @@ def audit_architecture(
             )
 
     for rule in RULES:
-        for relative in rule.paths:
+        for crate_relative in rule.paths:
+            if crate_relative == "src":
+                relative = manifest.production.source_root
+            elif crate_relative.startswith("src/"):
+                relative = (
+                    f"{manifest.production.source_root}/"
+                    f"{crate_relative.removeprefix('src/')}"
+                )
+            else:
+                relative = crate_relative
             analysis = analyses.get(relative)
             if analysis is None:
                 failures.append(f"{relative}: required architecture surface is missing")

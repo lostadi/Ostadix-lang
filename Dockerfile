@@ -7,24 +7,24 @@
 # delegate to (for example rustc, Node.js, Ruby, a JDK, or C/C++ compilers).
 #
 # Build:
-#   docker build -t o-lang:0.3.0 .
+#   docker build -t o-lang:0.4.0-dev .
 #
 # Run a .O program from the host:
 #   docker run --rm --mount type=bind,src="$PWD",dst=/work,readonly \
-#       o-lang:0.3.0 examples/hello.O
+#       o-lang:0.4.0-dev examples/hello.O
 #
 # Literal-link the checked-in Python-only fixture and run it immediately:
 #   docker run --rm \
 #       --mount type=bind,src="$PWD/examples/docker_literal",dst=/work,readonly \
-#       --entrypoint o-link o-lang:0.3.0 . -o /tmp/app.O
+#       --entrypoint o-link o-lang:0.4.0-dev . -o /tmp/app.O
 # Safe, nonexecuting lift of the actual repository root:
 #   mkdir -p target/docker
 #   docker run --rm --mount type=bind,src="$PWD",dst=/work,readonly \
-#       --entrypoint o-link o-lang:0.3.0 --project . --stdout \
+#       --entrypoint o-link o-lang:0.4.0-dev --project . --stdout \
 #       > target/docker/project.O
 #
 # Drop into an interactive REPL:
-#   docker run --rm -it o-lang:0.3.0 --repl
+#   docker run --rm -it o-lang:0.4.0-dev --repl
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Stage 1: build ───────────────────────────────────────────────────────────

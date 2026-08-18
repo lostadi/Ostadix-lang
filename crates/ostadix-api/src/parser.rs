@@ -95,7 +95,7 @@ impl SourceSpanV1 {
 /// Parsed nodes are read-only after construction:
 ///
 /// ```compile_fail
-/// fn mutate(document: &mut o_lang::parser::ParsedDocumentV1) {
+/// fn mutate(document: &mut ostadix_api::parser::ParsedDocumentV1) {
 ///     document.nodes.clear();
 /// }
 /// ```

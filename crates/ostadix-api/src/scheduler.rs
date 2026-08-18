@@ -1,5 +1,5 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// src/scheduler.rs
+// crates/ostadix-api/src/scheduler.rs
 //
 // STEP-4: Autonomous scheduler — buffered, concurrent, disk-cached Request
 // dispatch for Policy::Autonomous.

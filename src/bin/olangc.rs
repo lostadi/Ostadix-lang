@@ -28,7 +28,7 @@
 //        - All Ostadix-lang runtime source files (embedded in olangc at its own
 //          compile time via include_str!, so olangc is self-contained).
 //        - The .O source file (copied as "program.O" in the generated src/).
-//        - Compatibility adapter scripts (copied into src/shims/).
+//        - Compatibility adapter scripts (copied into crates/ostadix-api/src/shims/).
 //        - A generated main.rs that references them via include_str!/include_bytes!.
 //        - A Cargo.toml mirroring the runtime's dependencies.
 //        - A Cargo.lock projected deterministically from the workspace lock to
@@ -52,12 +52,12 @@
 //
 // Target D ("ir"):
 //   Parses the .O program, lowers the ONode forest to the OIR intermediate
-//   representation (src/ir.rs), builds the canonical ExecutionPlan dependency
+//   representation (crates/ostadix-api/src/ir.rs), builds the canonical ExecutionPlan dependency
 //   graph from that OIR, and prints both to stdout. This is the same OIR the
 //   script and generated-binary runtimes execute.
 //
 // Target E ("dot"):
-//   Parses and lowers to OIR, then builds the full hypergraph (src/hgraph/)
+//   Parses and lowers to OIR, then builds the full hypergraph (crates/ostadix-api/src/hgraph/)
 //   from that OIR, runs the type solver over it, and serialises the result as
 //   a Graphviz DOT digraph on stdout. Ordinary values, resource/actor state,
 //   and completion/control tokens use distinct node styles. Each directed
@@ -75,6 +75,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use o_lang::api::aot_source::*;
 use o_lang::eval::Evaluator;
 use o_lang::evidence::{
     admit_execution, analyze_execution, runtime_binding_from_adapter_bytes, ExecutionIntentV1,
@@ -85,203 +86,6 @@ use o_lang::parser::Parser;
 use o_lang::shims::read_shims;
 use o_lang::value::OValue;
 use o_lang::world::{GroundingReport, WorldEpoch, WorldId, WorldIdentity};
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Runtime source files — embedded at olangc's own compile time.
-//
-// These are written verbatim into the temp project so the generated binary
-// gets an identical copy of the Ostadix-lang runtime.  When the runtime changes,
-// olangc must be recompiled for those changes to appear in newly compiled
-// .O programs.
-// ─────────────────────────────────────────────────────────────────────────────
-
-const RUNTIME_VALUE_RS: &str = include_str!("../value.rs");
-const RUNTIME_CAPABILITY_RS: &str = include_str!("../capability.rs");
-const RUNTIME_ENVIRONMENT_RS: &str = include_str!("../environment.rs");
-const RUNTIME_PARSER_RS: &str = include_str!("../parser.rs");
-const RUNTIME_IR_RS: &str = include_str!("../ir.rs");
-const RUNTIME_BACKEND_CATALOG_MODULE_RS: &str = include_str!("../backend_catalog.rs");
-const RUNTIME_BACKEND_CATALOG_DATA_RS: &str = include_str!("../backend_catalog.inc.rs");
-const RUNTIME_EXECUTION_CONTRACT_RS: &str = include_str!("../execution_contract.rs");
-const RUNTIME_EVAL_CORE_RS: &str = include_str!("../eval_core.rs");
-const RUNTIME_EVAL_RS: &str = include_str!("../eval.rs");
-const RUNTIME_PROCESS_RS: &str = include_str!("../process.rs");
-const RUNTIME_BACKEND_RS: &str = include_str!("../backend.rs");
-const RUNTIME_BACKEND_MORPHISM_RS: &str = include_str!("../backend_morphism.rs");
-const RUNTIME_BACKEND_STATE_RS: &str = include_str!("../backend_state.rs");
-const RUNTIME_NIX_OPS_RS: &str = include_str!("../nix_ops.rs");
-const RUNTIME_NIXOS_OPS_RS: &str = include_str!("../nixos_ops.rs");
-const RUNTIME_SCHEDULER_RS: &str = include_str!("../scheduler.rs");
-const RUNTIME_CANONICAL_CBOR_RS: &str = include_str!("../canonical_cbor.rs");
-const RUNTIME_DISPATCH_MODEL_RS: &str = include_str!("../dispatch_model.rs");
-const RUNTIME_SYNTAX_DIALECT_RS: &str = include_str!("../syntax_dialect.rs");
-const RUNTIME_WIRE_RS: &str = include_str!("../wire.rs");
-const RUNTIME_EFFECTS_RS: &str = include_str!("../effects.rs");
-const RUNTIME_RUNTIME_EXEC_RS: &str = include_str!("../runtime_exec.rs");
-
-// placement protocol + compiled catalog — the canonical identity, state,
-// quota, and backend-capability vocabulary. Generated runtimes load the
-// physical protocol tree once as `placement_protocol`; `placement` remains the
-// public flat/nested compatibility projection over that same module identity.
-const RUNTIME_PLACEMENT_SOURCES: &[(&str, &str)] = &[
-    ("mod.rs", include_str!("../placement/mod.rs")),
-    ("projection.rs", include_str!("../placement/projection.rs")),
-    (
-        "protocol/mod.rs",
-        include_str!("../placement/protocol/mod.rs"),
-    ),
-    (
-        "protocol/candidate.rs",
-        include_str!("../placement/protocol/candidate.rs"),
-    ),
-    (
-        "protocol/catalog.rs",
-        include_str!("../placement/protocol/catalog.rs"),
-    ),
-    (
-        "protocol/digest.rs",
-        include_str!("../placement/protocol/digest.rs"),
-    ),
-    (
-        "protocol/error.rs",
-        include_str!("../placement/protocol/error.rs"),
-    ),
-    (
-        "protocol/records.rs",
-        include_str!("../placement/protocol/records.rs"),
-    ),
-    (
-        "protocol/requirement.rs",
-        include_str!("../placement/protocol/requirement.rs"),
-    ),
-    (
-        "protocol/state.rs",
-        include_str!("../placement/protocol/state.rs"),
-    ),
-    (
-        "protocol/target.rs",
-        include_str!("../placement/protocol/target.rs"),
-    ),
-    (
-        "protocol/warrant.rs",
-        include_str!("../placement/protocol/warrant.rs"),
-    ),
-];
-const RUNTIME_REGISTRY_BUNDLE_RS: &str = include_str!("../registry/bundle/mod.rs");
-const RUNTIME_REGISTRY_PLACEMENT_COMPAT_RS: &str = include_str!("../registry/placement_compat.rs");
-
-// evidence — pre-execution facts and the admission compiler. These modules
-// are part of every generated runtime because eval.rs cannot construct a
-// Coordinator without an AdmittedExecution.
-const RUNTIME_EVIDENCE_MOD_RS: &str = include_str!("../evidence/mod.rs");
-const RUNTIME_EVIDENCE_FACT_RS: &str = include_str!("../evidence/fact.rs");
-const RUNTIME_EVIDENCE_ANALYZE_RS: &str = include_str!("../evidence/analyze.rs");
-const RUNTIME_EVIDENCE_ADMIT_RS: &str = include_str!("../evidence/admit.rs");
-const RUNTIME_EVIDENCE_INTENT_RS: &str = include_str!("../evidence/intent.rs");
-const RUNTIME_EVIDENCE_PROFILE_RS: &str = include_str!("../evidence/profile.rs");
-
-// world — shared governed identities and the non-authorizing grounding view.
-const RUNTIME_WORLD_MOD_RS: &str = include_str!("../world/mod.rs");
-const RUNTIME_WORLD_CODEC_RS: &str = include_str!("../world/codec.rs");
-const RUNTIME_WORLD_IDENTITY_RS: &str = include_str!("../world/identity.rs");
-const RUNTIME_WORLD_IDENTITY_WIRE_RS: &str = include_str!("../world/identity_wire.rs");
-const RUNTIME_WORLD_GROUNDING_RS: &str = include_str!("../world/grounding.rs");
-const RUNTIME_WORLD_PROTOCOL_RS: &str = include_str!("../world/protocol.rs");
-const RUNTIME_WORLD_RECEIPT_RS: &str = include_str!("../world/receipt.rs");
-const RUNTIME_WORLD_RECEIPT_CODEC_RS: &str = include_str!("../world/receipt_codec.rs");
-const RUNTIME_WORLD_VALUE_RS: &str = include_str!("../world/value.rs");
-const RUNTIME_WORLD_VALUE_CODEC_RS: &str = include_str!("../world/value_codec.rs");
-
-// hgraph — hypergraph substrate used by ir.rs and eval.rs at runtime.
-const RUNTIME_HGRAPH_MOD_RS: &str = include_str!("../hgraph/mod.rs");
-const RUNTIME_HGRAPH_GRAPH_RS: &str = include_str!("../hgraph/graph.rs");
-const RUNTIME_HGRAPH_KINDS_RS: &str = include_str!("../hgraph/kinds.rs");
-const RUNTIME_HGRAPH_FROM_OIR_RS: &str = include_str!("../hgraph/from_oir.rs");
-const RUNTIME_HGRAPH_SCHEDULE_RS: &str = include_str!("../hgraph/schedule.rs");
-const RUNTIME_HGRAPH_SOLVE_RS: &str = include_str!("../hgraph/solve.rs");
-
-// executor: the readiness-driven graph coordinator used by eval.rs as the
-// default execution engine, with its serial reference path retained in eval.rs.
-const RUNTIME_EXECUTOR_MOD_RS: &str = include_str!("../executor/mod.rs");
-const RUNTIME_EXECUTOR_ACTOR_RS: &str = include_str!("../executor/actor.rs");
-const RUNTIME_EXECUTOR_CANCELLATION_RS: &str = include_str!("../executor/cancellation.rs");
-const RUNTIME_EXECUTOR_COORDINATOR_RS: &str = include_str!("../executor/coordinator.rs");
-const RUNTIME_EXECUTOR_EFFECTS_RS: &str = include_str!("../executor/effects.rs");
-const RUNTIME_EXECUTOR_PARALLEL_RS: &str = include_str!("../executor/parallel.rs");
-const RUNTIME_EXECUTOR_POOL_RS: &str = include_str!("../executor/pool.rs");
-const RUNTIME_EXECUTOR_TASK_RS: &str = include_str!("../executor/task.rs");
-const RUNTIME_EXECUTOR_TRACE_RS: &str = include_str!("../executor/trace.rs");
-
-// project — first-class project/route/bundle model, embedded so compiled
-// project binaries can materialize and run their embedded routes.
-const RUNTIME_PROJECT_SOURCES: &[(&str, &str)] = &[
-    ("mod.rs", include_str!("../project/mod.rs")),
-    ("bundle.rs", include_str!("../project/bundle.rs")),
-    ("deployment.rs", include_str!("../project/deployment.rs")),
-    ("discover.rs", include_str!("../project/discover.rs")),
-    ("executor.rs", include_str!("../project/executor.rs")),
-    ("launch.rs", include_str!("../project/launch.rs")),
-    ("logical.rs", include_str!("../project/logical.rs")),
-    ("lower.rs", include_str!("../project/lower.rs")),
-    ("manifest.rs", include_str!("../project/manifest.rs")),
-    ("materialize.rs", include_str!("../project/materialize.rs")),
-    ("model.rs", include_str!("../project/model.rs")),
-    ("plan.rs", include_str!("../project/plan.rs")),
-    ("runtime.rs", include_str!("../project/runtime.rs")),
-    (
-        "runtime_graph.rs",
-        include_str!("../project/runtime_graph.rs"),
-    ),
-    ("trace.rs", include_str!("../project/trace.rs")),
-    (
-        "world_execution.rs",
-        include_str!("../project/world_execution.rs"),
-    ),
-    (
-        "ecosystems/mod.rs",
-        include_str!("../project/ecosystems/mod.rs"),
-    ),
-    (
-        "ecosystems/c_family.rs",
-        include_str!("../project/ecosystems/c_family.rs"),
-    ),
-    (
-        "ecosystems/dotnet.rs",
-        include_str!("../project/ecosystems/dotnet.rs"),
-    ),
-    (
-        "ecosystems/generic.rs",
-        include_str!("../project/ecosystems/generic.rs"),
-    ),
-    (
-        "ecosystems/haskell_ocaml.rs",
-        include_str!("../project/ecosystems/haskell_ocaml.rs"),
-    ),
-    (
-        "ecosystems/java.rs",
-        include_str!("../project/ecosystems/java.rs"),
-    ),
-    (
-        "ecosystems/javascript.rs",
-        include_str!("../project/ecosystems/javascript.rs"),
-    ),
-    (
-        "ecosystems/nix.rs",
-        include_str!("../project/ecosystems/nix.rs"),
-    ),
-    (
-        "ecosystems/python.rs",
-        include_str!("../project/ecosystems/python.rs"),
-    ),
-    (
-        "ecosystems/rust.rs",
-        include_str!("../project/ecosystems/rust.rs"),
-    ),
-    (
-        "ecosystems/shell.rs",
-        include_str!("../project/ecosystems/shell.rs"),
-    ),
-];
 
 // Cargo.lock from the workspace — embedded so the temp project gets identical
 // resolved dependency versions (Cargo may still download an absent crate).
@@ -885,9 +689,8 @@ fn compile_project_to_binary(
         eprintln!("olangc: running cargo build --release --locked ...");
     }
 
-    let status = Command::new("cargo")
+    let status = generated_cargo_command(build_dir)
         .args(&cargo_args)
-        .current_dir(build_dir)
         .status()
         .context("failed to spawn cargo — is Rust/Cargo installed?")?;
     if !status.success() {
@@ -1193,9 +996,8 @@ fn compile_to_binary(
         eprintln!("olangc: running cargo build --release --locked ...");
     }
 
-    let status = Command::new("cargo")
+    let status = generated_cargo_command(build_dir)
         .args(&cargo_args)
-        .current_dir(build_dir)
         .status()
         .context("failed to spawn cargo — is Rust/Cargo installed?")?;
 
@@ -1443,7 +1245,7 @@ fn run_as_script(
 // Target C — dump the OIR intermediate representation
 //
 // Parses the program with the same front end as the other targets, lowers
-// the ONode forest to OIR (see src/ir.rs), then prints the lowered program,
+// the ONode forest to OIR (see crates/ostadix-api/src/ir.rs), then prints the lowered program,
 // ExecutionPlan, and directed executable HGraph.
 // Purely an inspection/debugging surface: nothing is executed and no output
 // file is produced.
@@ -2273,33 +2075,70 @@ fn write_generated_cargo_contract(
 fn generate_cargo_lock(include_project: bool) -> Result<String> {
     let workspace_lock = std::str::from_utf8(WORKSPACE_CARGO_LOCK)
         .context("workspace Cargo.lock embedded in olangc is not UTF-8")?;
+    generate_cargo_lock_from(workspace_lock, include_project)
+}
+
+fn generate_cargo_lock_from(workspace_lock: &str, include_project: bool) -> Result<String> {
     let mut lock: toml::Value =
         toml::from_str(workspace_lock).context("workspace Cargo.lock is not valid TOML")?;
 
-    let package_index = {
+    let (package_index, workspace_dependencies) = {
         let packages = lock
             .get("package")
             .and_then(toml::Value::as_array)
             .context("workspace Cargo.lock has no package array")?;
-        let matches = packages
-            .iter()
-            .enumerate()
-            .filter_map(|(index, package)| {
-                let table = package.as_table()?;
-                (table.get("name")?.as_str()? == env!("CARGO_PKG_NAME")
-                    && table.get("version")?.as_str()? == env!("CARGO_PKG_VERSION")
-                    && !table.contains_key("source"))
-                .then_some(index)
-            })
-            .collect::<Vec<_>>();
-        match matches.as_slice() {
-            [index] => *index,
-            _ => bail!(
-                "workspace Cargo.lock must contain exactly one local {} {} package entry",
-                env!("CARGO_PKG_NAME"),
-                env!("CARGO_PKG_VERSION")
-            ),
+        let package_index = |name: &str, require_local: bool| -> Result<usize> {
+            let matches = packages
+                .iter()
+                .enumerate()
+                .filter_map(|(index, package)| {
+                    let table = package.as_table()?;
+                    (table.get("name")?.as_str()? == name
+                        && table.get("version")?.as_str()? == env!("CARGO_PKG_VERSION")
+                        && (!require_local || !table.contains_key("source")))
+                    .then_some(index)
+                })
+                .collect::<Vec<_>>();
+            match matches.as_slice() {
+                [index] => Ok(*index),
+                _ => bail!(
+                    "workspace Cargo.lock must contain exactly one {}{name} {} package entry",
+                    if require_local { "local " } else { "" },
+                    env!("CARGO_PKG_VERSION")
+                ),
+            }
+        };
+
+        let shell_index = package_index(env!("CARGO_PKG_NAME"), true)?;
+        // A workspace lock records this package without a source, while a
+        // published o-lang shell resolves it from the registry. Both describe
+        // the same exact-version engine dependency and are valid AOT inputs.
+        let engine_index = package_index("ostadix-api", false)?;
+        let mut dependencies = Vec::new();
+        for index in [engine_index, shell_index] {
+            let package = packages[index]
+                .as_table()
+                .context("workspace Cargo.lock local package entry is not a table")?;
+            if let Some(entries) = package.get("dependencies") {
+                dependencies.extend(
+                    entries
+                        .as_array()
+                        .context(
+                            "workspace Cargo.lock local package dependencies are not an array",
+                        )?
+                        .iter()
+                        .map(|dependency| {
+                            dependency.as_str().map(str::to_owned).context(
+                                "workspace Cargo.lock contains a non-string dependency coordinate",
+                            )
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                );
+            }
         }
+        dependencies.sort();
+        dependencies.dedup();
+        (engine_index, dependencies)
     };
 
     {
@@ -2310,19 +2149,6 @@ fn generate_cargo_lock(include_project: bool) -> Result<String> {
         let package = packages[package_index]
             .as_table_mut()
             .context("workspace Cargo.lock local package entry is not a table")?;
-        let workspace_dependencies = package
-            .get("dependencies")
-            .and_then(toml::Value::as_array)
-            .context("workspace Cargo.lock local package has no dependency list")?
-            .iter()
-            .map(|dependency| {
-                dependency
-                    .as_str()
-                    .map(str::to_owned)
-                    .context("workspace Cargo.lock contains a non-string dependency coordinate")
-            })
-            .collect::<Result<Vec<_>>>()?;
-
         let mut dependency_names = GENERATED_RUNTIME_DEPENDENCY_NAMES.to_vec();
         if include_project {
             dependency_names.push("ignore");
@@ -2594,6 +2420,20 @@ fn sanitize_program_filename(input_path: &Path) -> String {
     // use ".O" unconditionally so the name is always predictable.
     let _ = input_path; // original path is accepted for future use
     "program.O".to_string()
+}
+
+/// Create a generated-project Cargo invocation whose artifact location cannot
+/// be redirected by the caller's ambient `CARGO_TARGET_DIR`.
+fn generated_cargo_command(build_dir: &Path) -> Command {
+    let mut command = Command::new("cargo");
+    command
+        .current_dir(build_dir)
+        // A caller-level target directory would put the artifact somewhere
+        // `built_binary_path` cannot safely identify and can also make
+        // independent AOT builds collide. Keep every generated build inside
+        // its disposable project, then copy only the verified result out.
+        .env("CARGO_TARGET_DIR", build_dir.join("target"));
+    command
 }
 
 /// Platform-aware path to the binary produced by `cargo build --release`.
@@ -3119,6 +2959,21 @@ mod tests {
     }
 
     #[test]
+    fn generated_cargo_command_pins_a_project_local_target_directory() {
+        let build_dir = tempfile::tempdir().unwrap();
+        let command = generated_cargo_command(build_dir.path());
+        let target_dir = command
+            .get_envs()
+            .find(|(key, _)| *key == "CARGO_TARGET_DIR")
+            .and_then(|(_, value)| value)
+            .expect("generated Cargo command must override the ambient target directory");
+        let expected = build_dir.path().join("target");
+
+        assert_eq!(command.get_current_dir(), Some(build_dir.path()));
+        assert_eq!(Path::new(target_dir), expected);
+    }
+
+    #[test]
     fn generated_runtime_build_contract_projects_lock_and_toolchain() {
         for include_project in [false, true] {
             for bin_name in ["generated-runtime", "serde"] {
@@ -3199,10 +3054,59 @@ mod tests {
                         })
                         .count(),
                     0,
-                    "the facade must remain unreachable from generated-runtime locks"
+                    "the engine package must be projected out of generated-runtime locks"
                 );
             }
         }
+    }
+
+    #[test]
+    fn generated_runtime_lock_accepts_a_registry_sourced_engine_package() {
+        let workspace_lock = std::str::from_utf8(WORKSPACE_CARGO_LOCK).unwrap();
+        let mut lock = toml::from_str::<toml::Value>(workspace_lock).unwrap();
+        let engine = lock
+            .get_mut("package")
+            .and_then(toml::Value::as_array_mut)
+            .unwrap()
+            .iter_mut()
+            .filter_map(toml::Value::as_table_mut)
+            .find(|package| {
+                package.get("name").and_then(toml::Value::as_str) == Some("ostadix-api")
+                    && package.get("version").and_then(toml::Value::as_str)
+                        == Some(env!("CARGO_PKG_VERSION"))
+            })
+            .unwrap();
+        engine.insert(
+            "source".to_owned(),
+            toml::Value::String("registry+https://github.com/rust-lang/crates.io-index".to_owned()),
+        );
+        engine.insert("checksum".to_owned(), toml::Value::String("0".repeat(64)));
+
+        let projected = generate_cargo_lock_from(&toml::to_string(&lock).unwrap(), true).unwrap();
+        let projected = toml::from_str::<toml::Value>(&projected).unwrap();
+        let packages = projected
+            .get("package")
+            .and_then(toml::Value::as_array)
+            .unwrap();
+        assert_eq!(
+            packages
+                .iter()
+                .filter_map(toml::Value::as_table)
+                .filter(|package| {
+                    package.get("name").and_then(toml::Value::as_str)
+                        == Some(GENERATED_PACKAGE_NAME)
+                        && package.get("source").is_none()
+                        && package.get("checksum").is_none()
+                })
+                .count(),
+            1
+        );
+        assert!(!packages
+            .iter()
+            .filter_map(toml::Value::as_table)
+            .any(|package| {
+                package.get("name").and_then(toml::Value::as_str) == Some("ostadix-api")
+            }));
     }
 
     #[test]
