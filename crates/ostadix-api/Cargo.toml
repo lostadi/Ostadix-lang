@@ -17,7 +17,7 @@ notebook = []
 
 [dependencies]
 anyhow = "1"
-base64 = "0.22"
+base64 = "0.23"
 bitflags = "2"
 ed25519-dalek = "2"
 fs2 = "0.4"
