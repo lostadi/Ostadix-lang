@@ -120,7 +120,7 @@ signal-hook = "0.3"
 
 [dev-dependencies]
 ed25519-dalek = "2"
-num-bigint = { version = "0.4", features = ["serde"] }
+num-bigint = { version = "0.5", features = ["serde"] }
 proptest = "1"
 tempfile = "3"
 
