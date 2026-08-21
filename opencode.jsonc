@@ -18,10 +18,11 @@
       "command": ["/Users/ustad/.local/bin/ostadix-mcp"],
       "enabled": true,
       "timeout": 600000,
-      "env": {
+      "environment": {
         "O_LANG_ROOT": "/Users/ustad/Ostadix-lang",
-        "O_BACKENDS_DIR": "/Users/ustad/Ostadix-lang/backends"
+        "O_BACKENDS_DIR": "/Users/ustad/Ostadix-lang/backends",
+        "PATH": "/Users/ustad/.local/bin:/Users/ustad/Ostadix-lang/target/release:/usr/bin:/bin:/usr/sbin:/sbin"
       }
     }
-  },
+  }
 }
