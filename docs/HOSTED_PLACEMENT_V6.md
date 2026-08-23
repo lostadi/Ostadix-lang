@@ -732,6 +732,13 @@ external effects idempotent or exactly once.
 
 ## User-facing commands
 
+The commands below are the raw Hosted Placement V6 protocol/operator surface.
+Ordinary LAN use is projected through the zero-configuration layer documented
+in [Zero-configuration LAN nodes](ZERO_CONFIG_LAN.md): `o node start`,
+`o node list`, `o node profile`, `o node run FILE.O`, and
+`o node session run FILE.O` derive the transport and proof artifacts internally.
+Passing `--manual` or explicit connection coordinates selects the raw surface.
+
 The implemented direct-node surface is explicit:
 
 ```text
@@ -835,9 +842,11 @@ Hosted Placement V6 does **not** establish:
 
 - OSTADIX World membership, a replicated Governor, Governor admission or
   commit, WorldFS, or passage of G1 or any G0--G13 gate;
-- automatic network discovery, a live network registry service, scheduler-
-  selected placement, or production placement-authority enrollment, multi-key
-  policy, rotation, revocation, or provider admission;
+- discovery, enrollment, or scheduling as properties of the Hosted Placement
+  V6 protocol itself. The separate usability-first `lan-open` projection adds
+  unauthenticated LAN discovery and enrollment, but not a production registry,
+  scheduler-selected placement, multi-key authority policy, rotation,
+  revocation, or provider admission;
 - proof enforcement, state-capacity reservation, a durable attempt ledger, or
   detached node attribution on frozen V1; these are bounded V2 properties and
   must not be read back into V1;

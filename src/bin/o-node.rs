@@ -1,14 +1,17 @@
 use std::env;
 use std::fs;
-use std::net::TcpListener;
-use std::path::PathBuf;
-use std::process::Command as ProcessCommand;
+use std::fs::OpenOptions;
+use std::net::{Ipv4Addr, SocketAddr, TcpListener};
+use std::path::{Path, PathBuf};
+use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -18,15 +21,21 @@ use o_lang::hosted_remote::v2::{
     serve_owned_node_dual_until_shutdown, write_new_node_public_key_v2,
     write_new_node_signing_key_v2, DurableSessionStoreV2, HostedDualNodeShutdown,
     HostedNodeSignerV2, HostedOwnedDualNodeServerConfig, HostedV2RuntimeConfig,
-    HostedV2RuntimeOwner, PinnedEd25519PlacementAuthorizerV2, DEFAULT_MAX_ACTORS_PER_SESSION_V2,
+    HostedV2RuntimeOwner, LanOpenPlacementAuthorizerV2, PinnedEd25519PlacementAuthorizerV2,
+    PlacementProofAuthorizerV2,
+    DEFAULT_MAX_ACTORS_PER_SESSION_V2,
     DEFAULT_MAX_OPEN_SESSIONS_V2, DEFAULT_MAX_SNAPSHOT_BYTES_PER_ACTOR_V2,
     DEFAULT_MAX_STATE_BYTES_PER_SESSION_V2, DEFAULT_MAX_STATE_BYTES_TOTAL_V2,
 };
 use o_lang::hosted_remote::{
     accept_mutual_tls, build_client_config, build_server_config, connect_mutual_tls,
-    default_ca_path, default_node_cert_path, default_node_key_path, hosted_config_dir, serve_node,
-    ClientTlsIdentity, HostedNodeRuntime, HostedNodeServerConfig, NodeDoctorCheckV1,
-    ServerTlsIdentity, DEFAULT_MAX_CONNECTIONS, DEFAULT_NODE_BIND, DEFAULT_NODE_ID,
+    default_ca_path, default_node_cert_path, default_node_key_path, hosted_config_dir,
+    lan_node_process_dir, lan_open_config_dir, lan_open_v2_state_dir, serve_node,
+    spawn_lan_bootstrap_server, spawn_lan_discovery_responder, ClientTlsIdentity,
+    HostedNodeRuntime, HostedNodeServerConfig, LanBootstrapBundleV1, LanNodeAdvertisementV1,
+    NodeDoctorCheckV1, ServerTlsIdentity, DEFAULT_LAN_BOOTSTRAP_PORT,
+    DEFAULT_LAN_DISCOVERY_PORT, DEFAULT_LAN_NODE_PORT, DEFAULT_MAX_CONNECTIONS,
+    DEFAULT_NODE_BIND, DEFAULT_NODE_ID, LAN_BOOTSTRAP_SCHEMA_V1, LAN_SECURITY_MODE,
 };
 use o_lang::placement::{GenerationV1, StateQuotaLimitsV2};
 use o_lang::runtime_exec::validate_native_runtime_binary;
@@ -47,6 +56,14 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Start the zero-configuration LAN node as a detached background process.
+    Start,
+    /// Stop the detached zero-configuration LAN node.
+    Stop,
+    /// Report whether the detached zero-configuration LAN node is running.
+    Status,
+    /// Restart the detached zero-configuration LAN node.
+    Restart,
     /// Provision a local development CA plus node/client identities.
     Pki(PkiArgs),
     /// Initialize the durable V2 node receipt-signing identity.
@@ -137,8 +154,9 @@ struct PkiInitArgs {
 
 #[derive(Debug, Clone, Args)]
 struct RuntimeArgs {
-    #[arg(long, default_value = DEFAULT_NODE_ID)]
-    node_id: String,
+    /// Stable semantic identity. Automatically generated and persisted unless --manual is used.
+    #[arg(long)]
+    node_id: Option<String>,
     /// Backend shim directory. Defaults to O_BACKENDS_DIR, then bundled shims.
     #[arg(long)]
     shim_dir: Option<PathBuf>,
@@ -153,8 +171,8 @@ struct RuntimeArgs {
 
 #[derive(Debug, Args)]
 struct ProfileArgs {
-    #[arg(long, default_value = DEFAULT_NODE_ID)]
-    node_id: String,
+    #[arg(long)]
+    node_id: Option<String>,
     #[arg(long, default_value_t = DEFAULT_MAX_CONNECTIONS)]
     max_connections: usize,
 }
@@ -178,6 +196,9 @@ struct DoctorArgs {
     runtime: RuntimeArgs,
     #[command(flatten)]
     tls: ServerTlsArgs,
+    /// Disable automatic LAN identity, PKI, and V2 provisioning.
+    #[arg(long)]
+    manual: bool,
 }
 
 #[derive(Debug, Args)]
@@ -186,8 +207,18 @@ struct ServeArgs {
     runtime: RuntimeArgs,
     #[command(flatten)]
     tls: ServerTlsArgs,
-    #[arg(long, default_value = DEFAULT_NODE_BIND)]
-    bind: String,
+    /// Listener address. Defaults to 0.0.0.0:7337 in automatic mode and 127.0.0.1:7337 in manual mode.
+    #[arg(long)]
+    bind: Option<String>,
+    /// Disable discovery, enrollment, automatic identities, and automatic V2 setup.
+    #[arg(long)]
+    manual: bool,
+    /// Keep automatic configuration but do not advertise on the LAN.
+    #[arg(long)]
+    no_discovery: bool,
+    /// Keep automatic configuration but do not expose LAN enrollment credentials.
+    #[arg(long)]
+    no_bootstrap: bool,
     /// Enable durable session protocol V2 using this capability-first state root.
     #[arg(long)]
     v2_state_dir: Option<PathBuf>,
@@ -216,6 +247,10 @@ struct ServeArgs {
 
 fn main() -> Result<()> {
     match Cli::parse().command {
+        Command::Start => start_detached_node(),
+        Command::Stop => stop_detached_node(),
+        Command::Status => detached_node_status(true).map(|_| ()),
+        Command::Restart => restart_detached_node(),
         Command::Pki(args) => match args.command {
             PkiCommand::Init(args) => init_development_pki(args),
         },
@@ -226,14 +261,475 @@ fn main() -> Result<()> {
             AdminCommand::GcClosed(args) => gc_closed_session(args),
         },
         Command::Profile(args) => {
+            let node_id = match args.node_id {
+                Some(node_id) => node_id,
+                None => ensure_lan_open_material()?.node_id,
+            };
             let profile =
-                o_lang::hosted_remote::NodeProfileV1::local(args.node_id, args.max_connections)?;
+                o_lang::hosted_remote::NodeProfileV1::local(node_id, args.max_connections)?;
             println!("{}", serde_json::to_string_pretty(&profile)?);
             Ok(())
         }
         Command::Doctor(args) => doctor(args),
         Command::Serve(args) => serve(args),
     }
+}
+
+#[derive(Debug, Clone)]
+struct LanOpenNodeMaterial {
+    node_id: String,
+    server_name: String,
+    pki_dir: PathBuf,
+    state_dir: PathBuf,
+    node_signing_key: PathBuf,
+    node_public_key: PathBuf,
+}
+
+fn ensure_lan_open_material() -> Result<LanOpenNodeMaterial> {
+    let config_dir = lan_open_config_dir();
+    ensure_private_directory(&config_dir)?;
+    let server_name = automatic_server_name()?;
+    let node_id_path = config_dir.join("node-id");
+    let node_id = load_or_create_automatic_node_id(&node_id_path, &server_name)?;
+
+    let pki_dir = config_dir.join("pki");
+    let server_name_path = pki_dir.join("server-name");
+    let required_pki = [
+        "ca.pem",
+        "ca-key.pem",
+        "node-cert.pem",
+        "node-key.pem",
+        "client-cert.pem",
+        "client-key.pem",
+    ];
+    let complete = required_pki.iter().all(|name| pki_dir.join(name).is_file());
+    let matching_name = fs::read_to_string(&server_name_path)
+        .is_ok_and(|value| value.trim() == server_name);
+    if !complete || !matching_name {
+        if pki_dir.exists() {
+            let backup = sibling_backup_path(&pki_dir, "stale-pki")?;
+            fs::rename(&pki_dir, &backup).with_context(|| {
+                format!(
+                    "failed to archive stale automatic PKI `{}` as `{}`",
+                    pki_dir.display(),
+                    backup.display()
+                )
+            })?;
+            eprintln!(
+                "o-node: archived stale automatic LAN identity at {}",
+                backup.display()
+            );
+        }
+        init_development_pki(PkiInitArgs {
+            directory: Some(pki_dir.clone()),
+            server_name: server_name.clone(),
+            openssl: PathBuf::from("openssl"),
+        })?;
+        fs::write(&server_name_path, format!("{server_name}\n"))?;
+    }
+
+    let state_dir = lan_open_v2_state_dir();
+    let node_signing_key = state_dir.join("node-signing-key.v2");
+    let node_public_key = state_dir.join("node-signing-public.v2");
+    match (node_signing_key.is_file(), node_public_key.is_file()) {
+        (true, true) => {}
+        (false, false) => init_v2_identity(IdentityInitArgs {
+            state_dir: Some(state_dir.clone()),
+            node_signing_key: Some(node_signing_key.clone()),
+            node_public_key: Some(node_public_key.clone()),
+        })?,
+        (true, false) => {
+            let signer = read_node_signing_key_v2(&node_signing_key)?;
+            write_new_node_public_key_v2(&node_public_key, &signer.public_key())?;
+        }
+        (false, true) => {
+            let backup = sibling_backup_path(&state_dir, "orphaned-v2")?;
+            fs::rename(&state_dir, &backup).with_context(|| {
+                format!(
+                    "failed to archive incomplete automatic V2 state at `{}`",
+                    state_dir.display()
+                )
+            })?;
+            eprintln!(
+                "o-node: archived incomplete automatic V2 state at {}",
+                backup.display()
+            );
+            init_v2_identity(IdentityInitArgs {
+                state_dir: Some(state_dir.clone()),
+                node_signing_key: Some(node_signing_key.clone()),
+                node_public_key: Some(node_public_key.clone()),
+            })?;
+        }
+    }
+
+    Ok(LanOpenNodeMaterial {
+        node_id,
+        server_name,
+        pki_dir,
+        state_dir,
+        node_signing_key,
+        node_public_key,
+    })
+}
+
+fn load_or_create_automatic_node_id(path: &Path, server_name: &str) -> Result<String> {
+    if path.is_file() {
+        let candidate = fs::read_to_string(path)
+            .with_context(|| format!("failed to read `{}`", path.display()))?
+            .trim()
+            .to_owned();
+        if o_lang::hosted_remote::NodeProfileV1::local(
+            candidate.clone(),
+            DEFAULT_MAX_CONNECTIONS,
+        )
+        .is_ok()
+        {
+            return Ok(candidate);
+        }
+        let backup = sibling_backup_path(path, "invalid-node-id")?;
+        fs::rename(path, &backup).with_context(|| {
+            format!(
+                "failed to archive invalid automatic node identity `{}`",
+                path.display()
+            )
+        })?;
+        eprintln!(
+            "o-node: archived invalid automatic node identity at {}",
+            backup.display()
+        );
+    }
+
+    let generated = generate_automatic_node_id(server_name)?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    use std::io::Write;
+    match options.open(path) {
+        Ok(mut file) => {
+            file.write_all(format!("{generated}\n").as_bytes())?;
+            file.sync_all()?;
+            Ok(generated)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Concurrent starts converge on whichever stable identity won the
+            // create-new race instead of making one invocation fail.
+            let candidate = fs::read_to_string(path)
+                .with_context(|| format!("failed to read raced-in `{}`", path.display()))?
+                .trim()
+                .to_owned();
+            o_lang::hosted_remote::NodeProfileV1::local(
+                candidate.clone(),
+                DEFAULT_MAX_CONNECTIONS,
+            )
+            .context("concurrently created automatic node identity is invalid")?;
+            Ok(candidate)
+        }
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to create `{}`", path.display())),
+    }
+}
+
+fn generate_automatic_node_id(server_name: &str) -> Result<String> {
+    let mut random = [0_u8; 4];
+    getrandom::fill(&mut random).context("failed to generate automatic node identity")?;
+    let host = server_name.trim_end_matches(".local");
+    let generated = format!("ostadix-{host}-{}", hex::encode(random));
+    o_lang::hosted_remote::NodeProfileV1::local(generated.clone(), DEFAULT_MAX_CONNECTIONS)
+        .context("generated automatic node identity is invalid")?;
+    Ok(generated)
+}
+
+fn sibling_backup_path(path: &Path, label: &str) -> Result<PathBuf> {
+    let parent = path.parent().context("automatic state path has no parent")?;
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .context("automatic state path has no portable file name")?;
+    for _ in 0..32 {
+        let mut random = [0_u8; 6];
+        getrandom::fill(&mut random).context("failed to generate backup identity")?;
+        let candidate = parent.join(format!("{name}.{label}-{}", hex::encode(random)));
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    bail!("failed to allocate a unique automatic-state backup path")
+}
+
+fn automatic_server_name() -> Result<String> {
+    let raw = env::var("HOSTNAME")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            ProcessCommand::new("hostname")
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .and_then(|output| String::from_utf8(output.stdout).ok())
+        });
+    let raw = raw.unwrap_or_else(|| "ostadix-node".to_owned());
+    let first = raw.trim().split('.').next().unwrap_or("ostadix-node");
+    let mut host = String::with_capacity(first.len().min(63));
+    let mut previous_dash = false;
+    for character in first.chars() {
+        if host.len() >= 63 {
+            break;
+        }
+        let normalized = if character.is_ascii_alphanumeric() {
+            previous_dash = false;
+            Some(character.to_ascii_lowercase())
+        } else if !previous_dash {
+            previous_dash = true;
+            Some('-')
+        } else {
+            None
+        };
+        if let Some(character) = normalized {
+            host.push(character);
+        }
+    }
+    let host = host.trim_matches('-');
+    let host = if host.is_empty() { "ostadix-node" } else { host };
+    let name = format!("{host}.local");
+    certificate_san(&name)?;
+    Ok(name)
+}
+
+fn lan_bootstrap_bundle(
+    material: &LanOpenNodeMaterial,
+    service_port: u16,
+) -> Result<LanBootstrapBundleV1> {
+    let read = |name: &str| -> Result<String> {
+        let path = material.pki_dir.join(name);
+        fs::read_to_string(&path)
+            .with_context(|| format!("failed to read automatic LAN identity `{}`", path.display()))
+    };
+    let node_receipt_public_key = fs::read_to_string(&material.node_public_key)
+        .with_context(|| {
+            format!(
+                "failed to read automatic node receipt identity `{}`",
+                material.node_public_key.display()
+            )
+        })?
+        .trim()
+        .to_owned();
+    let bundle = LanBootstrapBundleV1 {
+        schema: LAN_BOOTSTRAP_SCHEMA_V1.to_owned(),
+        node_id: material.node_id.clone(),
+        server_name: material.server_name.clone(),
+        service_port,
+        security_mode: LAN_SECURITY_MODE.to_owned(),
+        ca_pem: read("ca.pem")?,
+        client_cert_pem: read("client-cert.pem")?,
+        client_key_pem: read("client-key.pem")?,
+        node_receipt_public_key: Some(node_receipt_public_key),
+    };
+    bundle.validate()?;
+    Ok(bundle)
+}
+
+fn detached_node_paths() -> (PathBuf, PathBuf, PathBuf) {
+    let directory = lan_node_process_dir();
+    (
+        directory.clone(),
+        directory.join("o-node.pid"),
+        directory.join("o-node.log"),
+    )
+}
+
+fn start_detached_node() -> Result<()> {
+    #[cfg(not(unix))]
+    bail!("detached o-node start is currently supported on Unix-like systems");
+    #[cfg(unix)]
+    {
+        if detached_node_status(false)? {
+            println!("o-node is already running");
+            return Ok(());
+        }
+        // Provision synchronously so configuration errors are shown in this
+        // terminal instead of being buried in a detached log.
+        let material = ensure_lan_open_material()?;
+        let (directory, pid_path, log_path) = detached_node_paths();
+        ensure_private_directory(&directory)?;
+        let log = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(&log_path)
+            .with_context(|| format!("failed to open `{}`", log_path.display()))?;
+        let current = env::current_exe().context("failed to locate o-node executable")?;
+        let mut command = ProcessCommand::new(current);
+        command
+            .arg("serve")
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log.try_clone()?))
+            .stderr(Stdio::from(log));
+        // SAFETY: setsid is async-signal-safe and the closure performs no
+        // allocation or lock-taking after fork.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().context("failed to detach o-node serve")?;
+        fs::write(&pid_path, format!("{}\n", child.id()))?;
+        fs::set_permissions(&pid_path, fs::Permissions::from_mode(0o600))?;
+        thread::sleep(Duration::from_millis(450));
+        if let Some(status) = child.try_wait()? {
+            let _ = fs::remove_file(&pid_path);
+            bail!(
+                "o-node exited during startup with {status}; inspect {}",
+                log_path.display()
+            );
+        }
+        println!("o-node started: {}", material.node_id);
+        println!("log: {}", log_path.display());
+        println!("LAN clients can now use `octl node profile` without connection flags");
+        Ok(())
+    }
+}
+
+fn restart_detached_node() -> Result<()> {
+    stop_detached_node()?;
+    if detached_node_status(false)? {
+        bail!("o-node is still running after stop; refusing to start a duplicate")
+    }
+    start_detached_node()
+}
+
+fn stop_detached_node() -> Result<()> {
+    #[cfg(not(unix))]
+    bail!("detached o-node stop is currently supported on Unix-like systems");
+    #[cfg(unix)]
+    {
+        let (_, pid_path, _) = detached_node_paths();
+        let Some(pid) = read_detached_pid(&pid_path)? else {
+            println!("o-node is not running");
+            return Ok(());
+        };
+        if !process_is_detached_node(pid) {
+            let _ = fs::remove_file(&pid_path);
+            println!("o-node was not running; removed stale PID file");
+            return Ok(());
+        }
+        if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
+            return Err(std::io::Error::last_os_error()).context("failed to signal o-node");
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if !process_is_alive(pid) {
+                let _ = fs::remove_file(&pid_path);
+                println!("o-node stopped");
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        bail!("o-node is still draining accepted work after 10 seconds")
+    }
+}
+
+fn detached_node_status(print: bool) -> Result<bool> {
+    let (_, pid_path, log_path) = detached_node_paths();
+    let Some(pid) = read_detached_pid(&pid_path)? else {
+        if print {
+            println!("stopped");
+        }
+        return Ok(false);
+    };
+    let running = process_is_detached_node(pid);
+    if !running {
+        let _ = fs::remove_file(&pid_path);
+    }
+    if print {
+        if running {
+            println!("running pid={pid} log={}", log_path.display());
+        } else {
+            println!("stopped (stale PID removed)");
+        }
+    }
+    Ok(running)
+}
+
+fn read_detached_pid(path: &Path) -> Result<Option<i32>> {
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let value = fs::read_to_string(path)?;
+    let pid = value
+        .trim()
+        .parse::<i32>()
+        .with_context(|| format!("invalid o-node PID file `{}`", path.display()))?;
+    if pid <= 0 {
+        bail!("invalid o-node PID {pid}");
+    }
+    Ok(Some(pid))
+}
+
+fn process_is_alive(pid: i32) -> bool {
+    #[cfg(unix)]
+    {
+        let result = unsafe { libc::kill(pid, 0) };
+        result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+fn process_is_detached_node(pid: i32) -> bool {
+    if !process_is_alive(pid) {
+        return false;
+    }
+    let expected = env::current_exe()
+        .ok()
+        .and_then(|path| path.file_name().map(|name| name.to_owned()));
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(bytes) = fs::read(format!("/proc/{pid}/cmdline")) {
+            let arguments = bytes
+                .split(|byte| *byte == 0)
+                .filter(|part| !part.is_empty())
+                .map(|part| String::from_utf8_lossy(part).into_owned())
+                .collect::<Vec<_>>();
+            return detached_command_matches(&arguments, expected.as_deref());
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        let output = ProcessCommand::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "command="])
+            .output();
+        if let Ok(output) = output {
+            if output.status.success() {
+                let command = String::from_utf8_lossy(&output.stdout);
+                let arguments = command
+                    .split_whitespace()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                return detached_command_matches(&arguments, expected.as_deref());
+            }
+        }
+    }
+    false
+}
+
+fn detached_command_matches(arguments: &[String], expected: Option<&std::ffi::OsStr>) -> bool {
+    let Some(executable) = arguments.first() else {
+        return false;
+    };
+    let executable_name = Path::new(executable).file_name();
+    let executable_matches = expected
+        .zip(executable_name)
+        .is_some_and(|(expected, actual)| expected == actual);
+    executable_matches && arguments.iter().skip(1).any(|argument| argument == "serve")
 }
 
 fn gc_closed_session(args: AdminGcClosedArgs) -> Result<()> {
@@ -476,7 +972,20 @@ fn init_v2_identity(args: IdentityInitArgs) -> Result<()> {
     Ok(())
 }
 
-fn doctor(args: DoctorArgs) -> Result<()> {
+fn doctor(mut args: DoctorArgs) -> Result<()> {
+    if !args.manual {
+        let material = ensure_lan_open_material()?;
+        args.runtime.node_id.get_or_insert(material.node_id);
+        args.tls
+            .cert
+            .get_or_insert_with(|| material.pki_dir.join("node-cert.pem"));
+        args.tls
+            .key
+            .get_or_insert_with(|| material.pki_dir.join("node-key.pem"));
+        args.tls
+            .client_ca
+            .get_or_insert_with(|| material.pki_dir.join("ca.pem"));
+    }
     let (shim_dir, _shim_guard) = resolve_shim_dir(args.runtime.shim_dir.clone())?;
     let runtime = runtime_from_args(args.runtime, shim_dir)?;
     let mut doctor = runtime.doctor()?;
@@ -506,9 +1015,75 @@ fn doctor(args: DoctorArgs) -> Result<()> {
     Ok(())
 }
 
-fn serve(args: ServeArgs) -> Result<()> {
+fn serve(mut args: ServeArgs) -> Result<()> {
+    let lan_open = !args.manual;
+    let automatic = if lan_open {
+        let material = ensure_lan_open_material()?;
+        args.runtime.node_id.get_or_insert(material.node_id.clone());
+        args.tls
+            .cert
+            .get_or_insert_with(|| material.pki_dir.join("node-cert.pem"));
+        args.tls
+            .key
+            .get_or_insert_with(|| material.pki_dir.join("node-key.pem"));
+        args.tls
+            .client_ca
+            .get_or_insert_with(|| material.pki_dir.join("ca.pem"));
+        args.bind
+            .get_or_insert_with(|| format!("0.0.0.0:{DEFAULT_LAN_NODE_PORT}"));
+        args.v2_state_dir
+            .get_or_insert_with(|| material.state_dir.clone());
+        args.v2_node_signing_key
+            .get_or_insert_with(|| material.node_signing_key.clone());
+        Some(material)
+    } else {
+        args.runtime
+            .node_id
+            .get_or_insert_with(|| DEFAULT_NODE_ID.to_owned());
+        args.bind
+            .get_or_insert_with(|| DEFAULT_NODE_BIND.to_owned());
+        None
+    };
+
+    let bind_address = args
+        .bind
+        .take()
+        .expect("serve bind is resolved for automatic and manual modes");
+    let service_port = parse_bind_port(&bind_address)?;
     let (shim_dir, _shim_guard) = resolve_shim_dir(args.runtime.shim_dir.clone())?;
     let v1_runtime = runtime_from_args(args.runtime, shim_dir)?;
+
+    let mut _discovery = None;
+    let mut _bootstrap = None;
+    if let Some(material) = automatic.as_ref() {
+        eprintln!(
+            "{}",
+            concat!(
+                "o-node: LAN-open mode enabled -- LAN reachability is treated as permission ",
+                "to enroll and execute; use --manual for explicit trust configuration"
+            )
+        );
+        if !args.no_discovery {
+            let advertisement = LanNodeAdvertisementV1::new(
+                material.node_id.clone(),
+                material.server_name.clone(),
+                service_port,
+                DEFAULT_LAN_BOOTSTRAP_PORT,
+                args.v2_state_dir.is_some(),
+            )?;
+            _discovery = Some(spawn_lan_discovery_responder(
+                advertisement,
+                DEFAULT_LAN_DISCOVERY_PORT,
+            )?);
+        }
+        if !args.no_bootstrap {
+            _bootstrap = Some(spawn_lan_bootstrap_server(
+                SocketAddr::from((Ipv4Addr::UNSPECIFIED, DEFAULT_LAN_BOOTSTRAP_PORT)),
+                lan_bootstrap_bundle(material, service_port)?,
+            )?);
+        }
+    }
+
     if let Some(state_dir) = args.v2_state_dir {
         let shutdown = HostedDualNodeShutdown::new();
         // Register termination handling before opening the durable root. A
@@ -519,11 +1094,21 @@ fn serve(args: ServeArgs) -> Result<()> {
         let node_key_path = args
             .v2_node_signing_key
             .unwrap_or_else(|| state_dir.join("node-signing-key.v2"));
-        let authority_path = args
-            .v2_authority_public_key
-            .context("--v2-authority-public-key is required when --v2-state-dir enables V2")?;
         let signer = read_node_signing_key_v2(&node_key_path)?;
-        let authority = read_placement_public_key_v2(&authority_path)?;
+        let authorizer: Arc<dyn PlacementProofAuthorizerV2> = if lan_open {
+            if args.v2_authority_public_key.is_some() {
+                eprintln!(
+                    "o-node: --v2-authority-public-key is ignored in LAN-open mode; use --manual to pin it"
+                );
+            }
+            Arc::new(LanOpenPlacementAuthorizerV2)
+        } else {
+            let authority_path = args.v2_authority_public_key.context(
+                "--v2-authority-public-key is required when --v2-state-dir enables V2 in manual mode",
+            )?;
+            let authority = read_placement_public_key_v2(&authority_path)?;
+            Arc::new(PinnedEd25519PlacementAuthorizerV2::new(authority))
+        };
         let node_state_epoch = GenerationV1::new(args.v2_node_generation)?;
         let state_quota_generation = GenerationV1::new(args.v2_state_quota_generation)?;
         let state_quotas = StateQuotaLimitsV2::new(
@@ -544,7 +1129,7 @@ fn serve(args: ServeArgs) -> Result<()> {
                 state_quotas,
             },
             store,
-            Arc::new(PinnedEd25519PlacementAuthorizerV2::new(authority)),
+            authorizer,
         )
         .with_context(|| {
             format!(
@@ -570,11 +1155,11 @@ fn serve(args: ServeArgs) -> Result<()> {
         }
         eprintln!(
             "o-node: serving {} on {} (TLS 1.3 mTLS; frozen V1 + durable V2; max {} connections)",
-            v1_runtime.node_id, args.bind, v1_runtime.max_concurrent_connections
+            v1_runtime.node_id, bind_address, v1_runtime.max_concurrent_connections
         );
         return serve_owned_node_dual_until_shutdown(
             HostedOwnedDualNodeServerConfig {
-                bind_address: args.bind,
+                bind_address,
                 v1_runtime,
                 v2_runtime,
                 tls_identity: tls_identity(args.tls),
@@ -586,7 +1171,7 @@ fn serve(args: ServeArgs) -> Result<()> {
         bail!("--v2-state-dir is required when any V2 key option is supplied");
     }
     let config = HostedNodeServerConfig {
-        bind_address: args.bind,
+        bind_address,
         runtime: v1_runtime,
         tls_identity: tls_identity(args.tls),
     };
@@ -595,6 +1180,14 @@ fn serve(args: ServeArgs) -> Result<()> {
         config.runtime.node_id, config.bind_address, config.runtime.max_concurrent_connections
     );
     serve_node(config)
+}
+
+fn parse_bind_port(bind: &str) -> Result<u16> {
+    bind.rsplit_once(':')
+        .context("node bind address must include a port")?
+        .1
+        .parse::<u16>()
+        .with_context(|| format!("node bind address `{bind}` has an invalid port"))
 }
 
 #[cfg(unix)]
@@ -693,7 +1286,7 @@ fn observe_node_termination_signal(
 fn runtime_from_args(args: RuntimeArgs, shim_dir: PathBuf) -> Result<HostedNodeRuntime> {
     let runtime_executable = resolve_runtime_binary(args.runtime_binary)?;
     Ok(HostedNodeRuntime {
-        node_id: args.node_id,
+        node_id: args.node_id.unwrap_or_else(|| DEFAULT_NODE_ID.to_owned()),
         shim_dir,
         runtime_executable,
         max_concurrent_connections: args.max_connections,
@@ -953,6 +1546,23 @@ mod tests {
         assert!(help.contains("Reuse it across normal process restarts"));
         assert!(help.contains("new state root or archive the old root"));
         assert!(help.contains("never evicts or migrates existing sessions"));
+    }
+
+    #[test]
+    fn detached_pid_guard_only_matches_this_binary_in_serve_mode() {
+        let expected = std::ffi::OsStr::new("o-node");
+        assert!(detached_command_matches(
+            &["/tmp/o-node".to_owned(), "serve".to_owned()],
+            Some(expected)
+        ));
+        assert!(!detached_command_matches(
+            &["/tmp/o-node".to_owned(), "profile".to_owned()],
+            Some(expected)
+        ));
+        assert!(!detached_command_matches(
+            &["/usr/bin/sleep".to_owned(), "serve".to_owned()],
+            Some(expected)
+        ));
     }
 
     #[test]
