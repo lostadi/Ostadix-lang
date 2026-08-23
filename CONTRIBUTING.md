@@ -11,6 +11,11 @@ and attach evidence no broader than the substrate actually tested.
   [SECURITY.md](SECURITY.md), never in a public issue or pull request.
 - Do not submit secrets, credentials, private keys, proprietary fixtures, or
   generated artifacts you do not have the right to contribute.
+- Attribute authorship and contribution credit only to the human contributors
+  responsible for the change. Claude and Codex, including Anthropic or OpenAI
+  tool identities, are tools—not authors, committers, co-authors, signers, or
+  contributors; do not name them in Git identities, attribution trailers,
+  Cargo `authors`, or citation author lists.
 - Discuss large public-API, protocol, catalog, or file-format changes before
   implementation. These surfaces have independent version axes described in
   [docs/VERSIONING.md](docs/VERSIONING.md).

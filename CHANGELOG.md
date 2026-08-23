@@ -9,6 +9,9 @@ Package SemVer is only one of the independent coordinates documented in
 
 ### Changed
 
+- Project authorship metadata and new commit attribution now reject Claude and
+  Codex identities; contribution credit remains assigned to the responsible
+  human contributors.
 - Information Provenance V2 adds an authority-free, content-addressed sidecar
   over frozen Information Atom V1 identities plus a higher-layer execution
   analyzer that admits only its recomputed image. Acquisition origin is

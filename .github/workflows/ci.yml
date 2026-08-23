@@ -20,12 +20,23 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Reject Claude or Codex attribution
+        env:
+          ATTRIBUTION_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          ATTRIBUTION_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: >-
+          python3 scripts/check_attribution.py
+          --base "$ATTRIBUTION_BASE"
+          --head "$ATTRIBUTION_HEAD"
+          --ref-type "${{ github.ref_type || 'branch' }}"
       - name: Validate authoritative contract projections
         run: |
           python3 scripts/local_ci_posture.py --profile baseline --format text
           python3 scripts/contract_surfaces.py validate
           python3 scripts/check_architecture_boundaries.py
-          python3 -m unittest -v tests.test_contract_surfaces tests.test_local_ci_posture tests.test_architecture_boundaries tests.test_governance_surfaces
+          python3 -m unittest -v tests.test_contract_surfaces tests.test_local_ci_posture tests.test_attribution_policy tests.test_architecture_boundaries tests.test_governance_surfaces
 
   docker:
     name: Docker minimal runtime profile

@@ -178,6 +178,9 @@ type: software
 version: "0.1.0"
 license: {release.ROOT_LICENSE_SPDX}
 repository-code: "{release.ROOT_REPOSITORY}"
+authors:
+  - family-names: Ostadi
+    given-names: Lee Daghlar
 preferred-citation:
   type: article
   title: "Fixture preprint"
@@ -365,6 +368,16 @@ class RootReleaseMetadataValidationTests(unittest.TestCase):
                 FIXTURE_CITATION.replace('version: "0.1.0"', 'version: "9.9.9"'),
                 r"CITATION\.cff version must match Cargo\.toml",
             ),
+            "cargo tool author": (
+                "Cargo.toml",
+                FIXTURE_CARGO.replace("Lee Daghlar Ostadi", "OpenAI Codex"),
+                r"package\.authors must not attribute Claude or Codex",
+            ),
+            "citation tool author": (
+                "CITATION.cff",
+                FIXTURE_CITATION.replace("Lee Daghlar", "Claude Sonnet 5"),
+                r"authors line .* must not attribute Claude or Codex",
+            ),
             "license text": (
                 "LICENSE",
                 "Apache License\nVersion 2.0\n",
@@ -463,6 +476,20 @@ class WorkspaceFacadeReleaseValidationTests(unittest.TestCase):
             }
         }
         release._validate_workspace_facade_release_surface(files)
+
+    def test_tool_authors_cannot_be_made_consistent_across_packages(self) -> None:
+        files = self.fixture_files()
+        files["Cargo.toml"] = FIXTURE_CARGO.replace(
+            "Lee Daghlar Ostadi", "OpenAI Codex"
+        ).encode()
+        files["crates/ostadix-api/Cargo.toml"] = FIXTURE_API_CARGO.replace(
+            "Lee Daghlar Ostadi", "OpenAI Codex"
+        ).encode()
+        with self.assertRaisesRegex(
+            release.ReleaseError,
+            r"package\.authors must not attribute Claude or Codex",
+        ):
+            release._validate_workspace_facade_release_surface(files)
 
     def test_workspace_dependency_and_surface_drift_fail_closed(self) -> None:
         mutations = {
@@ -876,6 +903,7 @@ class SourceReleaseTests(unittest.TestCase):
             "scripts/smoke-docker.sh": "#!/usr/bin/env bash\n",
             "scripts/semantic_custody_demo.sh": "#!/usr/bin/env bash\n",
             "scripts/contract_surfaces.py": "#!/usr/bin/env python3\n",
+            "scripts/check_attribution.py": "#!/usr/bin/env python3\n",
             "scripts/check_architecture_boundaries.py": "#!/usr/bin/env python3\n",
             "scripts/local_ci_posture.py": "#!/usr/bin/env python3\n",
             "scripts/install-o-cli-wrapper.sh": "#!/usr/bin/env bash\n",
@@ -1014,6 +1042,7 @@ class SourceReleaseTests(unittest.TestCase):
             "tests/fixtures/world_receipt_v1.hex": "4f57524543454950\n",
             "tests/fixtures/world_value_v1.hex": "4f5756414c554531\n",
             "tests/test_example_manifest.py": "# fixture example manifest tests\n",
+            "tests/test_attribution_policy.py": "# fixture attribution policy tests\n",
             "tests/test_contract_surfaces.py": "# fixture contract projection tests\n",
             "tests/test_architecture_boundaries.py": "# fixture architecture boundary tests\n",
             "tests/test_governance_surfaces.py": "# fixture governance surface tests\n",
@@ -1345,6 +1374,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "scripts/smoke-docker.sh",
                 "scripts/semantic_custody_demo.sh",
                 "scripts/contract_surfaces.py",
+                "scripts/check_attribution.py",
                 "scripts/check_architecture_boundaries.py",
                 "scripts/local_ci_posture.py",
                 "scripts/install-o-cli-wrapper.sh",
@@ -1481,6 +1511,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "tests/fixtures/world_receipt_v1.hex",
                 "tests/fixtures/world_value_v1.hex",
                 "tests/test_example_manifest.py",
+                "tests/test_attribution_policy.py",
                 "tests/test_contract_surfaces.py",
                 "tests/test_architecture_boundaries.py",
                 "tests/test_governance_surfaces.py",
@@ -1926,10 +1957,12 @@ class SourceReleaseTests(unittest.TestCase):
             "ci/test-suites.toml",
             "rust-toolchain.toml",
             "docs/CI_POSTURE.md",
+            "scripts/check_attribution.py",
             "scripts/contract_surfaces.py",
             "scripts/check_architecture_boundaries.py",
             "scripts/local_ci_posture.py",
             "tests/test_architecture_boundaries.py",
+            "tests/test_attribution_policy.py",
             "tests/test_contract_surfaces.py",
             "tests/test_local_ci_posture.py",
         )
