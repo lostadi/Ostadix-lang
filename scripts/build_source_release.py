@@ -74,6 +74,7 @@ ALLOWED_TOP_LEVEL_FILES = frozenset(
         "LICENSE",
         "llms.txt",
         "NOTICE",
+        "o-node-quickstart.sh",
         "ORIGIN.md",
         "README.md",
         "SECURITY.md",

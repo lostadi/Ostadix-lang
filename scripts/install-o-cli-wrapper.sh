@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
-# Install the repository-owned lowercase `o` dispatcher at one exact path.
+# Install the repository-owned `o` dispatcher at one exact path.
 #
-# On a case-insensitive filesystem the destination is also reached as `O`.
-# The generated wrapper uses the spelling preserved in $0 so uppercase `O`
-# remains the direct evaluator while lowercase `o` owns repository commands.
+# On case-sensitive filesystems lowercase `o` and uppercase `O` remain distinct:
+# `o` is the dispatcher and `O` is the native evaluator wrapper. On the default
+# case-insensitive macOS filesystem they are one directory entry, so both
+# spellings intentionally use this dispatcher. Unknown arguments still fall
+# through to the native evaluator, and `ostadix-evaluator` is the unambiguous
+# raw-evaluator command.
 set -euo pipefail
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
@@ -22,9 +25,6 @@ trap 'rm -f -- "$temporary"' EXIT HUP INT TERM
 cat >"$temporary" <<WRAPPER
 #!/usr/bin/env bash
 set -euo pipefail
-if [[ "\${0##*/}" == "O" ]]; then
-    exec "$ROOT/target/release/O" "\$@"
-fi
 exec "$ROOT/scripts/o-cli.sh" "\$@"
 WRAPPER
 chmod +x "$temporary"

@@ -22,9 +22,11 @@ Repository commands:
   run FILE.O [backends]          Run one local O document
   plan <project-or-.O> [options]  Print the OIR and execution plan
   why FILE.O P<N> [options]       Explain one admitted plan operation
-  node <profile|doctor|run|session> ...
-                                  Inspect or invoke one explicit hosted node
-  node-host <command> ...         Provision or serve a hosted node
+  node start|stop|status|restart
+                                  Run this machine as a zero-config LAN node
+  node list|use|profile|doctor|run|session ...
+                                  Discover and use LAN nodes without connection flags
+  node-host <command> ...         Expert alias for the raw o-node service CLI
   registry <command> ...          Manage the local signed node registry
   info <command> ...              Manage the local authority-free information store
   live <command> ...              Run the hosted live-system control plane
@@ -32,8 +34,9 @@ Repository commands:
   kernel <command>               Build, boot, or verify the O-core kernel
   help                           Show this help
 
-Any other arguments retain the historical lowercase evaluator behavior and
-are forwarded to O. Uppercase O always invokes the evaluator directly.
+Any other arguments retain evaluator behavior and are forwarded to the native O
+binary. On case-insensitive filesystems O/o share this dispatcher; use
+ostadix-evaluator when a command word must be treated as evaluator input.
 USAGE
 }
 
@@ -76,11 +79,30 @@ case "${1:-}" in
         ;;
     node)
         shift
-        if [[ ! -x "$OCTL_BIN" ]]; then
-            printf 'error: hosted node client is missing or not executable: %s\n' "$OCTL_BIN" >&2
-            exit 1
-        fi
-        exec "$OCTL_BIN" node "$@"
+        case "${1:-}" in
+            start|stop|status|restart|serve|pki|identity|admin)
+                if [[ ! -x "$NODE_BIN" ]]; then
+                    printf 'error: hosted node service is missing or not executable: %s\n' "$NODE_BIN" >&2
+                    exit 1
+                fi
+                exec "$NODE_BIN" "$@"
+                ;;
+            host)
+                shift
+                if [[ ! -x "$NODE_BIN" ]]; then
+                    printf 'error: hosted node service is missing or not executable: %s\n' "$NODE_BIN" >&2
+                    exit 1
+                fi
+                exec "$NODE_BIN" "$@"
+                ;;
+            *)
+                if [[ ! -x "$OCTL_BIN" ]]; then
+                    printf 'error: hosted node client is missing or not executable: %s\n' "$OCTL_BIN" >&2
+                    exit 1
+                fi
+                exec "$OCTL_BIN" node "$@"
+                ;;
+        esac
         ;;
     node-host)
         shift
