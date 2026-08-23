@@ -23,23 +23,24 @@ use o_lang::hosted_remote::v2::{
     HostedNodeClientV2, HostedPlacementAuthorityV2, HostedPlacementEvidenceV2,
     HostedPlacementIdentityV2, HostedResponseV2, HostedV2ClientFailureDisposition,
     LocalDevPlacementConfigV2, OpenSessionRequestV2, OperationOutcomeV2, OperationStatusV2,
-    PlacementLeaseSignerV2,
-    PlacementPurposeV2, PreparedOperationV2, RecoverSessionRequestV2, RecoveryTriggerV2,
-    RecoveryWarrantV2, ReplayClassV2, SessionCapabilityV2, SessionMutationRequestV2,
-    SessionQueryV2, SessionStateTierV2, SessionStatusV2, SignedPlacementLeaseV2,
-    SubmitOperationRequestV2, DEFAULT_MAX_ACTORS_PER_SESSION_V2, DEFAULT_MAX_OPEN_SESSIONS_V2,
-    DEFAULT_MAX_SNAPSHOT_BYTES_PER_ACTOR_V2, DEFAULT_MAX_STATE_BYTES_PER_SESSION_V2,
-    DEFAULT_MAX_STATE_BYTES_TOTAL_V2, DEVELOPMENT_EVIDENCE_LIFETIME_MILLIS_V2,
-    HOSTED_COMMAND_BINDING_SCHEMA_V2, HOSTED_PROTOCOL_V2, HOSTED_RECOVERY_WARRANT_SCHEMA_V2,
+    PlacementLeaseSignerV2, PlacementPurposeV2, PreparedOperationV2, RecoverSessionRequestV2,
+    RecoveryTriggerV2, RecoveryWarrantV2, ReplayClassV2, SessionCapabilityV2,
+    SessionMutationRequestV2, SessionQueryV2, SessionStateTierV2, SessionStatusV2,
+    SignedPlacementLeaseV2, SubmitOperationRequestV2, DEFAULT_MAX_ACTORS_PER_SESSION_V2,
+    DEFAULT_MAX_OPEN_SESSIONS_V2, DEFAULT_MAX_SNAPSHOT_BYTES_PER_ACTOR_V2,
+    DEFAULT_MAX_STATE_BYTES_PER_SESSION_V2, DEFAULT_MAX_STATE_BYTES_TOTAL_V2,
+    DEVELOPMENT_EVIDENCE_LIFETIME_MILLIS_V2, HOSTED_COMMAND_BINDING_SCHEMA_V2, HOSTED_PROTOCOL_V2,
+    HOSTED_RECOVERY_WARRANT_SCHEMA_V2,
 };
 use o_lang::hosted_remote::{
     certificate_leaf_sha256, default_ca_path, default_client_cert_path, default_client_key_path,
     discover_lan_nodes, fetch_lan_bootstrap, hosted_config_dir, lan_client_sessions_dir,
     lan_peers_config_dir, list_stored_lan_peers, load_stored_lan_peer, store_lan_peer,
     unix_time_ms, ClientTlsIdentity, DiscoveredLanNodeV1, HostedNodeClient,
-    HostedOperationOutcomeV1, RemotePreparedOperationV1, StoredLanPeerPathsV1,
-    StoredLanPeerV1, DEFAULT_LAN_DISCOVERY_MILLIS, DEFAULT_NODE_ADDRESS,
-    DEFAULT_TLS_SERVER_NAME, MAX_HOSTED_OUTPUT_BYTES, MAX_HOSTED_SOURCE_BYTES,
+    HostedOperationOutcomeV1, RemotePreparedOperationV1, StoredLanPeerPathsV1, StoredLanPeerV1,
+    DEFAULT_LAN_DISCOVERY_MILLIS, DEFAULT_NODE_ADDRESS, DEFAULT_TLS_SERVER_NAME, LAN_SECURITY_MODE,
+    MAX_HOSTED_OUTPUT_BYTES, MAX_HOSTED_SOURCE_BYTES, PAIRED_SECURITY_MODE,
+    PAIRING_REQUIRED_SECURITY_MODE,
 };
 use o_lang::ir::BackendRegistry;
 use o_lang::placement::{
@@ -778,16 +779,47 @@ fn read_preferred_node() -> Option<String> {
 
 fn write_preferred_node(node_id: &str) -> Result<()> {
     let root = lan_peers_config_dir();
-    fs::create_dir_all(&root)
-        .with_context(|| format!("failed to create LAN peer directory `{}`", root.display()))?;
-    #[cfg(unix)]
-    fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+    ensure_private_client_directory(&root)?;
     let path = preferred_node_path();
-    fs::write(&path, format!("{node_id}\n"))
-        .with_context(|| format!("failed to remember preferred node `{node_id}`"))?;
-    #[cfg(unix)]
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-    Ok(())
+    let temporary = root.join(format!("._preferred.{}.tmp", fresh_id("write")?));
+    let written = (|| -> Result<()> {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&temporary).with_context(|| {
+            format!(
+                "failed to reserve preferred-node update `{}`",
+                temporary.display()
+            )
+        })?;
+        file.write_all(format!("{node_id}\n").as_bytes())?;
+        file.sync_all()?;
+        fs::rename(&temporary, &path)
+            .with_context(|| format!("failed to remember preferred node `{node_id}`"))?;
+        sync_parent_directory(&path)
+    })();
+    if written.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    written
+}
+
+fn load_stored_peer_if_present(
+    peers_root: &Path,
+    node_id: &str,
+) -> Result<Option<(StoredLanPeerV1, StoredLanPeerPathsV1)>> {
+    let paths = StoredLanPeerPathsV1::for_root(peers_root, node_id)?;
+    match fs::symlink_metadata(&paths.directory) {
+        Ok(_) => load_stored_lan_peer(peers_root, node_id).map(Some),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to inspect remembered peer directory `{}`",
+                paths.directory.display()
+            )
+        }),
+    }
 }
 
 fn choose_discovered_node(
@@ -864,6 +896,29 @@ fn resolved_from_stored(
 
 fn resolve_node_connection(args: &NodeConnectionArgs) -> Result<ResolvedNodeConnection> {
     let (connect_timeout, io_timeout) = validate_connection_timeouts(args)?;
+    let only_paired_route_override = args.node.is_some()
+        && args.address.is_some()
+        && !args.manual
+        && args.server_name.is_none()
+        && args.ca.is_none()
+        && args.cert.is_none()
+        && args.key.is_none();
+    if only_paired_route_override {
+        let node_id = args.node.as_deref().expect("checked above");
+        let (mut peer, paths) = load_stored_peer_if_present(&lan_peers_config_dir(), node_id)?
+            .with_context(|| {
+                format!(
+                    "node `{node_id}` has no remembered identity; pair it before overriding its route"
+                )
+            })?;
+        if !peer.is_paired() {
+            bail!(
+                "--node with --address may override only the route of a passcode-paired identity"
+            );
+        }
+        peer.address = args.address.clone().expect("checked above");
+        return resolved_from_stored(peer, paths, connect_timeout, io_timeout);
+    }
     if explicit_connection_requested(args) {
         if args.node.is_some() && args.manual {
             bail!("--node selects an automatically discovered peer and cannot be combined with --manual");
@@ -897,39 +952,54 @@ fn resolve_node_connection(args: &NodeConnectionArgs) -> Result<ResolvedNodeConn
             Vec::new()
         }
     };
-    if let Some(node) = choose_discovered_node(
-        discovered,
-        args.node.as_deref(),
-        preferred.as_deref(),
-    )? {
+    if let Some(node) =
+        choose_discovered_node(discovered, args.node.as_deref(), preferred.as_deref())?
+    {
         let node_id = node.advertisement.node_id.clone();
-        let existing = load_stored_lan_peer(&peers_root, &node_id).ok();
-        // Refresh from every live advertisement. The enrollment endpoint is
-        // deliberately the LAN-open source of truth, so this also heals CA,
-        // certificate, and receipt-key rotation without asking the user to
-        // delete remembered files or provide any transport override.
-        let need_bootstrap = true;
-        let enrolled = if need_bootstrap {
-            match fetch_lan_bootstrap(&node, connect_timeout) {
-                Ok(bundle) => Some(store_lan_peer(&peers_root, &node, &bundle)?),
-                Err(error) => {
-                    if existing.is_none() {
-                        return Err(error).context(format!(
-                            "discovered node `{node_id}` could not complete automatic enrollment"
-                        ));
-                    }
-                    eprintln!(
-                        "octl: node `{node_id}` was discovered but enrollment refresh failed; using remembered credentials: {error:#}"
-                    );
-                    None
+        let existing = load_stored_peer_if_present(&peers_root, &node_id)?;
+        if let Some((mut peer, paths)) = existing
+            .as_ref()
+            .filter(|(peer, _)| peer.security_mode == PAIRED_SECURITY_MODE)
+            .cloned()
+        {
+            // Discovery is only a routing hint for a paired node. Keep every
+            // identity field pinned; the subsequent mTLS handshake decides
+            // whether this candidate address actually belongs to that peer.
+            peer.address = node.service_address().to_string();
+            write_preferred_node(&node_id)?;
+            return resolved_from_stored(peer, paths, connect_timeout, io_timeout);
+        }
+
+        if node.advertisement.security_mode == PAIRING_REQUIRED_SECURITY_MODE {
+            bail!(
+                "node `{node_id}` requires reciprocal public-key pairing; run `o node pair` on one node, then `o node pair {node_id}` on this node"
+            );
+        }
+        if node.advertisement.security_mode != LAN_SECURITY_MODE {
+            bail!(
+                "node `{node_id}` advertised unsupported security mode `{}`",
+                node.advertisement.security_mode
+            );
+        }
+
+        // A server must opt into legacy LAN-open mode before this compatibility
+        // branch will download its shared private key. Paired pins never enter
+        // this branch and therefore cannot be refreshed from plaintext state.
+        let enrolled = match fetch_lan_bootstrap(&node, connect_timeout) {
+            Ok(bundle) => Some(store_lan_peer(&peers_root, &node, &bundle)?),
+            Err(error) => {
+                if existing.is_none() {
+                    return Err(error).context(format!(
+                        "legacy LAN-open node `{node_id}` could not complete enrollment"
+                    ));
                 }
+                eprintln!(
+                    "octl: legacy node `{node_id}` was discovered but enrollment refresh failed; using remembered credentials: {error:#}"
+                );
+                None
             }
-        } else {
-            None
         };
         let (mut peer, paths) = enrolled.or(existing).expect("enrolled or existing peer");
-        // A remembered credential remains valid across DHCP changes. The live
-        // advertisement is the routing coordinate for this invocation.
         peer.address = node.service_address().to_string();
         peer.server_name = node.advertisement.server_name.clone();
         write_preferred_node(&node_id)?;
@@ -937,11 +1007,9 @@ fn resolve_node_connection(args: &NodeConnectionArgs) -> Result<ResolvedNodeConn
     }
 
     let remembered = list_stored_lan_peers(&peers_root)?;
-    if let Some((peer, paths)) = choose_stored_peer(
-        remembered,
-        args.node.as_deref(),
-        preferred.as_deref(),
-    ) {
+    if let Some((peer, paths)) =
+        choose_stored_peer(remembered, args.node.as_deref(), preferred.as_deref())
+    {
         write_preferred_node(&peer.node_id)?;
         return resolved_from_stored(peer, paths, connect_timeout, io_timeout);
     }
@@ -949,11 +1017,11 @@ fn resolve_node_connection(args: &NodeConnectionArgs) -> Result<ResolvedNodeConn
     if let Some(node_id) = &args.node {
         bail!(
             "no reachable or remembered Ostadix node named `{node_id}`; {}",
-            "start it with `o-node start` on the other machine"
+            "start it with `o node start` on the other machine, then pair it with `o node pair`"
         );
     }
     bail!(
-        "no Ostadix LAN node was discovered or remembered; run `o-node start` once on a machine in this local network"
+        "no Ostadix LAN node was discovered or remembered; run `o node start` on both machines and pair them with `o node pair`"
     )
 }
 
@@ -974,7 +1042,7 @@ fn node_list(args: NodeListArgs) -> Result<()> {
     for node in discovered {
         let node_id = node.advertisement.node_id.clone();
         let address = node.service_address().to_string();
-        let remembered = load_stored_lan_peer(&lan_peers_config_dir(), &node_id).is_ok();
+        let remembered = load_stored_peer_if_present(&lan_peers_config_dir(), &node_id)?.is_some();
         let selected = preferred.as_deref() == Some(node_id.as_str());
         rows.push(serde_json::json!({
             "node_id": node_id,
@@ -1006,11 +1074,7 @@ fn node_list(args: NodeListArgs) -> Result<()> {
             "supports_v2": peer.supports_v2,
         }));
     }
-    rows.sort_by(|left, right| {
-        left["node_id"]
-            .as_str()
-            .cmp(&right["node_id"].as_str())
-    });
+    rows.sort_by(|left, right| left["node_id"].as_str().cmp(&right["node_id"].as_str()));
     println!("{}", serde_json::to_string_pretty(&rows)?);
     Ok(())
 }
@@ -2004,8 +2068,7 @@ impl SessionStateTierArg {
 }
 
 fn ensure_private_client_directory(path: &Path) -> Result<()> {
-    fs::create_dir_all(path)
-        .with_context(|| format!("failed to create `{}`", path.display()))?;
+    fs::create_dir_all(path).with_context(|| format!("failed to create `{}`", path.display()))?;
     #[cfg(unix)]
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
     Ok(())
@@ -2063,7 +2126,10 @@ fn load_current_auto_session() -> Result<AutoSessionHandle> {
     let record: AutoSessionRecordV1 =
         read_json_file(&directory.join("session.json"), "automatic session record")?;
     if record.schema != AUTO_SESSION_SCHEMA_V1 {
-        bail!("unsupported automatic session record schema `{}`", record.schema);
+        bail!(
+            "unsupported automatic session record schema `{}`",
+            record.schema
+        );
     }
     let capability_path = directory.join("capability.json");
     let capability = read_capability(&capability_path)?;
@@ -2327,7 +2393,11 @@ fn auto_open_session_core(
         state_tier: state_tier.cli_name().to_owned(),
         created_unix_ms: unix_time_ms()?,
     };
-    write_json_new(&directory.join("session.json"), &record, "automatic session record")?;
+    write_json_new(
+        &directory.join("session.json"),
+        &record,
+        "automatic session record",
+    )?;
     Ok(AutoSessionHandle {
         directory,
         capability,
@@ -2411,9 +2481,10 @@ fn auto_send_session_core(
         let HostedResponseV2::Status { session, .. } = response else {
             bail!("node returned the wrong response while waiting for automatic operation");
         };
-        let operation = session.operations.get(&operation_id).with_context(|| {
-            format!("node status omitted accepted operation `{operation_id}`")
-        })?;
+        let operation = session
+            .operations
+            .get(&operation_id)
+            .with_context(|| format!("node status omitted accepted operation `{operation_id}`"))?;
         match operation.status {
             OperationStatusV2::Accepted | OperationStatusV2::Running => {
                 if Instant::now() >= deadline {
@@ -2525,10 +2596,7 @@ fn auto_session_send(args: AutoSessionSendArgs) -> Result<()> {
 
 fn auto_session_info(args: AutoSessionInfoArgs) -> Result<()> {
     let handle = load_current_auto_session()?;
-    let resolved = automatic_connection_for_session(
-        args.connection,
-        Some(&handle.record.node_id),
-    )?;
+    let resolved = automatic_connection_for_session(args.connection, Some(&handle.record.node_id))?;
     let capability = read_capability(&handle.capability)?;
     let response = client_v2(resolved.explicit_v2_args()?)?.status(SessionQueryV2 {
         credentials: capability.into(),

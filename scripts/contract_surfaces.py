@@ -31,6 +31,7 @@ LOCAL_CI_POSTURE_TEST = ROOT / "tests" / "test_local_ci_posture.py"
 EVIDENCE_ADMISSION = ENGINE_SOURCE / "evidence" / "admit.rs"
 HGRAPH_BENCHMARK = ROOT / "scripts" / "benchmark_hgraph_hosted.sh"
 CLI_TEST = ROOT / "tests" / "test_cli.sh"
+LAN_PAIRING_SMOKE = ROOT / "scripts" / "smoke-zero-config-lan-netns.sh"
 
 SCHEDULE_EXPLANATION_STRUCT_FIELDS = {
     "ScheduleExplanationV2": ("schema", "admission", "realizability", "prediction"),
@@ -373,6 +374,22 @@ def validate_runtime_probe_consumers(workflow: str) -> None:
     if hosted_job.count(lan_smoke) != 1:
         raise ContractError(
             "rust-hosted CI must run the zero-config non-loopback LAN smoke exactly once"
+        )
+    pairing_smoke = LAN_PAIRING_SMOKE.read_text(encoding="utf-8")
+    required_pairing_markers = (
+        "passcode pairing wrong-code no-state boundary: PASS",
+        "reciprocal public-key pairing, private storage, distinct keys, and one-use-listener boundary: PASS",
+        "paired-default legacy-bootstrap-disabled in both namespaces: PASS",
+        "paired bidirectional restart reconnect over non-loopback links: PASS",
+        "explicit replacement recovers one-sided pairing persistence: PASS",
+    )
+    missing_markers = [
+        marker for marker in required_pairing_markers if pairing_smoke.count(marker) != 1
+    ]
+    if missing_markers:
+        raise ContractError(
+            "zero-config LAN smoke must retain every paired-node boundary marker: "
+            + ", ".join(missing_markers)
         )
 
 

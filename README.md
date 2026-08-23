@@ -112,30 +112,77 @@ that a placement is authorized, or that a World is live.
 
 ### Zero-configuration LAN execution
 
-Ordinary LAN use does not require addresses, host names, ports, certificates,
-keys, capabilities, leases, operation IDs, or proof files. On the machine that
-will contribute execution capacity:
+Ordinary LAN use keeps transport and proof coordinates internal. Start a node
+on both machines:
 
 ```bash
 o node start
 ```
 
-On another machine in the same local network:
+On the first machine, open a one-use five-minute pairing offer:
 
 ```bash
-o node profile
-o node run examples/hello.O
-o node session run examples/hello.O
+o node pair
 ```
+
+On the second machine, use the printed node ID and type the ten-digit passcode
+at the hidden prompt:
+
+```bash
+o node pair NODE_ID
+```
+
+`--passcode-stdin` is available for noninteractive input. If ordinary LAN
+discovery cannot cross the route, keep the same authenticated exchange and
+name the directly TCP-reachable pairing endpoint with `--address HOST:7340`.
+This is routed pairing, not NAT traversal, relay, or hole punching; later
+reconnect also requires a reachable hosted-service route.
+
+Later ordinary commands reuse the reciprocal pinned identities without another
+passcode, address, certificate, key, capability, lease, operation ID, or proof
+file:
+
+```bash
+o node profile --node NODE_ID
+o node run --node NODE_ID examples/hello.O
+o node session run --node NODE_ID examples/hello.O
+```
+
+To test a known service route without changing the stored identity, use, for
+example, `octl node profile --node NODE_ID --address HOST:7337`. That combination
+overrides only the socket for that invocation and retains the paired CA, server
+name, client credential, and receipt-key pins.
+
+Destination-issued pairing client certificates are valid for 397 days. To
+renew them, or to repair a pairing that persisted on only one side, create and
+join a fresh offer with explicit replacement enabled on both machines:
+
+```bash
+# offering machine
+o node pair --replace
+# joining machine
+o node pair NODE_ID --replace
+```
+
+Ordinary pairing remains fail-closed when material differs from an existing
+pin; only `--replace` authorizes that staged replacement.
 
 Use `o node list` to inspect reachable nodes and `o node use NODE_ID` only when
 you need to choose among several semantic nodes. Explicit transport and trust
 configuration remains available through `--manual` and `o node-host` for
 operators who deliberately need it.
 
-Automatic mode deliberately treats LAN reachability as permission to enroll
-and execute. Its exact security boundary and storage behavior are documented
-in [Zero-configuration LAN nodes](docs/ZERO_CONFIG_LAN.md).
+The default is pairing-required: UDP discovery supplies only an unauthenticated
+routing hint, while SPAKE2 plus explicit confirmation binds the immutable
+server-CA, server-name, and receipt-key pins. Only public CA, CSR, certificate,
+and receipt material crosses the pairing channel; fresh per-peer private keys
+stay local. The former plaintext shared-key bootstrap is available only through
+the explicit legacy `--lan-open` switch. Duplicate or spoofed discovery replies
+can disrupt route selection but cannot replace a paired pin. Inbound client
+authentication is pairing-CA-wide: there is not yet a leaf-certificate
+allowlist, unpair operation, or revocation mechanism. The exact security and
+non-claim boundaries are documented in
+[Zero-configuration LAN nodes](docs/ZERO_CONFIG_LAN.md).
 
 ### Independent Rust runtime engine
 
@@ -251,6 +298,7 @@ The ordinary LAN surface keeps protocol coordinates internal:
 
 ```text
 o node start|stop|status|restart
+o node pair [NODE_ID]
 o node list|use
 o node profile|doctor|run
 o node session start|run|send|info|stop
@@ -266,19 +314,20 @@ octl node authority dev-mint open|execute|recover ...
 octl node session principal|open|exec|status|actors|reset|recover|close ...
 ```
 
-After normal setup, the lowercase wrapper routes node lifecycle commands to
-`o-node`, ordinary node use to `octl`, and `o node-host ...` to the raw expert
-server CLI. `o run ...` remains the explicit local execution path. See
+After normal setup, the lowercase wrapper routes node lifecycle and pairing
+commands to `o-node`, ordinary node use to `octl`, and `o node-host ...` to the
+raw expert server CLI. `o run ...` remains the explicit local execution path. See
 [Zero-configuration LAN nodes](docs/ZERO_CONFIG_LAN.md).
 
 ### Hosted V2 development quickstart
 
 > **Expert/manual path.** Ordinary users should use `o node start`,
-> `o node list`, and `o node session run FILE.O`, or the compatibility
-> `./o-node-quickstart.sh` front door. Those paths derive discovery, routing,
-> enrollment, credentials, capabilities, leases, and operation identities
-> automatically. The walkthrough below deliberately exposes those internals for
-> protocol development and fault diagnosis.
+> `o node pair`, `o node list`, and `o node session run FILE.O`, or the
+> compatibility `./o-node-quickstart.sh` front door. Pairing establishes the
+> reciprocal transport identities once; later ordinary commands derive routing,
+> credentials, capabilities, leases, and operation identities automatically.
+> The walkthrough below deliberately exposes those internals for protocol
+> development and fault diagnosis.
 
 This loopback walkthrough exercises the opt-in durable V2 path with the
 co-located, self-attested development authority. It is not production
@@ -1768,8 +1817,8 @@ needs QEMU and the local Rust linker toolchain.
 | `o-link` | `target/release/o-link` | Recursively literal-links and runs a bare single directory; `--project` creates an inert route-preserving bundle. |
 | `o-unlink` | `target/release/o-unlink` | Restores safe project bundles and legacy literal link sections. |
 | `o-live-host` | `target/release/o-live-host` | Runs the hosted package-store, activation, service-supervision, and cross-world semantic oracle. |
-| `o-node` | `target/release/o-node` | Starts a zero-configuration LAN execution node by default; retains explicit PKI, identity, readiness, serving, and administration controls for manual operation. |
-| `octl` | `target/release/octl` | Discovers, enrolls with, remembers, and invokes LAN nodes automatically; retains the exact manual Hosted V1/V2 controls. |
+| `o-node` | `target/release/o-node` | Starts a pairing-required LAN execution node, offers or joins one-use passcode pairing, and retains explicit PKI, identity, readiness, serving, legacy LAN-open, and administration controls. |
+| `octl` | `target/release/octl` | Uses discovery as a routing hint, reuses reciprocally paired identities, remembers peers, and invokes nodes automatically; retains the exact manual Hosted V1/V2 controls. |
 | `o-registry` | `target/release/o-registry` | Generates local placement profiles and creates, signs, verifies, lists, exports, and imports local registry snapshots. |
 | `o-info` | `target/release/o-info` | Maintains a local authority-free information head and exchanges signed canonical offline delta packs. |
 | `o-notebook` | feature-gated Cargo binary | Runs the local notebook server when built with `--features notebook`. |

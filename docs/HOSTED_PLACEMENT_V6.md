@@ -337,10 +337,14 @@ descriptive inspection, not a warrant, candidate decision, lease, or dispatch.
 
 ## Discovery status
 
-The direct node channel performs no network registry discovery. The operator
-supplies the endpoint, trusted CA, expected server name, client certificate,
-and client key to `octl`. A node profile is useful inspection data; it is not a
-lease and does not automatically authorize dispatch.
+The Hosted Placement V6 protocol itself performs no network registry discovery.
+Its raw/manual surface requires an operator-supplied endpoint, trusted CA,
+expected server name, client certificate, and client key. The ordinary `o node`
+projection adds interface-aware UDP discovery and reciprocal passcode pairing
+outside that protocol. Discovery is an unauthenticated routing hint; only the
+paired server CA, expected server name, and receipt public key establish the
+remembered transport identity. A node profile is useful inspection data; it is
+not a lease and does not automatically authorize dispatch.
 
 Specifically, `o-node profile` and `octl node profile` expose the descriptive
 `hosted_remote::NodeProfileV1` catalog/limit record. It is distinct from the
@@ -354,8 +358,50 @@ The placement core separately caps a node profile at 60 seconds, a capacity
 observation at 5 seconds, and a placement lease at 30 seconds. These are maximum
 record validity intervals, not promises that a node remains healthy for their
 duration. V1 does not consume these records. V2 authenticates and revalidates
-the records it carries at the exact command time; an operator-provided endpoint
-still determines which node receives the request.
+the records it carries at the exact command time. Manual mode uses the
+operator-provided endpoint; ordinary mode uses a live discovery route when
+available and otherwise the paired peer's remembered address, always under the
+immutable paired identity pins.
+
+For a known paired node, `octl ... --node NODE_ID --address HOST:PORT`
+overrides only the route for that invocation. It retains the stored server CA,
+expected server name, client credential, and receipt public key; it does not
+persist the route or rotate identity. Duplicate or spoofed advertisements can
+therefore disrupt availability, but cannot replace paired pins.
+
+### Ordinary passcode pairing projection
+
+Both machines first run `o node start`. One runs `o node pair`, which prints a
+uniform ten-digit code and accepts one connection attempt for five minutes. The
+other runs `o node pair NODE_ID` and enters that code through a hidden prompt;
+`--passcode-stdin` is the noninteractive input path. Directly routed pairing can
+bypass discovery with `--address HOST:7340`, but that endpoint must be directly
+TCP-reachable. There is no NAT traversal, relay, or hole punching.
+
+The exchange uses SPAKE2 with explicit directional confirmation over both node
+identities, both public bundles, both SPAKE2 messages, both CSRs, and both
+issued certificates. Each side generates a fresh per-peer client private key
+locally. Only public server/client-issuer CA, CSR, issued certificate, and node
+receipt-key material crosses the channel. Later ordinary profile, run, and
+session commands reuse the reciprocal paired identities; pairing does not keep
+a background connection or form a persistent node mesh.
+
+Destination-issued client certificates are valid for 397 days. Renewal, or
+recovery when only one side retained pairing state, uses a fresh offer with
+`o node pair --replace` on the offerer and
+`o node pair NODE_ID --replace` on the joiner. Ordinary pairing refuses changed
+pins; `--replace` is the explicit authority for staged replacement on an
+existing side and ordinary first storage on a missing side.
+
+Pairing-required mode is the automatic default and exposes no plaintext
+bootstrap service. `--lan-open` is an explicit legacy compatibility switch that
+restores the former reachability-authorizes-download behavior and its shared
+client private key. A paired identity cannot be replaced by that legacy path.
+The `spake2` dependency has not been independently audited within Ostadix's
+evidence. Inbound client trust is pairing-CA-wide rather than restricted to a
+stored leaf. Version 1 has no leaf-certificate allowlist, unpair operation, or
+revocation mechanism, so replacing a record does not revoke an already issued
+certificate before expiry.
 
 ## Signed namespace registry: local and offline
 
@@ -441,13 +487,17 @@ requires a pinned trust root, expected server name, client certificate and key,
 and a version-specific Ostadix ALPN value. There is no plaintext fallback,
 opportunistic trust, 0-RTT path, or downgrade after ALPN selection. A dual node
 offers frozen `ostadix-hosted/1` and durable `ostadix-hosted/2` on the same port,
-but selects the decoder before reading application bytes.
+but selects the decoder before reading application bytes. The temporary TCP
+7340 pairing endpoint is a separate passcode-authenticated control channel and
+does not carry hosted operations.
 
-The node binds `127.0.0.1:7337` by default, the client connects to that address
-and validates the certificate name `localhost`, and the node permits at most 32
-simultaneous connections. Use `o-node serve --bind`, `octl node ... --address`,
-and `--server-name` for an explicitly configured non-loopback endpoint. Endpoint
-selection remains an operator action; neither protocol performs discovery.
+The raw manual node binds `127.0.0.1:7337` by default, the manual client connects
+to that address and validates the certificate name `localhost`, and the node
+permits at most 32 simultaneous connections. Use `o-node serve --manual` with
+`--bind`, or use `octl node ... --address` with `--server-name`, for an
+explicitly configured non-loopback endpoint. The separate ordinary projection
+discovers routing coordinates but never treats an advertisement as trusted
+identity.
 
 `o-node doctor` and `serve` also require a supported native evaluator image.
 Normal setup installs the byte-identical `ostadix-evaluator` alias beside
@@ -732,19 +782,26 @@ external effects idempotent or exactly once.
 
 ## User-facing commands
 
-The commands below are the raw Hosted Placement V6 protocol/operator surface.
+The commands below are the implemented node and Hosted Placement V6 operator
+surface. Pairing belongs to the ordinary projection; the explicit `octl`
+certificate, lease, and session arguments are the raw protocol surface.
 Ordinary LAN use is projected through the zero-configuration layer documented
-in [Zero-configuration LAN nodes](ZERO_CONFIG_LAN.md): `o node start`,
-`o node list`, `o node profile`, `o node run FILE.O`, and
-`o node session run FILE.O` derive the transport and proof artifacts internally.
-Passing `--manual` or explicit connection coordinates selects the raw surface.
+in [Zero-configuration LAN nodes](ZERO_CONFIG_LAN.md): both machines run
+`o node start`, then `o node pair` on the offerer and `o node pair NODE_ID` on
+the joiner. Later `o node list`, `o node profile`, `o node run FILE.O`, and
+`o node session run FILE.O` reuse the paired transport identity and derive proof
+artifacts internally. Passing `--manual` or explicit hosted-connection
+trust coordinates selects the raw surface. The paired
+`--node NODE_ID --address HOST:PORT` combination instead changes only the route
+for that invocation and retains the stored paired identity.
 
-The implemented direct-node surface is explicit:
+The implemented node surface is explicit:
 
 ```text
 o-node pki init ...
 o-node identity init ...
 o-node admin gc-closed ...
+o-node pair [NODE_ID] ...
 o-node profile ...
 o-node doctor ...
 o-node serve ...
@@ -843,10 +900,12 @@ Hosted Placement V6 does **not** establish:
 - OSTADIX World membership, a replicated Governor, Governor admission or
   commit, WorldFS, or passage of G1 or any G0--G13 gate;
 - discovery, enrollment, or scheduling as properties of the Hosted Placement
-  V6 protocol itself. The separate usability-first `lan-open` projection adds
-  unauthenticated LAN discovery and enrollment, but not a production registry,
-  scheduler-selected placement, multi-key authority policy, rotation,
-  revocation, or provider admission;
+  V6 protocol itself. The separate ordinary projection adds unauthenticated
+  routing discovery and one-use passcode pairing. Pairing authenticates and
+  pins transport identity, but it is not a production registry,
+  scheduler-selected placement, multi-key authority policy, CA rotation,
+  leaf-certificate revocation/allowlisting, unpair mechanism, or provider
+  admission. Inbound client trust is pairing-CA-wide;
 - proof enforcement, state-capacity reservation, a durable attempt ledger, or
   detached node attribution on frozen V1; these are bounded V2 properties and
   must not be read back into V1;
@@ -858,6 +917,12 @@ Hosted Placement V6 does **not** establish:
   accepted or ambiguous attempt;
 - encrypted-at-rest session state, hardware-protected node or authority keys,
   production secret distribution, or confidential-computing attestation;
+- an independently audited SPAKE2 implementation, router-crossing discovery,
+  NAT traversal, or a persistent node mesh. `--address HOST:7340` permits a
+  known directly TCP-reachable pairing endpoint, and paired state permits
+  remembered-address reconnect, but neither feature discovers, traverses NAT,
+  or maintains a cross-router link. Duplicate discovery replies can impair
+  routing availability but cannot replace paired identity pins;
 - physical-machine, Secure Boot, measured-boot, device-assignment, DMA/IOMMU,
   or O-core hardware-isolation evidence;
 - coherent cross-node memory, transparent pointers, persistent-actor

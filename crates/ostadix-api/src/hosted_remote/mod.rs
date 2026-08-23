@@ -12,6 +12,7 @@
 mod client;
 mod lan;
 mod node;
+mod pairing;
 mod paths;
 mod protocol;
 mod tls;
@@ -20,6 +21,7 @@ pub mod v2;
 pub use client::*;
 pub use lan::*;
 pub use node::*;
+pub use pairing::*;
 pub use paths::*;
 pub use protocol::*;
 pub use tls::*;
