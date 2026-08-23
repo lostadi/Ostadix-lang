@@ -26,6 +26,19 @@ from urllib.parse import unquote, urlsplit
 import zipfile
 import zlib
 
+try:
+    from scripts.check_attribution import (
+        cargo_author_values,
+        cff_author_values,
+        contains_forbidden_identity,
+    )
+except ModuleNotFoundError:  # Direct `python3 scripts/build_source_release.py`.
+    from check_attribution import (  # type: ignore[no-redef]
+        cargo_author_values,
+        cff_author_values,
+        contains_forbidden_identity,
+    )
+
 
 SCHEMA = "ostadix-source-release-v1"
 MANIFEST_NAME = "SOURCE-MANIFEST.json"
@@ -421,6 +434,7 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "scripts/smoke-docker.sh",
         "scripts/semantic_custody_demo.sh",
         "scripts/contract_surfaces.py",
+        "scripts/check_attribution.py",
         "scripts/check_architecture_boundaries.py",
         "scripts/local_ci_posture.py",
         "scripts/install-o-cli-wrapper.sh",
@@ -567,6 +581,7 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "tests/test_o_cli_dispatch.py",
         "tests/test_setup.py",
         "tests/test_contract_surfaces.py",
+        "tests/test_attribution_policy.py",
         "tests/test_architecture_boundaries.py",
         "tests/test_governance_surfaces.py",
         "tests/test_local_ci_posture.py",
@@ -1562,6 +1577,29 @@ def _readme_how_to_cite(text: str) -> str:
     return " ".join(text[start:end].split())
 
 
+def _validate_cargo_authors(manifest: dict[str, object], label: str) -> None:
+    authors = cargo_author_values(manifest)
+    if not authors:
+        raise ReleaseError(f"{label} must declare at least one package author")
+    for field, author in authors:
+        if contains_forbidden_identity(author):
+            raise ReleaseError(
+                f"{label} {field} must not attribute Claude or Codex: {author!r}"
+            )
+
+
+def _validate_cff_authors(text: str, label: str) -> None:
+    authors = cff_author_values(text)
+    if not authors:
+        raise ReleaseError(f"{label} must declare at least one author")
+    for line_number, author in authors:
+        if contains_forbidden_identity(author):
+            raise ReleaseError(
+                f"{label} authors line {line_number} must not attribute "
+                f"Claude or Codex: {author!r}"
+            )
+
+
 def _validate_root_release_metadata(files: dict[str, bytes]) -> None:
     """Keep root license, Cargo, CFF, and live citation prose coherent."""
 
@@ -1576,6 +1614,7 @@ def _validate_root_release_metadata(files: dict[str, bytes]) -> None:
     package = cargo.get("package")
     if not isinstance(package, dict):
         raise ReleaseError("Cargo.toml must contain a package table")
+    _validate_cargo_authors(cargo, "Cargo.toml")
     cargo_version = _required_string(
         package.get("version"), "Cargo.toml package.version"
     )
@@ -1605,6 +1644,7 @@ def _validate_root_release_metadata(files: dict[str, bytes]) -> None:
             )
 
     citation = _utf8_text(files["CITATION.cff"], "CITATION.cff")
+    _validate_cff_authors(citation, "CITATION.cff")
     citation_version = _cff_scalar(citation, "version")
     citation_license = _cff_scalar(citation, "license")
     citation_repository = _cff_scalar(citation, "repository-code")
@@ -1789,6 +1829,7 @@ def _validate_workspace_facade_release_surface(files: dict[str, bytes]) -> None:
     engine_package = engine.get("package")
     if not isinstance(engine_package, dict):
         raise ReleaseError(f"{engine_path} must contain a package table")
+    _validate_cargo_authors(engine, engine_path)
     expected_package = {
         "name": "ostadix-api",
         "version": root_version,
