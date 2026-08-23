@@ -1,14 +1,18 @@
+use std::env;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::process::Command as ProcessCommand;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use serde::{Deserialize, Serialize};
 
 #[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use o_lang::eval::{Evaluator, PlacementFragmentBindingsV2};
 use o_lang::hosted_remote::v2::{
@@ -18,7 +22,8 @@ use o_lang::hosted_remote::v2::{
     write_new_placement_public_key_v2, write_new_placement_signing_key_v2, HostedCommandBindingV2,
     HostedNodeClientV2, HostedPlacementAuthorityV2, HostedPlacementEvidenceV2,
     HostedPlacementIdentityV2, HostedResponseV2, HostedV2ClientFailureDisposition,
-    LocalDevPlacementConfigV2, OpenSessionRequestV2, OperationStatusV2, PlacementLeaseSignerV2,
+    LocalDevPlacementConfigV2, OpenSessionRequestV2, OperationOutcomeV2, OperationStatusV2,
+    PlacementLeaseSignerV2,
     PlacementPurposeV2, PreparedOperationV2, RecoverSessionRequestV2, RecoveryTriggerV2,
     RecoveryWarrantV2, ReplayClassV2, SessionCapabilityV2, SessionMutationRequestV2,
     SessionQueryV2, SessionStateTierV2, SessionStatusV2, SignedPlacementLeaseV2,
@@ -29,9 +34,12 @@ use o_lang::hosted_remote::v2::{
 };
 use o_lang::hosted_remote::{
     certificate_leaf_sha256, default_ca_path, default_client_cert_path, default_client_key_path,
-    hosted_config_dir, unix_time_ms, ClientTlsIdentity, HostedNodeClient, HostedOperationOutcomeV1,
-    RemotePreparedOperationV1, DEFAULT_NODE_ADDRESS, DEFAULT_TLS_SERVER_NAME,
-    MAX_HOSTED_OUTPUT_BYTES, MAX_HOSTED_SOURCE_BYTES,
+    discover_lan_nodes, fetch_lan_bootstrap, hosted_config_dir, lan_client_sessions_dir,
+    lan_peers_config_dir, list_stored_lan_peers, load_stored_lan_peer, store_lan_peer,
+    unix_time_ms, ClientTlsIdentity, DiscoveredLanNodeV1, HostedNodeClient,
+    HostedOperationOutcomeV1, RemotePreparedOperationV1, StoredLanPeerPathsV1,
+    StoredLanPeerV1, DEFAULT_LAN_DISCOVERY_MILLIS, DEFAULT_NODE_ADDRESS,
+    DEFAULT_TLS_SERVER_NAME, MAX_HOSTED_OUTPUT_BYTES, MAX_HOSTED_SOURCE_BYTES,
 };
 use o_lang::ir::BackendRegistry;
 use o_lang::placement::{
@@ -41,6 +49,7 @@ use o_lang::placement::{
     StateSessionIdV2, TaskAttemptIdV1, UnixMillisV1,
 };
 use o_lang::runtime_exec::validate_native_runtime_binary;
+use o_lang::shims::ExtractedShims;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -67,13 +76,17 @@ struct NodeArgs {
 
 #[derive(Debug, Subcommand)]
 enum NodeCommand {
+    /// Discover reachable LAN nodes and show remembered peers.
+    List(NodeListArgs),
+    /// Select the preferred node used when ordinary commands omit --node.
+    Use(NodeUseArgs),
     /// Fetch the node's descriptive backend catalog and transport limits.
     Profile(NodeQueryArgs),
     /// Fetch node-local readiness checks (not a placement warrant).
     Doctor(NodeQueryArgs),
-    /// Run one exact O source document on the explicitly selected node.
+    /// Run one exact O source document on the automatically selected or explicitly overridden node.
     Run(NodeRunArgs),
-    /// Open and operate durable, explicitly closed hosted V2 sessions.
+    /// Open and operate automatically managed or expert-level durable V2 sessions.
     Session(SessionArgs),
     /// Provision a co-located self-attested development authority and issue exact signed V2 leases.
     Authority(AuthorityArgs),
@@ -329,15 +342,17 @@ impl LocalDevOpenSubmissionArgs {
             .context("--node-receipt-public-key is required with --submit")?;
         Ok(V2ConnectionArgs {
             connection: NodeConnectionArgs {
-                address: self.address.clone(),
-                server_name: self.server_name.clone(),
+                node: None,
+                address: Some(self.address.clone()),
+                server_name: Some(self.server_name.clone()),
                 ca: self.ca.clone(),
                 cert: client_cert,
                 key: self.key.clone(),
+                manual: true,
                 connect_timeout_seconds: self.connect_timeout_seconds,
                 io_timeout_seconds: self.io_timeout_seconds,
             },
-            node_receipt_public_key,
+            node_receipt_public_key: Some(node_receipt_public_key),
         })
     }
 }
@@ -410,6 +425,16 @@ struct SessionArgs {
 
 #[derive(Debug, Subcommand)]
 enum SessionCommand {
+    /// Open a zero-configuration LAN session and make it the current session.
+    Start(AutoSessionStartArgs),
+    /// Open, execute, wait for the result, and close -- all automatically.
+    Run(AutoSessionRunArgs),
+    /// Execute another source document in the current zero-configuration session.
+    Send(AutoSessionSendArgs),
+    /// Show the current zero-configuration session and remote status.
+    Info(AutoSessionInfoArgs),
+    /// Close the current zero-configuration session.
+    Stop(AutoSessionStopArgs),
     /// Print the TLS client-certificate principal digest leases must bind.
     Principal(SessionPrincipalArgs),
     /// Open using the precommitted mode-0600 capability bound by the signed lease.
@@ -435,26 +460,115 @@ struct SessionPrincipalArgs {
     cert: Option<PathBuf>,
 }
 
+#[derive(Debug, Args)]
+struct NodeListArgs {
+    /// Spend this many milliseconds listening for LAN advertisements.
+    #[arg(long, default_value_t = DEFAULT_LAN_DISCOVERY_MILLIS)]
+    timeout_millis: u64,
+}
+
+#[derive(Debug, Args)]
+struct NodeUseArgs {
+    /// Stable node identity shown by `octl node list`.
+    node_id: String,
+}
+
 #[derive(Debug, Clone, Args)]
 struct NodeConnectionArgs {
-    #[arg(long, default_value = DEFAULT_NODE_ADDRESS)]
-    address: String,
-    /// DNS name or IP SAN pinned by the node certificate.
-    #[arg(long, default_value = DEFAULT_TLS_SERVER_NAME)]
-    server_name: String,
-    /// Server CA PEM (default: XDG config ostadix/hosted/ca.pem).
+    /// Prefer this automatically discovered node. Omit to use the remembered
+    /// preference, or choose deterministically when no preference exists.
+    #[arg(long)]
+    node: Option<String>,
+    /// Expert override: connect to this exact socket instead of discovering.
+    #[arg(long)]
+    address: Option<String>,
+    /// Expert override: DNS name or IP SAN pinned by the node certificate.
+    #[arg(long)]
+    server_name: Option<String>,
+    /// Expert override: server CA PEM.
     #[arg(long)]
     ca: Option<PathBuf>,
-    /// Client certificate chain PEM.
+    /// Expert override: client certificate chain PEM.
     #[arg(long)]
     cert: Option<PathBuf>,
-    /// Client private key PEM.
+    /// Expert override: client private key PEM.
     #[arg(long)]
     key: Option<PathBuf>,
+    /// Disable discovery/enrollment and restore the explicit localhost defaults.
+    #[arg(long)]
+    manual: bool,
     #[arg(long, default_value_t = 10)]
     connect_timeout_seconds: u64,
     #[arg(long, default_value_t = 60)]
     io_timeout_seconds: u64,
+}
+
+impl Default for NodeConnectionArgs {
+    fn default() -> Self {
+        Self {
+            node: None,
+            address: None,
+            server_name: None,
+            ca: None,
+            cert: None,
+            key: None,
+            manual: false,
+            connect_timeout_seconds: 10,
+            io_timeout_seconds: 60,
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+struct AutoSessionStartArgs {
+    #[command(flatten)]
+    connection: NodeConnectionArgs,
+    /// Source whose backend/environment footprint defines the session.
+    source: PathBuf,
+    /// State model. Stateless is the lowest-friction and most portable default.
+    #[arg(long, value_enum, default_value = "stateless")]
+    state_tier: SessionStateTierArg,
+}
+
+#[derive(Debug, Args)]
+struct AutoSessionRunArgs {
+    #[command(flatten)]
+    connection: NodeConnectionArgs,
+    /// Source to execute in a temporary automatically managed session.
+    source: PathBuf,
+    #[arg(long, value_enum, default_value = "stateless")]
+    state_tier: SessionStateTierArg,
+    /// Leave the generated session open and make it current after execution.
+    #[arg(long)]
+    keep_open: bool,
+    #[arg(long, default_value_t = 300)]
+    deadline_seconds: u64,
+    #[arg(long, default_value_t = MAX_HOSTED_OUTPUT_BYTES as u64)]
+    output_limit_bytes: u64,
+}
+
+#[derive(Debug, Args)]
+struct AutoSessionSendArgs {
+    #[command(flatten)]
+    connection: NodeConnectionArgs,
+    /// Source to execute in the current automatically managed session.
+    source: PathBuf,
+    #[arg(long, default_value_t = 300)]
+    deadline_seconds: u64,
+    #[arg(long, default_value_t = MAX_HOSTED_OUTPUT_BYTES as u64)]
+    output_limit_bytes: u64,
+}
+
+#[derive(Debug, Args)]
+struct AutoSessionInfoArgs {
+    #[command(flatten)]
+    connection: NodeConnectionArgs,
+}
+
+#[derive(Debug, Args)]
+struct AutoSessionStopArgs {
+    #[command(flatten)]
+    connection: NodeConnectionArgs,
 }
 
 #[derive(Debug, Args)]
@@ -513,7 +627,7 @@ struct V2ConnectionArgs {
     connection: NodeConnectionArgs,
     /// Pinned Ed25519 receipt public key written by `o-node identity init`.
     #[arg(long)]
-    node_receipt_public_key: PathBuf,
+    node_receipt_public_key: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -580,9 +694,352 @@ struct SessionRecoverArgs {
     lease: PathBuf,
 }
 
+#[derive(Debug, Clone)]
+struct ResolvedNodeConnection {
+    node_id: Option<String>,
+    address: String,
+    server_name: String,
+    ca: PathBuf,
+    cert: PathBuf,
+    key: PathBuf,
+    node_receipt_public_key: Option<PathBuf>,
+    connect_timeout: Duration,
+    io_timeout: Duration,
+}
+
+impl ResolvedNodeConnection {
+    fn tls_identity(&self) -> ClientTlsIdentity {
+        ClientTlsIdentity {
+            ca_path: self.ca.clone(),
+            cert_path: self.cert.clone(),
+            key_path: self.key.clone(),
+            server_name: self.server_name.clone(),
+        }
+    }
+
+    fn explicit_args(&self) -> NodeConnectionArgs {
+        NodeConnectionArgs {
+            node: None,
+            address: Some(self.address.clone()),
+            server_name: Some(self.server_name.clone()),
+            ca: Some(self.ca.clone()),
+            cert: Some(self.cert.clone()),
+            key: Some(self.key.clone()),
+            manual: true,
+            connect_timeout_seconds: self.connect_timeout.as_secs(),
+            io_timeout_seconds: self.io_timeout.as_secs(),
+        }
+    }
+
+    fn explicit_v2_args(&self) -> Result<V2ConnectionArgs> {
+        Ok(V2ConnectionArgs {
+            connection: self.explicit_args(),
+            node_receipt_public_key: Some(
+                self.node_receipt_public_key
+                    .clone()
+                    .context("selected node did not advertise durable V2 receipt identity")?,
+            ),
+        })
+    }
+}
+
+fn validate_connection_timeouts(args: &NodeConnectionArgs) -> Result<(Duration, Duration)> {
+    if args.connect_timeout_seconds == 0 || args.io_timeout_seconds == 0 {
+        bail!("node connection timeouts must be positive");
+    }
+    if args.connect_timeout_seconds > 3600 || args.io_timeout_seconds > 3600 {
+        bail!("node connection timeouts may not exceed 3600 seconds");
+    }
+    Ok((
+        Duration::from_secs(args.connect_timeout_seconds),
+        Duration::from_secs(args.io_timeout_seconds),
+    ))
+}
+
+fn explicit_connection_requested(args: &NodeConnectionArgs) -> bool {
+    args.manual
+        || args.address.is_some()
+        || args.server_name.is_some()
+        || args.ca.is_some()
+        || args.cert.is_some()
+        || args.key.is_some()
+}
+
+fn preferred_node_path() -> PathBuf {
+    lan_peers_config_dir().join("_preferred")
+}
+
+fn read_preferred_node() -> Option<String> {
+    fs::read_to_string(preferred_node_path())
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn write_preferred_node(node_id: &str) -> Result<()> {
+    let root = lan_peers_config_dir();
+    fs::create_dir_all(&root)
+        .with_context(|| format!("failed to create LAN peer directory `{}`", root.display()))?;
+    #[cfg(unix)]
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+    let path = preferred_node_path();
+    fs::write(&path, format!("{node_id}\n"))
+        .with_context(|| format!("failed to remember preferred node `{node_id}`"))?;
+    #[cfg(unix)]
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+fn choose_discovered_node(
+    mut nodes: Vec<DiscoveredLanNodeV1>,
+    requested: Option<&str>,
+    preferred: Option<&str>,
+) -> Result<Option<DiscoveredLanNodeV1>> {
+    nodes.sort_by(|left, right| {
+        left.advertisement
+            .node_id
+            .cmp(&right.advertisement.node_id)
+            .then_with(|| left.source_ip.to_string().cmp(&right.source_ip.to_string()))
+    });
+    if let Some(requested) = requested {
+        return Ok(nodes
+            .into_iter()
+            .find(|node| node.advertisement.node_id == requested));
+    }
+    if let Some(preferred) = preferred {
+        if let Some(index) = nodes
+            .iter()
+            .position(|node| node.advertisement.node_id == preferred)
+        {
+            return Ok(Some(nodes.remove(index)));
+        }
+    }
+    if nodes.iter().any(|node| !node.source_ip.is_loopback()) {
+        nodes.retain(|node| !node.source_ip.is_loopback());
+    }
+    Ok(nodes.into_iter().next())
+}
+
+fn choose_stored_peer(
+    mut peers: Vec<(StoredLanPeerV1, StoredLanPeerPathsV1)>,
+    requested: Option<&str>,
+    preferred: Option<&str>,
+) -> Option<(StoredLanPeerV1, StoredLanPeerPathsV1)> {
+    peers.sort_by(|left, right| left.0.node_id.cmp(&right.0.node_id));
+    if let Some(requested) = requested {
+        return peers
+            .into_iter()
+            .find(|(peer, _)| peer.node_id == requested);
+    }
+    if let Some(preferred) = preferred {
+        if let Some(index) = peers.iter().position(|(peer, _)| peer.node_id == preferred) {
+            return Some(peers.remove(index));
+        }
+    }
+    peers.into_iter().next()
+}
+
+fn resolved_from_stored(
+    peer: StoredLanPeerV1,
+    paths: StoredLanPeerPathsV1,
+    connect_timeout: Duration,
+    io_timeout: Duration,
+) -> Result<ResolvedNodeConnection> {
+    let receipt = paths
+        .node_receipt_public_key
+        .is_file()
+        .then_some(paths.node_receipt_public_key.clone());
+    Ok(ResolvedNodeConnection {
+        node_id: Some(peer.node_id),
+        address: peer.address,
+        server_name: peer.server_name,
+        ca: paths.ca,
+        cert: paths.client_cert,
+        key: paths.client_key,
+        node_receipt_public_key: receipt,
+        connect_timeout,
+        io_timeout,
+    })
+}
+
+fn resolve_node_connection(args: &NodeConnectionArgs) -> Result<ResolvedNodeConnection> {
+    let (connect_timeout, io_timeout) = validate_connection_timeouts(args)?;
+    if explicit_connection_requested(args) {
+        if args.node.is_some() && args.manual {
+            bail!("--node selects an automatically discovered peer and cannot be combined with --manual");
+        }
+        return Ok(ResolvedNodeConnection {
+            node_id: args.node.clone(),
+            address: args
+                .address
+                .clone()
+                .unwrap_or_else(|| DEFAULT_NODE_ADDRESS.to_owned()),
+            server_name: args
+                .server_name
+                .clone()
+                .unwrap_or_else(|| DEFAULT_TLS_SERVER_NAME.to_owned()),
+            ca: args.ca.clone().unwrap_or_else(default_ca_path),
+            cert: args.cert.clone().unwrap_or_else(default_client_cert_path),
+            key: args.key.clone().unwrap_or_else(default_client_key_path),
+            node_receipt_public_key: None,
+            connect_timeout,
+            io_timeout,
+        });
+    }
+
+    let peers_root = lan_peers_config_dir();
+    let preferred = read_preferred_node();
+    let timeout = Duration::from_millis(DEFAULT_LAN_DISCOVERY_MILLIS);
+    let discovered = match discover_lan_nodes(timeout) {
+        Ok(nodes) => nodes,
+        Err(error) => {
+            eprintln!("octl: LAN discovery was unavailable; trying remembered peers: {error:#}");
+            Vec::new()
+        }
+    };
+    if let Some(node) = choose_discovered_node(
+        discovered,
+        args.node.as_deref(),
+        preferred.as_deref(),
+    )? {
+        let node_id = node.advertisement.node_id.clone();
+        let existing = load_stored_lan_peer(&peers_root, &node_id).ok();
+        // Refresh from every live advertisement. The enrollment endpoint is
+        // deliberately the LAN-open source of truth, so this also heals CA,
+        // certificate, and receipt-key rotation without asking the user to
+        // delete remembered files or provide any transport override.
+        let need_bootstrap = true;
+        let enrolled = if need_bootstrap {
+            match fetch_lan_bootstrap(&node, connect_timeout) {
+                Ok(bundle) => Some(store_lan_peer(&peers_root, &node, &bundle)?),
+                Err(error) => {
+                    if existing.is_none() {
+                        return Err(error).context(format!(
+                            "discovered node `{node_id}` could not complete automatic enrollment"
+                        ));
+                    }
+                    eprintln!(
+                        "octl: node `{node_id}` was discovered but enrollment refresh failed; using remembered credentials: {error:#}"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let (mut peer, paths) = enrolled.or(existing).expect("enrolled or existing peer");
+        // A remembered credential remains valid across DHCP changes. The live
+        // advertisement is the routing coordinate for this invocation.
+        peer.address = node.service_address().to_string();
+        peer.server_name = node.advertisement.server_name.clone();
+        write_preferred_node(&node_id)?;
+        return resolved_from_stored(peer, paths, connect_timeout, io_timeout);
+    }
+
+    let remembered = list_stored_lan_peers(&peers_root)?;
+    if let Some((peer, paths)) = choose_stored_peer(
+        remembered,
+        args.node.as_deref(),
+        preferred.as_deref(),
+    ) {
+        write_preferred_node(&peer.node_id)?;
+        return resolved_from_stored(peer, paths, connect_timeout, io_timeout);
+    }
+
+    if let Some(node_id) = &args.node {
+        bail!(
+            "no reachable or remembered Ostadix node named `{node_id}`; {}",
+            "start it with `o-node start` on the other machine"
+        );
+    }
+    bail!(
+        "no Ostadix LAN node was discovered or remembered; run `o-node start` once on a machine in this local network"
+    )
+}
+
+fn node_list(args: NodeListArgs) -> Result<()> {
+    if args.timeout_millis == 0 || args.timeout_millis > 60_000 {
+        bail!("--timeout-millis must be between 1 and 60000");
+    }
+    let preferred = read_preferred_node();
+    let discovered = match discover_lan_nodes(Duration::from_millis(args.timeout_millis)) {
+        Ok(nodes) => nodes,
+        Err(error) => {
+            eprintln!("octl: LAN discovery was unavailable; showing remembered peers: {error:#}");
+            Vec::new()
+        }
+    };
+    let remembered = list_stored_lan_peers(&lan_peers_config_dir())?;
+    let mut rows = Vec::new();
+    for node in discovered {
+        let node_id = node.advertisement.node_id.clone();
+        let address = node.service_address().to_string();
+        let remembered = load_stored_lan_peer(&lan_peers_config_dir(), &node_id).is_ok();
+        let selected = preferred.as_deref() == Some(node_id.as_str());
+        rows.push(serde_json::json!({
+            "node_id": node_id,
+            "address": address,
+            "server_name": node.advertisement.server_name,
+            "reachable": true,
+            "remembered": remembered,
+            "selected": selected,
+            "security_mode": node.advertisement.security_mode,
+            "supports_v2": node.advertisement.supports_v2,
+        }));
+    }
+    for (peer, _) in remembered {
+        let already_listed = rows
+            .iter()
+            .any(|row| row["node_id"].as_str() == Some(peer.node_id.as_str()));
+        if already_listed {
+            continue;
+        }
+        let selected = preferred.as_deref() == Some(peer.node_id.as_str());
+        rows.push(serde_json::json!({
+            "node_id": peer.node_id,
+            "address": peer.address,
+            "server_name": peer.server_name,
+            "reachable": false,
+            "remembered": true,
+            "selected": selected,
+            "security_mode": peer.security_mode,
+            "supports_v2": peer.supports_v2,
+        }));
+    }
+    rows.sort_by(|left, right| {
+        left["node_id"]
+            .as_str()
+            .cmp(&right["node_id"].as_str())
+    });
+    println!("{}", serde_json::to_string_pretty(&rows)?);
+    Ok(())
+}
+
+fn node_use(args: NodeUseArgs) -> Result<()> {
+    let connection = NodeConnectionArgs {
+        node: Some(args.node_id.clone()),
+        ..NodeConnectionArgs::default()
+    };
+    let resolved = resolve_node_connection(&connection)?;
+    write_preferred_node(
+        resolved
+            .node_id
+            .as_deref()
+            .context("automatically selected node did not report an identity")?,
+    )?;
+    println!(
+        "using {} at {}",
+        resolved.node_id.as_deref().unwrap_or("selected-node"),
+        resolved.address
+    );
+    Ok(())
+}
+
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Node(args) => match args.command {
+            NodeCommand::List(args) => node_list(args),
+            NodeCommand::Use(args) => node_use(args),
             NodeCommand::Profile(args) => {
                 let profile = client(args.connection)?.profile()?;
                 println!("{}", serde_json::to_string_pretty(&profile)?);
@@ -1515,8 +1972,587 @@ fn fresh_session_capability(session_id: String) -> Result<SessionCapabilityV2> {
     Ok(capability)
 }
 
+const AUTO_SESSION_SCHEMA_V1: &str = "ostadix.auto-session/v1";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AutoSessionRecordV1 {
+    schema: String,
+    session_id: String,
+    node_id: String,
+    state_tier: String,
+    created_unix_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+struct AutoSessionHandle {
+    directory: PathBuf,
+    capability: PathBuf,
+    open_lease: PathBuf,
+    record: AutoSessionRecordV1,
+}
+
+impl SessionStateTierArg {
+    fn cli_name(self) -> &'static str {
+        match self {
+            Self::Stateless => "stateless",
+            Self::CheckpointRestore => "checkpoint-restore",
+            Self::ReplayReconstructible => "replay-reconstructible",
+            Self::LiveActorOnly => "live-actor-only",
+        }
+    }
+}
+
+fn ensure_private_client_directory(path: &Path) -> Result<()> {
+    fs::create_dir_all(path)
+        .with_context(|| format!("failed to create `{}`", path.display()))?;
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+fn auto_session_current_path() -> PathBuf {
+    lan_client_sessions_dir().join("_current")
+}
+
+fn write_current_auto_session(directory: &Path) -> Result<()> {
+    let root = lan_client_sessions_dir();
+    ensure_private_client_directory(&root)?;
+    let name = directory
+        .file_name()
+        .and_then(|value| value.to_str())
+        .context("automatic session directory has no portable name")?;
+    if name.is_empty() || name.contains('/') || name.contains('\\') {
+        bail!("automatic session directory name is invalid");
+    }
+    let path = auto_session_current_path();
+    fs::write(&path, format!("{name}\n"))?;
+    #[cfg(unix)]
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+fn clear_current_auto_session(directory: &Path) -> Result<()> {
+    let path = auto_session_current_path();
+    let expected = directory
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    if fs::read_to_string(&path)
+        .ok()
+        .is_some_and(|value| value.trim() == expected)
+    {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+fn load_current_auto_session() -> Result<AutoSessionHandle> {
+    let current = auto_session_current_path();
+    let name = fs::read_to_string(&current).with_context(|| {
+        concat!(
+            "no current automatic session; use `octl node session start SOURCE` or ",
+            "`octl node session run SOURCE --keep-open`"
+        )
+    })?;
+    let name = name.trim();
+    if name.is_empty() || name.contains('/') || name.contains('\\') || name == "." || name == ".." {
+        bail!("current automatic session pointer is invalid");
+    }
+    let directory = lan_client_sessions_dir().join(name);
+    let record: AutoSessionRecordV1 =
+        read_json_file(&directory.join("session.json"), "automatic session record")?;
+    if record.schema != AUTO_SESSION_SCHEMA_V1 {
+        bail!("unsupported automatic session record schema `{}`", record.schema);
+    }
+    let capability_path = directory.join("capability.json");
+    let capability = read_capability(&capability_path)?;
+    if capability.session_id != record.session_id {
+        bail!("automatic session record does not match its capability");
+    }
+    Ok(AutoSessionHandle {
+        directory: directory.clone(),
+        capability: capability_path,
+        open_lease: directory.join("open-lease.json"),
+        record,
+    })
+}
+
+fn ensure_auto_authority() -> Result<PathBuf> {
+    let directory = lan_peers_config_dir().join("_authority");
+    ensure_private_client_directory(&directory)?;
+    let signing = directory.join("placement-signing-key.v2");
+    let public = directory.join("placement-public-key.v2");
+    match (signing.is_file(), public.is_file()) {
+        (true, true) => {
+            read_placement_signing_key_v2(&signing)
+                .context("automatic LAN placement authority key is unreadable")?;
+        }
+        (true, false) => {
+            let signer = read_placement_signing_key_v2(&signing)?;
+            write_new_placement_public_key_v2(&public, &signer.public_key())?;
+        }
+        (false, true) => {
+            fs::remove_file(&public)?;
+            let signer = PlacementLeaseSignerV2::generate()?;
+            write_new_placement_signing_key_v2(&signing, &signer)?;
+            write_new_placement_public_key_v2(&public, &signer.public_key())?;
+        }
+        (false, false) => {
+            let signer = PlacementLeaseSignerV2::generate()?;
+            write_new_placement_signing_key_v2(&signing, &signer)?;
+            write_new_placement_public_key_v2(&public, &signer.public_key())?;
+        }
+    }
+    Ok(signing)
+}
+
+fn resolve_auto_local_runtime() -> Result<(LocalDevRuntimeArgs, Option<ExtractedShims>)> {
+    let (shim_dir, guard) = if let Some(path) = env::var_os("O_BACKENDS_DIR")
+        .or_else(|| env::var_os("BACKENDS_DIR"))
+        .filter(|path| !path.is_empty())
+    {
+        (PathBuf::from(path), None)
+    } else if let Some(root) = env::var_os("O_LANG_ROOT").filter(|path| !path.is_empty()) {
+        let path = PathBuf::from(root).join("backends");
+        if path.is_dir() {
+            (path, None)
+        } else {
+            let extracted = o_lang::shims::extract_bundled_shims("octl_auto_session_shims")?;
+            (extracted.path().to_path_buf(), Some(extracted))
+        }
+    } else if Path::new("backends").is_dir() {
+        (PathBuf::from("backends"), None)
+    } else {
+        let extracted = o_lang::shims::extract_bundled_shims("octl_auto_session_shims")
+            .context("failed to extract bundled backend shims for automatic session")?;
+        (extracted.path().to_path_buf(), Some(extracted))
+    };
+
+    let current = env::current_exe().context("failed to locate octl executable")?;
+    let mut candidates = Vec::new();
+    if let Some(explicit) = env::var_os("O_RUNTIME_BINARY").filter(|path| !path.is_empty()) {
+        candidates.push(PathBuf::from(explicit));
+    }
+    if let Some(directory) = current.parent() {
+        candidates.push(directory.join("ostadix-evaluator"));
+        candidates.push(directory.join("O"));
+    }
+    if let Ok(path) = which::which("ostadix-evaluator") {
+        candidates.push(path);
+    }
+    if let Ok(path) = which::which("O") {
+        candidates.push(path);
+    }
+    let mut rejected = Vec::new();
+    for candidate in candidates {
+        match validate_native_runtime_binary(&candidate) {
+            Ok(runtime_binary) => {
+                return Ok((
+                    LocalDevRuntimeArgs {
+                        shim_dir,
+                        runtime_binary,
+                    },
+                    guard,
+                ))
+            }
+            Err(error) => rejected.push(format!("{} ({error})", candidate.display())),
+        }
+    }
+    bail!(
+        "automatic session could not find a native Ostadix evaluator beside octl; run setup.sh{}",
+        if rejected.is_empty() {
+            String::new()
+        } else {
+            format!("; rejected candidates: {}", rejected.join(", "))
+        }
+    )
+}
+
+fn run_internal_octl(command: &mut ProcessCommand, label: &str) -> Result<()> {
+    let output = command
+        .output()
+        .with_context(|| format!("failed to start internal {label}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    bail!(
+        "internal {label} failed with {}\n{}{}",
+        output.status,
+        stderr.trim(),
+        if stdout.trim().is_empty() {
+            String::new()
+        } else {
+            format!("\n{}", stdout.trim())
+        }
+    )
+}
+
+fn append_manual_connection(
+    command: &mut ProcessCommand,
+    resolved: &ResolvedNodeConnection,
+    receipt: bool,
+) -> Result<()> {
+    command
+        .arg("--manual")
+        .arg("--address")
+        .arg(&resolved.address)
+        .arg("--server-name")
+        .arg(&resolved.server_name)
+        .arg("--ca")
+        .arg(&resolved.ca)
+        .arg("--cert")
+        .arg(&resolved.cert)
+        .arg("--key")
+        .arg(&resolved.key)
+        .arg("--connect-timeout-seconds")
+        .arg(resolved.connect_timeout.as_secs().to_string())
+        .arg("--io-timeout-seconds")
+        .arg(resolved.io_timeout.as_secs().to_string());
+    if receipt {
+        command.arg("--node-receipt-public-key").arg(
+            resolved
+                .node_receipt_public_key
+                .as_ref()
+                .context("selected node does not expose durable V2 receipt identity")?,
+        );
+    }
+    Ok(())
+}
+
+fn append_open_submission_connection(
+    command: &mut ProcessCommand,
+    resolved: &ResolvedNodeConnection,
+) -> Result<()> {
+    command
+        .arg("--address")
+        .arg(&resolved.address)
+        .arg("--server-name")
+        .arg(&resolved.server_name)
+        .arg("--ca")
+        .arg(&resolved.ca)
+        .arg("--key")
+        .arg(&resolved.key)
+        .arg("--node-receipt-public-key")
+        .arg(
+            resolved
+                .node_receipt_public_key
+                .as_ref()
+                .context("selected node does not expose durable V2 receipt identity")?,
+        )
+        .arg("--connect-timeout-seconds")
+        .arg(resolved.connect_timeout.as_secs().to_string())
+        .arg("--io-timeout-seconds")
+        .arg(resolved.io_timeout.as_secs().to_string());
+    Ok(())
+}
+
+fn automatic_connection_for_session(
+    mut requested: NodeConnectionArgs,
+    node_id: Option<&str>,
+) -> Result<ResolvedNodeConnection> {
+    if !explicit_connection_requested(&requested) && requested.node.is_none() {
+        requested.node = node_id.map(str::to_owned);
+    }
+    let resolved = resolve_node_connection(&requested)?;
+    if let (Some(expected), Some(actual)) = (node_id, resolved.node_id.as_deref()) {
+        if expected != actual {
+            bail!("session belongs to node `{expected}`, but connection selected `{actual}`");
+        }
+    }
+    if resolved.node_receipt_public_key.is_none() {
+        bail!("selected node does not support automatic durable sessions");
+    }
+    Ok(resolved)
+}
+
+fn auto_open_session_core(
+    connection: NodeConnectionArgs,
+    source: &Path,
+    state_tier: SessionStateTierArg,
+) -> Result<AutoSessionHandle> {
+    let resolved = automatic_connection_for_session(connection, None)?;
+    let node_id = resolved
+        .node_id
+        .clone()
+        .context("automatic node selection did not produce a node identity")?;
+    let (runtime, _shim_guard) = resolve_auto_local_runtime()?;
+    let signing_key = ensure_auto_authority()?;
+    let root = lan_client_sessions_dir();
+    ensure_private_client_directory(&root)?;
+    let directory = root.join(fresh_id("session")?);
+    ensure_private_client_directory(&directory)?;
+    let source_path = directory.join("open-source.O");
+    fs::write(&source_path, read_source(source)?)?;
+    let capability = directory.join("capability.json");
+    let open_lease = directory.join("open-lease.json");
+
+    let mut command = ProcessCommand::new(env::current_exe()?);
+    command
+        .arg("node")
+        .arg("authority")
+        .arg("dev-mint")
+        .arg("open")
+        .arg("--shim-dir")
+        .arg(&runtime.shim_dir)
+        .arg("--runtime-binary")
+        .arg(&runtime.runtime_binary)
+        .arg("--signing-key")
+        .arg(&signing_key)
+        .arg("--source")
+        .arg(&source_path)
+        .arg("--node-id")
+        .arg(&node_id)
+        .arg("--state-tier")
+        .arg(state_tier.cli_name())
+        .arg("--client-cert")
+        .arg(&resolved.cert)
+        .arg("--submit")
+        .arg("--capability-out")
+        .arg(&capability)
+        .arg("--out")
+        .arg(&open_lease);
+    append_open_submission_connection(&mut command, &resolved)?;
+    if let Err(error) = run_internal_octl(&mut command, "automatic OpenSession") {
+        let _ = fs::remove_dir_all(&directory);
+        return Err(error);
+    }
+    let session_capability = read_capability(&capability)?;
+    let record = AutoSessionRecordV1 {
+        schema: AUTO_SESSION_SCHEMA_V1.to_owned(),
+        session_id: session_capability.session_id,
+        node_id,
+        state_tier: state_tier.cli_name().to_owned(),
+        created_unix_ms: unix_time_ms()?,
+    };
+    write_json_new(&directory.join("session.json"), &record, "automatic session record")?;
+    Ok(AutoSessionHandle {
+        directory,
+        capability,
+        open_lease,
+        record,
+    })
+}
+
+fn auto_send_session_core(
+    handle: &AutoSessionHandle,
+    connection: NodeConnectionArgs,
+    source: &Path,
+    deadline_seconds: u64,
+    output_limit_bytes: u64,
+) -> Result<OperationOutcomeV2> {
+    if deadline_seconds == 0 || deadline_seconds > 86_400 {
+        bail!("--deadline-seconds must be between 1 and 86400");
+    }
+    if output_limit_bytes == 0 || output_limit_bytes > MAX_HOSTED_OUTPUT_BYTES as u64 {
+        bail!(
+            "--output-limit-bytes must be between 1 and {}",
+            MAX_HOSTED_OUTPUT_BYTES
+        );
+    }
+    let resolved = automatic_connection_for_session(connection, Some(&handle.record.node_id))?;
+    let (runtime, _shim_guard) = resolve_auto_local_runtime()?;
+    let signing_key = ensure_auto_authority()?;
+    let operation_id = fresh_id("operation")?;
+    let operation_dir = handle.directory.join(&operation_id);
+    ensure_private_client_directory(&operation_dir)?;
+    let source_path = operation_dir.join("source.O");
+    fs::write(&source_path, read_source(source)?)?;
+    let operation_out = operation_dir.join("operation.json");
+    let execute_lease = operation_dir.join("execute-lease.json");
+    let task_sha256 = random_semantic_digest("ostadix/auto-session/task/v1")?.to_string();
+
+    let mut command = ProcessCommand::new(env::current_exe()?);
+    command
+        .arg("node")
+        .arg("authority")
+        .arg("dev-mint")
+        .arg("execute")
+        .arg("--shim-dir")
+        .arg(&runtime.shim_dir)
+        .arg("--runtime-binary")
+        .arg(&runtime.runtime_binary)
+        .arg("--signing-key")
+        .arg(&signing_key)
+        .arg("--open-lease")
+        .arg(&handle.open_lease)
+        .arg("--source")
+        .arg(&source_path)
+        .arg("--operation-id")
+        .arg(&operation_id)
+        .arg("--task-sha256")
+        .arg(task_sha256)
+        .arg("--attempt-generation")
+        .arg("1")
+        .arg("--deadline-seconds")
+        .arg(deadline_seconds.to_string())
+        .arg("--output-limit-bytes")
+        .arg(output_limit_bytes.to_string())
+        .arg("--submit")
+        .arg("--operation-out")
+        .arg(&operation_out)
+        .arg("--out")
+        .arg(&execute_lease)
+        .arg("--capability")
+        .arg(&handle.capability);
+    append_manual_connection(&mut command, &resolved, true)?;
+    run_internal_octl(&mut command, "automatic Execute")?;
+
+    let capability = read_capability(&handle.capability)?;
+    let client = client_v2(resolved.explicit_v2_args()?)?;
+    let deadline = Instant::now() + Duration::from_secs(deadline_seconds.saturating_add(15));
+    loop {
+        let response = client.status(SessionQueryV2 {
+            credentials: capability.clone().into(),
+            operation_id: Some(operation_id.clone()),
+        })?;
+        let HostedResponseV2::Status { session, .. } = response else {
+            bail!("node returned the wrong response while waiting for automatic operation");
+        };
+        let operation = session.operations.get(&operation_id).with_context(|| {
+            format!("node status omitted accepted operation `{operation_id}`")
+        })?;
+        match operation.status {
+            OperationStatusV2::Accepted | OperationStatusV2::Running => {
+                if Instant::now() >= deadline {
+                    bail!("automatic operation did not become terminal before its wait deadline");
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            OperationStatusV2::Succeeded | OperationStatusV2::Failed => {
+                return operation
+                    .outcome
+                    .clone()
+                    .context("terminal operation omitted its outcome");
+            }
+            OperationStatusV2::NotStarted | OperationStatusV2::Ambiguous => {
+                bail!(
+                    "automatic operation ended in non-terminally-replayable state {:?}; retained artifacts at {}",
+                    operation.status,
+                    operation_dir.display()
+                );
+            }
+        }
+    }
+}
+
+fn close_auto_session_core(
+    handle: &AutoSessionHandle,
+    connection: NodeConnectionArgs,
+) -> Result<HostedResponseV2> {
+    let resolved = automatic_connection_for_session(connection, Some(&handle.record.node_id))?;
+    let capability = read_capability(&handle.capability)?;
+    let client = client_v2(resolved.explicit_v2_args()?)?;
+    let sequence = current_next_sequence(&client, &capability)?;
+    client.close_session(SessionMutationRequestV2 {
+        credentials: capability.into(),
+        client_request_id: fresh_id("auto-close")?,
+        client_sequence: sequence,
+    })
+}
+
+fn auto_session_start(args: AutoSessionStartArgs) -> Result<()> {
+    let handle = auto_open_session_core(args.connection, &args.source, args.state_tier)?;
+    write_current_auto_session(&handle.directory)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "session_id": handle.record.session_id,
+            "node_id": handle.record.node_id,
+            "state_tier": handle.record.state_tier,
+            "status": "open",
+            "artifacts": handle.directory,
+        }))?
+    );
+    Ok(())
+}
+
+fn auto_session_run(args: AutoSessionRunArgs) -> Result<()> {
+    let handle = auto_open_session_core(args.connection.clone(), &args.source, args.state_tier)?;
+    // If execution becomes ambiguous, leaving this as current gives the user a
+    // direct recovery/status path instead of hiding the surviving session.
+    write_current_auto_session(&handle.directory)?;
+    let source_snapshot = handle.directory.join("open-source.O");
+    let outcome = auto_send_session_core(
+        &handle,
+        args.connection.clone(),
+        &source_snapshot,
+        args.deadline_seconds,
+        args.output_limit_bytes,
+    )?;
+    println!("{}", serde_json::to_string_pretty(&outcome)?);
+    let succeeded = matches!(&outcome, OperationOutcomeV2::Succeeded { .. });
+    if args.keep_open {
+        eprintln!(
+            "octl: session {} remains open and is now current",
+            handle.record.session_id
+        );
+    } else {
+        match close_auto_session_core(&handle, args.connection) {
+            Ok(_) => {
+                clear_current_auto_session(&handle.directory)?;
+                eprintln!("octl: temporary session closed automatically");
+            }
+            Err(error) => eprintln!(
+                "octl: operation completed, but automatic close failed; session remains current: {error:#}"
+            ),
+        }
+    }
+    if !succeeded {
+        bail!("automatic session operation failed");
+    }
+    Ok(())
+}
+
+fn auto_session_send(args: AutoSessionSendArgs) -> Result<()> {
+    let handle = load_current_auto_session()?;
+    let outcome = auto_send_session_core(
+        &handle,
+        args.connection,
+        &args.source,
+        args.deadline_seconds,
+        args.output_limit_bytes,
+    )?;
+    let succeeded = matches!(&outcome, OperationOutcomeV2::Succeeded { .. });
+    println!("{}", serde_json::to_string_pretty(&outcome)?);
+    if !succeeded {
+        bail!("automatic session operation failed");
+    }
+    Ok(())
+}
+
+fn auto_session_info(args: AutoSessionInfoArgs) -> Result<()> {
+    let handle = load_current_auto_session()?;
+    let resolved = automatic_connection_for_session(
+        args.connection,
+        Some(&handle.record.node_id),
+    )?;
+    let capability = read_capability(&handle.capability)?;
+    let response = client_v2(resolved.explicit_v2_args()?)?.status(SessionQueryV2 {
+        credentials: capability.into(),
+        operation_id: None,
+    })?;
+    println!("{}", serde_json::to_string_pretty(&response)?);
+    Ok(())
+}
+
+fn auto_session_stop(args: AutoSessionStopArgs) -> Result<()> {
+    let handle = load_current_auto_session()?;
+    let response = close_auto_session_core(&handle, args.connection)?;
+    clear_current_auto_session(&handle.directory)?;
+    println!("{}", serde_json::to_string_pretty(&response)?);
+    Ok(())
+}
+
 fn session(args: SessionArgs) -> Result<()> {
     match args.command {
+        SessionCommand::Start(args) => auto_session_start(args),
+        SessionCommand::Run(args) => auto_session_run(args),
+        SessionCommand::Send(args) => auto_session_send(args),
+        SessionCommand::Info(args) => auto_session_info(args),
+        SessionCommand::Stop(args) => auto_session_stop(args),
         SessionCommand::Principal(args) => {
             println!(
                 "{}",
@@ -1754,26 +2790,19 @@ fn current_next_sequence(
 }
 
 fn client_v2(args: V2ConnectionArgs) -> Result<HostedNodeClientV2> {
-    let receipt_key = read_node_public_key_v2(&args.node_receipt_public_key)?;
-    let args = args.connection;
-    if args.connect_timeout_seconds == 0 || args.io_timeout_seconds == 0 {
-        bail!("node connection timeouts must be positive");
-    }
-    if args.connect_timeout_seconds > 3600 || args.io_timeout_seconds > 3600 {
-        bail!("node connection timeouts may not exceed 3600 seconds");
-    }
-    let mut client = HostedNodeClientV2::new(
-        args.address,
-        ClientTlsIdentity {
-            ca_path: args.ca.unwrap_or_else(default_ca_path),
-            cert_path: args.cert.unwrap_or_else(default_client_cert_path),
-            key_path: args.key.unwrap_or_else(default_client_key_path),
-            server_name: args.server_name,
-        },
-        receipt_key,
-    );
-    client.connect_timeout = Duration::from_secs(args.connect_timeout_seconds);
-    client.io_timeout = Duration::from_secs(args.io_timeout_seconds);
+    let explicit_receipt_key = args.node_receipt_public_key;
+    let resolved = resolve_node_connection(&args.connection)?;
+    let receipt_path = explicit_receipt_key
+        .or_else(|| resolved.node_receipt_public_key.clone())
+        .context(concat!(
+            "durable V2 requires a node receipt key; automatic LAN enrollment supplies it, ",
+            "while manual mode requires --node-receipt-public-key"
+        ))?;
+    let receipt_key = read_node_public_key_v2(&receipt_path)?;
+    let tls_identity = resolved.tls_identity();
+    let mut client = HostedNodeClientV2::new(resolved.address, tls_identity, receipt_key);
+    client.connect_timeout = resolved.connect_timeout;
+    client.io_timeout = resolved.io_timeout;
     Ok(client)
 }
 
@@ -1949,23 +2978,11 @@ fn run(args: NodeRunArgs) -> Result<()> {
 }
 
 fn client(args: NodeConnectionArgs) -> Result<HostedNodeClient> {
-    if args.connect_timeout_seconds == 0 || args.io_timeout_seconds == 0 {
-        bail!("node connection timeouts must be positive");
-    }
-    if args.connect_timeout_seconds > 3600 || args.io_timeout_seconds > 3600 {
-        bail!("node connection timeouts may not exceed 3600 seconds");
-    }
-    let mut client = HostedNodeClient::new(
-        args.address,
-        ClientTlsIdentity {
-            ca_path: args.ca.unwrap_or_else(default_ca_path),
-            cert_path: args.cert.unwrap_or_else(default_client_cert_path),
-            key_path: args.key.unwrap_or_else(default_client_key_path),
-            server_name: args.server_name,
-        },
-    );
-    client.connect_timeout = Duration::from_secs(args.connect_timeout_seconds);
-    client.io_timeout = Duration::from_secs(args.io_timeout_seconds);
+    let resolved = resolve_node_connection(&args)?;
+    let tls_identity = resolved.tls_identity();
+    let mut client = HostedNodeClient::new(resolved.address, tls_identity);
+    client.connect_timeout = resolved.connect_timeout;
+    client.io_timeout = resolved.io_timeout;
     Ok(client)
 }
 

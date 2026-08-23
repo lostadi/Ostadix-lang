@@ -381,7 +381,7 @@ refresh_cargo_bin_binaries() {
   chmod +x "$CARGO_BIN_DIR/$EVALUATOR_ALIAS"
   "$PROJECT_ROOT/scripts/install-o-cli-wrapper.sh" "$CARGO_BIN_DIR/o"
   if directory_is_case_insensitive "$CARGO_BIN_DIR"; then
-    echo "  $CARGO_BIN_DIR shares O/o; the wrapper dispatches by invocation spelling."
+    echo "  $CARGO_BIN_DIR shares O/o; both spellings use the dispatcher; raw evaluation remains available as ostadix-evaluator."
   fi
 }
 
@@ -969,9 +969,9 @@ exec "$PROJECT_ROOT/target/release/O" "\$@"
 WRAP
   chmod +x "$BIN_DIR/O"
 
-  # Lowercase `o` preserves evaluator compatibility and owns repo subcommands.
-  # The installer also preserves uppercase evaluator behavior when O/o share
-  # one filesystem entry on a case-insensitive host.
+  # Lowercase `o` owns repository subcommands. On a case-insensitive host,
+  # O/o are one entry and both use the dispatcher; unknown arguments still
+  # fall through to the native evaluator.
   "$PROJECT_ROOT/scripts/install-o-cli-wrapper.sh" "$BIN_DIR/o"
 
   cat > "$BIN_DIR/olangc" <<WRAP

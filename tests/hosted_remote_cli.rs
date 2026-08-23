@@ -146,6 +146,7 @@ fn provision_profile_doctor_and_run_are_usable_end_to_end() {
     let stderr_file = fs::File::create(&server_stderr).unwrap();
     let server = Command::new(env!("CARGO_BIN_EXE_o-node"))
         .arg("serve")
+        .arg("--manual")
         .arg("--node-id")
         .arg("hosted-cli-test")
         .arg("--shim-dir")
@@ -289,7 +290,7 @@ fn exercise_durable_v2_dev_flow(continue_through_execute: bool) {
     drop(reservation);
     let stderr_file = fs::File::create(&server_stderr).unwrap();
     let server = Command::new(env!("CARGO_BIN_EXE_o-node"))
-        .args(["serve", "--node-id", "hosted-v2-cli-test", "--shim-dir"])
+        .args(["serve", "--manual", "--node-id", "hosted-v2-cli-test", "--shim-dir"])
         .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("backends"))
         .arg("--runtime-binary")
         .arg(env!("CARGO_BIN_EXE_O"))
@@ -952,6 +953,7 @@ fn spawn_v2_cli_server(
     let server = Command::new(env!("CARGO_BIN_EXE_o-node"))
         .args([
             "serve",
+            "--manual",
             "--node-id",
             "hosted-v2-integrated-cli-test",
             "--shim-dir",

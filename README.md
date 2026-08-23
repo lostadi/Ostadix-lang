@@ -57,6 +57,7 @@ system.
 [Information Kernel V1](docs/INFORMATION_KERNEL_V1.md) ·
 [Versioning](docs/VERSIONING.md) · [Testing](#running-the-tests) ·
 [Evidence claims](docs/CLAIMS.md) ·
+[Zero-config LAN nodes](docs/ZERO_CONFIG_LAN.md) ·
 [Hosted Placement V6](docs/HOSTED_PLACEMENT_V6.md)
 
 Ostadix-lang now has two computation layers that share one project but do different
@@ -108,6 +109,33 @@ O version --json
 toolchain, admission, catalog, Hosted, and World schema versions. It is
 descriptive: it does not prove that optional backend runtimes are installed,
 that a placement is authorized, or that a World is live.
+
+### Zero-configuration LAN execution
+
+Ordinary LAN use does not require addresses, host names, ports, certificates,
+keys, capabilities, leases, operation IDs, or proof files. On the machine that
+will contribute execution capacity:
+
+```bash
+o node start
+```
+
+On another machine in the same local network:
+
+```bash
+o node profile
+o node run examples/hello.O
+o node session run examples/hello.O
+```
+
+Use `o node list` to inspect reachable nodes and `o node use NODE_ID` only when
+you need to choose among several semantic nodes. Explicit transport and trust
+configuration remains available through `--manual` and `o node-host` for
+operators who deliberately need it.
+
+Automatic mode deliberately treats LAN reachability as permission to enroll
+and execute. Its exact security boundary and storage behavior are documented
+in [Zero-configuration LAN nodes](docs/ZERO_CONFIG_LAN.md).
 
 ### Independent Rust runtime engine
 
@@ -219,28 +247,38 @@ catalog-alternative coordinates, and immutable content identify the realization.
 A legacy local-realization V1 record remains inspectable but cannot authorize a
 current profile; it is never relabeled as V2.
 
-The direct transport has an explicit command surface:
+The ordinary LAN surface keeps protocol coordinates internal:
 
 ```text
-o-node pki init ...
-o-node identity init ...
-o-node profile ...
-o-node doctor ...
-o-node serve ...
-o-node admin gc-closed ...
-octl node profile ...
-octl node doctor ...
-octl node run ...
+o node start|stop|status|restart
+o node list|use
+o node profile|doctor|run
+o node session start|run|send|info|stop
+```
+
+The expert surface remains available without becoming the default contract:
+
+```text
+o node-host pki|identity|profile|doctor|serve|admin ...
+octl node ... --manual --address ... --server-name ... --ca ... --cert ... --key ...
 octl node authority init|issue ...
 octl node authority dev-mint open|execute|recover ...
 octl node session principal|open|exec|status|actors|reset|recover|close ...
 ```
 
-After normal setup, the lowercase wrapper delegates `o node ...` to `octl` and
-`o node-host ...` to `o-node`; `o run ...` remains the explicit local
-execution path.
+After normal setup, the lowercase wrapper routes node lifecycle commands to
+`o-node`, ordinary node use to `octl`, and `o node-host ...` to the raw expert
+server CLI. `o run ...` remains the explicit local execution path. See
+[Zero-configuration LAN nodes](docs/ZERO_CONFIG_LAN.md).
 
 ### Hosted V2 development quickstart
+
+> **Expert/manual path.** Ordinary users should use `o node start`,
+> `o node list`, and `o node session run FILE.O`, or the compatibility
+> `./o-node-quickstart.sh` front door. Those paths derive discovery, routing,
+> enrollment, credentials, capabilities, leases, and operation identities
+> automatically. The walkthrough below deliberately exposes those internals for
+> protocol development and fault diagnosis.
 
 This loopback walkthrough exercises the opt-in durable V2 path with the
 co-located, self-attested development authority. It is not production
@@ -1730,8 +1768,8 @@ needs QEMU and the local Rust linker toolchain.
 | `o-link` | `target/release/o-link` | Recursively literal-links and runs a bare single directory; `--project` creates an inert route-preserving bundle. |
 | `o-unlink` | `target/release/o-unlink` | Restores safe project bundles and legacy literal link sections. |
 | `o-live-host` | `target/release/o-live-host` | Runs the hosted package-store, activation, service-supervision, and cross-world semantic oracle. |
-| `o-node` | `target/release/o-node` | Provisions development mTLS identities, reports a descriptive profile, checks readiness, and serves bounded prepared operations. |
-| `octl` | `target/release/octl` | Inspects or directly invokes one explicitly selected mutually authenticated hosted node. |
+| `o-node` | `target/release/o-node` | Starts a zero-configuration LAN execution node by default; retains explicit PKI, identity, readiness, serving, and administration controls for manual operation. |
+| `octl` | `target/release/octl` | Discovers, enrolls with, remembers, and invokes LAN nodes automatically; retains the exact manual Hosted V1/V2 controls. |
 | `o-registry` | `target/release/o-registry` | Generates local placement profiles and creates, signs, verifies, lists, exports, and imports local registry snapshots. |
 | `o-info` | `target/release/o-info` | Maintains a local authority-free information head and exchanges signed canonical offline delta packs. |
 | `o-notebook` | feature-gated Cargo binary | Runs the local notebook server when built with `--features notebook`. |

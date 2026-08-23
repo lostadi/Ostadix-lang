@@ -3,7 +3,9 @@
 //! V2 is deliberately separate from the frozen one-operation V1 wire
 //! protocol.  A V2 session is bound to the authenticated client certificate
 //! and a high-entropy bearer, journals every mutation before acknowledging it,
-//! and never executes without an exact, authenticated placement lease.
+//! and never executes without an exact, internally consistent placement lease.
+//! Manual mode authenticates that lease against a pinned authority. LAN-open
+//! mode deliberately accepts any signing key after exact live-request binding.
 
 mod auth;
 mod client;

@@ -82,6 +82,175 @@ impl PlacementProofAuthorizerV2 for DenyAllPlacementAuthorizerV2 {
     }
 }
 
+/// Usability-first authority for automatically discovered LAN nodes.
+///
+/// Any correctly formed lease signed by any key is accepted after its command
+/// is matched to the live request context. Placement evidence is retained in
+/// the journal as an explanatory projection, but it is not treated as an
+/// authorization barrier. This intentionally makes LAN reachability plus the
+/// automatically enrolled TLS identity the effective trust boundary.
+#[derive(Debug, Default, Clone)]
+pub struct LanOpenPlacementAuthorizerV2;
+
+impl PlacementProofAuthorizerV2 for LanOpenPlacementAuthorizerV2 {
+    fn authorize(
+        &self,
+        context: &PlacementAuthorizationContextV2,
+        envelope: &SignedPlacementLeaseV2,
+    ) -> Result<AuthorizedPlacementV2> {
+        // Keep the envelope internally self-consistent and attributable even
+        // though no particular authority key is privileged in LAN-open mode.
+        verify_placement_lease_signature_v2(envelope)
+            .context("LAN-open placement envelope signature is malformed")?;
+        envelope.evidence.validate_shape()?;
+        let command = &envelope.command;
+        exact_command_context(context, command)?;
+        let (issued_at, expires_at) = match (&envelope.authority, command.purpose) {
+            (HostedPlacementAuthorityV2::Execution(lease), PlacementPurposeV2::Execute) => {
+                (lease.issued_at().get(), lease.expires_at().get())
+            }
+            (
+                HostedPlacementAuthorityV2::StateControl(lease),
+                PlacementPurposeV2::OpenSession | PlacementPurposeV2::Recover,
+            ) => (lease.issued_at().get(), lease.expires_at().get()),
+            (HostedPlacementAuthorityV2::Execution(_), _) => {
+                bail!("OpenSession and Recover require a state-control lease")
+            }
+            (HostedPlacementAuthorityV2::StateControl(_), PlacementPurposeV2::Execute) => {
+                bail!("Execute requires an execution placement lease")
+            }
+        };
+        if context.now_unix_ms < issued_at {
+            bail!("LAN-open placement authority is not yet valid");
+        }
+        if context.now_unix_ms >= expires_at {
+            bail!("LAN-open placement authority has expired");
+        }
+        if command.state_session.node_generation() != context.node_generation {
+            bail!("LAN-open command names a different node generation");
+        }
+        if command.state_quota_generation != context.state_quota_generation
+            || command.state_quota_limits != context.state_quota_limits
+        {
+            bail!("LAN-open command quota coordinates differ from the node");
+        }
+        command
+            .state_reservation
+            .validate_against(&context.state_quota_limits)?;
+        if command.session_state_tier == SessionStateTierV2::CheckpointRestore
+            && command.state_reservation.snapshot_bytes_per_actor() == 0
+        {
+            bail!("checkpoint/restore LAN-open session requires a nonzero snapshot reservation");
+        }
+        if context.state_session != command.state_session
+            || context.state_reservation != command.state_reservation
+        {
+            bail!("LAN-open command state identity differs from the live request");
+        }
+        validate_command_actor_lifecycle(
+            command.purpose,
+            context.session_state_tier,
+            context.current_actor_generation.as_ref(),
+            command.actor_generation.as_ref(),
+        )?;
+
+        let evidence = &envelope.evidence;
+        let target_descriptor = evidence.node_profile.descriptor_digest()?;
+        let footprint = evidence.requirement_footprint.semantic_digest()?;
+        let scope = evidence.warrant_discharge.exact_scope();
+        let backend_implementation = scope
+            .backend_implementation()
+            .cloned()
+            .or_else(|| {
+                context
+                    .prepared_fragment
+                    .as_ref()
+                    .map(|fragment| fragment.backend_implementation_sha256().clone())
+            })
+            .context("LAN-open placement evidence omits a backend implementation")?;
+        let realization_pipeline = scope
+            .realization_pipeline()
+            .cloned()
+            .or_else(|| {
+                context
+                    .prepared_fragment
+                    .as_ref()
+                    .map(|fragment| fragment.realization_pipeline().clone())
+            })
+            .context("LAN-open placement evidence omits a realization pipeline")?;
+        let placement_identity = HostedPlacementIdentityV2 {
+            target_descriptor,
+            requirement_footprint: footprint,
+            backend_implementation,
+            realization_pipeline,
+            trust_policy: evidence.trust_policy.semantic_digest()?,
+            reservation: evidence.reservation.clone(),
+        };
+        if context
+            .expected_session_identity
+            .as_ref()
+            .is_some_and(|expected| expected != &placement_identity)
+        {
+            bail!("LAN-open command attempts to switch the session placement identity");
+        }
+
+        let actor_generation = match command.purpose {
+            PlacementPurposeV2::OpenSession => None,
+            PlacementPurposeV2::Recover => context.current_actor_generation.clone(),
+            PlacementPurposeV2::Execute if context.session_state_tier == SessionStateTierV2::Stateless => {
+                let fragment = context
+                    .prepared_fragment
+                    .as_ref()
+                    .context("LAN-open Execute requires a locally prepared fragment")?;
+                if !fragment.environment().is_fresh() {
+                    bail!("stateless LAN-open session requires a fresh fragment environment");
+                }
+                None
+            }
+            PlacementPurposeV2::Execute => {
+                // Stateful LAN-open sessions still bind to the node's actual
+                // prepared fragment, not the advisory client-side evidence.
+                if let Some(current) = &context.current_actor_generation {
+                    Some(current.clone())
+                } else {
+                    let fragment = context
+                        .prepared_fragment
+                        .as_ref()
+                        .context("stateful LAN-open Execute requires a prepared fragment")?;
+                    if fragment.environment().is_fresh() {
+                        bail!("stateful LAN-open session requires a persistent environment");
+                    }
+                    let logical_environment = logical_environment_requirement(
+                        fragment.requirement_footprint(),
+                    )?
+                    .context("stateful LAN-open fragment omits its logical environment")?;
+                    Some(ActorGenerationIdV1::new(
+                        logical_environment,
+                        fragment.backend_implementation_sha256().clone(),
+                        placement_identity.target_descriptor.clone(),
+                        fragment.sandbox_policy_sha256().clone(),
+                        fragment.backend_launch_generation().clone(),
+                        context.next_actor_generation,
+                    ))
+                }
+            }
+        };
+
+        Ok(AuthorizedPlacementV2 {
+            lease_sha256: envelope.authority.semantic_digest()?.to_string(),
+            lease_nonce: envelope.authority.lease_nonce().to_string(),
+            expires_at_unix_ms: envelope.authority.expires_at().get(),
+            state_session: command.state_session.clone(),
+            state_tier: command.session_state_tier,
+            state_quota_generation: command.state_quota_generation,
+            state_quota_limits: command.state_quota_limits.clone(),
+            state_reservation: command.state_reservation.clone(),
+            actor_generation,
+            placement_identity,
+        })
+    }
+}
+
 /// Production adapter for one explicitly pinned registry-compatible Ed25519
 /// authority key.  The signature authenticates the canonical placement lease,
 /// exact hosted command binding, and (for open) the state-capacity observation.
