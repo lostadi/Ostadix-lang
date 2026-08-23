@@ -58,6 +58,7 @@ system.
 [Versioning](docs/VERSIONING.md) · [Testing](#running-the-tests) ·
 [Evidence claims](docs/CLAIMS.md) ·
 [Zero-config LAN nodes](docs/ZERO_CONFIG_LAN.md) ·
+[Project mesh V1](docs/PROJECT_MESH_V1.md) ·
 [Hosted Placement V6](docs/HOSTED_PLACEMENT_V6.md)
 
 Ostadix-lang now has two computation layers that share one project but do different
@@ -183,6 +184,26 @@ authentication is pairing-CA-wide: there is not yet a leaf-certificate
 allowlist, unpair operation, or revocation mechanism. The exact security and
 non-claim boundaries are documented in
 [Zero-configuration LAN nodes](docs/ZERO_CONFIG_LAN.md).
+
+### Peer-mesh execution for whole projects
+
+After the nodes are running and paired, `o-link` can place a source-closed
+project route on an authenticated peer:
+
+```bash
+o-link ./large-codebase --project --run --route build \
+  --mesh --explain-mesh --mesh-trace-out mesh-attempt.json
+```
+
+The default is `prefer` with two additional remote attempts and local fallback
+only when execution is proven not to have started. The transferred actor is the
+exact project bundle plus a route/prerequisite island bound to its canonical
+Project Logical HGraph; retry creates a fresh actor generation rather than
+moving a live process image. Use `--mesh=required` when local fallback is not
+acceptable. Discovery is limited to LAN advertisements and the paired-peer
+registry—there is no NAT traversal or Internet gossip. The protocol, replay
+matrix, CLI flags, and nonclaims are in [Project mesh
+V1](docs/PROJECT_MESH_V1.md).
 
 ### Independent Rust runtime engine
 

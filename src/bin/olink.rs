@@ -45,6 +45,7 @@
 //   o-link src/ --literal -o sequential.O     # literal link only (do not run)
 //   o-link src/ --project -o project.O        # safely lift a whole codebase
 //   o-link src/ --project --run                # run its project default route
+//   o-link src/ --run --mesh=prefer            # place its default route on the peer mesh
 //   o-link a.py --lang txt=markdown -o out.O  # extra extension mapping
 //   o-link a.py --stdout                      # write to stdout instead
 //   o-link a.py b.sh --run                    # link, then execute in-process
@@ -85,6 +86,24 @@ enum ParallelLinkMode {
     /// Overlap only catalog-verified pure inline renderers; hosted shims remain
     /// sequential in their original positions.
     Verified,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum MeshMode {
+    /// Prefer an eligible peer, with policy-controlled local fallback.
+    Prefer,
+    /// Require mesh placement; fail when no eligible peer can execute the work.
+    Required,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum MeshLocalFallbackMode {
+    /// Fall back locally only when actor execution is proven not to have begun.
+    PreSend,
+    /// Also permit local replay when the bundle declares the route idempotent.
+    Idempotent,
+    /// Never fall back to local execution after mesh placement is requested.
+    Never,
 }
 
 impl ParallelLinkMode {
@@ -271,6 +290,113 @@ struct Cli {
     /// Explain each section's parallel-placement decision on stderr.
     #[arg(long = "explain-parallel")]
     explain_parallel: bool,
+
+    /// Execute a project route through the peer mesh. With no value, prefer an
+    /// eligible peer; use `--mesh=required` to fail instead of accepting policy-
+    /// controlled local fallback when no peer can execute the route.
+    #[arg(
+        long,
+        value_enum,
+        num_args = 0..=1,
+        default_missing_value = "prefer",
+        require_equals = true,
+        requires = "run",
+        conflicts_with_all = ["literal", "project_trace_out"]
+    )]
+    mesh: Option<MeshMode>,
+
+    /// Maximum mesh retries after the first attempt.
+    #[arg(
+        long = "mesh-retries",
+        default_value_t = 2,
+        value_parser = clap::value_parser!(u32).range(0..=64),
+        requires_all = ["mesh", "run"]
+    )]
+    mesh_retries: u32,
+
+    /// Policy for falling back to local project execution after mesh failure.
+    #[arg(
+        long = "mesh-local-fallback",
+        value_enum,
+        default_value = "pre-send",
+        requires_all = ["mesh", "run"]
+    )]
+    mesh_local_fallback: MeshLocalFallbackMode,
+
+    /// Time allowed for automatic peer discovery before target selection.
+    #[arg(
+        long = "mesh-discovery-timeout-ms",
+        default_value_t = 750,
+        value_parser = clap::value_parser!(u64).range(1..=60_000),
+        requires_all = ["mesh", "run"]
+    )]
+    mesh_discovery_timeout_ms: u64,
+
+    /// Use only the explicit paired-peer registry; do not send or accept live
+    /// UDP LAN discovery advertisements for this invocation.
+    #[arg(
+        long = "mesh-no-lan-discovery",
+        requires_all = ["mesh", "run"]
+    )]
+    mesh_no_lan_discovery: bool,
+
+    /// Root containing paired peer records and transport credentials.
+    #[arg(
+        long = "mesh-peer-root",
+        value_name = "PATH",
+        requires_all = ["mesh", "run"]
+    )]
+    mesh_peer_root: Option<PathBuf>,
+
+    /// Write the mesh scheduler/placement attempt trace as JSON.
+    #[arg(
+        long = "mesh-trace-out",
+        value_name = "PATH",
+        requires_all = ["mesh", "run"]
+    )]
+    mesh_trace_out: Option<PathBuf>,
+
+    /// Explain mesh discovery, eligibility, target choice, retries, and fallback
+    /// decisions on stderr while executing the project route.
+    #[arg(long = "explain-mesh", requires_all = ["mesh", "run"])]
+    explain_mesh: bool,
+}
+
+fn has_project_intent(cli: &Cli) -> bool {
+    cli.project
+        || cli.list_routes
+        || cli.route.is_some()
+        || cli.routes_policy.is_some()
+        || cli.project_trace_out.is_some()
+        || !cli.route_decls.is_empty()
+        || cli.mesh.is_some()
+}
+
+fn mesh_execution_config(
+    cli: &Cli,
+) -> Option<o_lang::hosted_remote::project_mesh::MeshExecutionConfig> {
+    use o_lang::hosted_remote::project_mesh::{MeshLocalFallback, MeshRequirement};
+
+    let requirement = match cli.mesh? {
+        MeshMode::Prefer => MeshRequirement::Prefer,
+        MeshMode::Required => MeshRequirement::Required,
+    };
+    let local_fallback = match cli.mesh_local_fallback {
+        MeshLocalFallbackMode::PreSend => MeshLocalFallback::PreSend,
+        MeshLocalFallbackMode::Idempotent => MeshLocalFallback::Idempotent,
+        MeshLocalFallbackMode::Never => MeshLocalFallback::Never,
+    };
+
+    Some(o_lang::hosted_remote::project_mesh::MeshExecutionConfig {
+        requirement,
+        max_retries: cli.mesh_retries,
+        local_fallback,
+        discover_lan: !cli.mesh_no_lan_discovery,
+        discovery_timeout: std::time::Duration::from_millis(cli.mesh_discovery_timeout_ms),
+        peer_root: cli.mesh_peer_root.clone(),
+        trace_out: cli.mesh_trace_out.clone(),
+        explain: cli.explain_mesh,
+    })
 }
 
 fn main() -> Result<()> {
@@ -296,12 +422,7 @@ fn main() -> Result<()> {
         bail!("--route and --routes-policy require --run");
     }
 
-    let project_intent = cli.project
-        || cli.list_routes
-        || cli.route.is_some()
-        || cli.routes_policy.is_some()
-        || cli.project_trace_out.is_some()
-        || !cli.route_decls.is_empty();
+    let project_intent = has_project_intent(&cli);
     let implicit_literal_run =
         !project_intent && !cli.literal && cli.inputs.len() == 1 && cli.inputs[0].is_dir();
     if implicit_literal_run {
@@ -560,6 +681,9 @@ fn load_project_bundle(cli: &Cli) -> Result<o_lang::project::ProjectBundle> {
         if let Some(trace_out) = &cli.project_trace_out {
             exclusions.push(trace_out.clone());
         }
+        if let Some(trace_out) = &cli.mesh_trace_out {
+            exclusions.push(trace_out.clone());
+        }
         o_lang::project::assemble_excluding(&input, &name, &cli.route_decls, &exclusions)
     } else if input.is_file() {
         let source = fs::read_to_string(&input)
@@ -627,6 +751,7 @@ fn project_mode(cli: &Cli) -> Result<()> {
 
 /// Execute a route (or route set) through the project runtime.
 fn run_project(cli: &Cli, bundle: &o_lang::project::ProjectBundle) -> Result<()> {
+    use o_lang::hosted_remote::project_mesh::execute_mesh_selection;
     use o_lang::project::executor::{
         execute_selection_with_configured_executor, write_project_attempt_trace,
         ProjectExecutionError, PROJECT_EXECUTOR_ENV,
@@ -646,7 +771,9 @@ fn run_project(cli: &Cli, bundle: &o_lang::project::ProjectBundle) -> Result<()>
         .transpose()
         .map_err(anyhow::Error::msg)?;
     let opts = RunOptions::default();
-    if cli.project_trace_out.is_some()
+    let mesh_config = mesh_execution_config(cli);
+    if mesh_config.is_none()
+        && cli.project_trace_out.is_some()
         && std::env::var_os(PROJECT_EXECUTOR_ENV).as_deref() != Some(std::ffi::OsStr::new("hgraph"))
     {
         bail!(
@@ -654,12 +781,13 @@ fn run_project(cli: &Cli, bundle: &o_lang::project::ProjectBundle) -> Result<()>
         );
     }
 
-    let execution = match execute_selection_with_configured_executor(
-        bundle,
-        cli.route.as_deref(),
-        policy,
-        &opts,
-    ) {
+    let execution_result = match mesh_config.as_ref() {
+        Some(config) => execute_mesh_selection(bundle, cli.route.as_deref(), policy, &opts, config),
+        None => {
+            execute_selection_with_configured_executor(bundle, cli.route.as_deref(), policy, &opts)
+        }
+    };
+    let execution = match execution_result {
         Ok(execution) => execution,
         Err(error) => {
             if let (Some(path), Some(project_error)) = (
@@ -2079,6 +2207,150 @@ mod tests {
             Cli::try_parse_from(["o-link", "project", "--project-trace-out", "attempt.json"])
                 .unwrap_err();
         assert!(error.to_string().contains("--run"));
+    }
+
+    #[test]
+    fn mesh_cli_defaults_to_prefer_and_builds_exact_config() {
+        use o_lang::hosted_remote::project_mesh::{MeshLocalFallback, MeshRequirement};
+
+        // `require_equals` prevents the optional mesh mode from swallowing a
+        // positional project path when the flag appears first.
+        let cli = Cli::try_parse_from(["o-link", "--mesh", "--run", "project"]).unwrap();
+        assert_eq!(cli.mesh, Some(MeshMode::Prefer));
+        assert!(has_project_intent(&cli));
+
+        let config = mesh_execution_config(&cli).expect("--mesh must construct mesh config");
+        assert_eq!(config.requirement, MeshRequirement::Prefer);
+        assert_eq!(config.max_retries, 2);
+        assert_eq!(config.local_fallback, MeshLocalFallback::PreSend);
+        assert!(config.discover_lan);
+        assert_eq!(
+            config.discovery_timeout,
+            std::time::Duration::from_millis(750)
+        );
+        assert_eq!(config.peer_root, None);
+        assert_eq!(config.trace_out, None);
+        assert!(!config.explain);
+    }
+
+    #[test]
+    fn mesh_cli_maps_required_mode_and_all_overrides() {
+        use o_lang::hosted_remote::project_mesh::{MeshLocalFallback, MeshRequirement};
+
+        let cli = Cli::try_parse_from([
+            "o-link",
+            "project",
+            "--run",
+            "--mesh=required",
+            "--mesh-retries=5",
+            "--mesh-local-fallback=idempotent",
+            "--mesh-discovery-timeout-ms=1250",
+            "--mesh-no-lan-discovery",
+            "--mesh-peer-root=peer-state",
+            "--mesh-trace-out=mesh-attempt.json",
+            "--explain-mesh",
+        ])
+        .unwrap();
+
+        let config = mesh_execution_config(&cli).expect("--mesh must construct mesh config");
+        assert_eq!(config.requirement, MeshRequirement::Required);
+        assert_eq!(config.max_retries, 5);
+        assert_eq!(config.local_fallback, MeshLocalFallback::Idempotent);
+        assert!(!config.discover_lan);
+        assert_eq!(
+            config.discovery_timeout,
+            std::time::Duration::from_millis(1_250)
+        );
+        assert_eq!(config.peer_root.as_deref(), Some(Path::new("peer-state")));
+        assert_eq!(
+            config.trace_out.as_deref(),
+            Some(Path::new("mesh-attempt.json"))
+        );
+        assert!(config.explain);
+    }
+
+    #[test]
+    fn mesh_cli_requires_run_and_tuning_flags_require_mesh() {
+        let missing_run = Cli::try_parse_from(["o-link", "project", "--mesh"]).unwrap_err();
+        assert!(missing_run.to_string().contains("--run"));
+
+        for args in [
+            vec!["o-link", "project", "--run", "--mesh-retries=3"],
+            vec!["o-link", "project", "--run", "--mesh-local-fallback=never"],
+            vec![
+                "o-link",
+                "project",
+                "--run",
+                "--mesh-discovery-timeout-ms=900",
+            ],
+            vec!["o-link", "project", "--run", "--mesh-no-lan-discovery"],
+            vec!["o-link", "project", "--run", "--mesh-peer-root=peers"],
+            vec!["o-link", "project", "--run", "--mesh-trace-out=trace.json"],
+            vec!["o-link", "project", "--run", "--explain-mesh"],
+        ] {
+            let error = Cli::try_parse_from(args).unwrap_err();
+            assert!(
+                error.to_string().contains("--mesh"),
+                "unexpected clap error: {error}"
+            );
+        }
+
+        let zero_timeout = Cli::try_parse_from([
+            "o-link",
+            "project",
+            "--run",
+            "--mesh",
+            "--mesh-discovery-timeout-ms=0",
+        ])
+        .unwrap_err();
+        assert!(zero_timeout
+            .to_string()
+            .contains("mesh-discovery-timeout-ms"));
+
+        let too_many_retries =
+            Cli::try_parse_from(["o-link", "project", "--run", "--mesh", "--mesh-retries=65"])
+                .unwrap_err();
+        assert!(too_many_retries.to_string().contains("mesh-retries"));
+
+        let too_long_discovery = Cli::try_parse_from([
+            "o-link",
+            "project",
+            "--run",
+            "--mesh",
+            "--mesh-discovery-timeout-ms=60001",
+        ])
+        .unwrap_err();
+        assert!(too_long_discovery
+            .to_string()
+            .contains("mesh-discovery-timeout-ms"));
+    }
+
+    #[test]
+    fn mesh_is_project_only_while_parallel_remains_literal_only() {
+        let conflict =
+            Cli::try_parse_from(["o-link", "project", "--literal", "--run", "--mesh"]).unwrap_err();
+        assert!(conflict.to_string().contains("--literal"));
+        assert!(conflict.to_string().contains("--mesh"));
+
+        let trace_conflict = Cli::try_parse_from([
+            "o-link",
+            "project",
+            "--run",
+            "--mesh",
+            "--project-trace-out=project-attempt.json",
+        ])
+        .unwrap_err();
+        assert!(trace_conflict.to_string().contains("--mesh"));
+        assert!(trace_conflict.to_string().contains("--project-trace-out"));
+
+        let mesh_parallel =
+            Cli::try_parse_from(["o-link", "project", "--run", "--mesh", "--parallel"]).unwrap();
+        let error = ensure_project_compatible_flags(&mesh_parallel).unwrap_err();
+        assert!(error.to_string().contains("--parallel"));
+
+        let literal_parallel = Cli::try_parse_from(["o-link", "script.py", "--parallel"]).unwrap();
+        assert!(!has_project_intent(&literal_parallel));
+        assert!(mesh_execution_config(&literal_parallel).is_none());
     }
     use o_lang::parser::{reconstruct_source, ONode, Parser};
 

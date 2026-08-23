@@ -19,6 +19,7 @@ use clap::{Args, Parser, Subcommand};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
+use o_lang::hosted_remote::mesh::{MeshNodeRuntime, MeshNodeRuntimeConfig};
 use o_lang::hosted_remote::v2::{
     default_hosted_v2_state_dir, read_node_signing_key_v2, read_placement_public_key_v2,
     serve_owned_node_dual_until_shutdown, write_new_node_public_key_v2,
@@ -81,7 +82,7 @@ enum Command {
     Profile(ProfileArgs),
     /// Validate the local shim and TLS configuration without listening.
     Doctor(DoctorArgs),
-    /// Serve frozen V1 and optional durable Hosted V2 requests over mTLS.
+    /// Serve frozen V1, optional durable Hosted V2, and scheduler/actor mesh requests over mTLS.
     Serve(ServeArgs),
 }
 
@@ -269,6 +270,13 @@ struct ServeArgs {
     /// Enable durable session protocol V2 using this capability-first state root.
     #[arg(long)]
     v2_state_dir: Option<PathBuf>,
+    /// Durable scheduler/actor mesh state root. Automatic mode defaults to V2_STATE_DIR/mesh-v1;
+    /// manual mode enables the mesh only when this option is supplied.
+    #[arg(long, value_name = "PATH", conflicts_with = "no_mesh")]
+    mesh_state_dir: Option<PathBuf>,
+    /// Disable the scheduler/actor mesh that automatic mode enables by default.
+    #[arg(long, conflicts_with = "mesh_state_dir")]
+    no_mesh: bool,
     /// V2 Ed25519 receipt key (default: V2_STATE_DIR/node-signing-key.v2).
     #[arg(long)]
     v2_node_signing_key: Option<PathBuf>,
@@ -1240,6 +1248,10 @@ fn start_detached_node(args: StartArgs) -> Result<()> {
         }
         println!("o-node started: {}", material.node_id);
         println!("log: {}", log_path.display());
+        println!(
+            "scheduler/actor mesh: {} (automatic)",
+            material.state_dir.join("mesh-v1").display()
+        );
         if args.lan_open {
             println!("legacy LAN-open enrollment enabled explicitly");
         } else {
@@ -1704,6 +1716,13 @@ fn serve(mut args: ServeArgs) -> Result<()> {
         None
     };
 
+    let mesh_state_dir = resolve_mesh_state_dir(
+        automatic_mode,
+        args.no_mesh,
+        args.v2_state_dir.as_deref(),
+        args.mesh_state_dir.take(),
+    )?;
+
     let bind_address = args
         .bind
         .take()
@@ -1813,6 +1832,23 @@ fn serve(mut args: ServeArgs) -> Result<()> {
                 node_state_epoch.get()
             )
         })?;
+        let mesh_runtime = mesh_state_dir
+            .as_ref()
+            .map(|mesh_state_dir| {
+                let mut config =
+                    MeshNodeRuntimeConfig::new(v1_runtime.node_id.clone(), mesh_state_dir.clone());
+                config.max_concurrent_actors = u32::try_from(v1_runtime.max_concurrent_connections)
+                    .context(
+                        "node max-connections exceeds the mesh actor-capacity representation",
+                    )?;
+                MeshNodeRuntime::open(config).with_context(|| {
+                    format!(
+                        "failed to open durable scheduler/actor mesh state at `{}`",
+                        mesh_state_dir.display()
+                    )
+                })
+            })
+            .transpose()?;
         eprintln!(
             "o-node: durable V2 node-state/deployment epoch {} is stable across normal restarts; bump only with a new state root or after archiving `{}`; changing the epoch never evicts or migrates existing sessions",
             node_state_epoch.get(),
@@ -1828,15 +1864,29 @@ fn serve(mut args: ServeArgs) -> Result<()> {
                 eprintln!("o-node: retained unreadable V2 session: {diagnostic}");
             }
         }
+        let mesh_status = if let Some(mesh_state_dir) = mesh_state_dir.as_ref() {
+            eprintln!(
+                "o-node: scheduler/actor mesh enabled at `{}` with capacity for {} concurrent actors",
+                mesh_state_dir.display(),
+                v1_runtime.max_concurrent_connections
+            );
+            "scheduler/actor mesh enabled"
+        } else {
+            "scheduler/actor mesh disabled"
+        };
         eprintln!(
-            "o-node: serving {} on {} (TLS 1.3 mTLS; frozen V1 + durable V2; max {} connections)",
-            v1_runtime.node_id, bind_address, v1_runtime.max_concurrent_connections
+            "o-node: serving {} on {} (TLS 1.3 mTLS; frozen V1 + durable V2; {}; max {} connections)",
+            v1_runtime.node_id,
+            bind_address,
+            mesh_status,
+            v1_runtime.max_concurrent_connections
         );
         return serve_owned_node_dual_until_shutdown(
             HostedOwnedDualNodeServerConfig {
                 bind_address,
                 v1_runtime,
                 v2_runtime,
+                mesh_runtime,
                 tls_identity: tls_identity(args.tls),
             },
             shutdown,
@@ -1855,6 +1905,32 @@ fn serve(mut args: ServeArgs) -> Result<()> {
         config.runtime.node_id, config.bind_address, config.runtime.max_concurrent_connections
     );
     serve_node(config)
+}
+
+fn resolve_mesh_state_dir(
+    automatic_mode: bool,
+    no_mesh: bool,
+    v2_state_dir: Option<&Path>,
+    explicit_mesh_state_dir: Option<PathBuf>,
+) -> Result<Option<PathBuf>> {
+    if no_mesh {
+        if explicit_mesh_state_dir.is_some() {
+            bail!("--no-mesh conflicts with --mesh-state-dir");
+        }
+        return Ok(None);
+    }
+    if let Some(mesh_state_dir) = explicit_mesh_state_dir {
+        if v2_state_dir.is_none() {
+            bail!("--mesh-state-dir requires --v2-state-dir in manual mode");
+        }
+        return Ok(Some(mesh_state_dir));
+    }
+    if automatic_mode {
+        let v2_state_dir = v2_state_dir
+            .context("automatic scheduler/actor mesh requires a durable V2 state root")?;
+        return Ok(Some(v2_state_dir.join("mesh-v1")));
+    }
+    Ok(None)
 }
 
 fn parse_bind_port(bind: &str) -> Result<u16> {
@@ -2305,6 +2381,56 @@ mod tests {
         assert!(help.contains("Reuse it across normal process restarts"));
         assert!(help.contains("new state root or archive the old root"));
         assert!(help.contains("never evicts or migrates existing sessions"));
+    }
+
+    #[test]
+    fn mesh_cli_rejects_an_explicit_state_root_with_no_mesh() {
+        let error = Cli::try_parse_from([
+            "o-node",
+            "serve",
+            "--mesh-state-dir",
+            "mesh-state",
+            "--no-mesh",
+        ])
+        .unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn mesh_policy_defaults_only_automatic_mode_under_the_v2_root() {
+        let v2_state_dir = Path::new("durable-v2");
+        assert_eq!(
+            resolve_mesh_state_dir(true, false, Some(v2_state_dir), None).unwrap(),
+            Some(v2_state_dir.join("mesh-v1"))
+        );
+        assert_eq!(
+            resolve_mesh_state_dir(false, false, Some(v2_state_dir), None).unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_mesh_state_dir(true, true, Some(v2_state_dir), None).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn manual_mesh_is_explicit_and_requires_durable_v2() {
+        let v2_state_dir = Path::new("durable-v2");
+        let mesh_state_dir = PathBuf::from("chosen-mesh");
+        assert_eq!(
+            resolve_mesh_state_dir(
+                false,
+                false,
+                Some(v2_state_dir),
+                Some(mesh_state_dir.clone())
+            )
+            .unwrap(),
+            Some(mesh_state_dir.clone())
+        );
+        let error = resolve_mesh_state_dir(false, false, None, Some(mesh_state_dir)).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("--mesh-state-dir requires --v2-state-dir in manual mode"));
     }
 
     #[test]

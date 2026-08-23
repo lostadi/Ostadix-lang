@@ -7,11 +7,13 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use thiserror::Error;
 
+use super::super::mesh::{serve_mesh_stream, MeshNodeRuntime};
 use super::super::node::{serve_v1_stream, HostedNodeRuntime};
 use super::super::protocol::{read_hosted_frame, write_hosted_frame};
 use super::super::tls::{
-    accept_mutual_tls_versioned, build_dual_server_config, peer_principal_sha256,
-    HostedTlsProtocol, ServerTlsIdentity, DEFAULT_CONNECT_TIMEOUT, DEFAULT_IO_TIMEOUT,
+    accept_mutual_tls_versioned, build_dual_server_config, build_dual_server_config_with_mesh,
+    peer_principal_sha256, HostedTlsProtocol, ServerTlsIdentity, DEFAULT_CONNECT_TIMEOUT,
+    DEFAULT_IO_TIMEOUT,
 };
 use super::protocol::{HostedProtocolErrorV2, HostedRequestV2, HostedResponseV2};
 use super::runtime::{HostedV2Runtime, HostedV2RuntimeHandle, HostedV2RuntimeOwner};
@@ -23,6 +25,7 @@ pub struct HostedDualNodeServerConfig {
     pub bind_address: String,
     pub v1_runtime: HostedNodeRuntime,
     pub v2_runtime: HostedV2Runtime,
+    pub mesh_runtime: Option<MeshNodeRuntime>,
     pub tls_identity: ServerTlsIdentity,
 }
 
@@ -32,6 +35,7 @@ pub struct HostedOwnedDualNodeServerConfig {
     pub bind_address: String,
     pub v1_runtime: HostedNodeRuntime,
     pub v2_runtime: HostedV2RuntimeOwner,
+    pub mesh_runtime: Option<MeshNodeRuntime>,
     pub tls_identity: ServerTlsIdentity,
 }
 
@@ -90,9 +94,9 @@ pub fn serve_owned_node_dual(config: HostedOwnedDualNodeServerConfig) -> Result<
 /// Serve frozen V1 and durable V2 until `shutdown` is requested.
 ///
 /// Returning from this function is a deterministic lifecycle barrier. No new
-/// TCP connection can be admitted, the V2 runtime has settled every admitted
-/// actor command and released its durable-store lock, and every connection
-/// worker accepted by this server has been joined.
+/// TCP connection can be admitted, the V2 runtime and optional mesh runtime
+/// have settled every admitted actor command, their durable roots remain
+/// coherent, and every connection worker accepted by this server has joined.
 pub fn serve_node_dual_until_shutdown(
     config: HostedDualNodeServerConfig,
     shutdown: HostedDualNodeShutdown,
@@ -101,12 +105,14 @@ pub fn serve_node_dual_until_shutdown(
         bind_address,
         v1_runtime,
         v2_runtime,
+        mesh_runtime,
         tls_identity,
     } = config;
     serve_node_dual_with_runtime(
         bind_address,
         v1_runtime,
         DualRuntimeAuthorityV2::Compatibility(v2_runtime),
+        mesh_runtime,
         tls_identity,
         shutdown,
     )
@@ -122,12 +128,14 @@ pub fn serve_owned_node_dual_until_shutdown(
         bind_address,
         v1_runtime,
         v2_runtime,
+        mesh_runtime,
         tls_identity,
     } = config;
     serve_node_dual_with_runtime(
         bind_address,
         v1_runtime,
         DualRuntimeAuthorityV2::Owned(v2_runtime),
+        mesh_runtime,
         tls_identity,
         shutdown,
     )
@@ -158,6 +166,7 @@ fn serve_node_dual_with_runtime(
     bind_address: String,
     v1_runtime: HostedNodeRuntime,
     v2_runtime: DualRuntimeAuthorityV2,
+    mesh_runtime: Option<MeshNodeRuntime>,
     tls_identity: ServerTlsIdentity,
     shutdown: HostedDualNodeShutdown,
 ) -> Result<()> {
@@ -165,7 +174,11 @@ fn serve_node_dual_with_runtime(
 
     let setup = (|| -> Result<_> {
         v1_runtime.validate()?;
-        let tls_config = build_dual_server_config(&tls_identity)?;
+        let tls_config = if mesh_runtime.is_some() {
+            build_dual_server_config_with_mesh(&tls_identity)?
+        } else {
+            build_dual_server_config(&tls_identity)?
+        };
         let listener = TcpListener::bind(&bind_address)
             .with_context(|| format!("failed to bind dual hosted node at `{bind_address}`"))?;
         listener.set_nonblocking(true).with_context(|| {
@@ -176,7 +189,13 @@ fn serve_node_dual_with_runtime(
     let (listener, tls_config) = match setup {
         Ok(setup) => setup,
         Err(error) => {
-            return finish_dual_node_server(Some(error), &v2_runtime, Vec::new(), Vec::new())
+            return finish_dual_node_server(
+                Some(error),
+                &v2_runtime,
+                mesh_runtime.as_ref(),
+                Vec::new(),
+                Vec::new(),
+            )
         }
     };
 
@@ -230,13 +249,19 @@ fn serve_node_dual_with_runtime(
         let tls_config = Arc::clone(&tls_config);
         let v1_runtime = Arc::clone(&v1_runtime);
         let v2_runtime = v2_handle.clone();
+        let mesh_runtime = mesh_runtime.clone();
         let worker_active = Arc::clone(&active);
         if let Ok(worker) = spawn_dual_connection_worker_with(
             Arc::clone(&active),
             move || {
                 let _guard = ActiveDualConnectionGuard(worker_active);
-                if let Err(error) = serve_dual_connection(tcp, tls_config, &v1_runtime, &v2_runtime)
-                {
+                if let Err(error) = serve_dual_connection(
+                    tcp,
+                    tls_config,
+                    &v1_runtime,
+                    &v2_runtime,
+                    mesh_runtime.as_ref(),
+                ) {
                     eprintln!("o-node: hosted connection failed: {error:#}");
                 }
             },
@@ -247,10 +272,16 @@ fn serve_node_dual_with_runtime(
     }
 
     // Dropping the listener is the admission barrier. Runtime shutdown then
-    // drains any request already inside V2. Finally, joining connection
-    // workers settles accepted V1 handshakes/requests and V2 replies.
+    // drains any request already inside V2 and every accepted mesh actor.
+    // Finally, joining connection workers settles authenticated replies.
     drop(listener);
-    finish_dual_node_server(server_error, &v2_runtime, workers, worker_failures)
+    finish_dual_node_server(
+        server_error,
+        &v2_runtime,
+        mesh_runtime.as_ref(),
+        workers,
+        worker_failures,
+    )
 }
 
 fn spawn_dual_connection_worker_with<Job, Spawn>(
@@ -280,10 +311,23 @@ where
 fn finish_dual_node_server(
     server_error: Option<anyhow::Error>,
     v2_runtime: &DualRuntimeAuthorityV2,
+    mesh_runtime: Option<&MeshNodeRuntime>,
     workers: Vec<thread::JoinHandle<()>>,
     mut worker_failures: Vec<String>,
 ) -> Result<()> {
-    let runtime_shutdown_error = v2_runtime.shutdown().err();
+    // Mesh streams are multi-request and may already be authenticated when the
+    // listener closes. Stop their actor admission first so V2 draining cannot
+    // leave an existing mesh connection able to admit fresh work meanwhile.
+    let mesh_shutdown_error = mesh_runtime.and_then(|runtime| runtime.shutdown().err());
+    let v2_shutdown_error = v2_runtime.shutdown().err();
+    let runtime_shutdown_error = match (v2_shutdown_error, mesh_shutdown_error) {
+        (None, None) => None,
+        (Some(error), None) => Some(error),
+        (None, Some(error)) => Some(error.context("mesh runtime shutdown failed")),
+        (Some(error), Some(mesh_error)) => {
+            Some(error.context(format!("mesh runtime shutdown also failed: {mesh_error:#}")))
+        }
+    };
     for worker in workers {
         record_connection_worker_result(worker, &mut worker_failures);
     }
@@ -346,6 +390,7 @@ fn serve_dual_connection(
     tls_config: Arc<rustls::ServerConfig>,
     v1_runtime: &HostedNodeRuntime,
     v2_runtime: &HostedV2RuntimeHandle,
+    mesh_runtime: Option<&MeshNodeRuntime>,
 ) -> Result<()> {
     let (mut stream, protocol) =
         accept_mutual_tls_versioned(tcp, tls_config, DEFAULT_CONNECT_TIMEOUT, DEFAULT_IO_TIMEOUT)?;
@@ -372,6 +417,11 @@ fn serve_dual_connection(
             };
             let response = v2_runtime.handle_request(&principal, request);
             write_hosted_frame(&mut stream, &response).context("failed to write hosted V2 response")
+        }
+        HostedTlsProtocol::MeshV1 => {
+            let runtime = mesh_runtime
+                .context("client negotiated the mesh ALPN while the mesh runtime is disabled")?;
+            serve_mesh_stream(&mut stream, runtime)
         }
     }
 }
