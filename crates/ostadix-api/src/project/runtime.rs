@@ -2825,7 +2825,7 @@ pub fn resolve_selection(
     })
 }
 
-fn potential_route_execution_count(
+pub(crate) fn potential_route_execution_count(
     bundle: &ProjectBundle,
     alternatives: &[String],
 ) -> Result<usize> {

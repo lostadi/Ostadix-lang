@@ -7,7 +7,7 @@
 //! to enroll. Operators who need explicit trust boundaries should use the
 //! manual `o-node` / `octl` connection flags instead.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
@@ -349,6 +349,7 @@ pub fn discover_lan_nodes(timeout: Duration) -> Result<Vec<DiscoveredLanNodeV1>>
 
     let deadline = Instant::now() + timeout;
     let mut discovered = BTreeMap::new();
+    let mut identity_conflicts = BTreeSet::new();
     let mut buffer = [0_u8; 4096];
     while Instant::now() < deadline {
         let mut received = false;
@@ -360,7 +361,12 @@ pub fn discover_lan_nodes(timeout: Duration) -> Result<Vec<DiscoveredLanNodeV1>>
                 match discovery_socket.socket.recv_from(&mut buffer) {
                     Ok((length, source)) => {
                         received = true;
-                        record_discovered_node(&mut discovered, &buffer[..length], source);
+                        record_discovered_node(
+                            &mut discovered,
+                            &mut identity_conflicts,
+                            &buffer[..length],
+                            source,
+                        );
                     }
                     Err(error) if error.kind() == ErrorKind::WouldBlock => break,
                     Err(error) => {
@@ -525,6 +531,7 @@ fn discovery_destinations(interface: Option<LanIpv4Interface>, port: u16) -> Vec
 
 fn record_discovered_node(
     discovered: &mut BTreeMap<String, DiscoveredLanNodeV1>,
+    identity_conflicts: &mut BTreeSet<String>,
     payload: &[u8],
     source: SocketAddr,
 ) {
@@ -535,13 +542,25 @@ fn record_discovered_node(
         return;
     }
     let key = format!("{}@{}", advertisement.node_id, source.ip());
-    discovered.insert(
-        key,
-        DiscoveredLanNodeV1 {
-            advertisement,
-            source_ip: source.ip(),
-        },
-    );
+    if identity_conflicts.contains(&key) {
+        return;
+    }
+    let candidate = DiscoveredLanNodeV1 {
+        advertisement,
+        source_ip: source.ip(),
+    };
+    if discovered
+        .get(&key)
+        .is_some_and(|existing| existing != &candidate)
+    {
+        // One source address claimed incompatible identities for the same node
+        // during this discovery window. Remove both rather than making packet
+        // arrival order an identity-selection mechanism.
+        discovered.remove(&key);
+        identity_conflicts.insert(key);
+        return;
+    }
+    discovered.entry(key).or_insert(candidate);
 }
 
 pub fn spawn_lan_bootstrap_server(
@@ -1207,6 +1226,12 @@ fn read_stored_peer_metadata(
     )?)
     .with_context(|| format!("failed to decode stored LAN peer `{node_id}` metadata"))?;
     metadata.validate()?;
+    if metadata.node_id != node_id {
+        bail!(
+            "stored LAN peer directory identity `{node_id}` disagrees with metadata node_id `{}`",
+            metadata.node_id
+        );
+    }
     Ok(metadata)
 }
 
@@ -1229,17 +1254,37 @@ pub fn list_stored_lan_peers(
         }
     }
     let mut peers = Vec::new();
+    let mut node_ids = BTreeSet::new();
     for entry in fs::read_dir(peers_root)? {
         let entry = entry?;
         if !entry.file_type()?.is_dir() {
             continue;
         }
-        let Some(node_id) = entry.file_name().to_str().map(str::to_owned) else {
+        let node_id = entry
+            .file_name()
+            .to_str()
+            .map(str::to_owned)
+            .with_context(|| {
+                format!(
+                    "stored LAN peer directory name under `{}` is not valid UTF-8",
+                    peers_root.display()
+                )
+            })?;
+        // Pairing stages and rollback backups use a leading-dot namespace.
+        // Public node identities are forbidden from that namespace below, so
+        // an interrupted atomic store cannot appear as a second peer identity.
+        if node_id.starts_with('.') {
             continue;
-        };
-        if let Ok(peer) = load_stored_lan_peer(peers_root, &node_id) {
-            peers.push(peer);
         }
+        let peer = load_stored_lan_peer(peers_root, &node_id)
+            .with_context(|| format!("stored LAN peer `{node_id}` is corrupt or incomplete"))?;
+        if !node_ids.insert(peer.0.node_id.clone()) {
+            bail!(
+                "stored LAN peer registry contains conflicting duplicate node_id `{}`",
+                peer.0.node_id
+            );
+        }
+        peers.push(peer);
     }
     peers.sort_by(|left, right| left.0.node_id.cmp(&right.0.node_id));
     Ok(peers)
@@ -1254,6 +1299,9 @@ fn validate_lan_identifier(field: &str, value: &str) -> Result<()> {
         .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
     {
         bail!("{field} contains characters outside [A-Za-z0-9._:-]");
+    }
+    if value.starts_with('.') {
+        bail!("{field} must not use the peer store's leading-dot internal namespace");
     }
     Ok(())
 }
@@ -1483,6 +1531,61 @@ mod tests {
     }
 
     #[test]
+    fn conflicting_same_source_advertisements_are_tombstoned() {
+        let first = LanNodeAdvertisementV1::new(
+            "ostadix-test-node",
+            "test-node.local",
+            DEFAULT_LAN_NODE_PORT,
+            DEFAULT_LAN_BOOTSTRAP_PORT,
+            true,
+        )
+        .unwrap();
+        let mut conflicting = first.clone();
+        conflicting.service_port += 1;
+        conflicting.validate().unwrap();
+
+        let source_a: SocketAddr = "192.0.2.8:41000".parse().unwrap();
+        let source_b: SocketAddr = "192.0.2.8:41001".parse().unwrap();
+        let mut discovered = BTreeMap::new();
+        let mut conflicts = BTreeSet::new();
+        let first_bytes = serde_json::to_vec(&first).unwrap();
+        record_discovered_node(&mut discovered, &mut conflicts, &first_bytes, source_a);
+        record_discovered_node(&mut discovered, &mut conflicts, &first_bytes, source_b);
+        assert_eq!(discovered.len(), 1);
+        assert!(conflicts.is_empty());
+
+        record_discovered_node(
+            &mut discovered,
+            &mut conflicts,
+            &serde_json::to_vec(&conflicting).unwrap(),
+            source_b,
+        );
+        assert!(discovered.is_empty());
+        assert_eq!(
+            conflicts,
+            BTreeSet::from(["ostadix-test-node@192.0.2.8".to_owned()])
+        );
+
+        // Once conflicted, later packet order cannot select either identity.
+        record_discovered_node(&mut discovered, &mut conflicts, &first_bytes, source_a);
+        assert!(discovered.is_empty());
+    }
+
+    #[test]
+    fn node_ids_cannot_enter_the_internal_peer_store_namespace() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(StoredLanPeerPathsV1::for_root(root.path(), "..").is_err());
+        assert!(LanNodeAdvertisementV1::new(
+            ".hidden",
+            "test-node.local",
+            DEFAULT_LAN_NODE_PORT,
+            DEFAULT_LAN_BOOTSTRAP_PORT,
+            true,
+        )
+        .is_err());
+    }
+
+    #[test]
     fn stored_peer_round_trip_keeps_private_key_private() {
         let root = tempfile::tempdir().unwrap();
         let advertisement = LanNodeAdvertisementV1::new(
@@ -1506,6 +1609,52 @@ mod tests {
             fs::metadata(paths.client_key).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn stored_peer_directory_identity_mismatch_fails_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let (_, paths) = store_sample_paired(root.path()).unwrap();
+        let alias = root.path().join("alias-node");
+        fs::create_dir(&alias).unwrap();
+        for source in [
+            &paths.metadata,
+            &paths.ca,
+            &paths.client_cert,
+            &paths.client_key,
+        ] {
+            fs::copy(source, alias.join(source.file_name().unwrap())).unwrap();
+        }
+
+        let error = load_stored_lan_peer(root.path(), "alias-node").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("directory identity `alias-node` disagrees with metadata node_id `ostadix-test-node`"),
+            "{error:#}"
+        );
+        let error = list_stored_lan_peers(root.path()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("`alias-node` is corrupt or incomplete"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn stored_peer_listing_ignores_only_the_internal_atomic_store_namespace() {
+        let root = tempfile::tempdir().unwrap();
+        let (expected, _) = store_sample_paired(root.path()).unwrap();
+        fs::create_dir(
+            root.path()
+                .join(".ostadix-test-node.pairing-stage-0000000000000000"),
+        )
+        .unwrap();
+
+        let peers = list_stored_lan_peers(root.path()).unwrap();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].0, expected);
     }
 
     #[test]

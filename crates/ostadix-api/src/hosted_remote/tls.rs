@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 
 pub const HOSTED_TLS_ALPN_V1: &[u8] = b"ostadix-hosted/1";
 pub const HOSTED_TLS_ALPN_V2: &[u8] = b"ostadix-hosted/2";
+pub const HOSTED_TLS_ALPN_MESH_V1: &[u8] = b"ostadix-mesh/1";
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DEFAULT_IO_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -42,6 +43,7 @@ pub type HostedServerStream = StreamOwned<ServerConnection, TcpStream>;
 pub enum HostedTlsProtocol {
     V1,
     V2,
+    MeshV1,
 }
 
 pub fn build_client_config(identity: &ClientTlsIdentity) -> Result<Arc<ClientConfig>> {
@@ -50,6 +52,10 @@ pub fn build_client_config(identity: &ClientTlsIdentity) -> Result<Arc<ClientCon
 
 pub fn build_client_config_v2(identity: &ClientTlsIdentity) -> Result<Arc<ClientConfig>> {
     build_client_config_for_alpn(identity, HOSTED_TLS_ALPN_V2)
+}
+
+pub fn build_client_config_mesh_v1(identity: &ClientTlsIdentity) -> Result<Arc<ClientConfig>> {
+    build_client_config_for_alpn(identity, HOSTED_TLS_ALPN_MESH_V1)
 }
 
 fn build_client_config_for_alpn(
@@ -91,6 +97,21 @@ pub fn build_dual_server_config(identity: &ServerTlsIdentity) -> Result<Arc<Serv
     build_server_config_for_alpns(
         identity,
         vec![HOSTED_TLS_ALPN_V2.to_vec(), HOSTED_TLS_ALPN_V1.to_vec()],
+    )
+}
+
+/// Build the existing V1/V2 listener configuration with the independently
+/// versioned project-mesh data plane enabled on the same TLS port.
+pub fn build_dual_server_config_with_mesh(
+    identity: &ServerTlsIdentity,
+) -> Result<Arc<ServerConfig>> {
+    build_server_config_for_alpns(
+        identity,
+        vec![
+            HOSTED_TLS_ALPN_MESH_V1.to_vec(),
+            HOSTED_TLS_ALPN_V2.to_vec(),
+            HOSTED_TLS_ALPN_V1.to_vec(),
+        ],
     )
 }
 
@@ -165,6 +186,21 @@ pub fn connect_mutual_tls_v2(
     )
 }
 
+pub fn connect_mutual_tls_mesh_v1(
+    address: &str,
+    identity: &ClientTlsIdentity,
+    connect_timeout: Duration,
+    io_timeout: Duration,
+) -> Result<HostedClientStream> {
+    connect_mutual_tls_for_protocol(
+        address,
+        identity,
+        connect_timeout,
+        io_timeout,
+        HostedTlsProtocol::MeshV1,
+    )
+}
+
 fn connect_mutual_tls_for_protocol(
     address: &str,
     identity: &ClientTlsIdentity,
@@ -175,6 +211,7 @@ fn connect_mutual_tls_for_protocol(
     let config = match protocol {
         HostedTlsProtocol::V1 => build_client_config(identity)?,
         HostedTlsProtocol::V2 => build_client_config_v2(identity)?,
+        HostedTlsProtocol::MeshV1 => build_client_config_mesh_v1(identity)?,
     };
     let server_name = ServerName::try_from(identity.server_name.clone()).with_context(|| {
         format!(
@@ -250,6 +287,7 @@ pub fn accept_mutual_tls_versioned(
     let protocol = match connection.alpn_protocol() {
         Some(protocol) if protocol == HOSTED_TLS_ALPN_V1 => HostedTlsProtocol::V1,
         Some(protocol) if protocol == HOSTED_TLS_ALPN_V2 => HostedTlsProtocol::V2,
+        Some(protocol) if protocol == HOSTED_TLS_ALPN_MESH_V1 => HostedTlsProtocol::MeshV1,
         _ => bail!("client did not negotiate a supported hosted-transport ALPN"),
     };
     set_timeouts(&tcp, io_timeout)?;
@@ -288,6 +326,7 @@ fn complete_client_handshake(
     let expected = match protocol {
         HostedTlsProtocol::V1 => HOSTED_TLS_ALPN_V1,
         HostedTlsProtocol::V2 => HOSTED_TLS_ALPN_V2,
+        HostedTlsProtocol::MeshV1 => HOSTED_TLS_ALPN_MESH_V1,
     };
     if connection.alpn_protocol() != Some(expected) {
         bail!("node did not negotiate the hosted-transport ALPN");
