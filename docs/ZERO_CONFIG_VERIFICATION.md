@@ -82,6 +82,16 @@ o node run examples/hello.O
 o node session run examples/hello.O
 ```
 
+The required `rust-hosted` CI lane also runs
+`scripts/smoke-zero-config-lan-netns.sh`. That gate gives a multi-homed client
+a silent decoy network as its default and multicast route while the real node
+is reachable only through a non-default `192.0.2.0/30` veth. It profiles the
+node through ordinary automatic discovery and enrollment, verifies the stored
+route is the non-loopback node address, and then removes the real client link
+and requires the same command to fail. This is Linux veth evidence; it does not
+replace the physical two-host acceptance path for Wi-Fi, router, firewall,
+macOS, IPv6, NAT, or cross-subnet behavior.
+
 Acceptance requires that ordinary client commands request no address, port,
 hostname, CA, certificate, key, receipt key, capability, lease, operation ID,
 task digest, or attempt generation.

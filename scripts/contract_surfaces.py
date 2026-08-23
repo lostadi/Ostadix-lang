@@ -368,6 +368,13 @@ def validate_runtime_probe_consumers(workflow: str) -> None:
     if mcp_job.index(component) > mcp_job.index(invocation):
         raise ContractError("MCP CI must install Clippy before invoking it")
 
+    hosted_job = workflow_job_body(workflow, "rust-hosted")
+    lan_smoke = "bash scripts/smoke-zero-config-lan-netns.sh"
+    if hosted_job.count(lan_smoke) != 1:
+        raise ContractError(
+            "rust-hosted CI must run the zero-config non-loopback LAN smoke exactly once"
+        )
+
 
 def validate_local_ci_posture_consumer(workflow: str) -> None:
     contracts = workflow_job_body(workflow, "contracts")

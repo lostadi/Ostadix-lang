@@ -20,7 +20,9 @@ use std::time::{Duration, Instant};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 
 use anyhow::{bail, Context, Result};
+use if_addrs::IfAddr;
 use serde::{Deserialize, Serialize};
+use socket2::SockRef;
 
 pub const LAN_DISCOVERY_SCHEMA_V1: &str = "ostadix.lan-discovery/v1";
 pub const LAN_BOOTSTRAP_SCHEMA_V1: &str = "ostadix.lan-bootstrap/v1";
@@ -32,6 +34,18 @@ pub const DEFAULT_LAN_DISCOVERY_PORT: u16 = 7339;
 pub const DEFAULT_LAN_DISCOVERY_MILLIS: u64 = 900;
 const DISCOVERY_MULTICAST: Ipv4Addr = Ipv4Addr::new(239, 255, 73, 37);
 const MAX_BOOTSTRAP_BYTES: usize = 4 * 1024 * 1024;
+const MAX_DISCOVERY_DATAGRAMS_PER_SOCKET: usize = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct LanIpv4Interface {
+    address: Ipv4Addr,
+    broadcast: Option<Ipv4Addr>,
+}
+
+struct LanDiscoverySocket {
+    socket: UdpSocket,
+    interface: Option<LanIpv4Interface>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -223,9 +237,7 @@ pub fn spawn_lan_discovery_responder(
     let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, discovery_port)).with_context(|| {
         format!("failed to bind Ostadix LAN discovery UDP port {discovery_port}")
     })?;
-    socket
-        .join_multicast_v4(&DISCOVERY_MULTICAST, &Ipv4Addr::UNSPECIFIED)
-        .context("failed to join Ostadix LAN discovery multicast group")?;
+    join_discovery_multicast_interfaces(&socket)?;
     socket
         .set_read_timeout(Some(Duration::from_secs(1)))
         .context("failed to configure Ostadix LAN discovery socket")?;
@@ -264,29 +276,19 @@ pub fn discover_lan_nodes(timeout: Duration) -> Result<Vec<DiscoveredLanNodeV1>>
     if timeout.is_zero() {
         bail!("LAN discovery timeout must be positive");
     }
-    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
-        .context("failed to bind Ostadix LAN discovery client socket")?;
-    socket
-        .set_broadcast(true)
-        .context("failed to enable Ostadix LAN broadcast discovery")?;
-    socket
-        .set_read_timeout(Some(Duration::from_millis(100)))
-        .context("failed to configure Ostadix LAN discovery timeout")?;
+    let sockets = open_lan_discovery_sockets()?;
     let request = serde_json::to_vec(&LanDiscoveryRequestV1::discover())?;
     let port = DEFAULT_LAN_DISCOVERY_PORT;
-    let destinations = [
-        SocketAddr::from((Ipv4Addr::BROADCAST, port)),
-        SocketAddr::from((DISCOVERY_MULTICAST, port)),
-        SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
-    ];
     let mut sent = false;
-    for destination in destinations {
-        match socket.send_to(&request, destination) {
-            Ok(_) => sent = true,
-            Err(error) => {
-                eprintln!(
-                    "octl: LAN discovery probe to {destination} could not be sent: {error}"
-                );
+    for discovery_socket in &sockets {
+        for destination in discovery_destinations(discovery_socket.interface, port) {
+            match discovery_socket.socket.send_to(&request, destination) {
+                Ok(_) => sent = true,
+                Err(error) => {
+                    eprintln!(
+                        "octl: LAN discovery probe to {destination} could not be sent: {error}"
+                    );
+                }
             }
         }
     }
@@ -298,31 +300,197 @@ pub fn discover_lan_nodes(timeout: Duration) -> Result<Vec<DiscoveredLanNodeV1>>
     let mut discovered = BTreeMap::new();
     let mut buffer = [0_u8; 4096];
     while Instant::now() < deadline {
-        match socket.recv_from(&mut buffer) {
-            Ok((length, source)) => {
-                let Ok(advertisement) = serde_json::from_slice::<LanNodeAdvertisementV1>(
-                    &buffer[..length],
-                ) else {
-                    continue;
-                };
-                if advertisement.validate().is_err() {
-                    continue;
+        let mut received = false;
+        for discovery_socket in &sockets {
+            for _ in 0..MAX_DISCOVERY_DATAGRAMS_PER_SOCKET {
+                if Instant::now() >= deadline {
+                    break;
                 }
-                let key = format!("{}@{}", advertisement.node_id, source.ip());
-                discovered.insert(
-                    key,
-                    DiscoveredLanNodeV1 {
-                        advertisement,
-                        source_ip: source.ip(),
-                    },
-                );
+                match discovery_socket.socket.recv_from(&mut buffer) {
+                    Ok((length, source)) => {
+                        received = true;
+                        record_discovered_node(&mut discovered, &buffer[..length], source);
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                    Err(error) => {
+                        return Err(error).context("Ostadix LAN discovery receive failed");
+                    }
+                }
             }
-            Err(error)
-                if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
-            Err(error) => return Err(error).context("Ostadix LAN discovery receive failed"),
+        }
+        if !received {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            thread::sleep(remaining.min(Duration::from_millis(10)));
         }
     }
     Ok(discovered.into_values().collect())
+}
+
+fn active_lan_ipv4_interfaces() -> Result<Vec<LanIpv4Interface>> {
+    let mut interfaces = BTreeMap::<Ipv4Addr, Option<Ipv4Addr>>::new();
+    for interface in if_addrs::get_if_addrs().context("failed to enumerate IPv4 interfaces")? {
+        if !interface.is_oper_up() {
+            continue;
+        }
+        let IfAddr::V4(address) = interface.addr else {
+            continue;
+        };
+        if address.ip.is_unspecified()
+            || address.ip.is_multicast()
+            || address.ip == Ipv4Addr::BROADCAST
+        {
+            continue;
+        }
+        interfaces
+            .entry(address.ip)
+            .and_modify(|broadcast| {
+                if broadcast.is_none() {
+                    *broadcast = address.broadcast;
+                }
+            })
+            .or_insert(address.broadcast);
+    }
+    if interfaces.is_empty() {
+        bail!("no active IPv4 interfaces are available for Ostadix LAN discovery");
+    }
+    Ok(interfaces
+        .into_iter()
+        .map(|(address, broadcast)| LanIpv4Interface { address, broadcast })
+        .collect())
+}
+
+fn join_discovery_multicast_interfaces(socket: &UdpSocket) -> Result<()> {
+    let interfaces = match active_lan_ipv4_interfaces() {
+        Ok(interfaces) => interfaces,
+        Err(error) => {
+            eprintln!(
+                "o-node: IPv4 interface enumeration failed; using the default multicast interface: {error:#}"
+            );
+            Vec::new()
+        }
+    };
+    let mut joined = false;
+    for interface in interfaces {
+        match socket.join_multicast_v4(&DISCOVERY_MULTICAST, &interface.address) {
+            Ok(()) => joined = true,
+            Err(error) => eprintln!(
+                "o-node: could not join LAN discovery multicast on {}: {error}",
+                interface.address
+            ),
+        }
+    }
+    if !joined {
+        socket
+            .join_multicast_v4(&DISCOVERY_MULTICAST, &Ipv4Addr::UNSPECIFIED)
+            .context("failed to join Ostadix LAN discovery multicast group")?;
+    }
+    Ok(())
+}
+
+fn open_lan_discovery_sockets() -> Result<Vec<LanDiscoverySocket>> {
+    let interfaces = match active_lan_ipv4_interfaces() {
+        Ok(interfaces) => interfaces,
+        Err(error) => {
+            eprintln!(
+                "octl: IPv4 interface enumeration failed; using the default route for LAN discovery: {error:#}"
+            );
+            Vec::new()
+        }
+    };
+    let mut sockets = Vec::new();
+    for interface in interfaces {
+        let socket = match UdpSocket::bind((interface.address, 0)) {
+            Ok(socket) => socket,
+            Err(error) => {
+                eprintln!(
+                    "octl: could not bind a LAN discovery probe on {}: {error}",
+                    interface.address
+                );
+                continue;
+            }
+        };
+        configure_lan_discovery_socket(&socket)?;
+        if !interface.address.is_loopback() {
+            if let Err(error) = SockRef::from(&socket).set_multicast_if_v4(&interface.address) {
+                eprintln!(
+                    "octl: could not select {} for multicast discovery: {error}",
+                    interface.address
+                );
+            }
+        }
+        sockets.push(LanDiscoverySocket {
+            socket,
+            interface: Some(interface),
+        });
+    }
+    if sockets.is_empty() {
+        let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+            .context("failed to bind Ostadix LAN discovery client socket")?;
+        configure_lan_discovery_socket(&socket)?;
+        sockets.push(LanDiscoverySocket {
+            socket,
+            interface: None,
+        });
+    }
+    Ok(sockets)
+}
+
+fn configure_lan_discovery_socket(socket: &UdpSocket) -> Result<()> {
+    socket
+        .set_broadcast(true)
+        .context("failed to enable Ostadix LAN broadcast discovery")?;
+    socket
+        .set_nonblocking(true)
+        .context("failed to configure Ostadix LAN discovery socket")
+}
+
+fn discovery_destinations(interface: Option<LanIpv4Interface>, port: u16) -> Vec<SocketAddr> {
+    let addresses = match interface {
+        Some(interface) if interface.address.is_loopback() => vec![Ipv4Addr::LOCALHOST],
+        Some(interface) => {
+            let mut addresses = Vec::with_capacity(3);
+            if let Some(broadcast) = interface.broadcast {
+                addresses.push(broadcast);
+            }
+            addresses.push(Ipv4Addr::BROADCAST);
+            addresses.push(DISCOVERY_MULTICAST);
+            addresses
+        }
+        None => vec![
+            Ipv4Addr::BROADCAST,
+            DISCOVERY_MULTICAST,
+            Ipv4Addr::LOCALHOST,
+        ],
+    };
+    let mut destinations = Vec::with_capacity(addresses.len());
+    for address in addresses {
+        let destination = SocketAddr::from((address, port));
+        if !destinations.contains(&destination) {
+            destinations.push(destination);
+        }
+    }
+    destinations
+}
+
+fn record_discovered_node(
+    discovered: &mut BTreeMap<String, DiscoveredLanNodeV1>,
+    payload: &[u8],
+    source: SocketAddr,
+) {
+    let Ok(advertisement) = serde_json::from_slice::<LanNodeAdvertisementV1>(payload) else {
+        return;
+    };
+    if advertisement.validate().is_err() {
+        return;
+    }
+    let key = format!("{}@{}", advertisement.node_id, source.ip());
+    discovered.insert(
+        key,
+        DiscoveredLanNodeV1 {
+            advertisement,
+            source_ip: source.ip(),
+        },
+    );
 }
 
 pub fn spawn_lan_bootstrap_server(
@@ -641,6 +809,35 @@ mod tests {
         assert_eq!(
             fs::metadata(paths.client_key).unwrap().permissions().mode() & 0o777,
             0o600
+        );
+    }
+
+    #[test]
+    fn physical_interfaces_probe_their_subnet_and_multicast_group() {
+        let interface = LanIpv4Interface {
+            address: "192.168.50.12".parse().unwrap(),
+            broadcast: Some("192.168.50.255".parse().unwrap()),
+        };
+        let destinations = discovery_destinations(Some(interface), 7339);
+        assert_eq!(
+            destinations,
+            vec![
+                "192.168.50.255:7339".parse().unwrap(),
+                "255.255.255.255:7339".parse().unwrap(),
+                "239.255.73.37:7339".parse().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn loopback_discovery_stays_a_separate_compatibility_probe() {
+        let interface = LanIpv4Interface {
+            address: Ipv4Addr::LOCALHOST,
+            broadcast: None,
+        };
+        assert_eq!(
+            discovery_destinations(Some(interface), 7339),
+            vec!["127.0.0.1:7339".parse().unwrap()]
         );
     }
 }

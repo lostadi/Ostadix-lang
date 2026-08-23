@@ -432,6 +432,7 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "ocore/world/value_codec.oc",
         "scripts/smoke_ostadix_mcp.py",
         "scripts/smoke-docker.sh",
+        "scripts/smoke-zero-config-lan-netns.sh",
         "scripts/semantic_custody_demo.sh",
         "scripts/contract_surfaces.py",
         "scripts/check_attribution.py",

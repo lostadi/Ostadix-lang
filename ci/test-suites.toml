@@ -33,6 +33,10 @@ probe_args = ["--version"]
 executable = "grub-mkstandalone"
 probe_args = ["--version"]
 
+[runtime_probes.ip]
+executable = "ip"
+probe_args = ["-Version"]
+
 [runtime_probes.make]
 executable = "make"
 probe_args = ["--version"]
@@ -85,7 +89,7 @@ required_executables = ["cargo", "rustc"]
 required_executables = ["bash", "clang", "node", "python3", "sqlite3"]
 
 [suites.rust-hosted]
-required_executables = ["bash", "clang", "openssl", "python3", "sqlite3"]
+required_executables = ["bash", "clang", "ip", "openssl", "python3", "sqlite3"]
 
 [suites.python]
 required_executables = ["python3"]
