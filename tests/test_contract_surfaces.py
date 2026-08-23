@@ -45,6 +45,19 @@ class ContractSurfacesTests(unittest.TestCase):
         self.assertEqual(job.count("bash scripts/smoke-zero-config-lan-netns.sh"), 1)
         self.assertIn("iproute2", job)
 
+    def test_lan_smoke_retains_pairing_and_reconnect_boundaries(self) -> None:
+        smoke = (ROOT / "scripts" / "smoke-zero-config-lan-netns.sh").read_text(
+            encoding="utf-8"
+        )
+        for marker in (
+            "passcode pairing wrong-code no-state boundary: PASS",
+            "reciprocal public-key pairing, private storage, distinct keys, and one-use-listener boundary: PASS",
+            "paired-default legacy-bootstrap-disabled in both namespaces: PASS",
+            "paired bidirectional restart reconnect over non-loopback links: PASS",
+            "explicit replacement recovers one-sided pairing persistence: PASS",
+        ):
+            self.assertEqual(smoke.count(marker), 1)
+
     def test_openssl_probe_uses_the_authoritative_version_subcommand(self) -> None:
         probe = contracts.runtime_probes()["openssl"]
         self.assertEqual(probe, {"executable": "openssl", "probe_args": ["version"]})

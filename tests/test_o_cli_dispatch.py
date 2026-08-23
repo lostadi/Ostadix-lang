@@ -77,11 +77,36 @@ class LowercaseCliDispatchTests(unittest.TestCase):
             "session.json",
         ])
 
+    def test_node_pairing_routes_all_arguments_to_the_service_cli(self) -> None:
+        self.assert_dispatch(("node", "pair"), ["pair"])
+        self.assert_dispatch(
+            (
+                "node",
+                "pair",
+                "ostadix-peer",
+                "--passcode-stdin",
+                "--replace",
+                "--address",
+                "203.0.113.8:7340",
+            ),
+            [
+                "pair",
+                "ostadix-peer",
+                "--passcode-stdin",
+                "--replace",
+                "--address",
+                "203.0.113.8:7340",
+            ],
+        )
+
     def test_help_advertises_hosted_v2_sessions(self) -> None:
         result = self.run_cli("help")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("node start|stop|status|restart", result.stdout)
+        self.assertIn("node pair [NODE_ID]", result.stdout)
         self.assertIn("node list|use|profile|doctor|run|session", result.stdout)
+        self.assertNotIn("node pair PASSCODE", result.stdout)
+        self.assertNotIn("node pair [NODE_ID] PASSCODE", result.stdout)
 
     def test_registry_and_live_commands_forward_exact_arguments(self) -> None:
         self.assert_dispatch(("registry", "verify", "--state", "store.cbor"), [

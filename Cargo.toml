@@ -109,6 +109,10 @@ ignore      = "0.4"
 # REPL line editing: history, arrow keys, Ctrl+A/E, Ctrl+C/D
 rustyline   = "14"
 
+# Hidden terminal input for one-use node pairing passcodes.
+rpassword  = "7.5.4"
+zeroize    = "1"
+
 # Notebook server (opt-in via --features notebook)
 axum        = { version = "0.7", optional = true }
 tokio       = { version = "1", features = ["full"], optional = true }

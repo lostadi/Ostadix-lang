@@ -1,7 +1,8 @@
 use std::env;
 use std::fs;
 use std::fs::OpenOptions;
-use std::net::{Ipv4Addr, SocketAddr, TcpListener};
+use std::io::{self, BufRead, Write};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::Arc;
@@ -15,6 +16,8 @@ use std::os::unix::process::CommandExt;
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
+use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 use o_lang::hosted_remote::v2::{
     default_hosted_v2_state_dir, read_node_signing_key_v2, read_placement_public_key_v2,
@@ -22,20 +25,22 @@ use o_lang::hosted_remote::v2::{
     write_new_node_signing_key_v2, DurableSessionStoreV2, HostedDualNodeShutdown,
     HostedNodeSignerV2, HostedOwnedDualNodeServerConfig, HostedV2RuntimeConfig,
     HostedV2RuntimeOwner, LanOpenPlacementAuthorizerV2, PinnedEd25519PlacementAuthorizerV2,
-    PlacementProofAuthorizerV2,
-    DEFAULT_MAX_ACTORS_PER_SESSION_V2,
-    DEFAULT_MAX_OPEN_SESSIONS_V2, DEFAULT_MAX_SNAPSHOT_BYTES_PER_ACTOR_V2,
-    DEFAULT_MAX_STATE_BYTES_PER_SESSION_V2, DEFAULT_MAX_STATE_BYTES_TOTAL_V2,
+    PlacementProofAuthorizerV2, DEFAULT_MAX_ACTORS_PER_SESSION_V2, DEFAULT_MAX_OPEN_SESSIONS_V2,
+    DEFAULT_MAX_SNAPSHOT_BYTES_PER_ACTOR_V2, DEFAULT_MAX_STATE_BYTES_PER_SESSION_V2,
+    DEFAULT_MAX_STATE_BYTES_TOTAL_V2,
 };
 use o_lang::hosted_remote::{
-    accept_mutual_tls, build_client_config, build_server_config, connect_mutual_tls,
-    default_ca_path, default_node_cert_path, default_node_key_path, hosted_config_dir,
-    lan_node_process_dir, lan_open_config_dir, lan_open_v2_state_dir, serve_node,
-    spawn_lan_bootstrap_server, spawn_lan_discovery_responder, ClientTlsIdentity,
-    HostedNodeRuntime, HostedNodeServerConfig, LanBootstrapBundleV1, LanNodeAdvertisementV1,
-    NodeDoctorCheckV1, ServerTlsIdentity, DEFAULT_LAN_BOOTSTRAP_PORT,
-    DEFAULT_LAN_DISCOVERY_PORT, DEFAULT_LAN_NODE_PORT, DEFAULT_MAX_CONNECTIONS,
-    DEFAULT_NODE_BIND, DEFAULT_NODE_ID, LAN_BOOTSTRAP_SCHEMA_V1, LAN_SECURITY_MODE,
+    accept_mutual_tls, accept_pairing_once, build_client_config, build_server_config,
+    connect_mutual_tls, default_ca_path, default_node_cert_path, default_node_key_path,
+    discover_lan_nodes, generate_pairing_passcode, hosted_config_dir, join_pairing_once,
+    lan_node_process_dir, lan_open_config_dir, lan_open_v2_state_dir, lan_peers_config_dir,
+    load_stored_lan_peer, replace_paired_lan_peer, serve_node, spawn_lan_bootstrap_server,
+    spawn_lan_discovery_responder, store_paired_lan_peer, ClientTlsIdentity, HostedNodeRuntime,
+    HostedNodeServerConfig, LanBootstrapBundleV1, LanNodeAdvertisementV1, NodeDoctorCheckV1,
+    PairingLocalIdentityV1, PairingPublicIdentityV1, PairingResultV1, ServerTlsIdentity,
+    StoredLanPeerPathsV1, DEFAULT_LAN_BOOTSTRAP_PORT, DEFAULT_LAN_DISCOVERY_PORT,
+    DEFAULT_LAN_NODE_PORT, DEFAULT_LAN_PAIRING_PORT, DEFAULT_MAX_CONNECTIONS, DEFAULT_NODE_BIND,
+    DEFAULT_NODE_ID, LAN_BOOTSTRAP_SCHEMA_V1, LAN_SECURITY_MODE,
 };
 use o_lang::placement::{GenerationV1, StateQuotaLimitsV2};
 use o_lang::runtime_exec::validate_native_runtime_binary;
@@ -57,13 +62,15 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Start the zero-configuration LAN node as a detached background process.
-    Start,
+    Start(StartArgs),
     /// Stop the detached zero-configuration LAN node.
     Stop,
     /// Report whether the detached zero-configuration LAN node is running.
     Status,
     /// Restart the detached zero-configuration LAN node.
-    Restart,
+    Restart(StartArgs),
+    /// Pair once with another node using a short passcode, then remember its public identity.
+    Pair(PairArgs),
     /// Provision a local development CA plus node/client identities.
     Pki(PkiArgs),
     /// Initialize the durable V2 node receipt-signing identity.
@@ -76,6 +83,43 @@ enum Command {
     Doctor(DoctorArgs),
     /// Serve frozen V1 and optional durable Hosted V2 requests over mTLS.
     Serve(ServeArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+struct StartArgs {
+    /// Legacy compatibility: let any LAN-reachable client download a shared private key.
+    #[arg(long)]
+    lan_open: bool,
+}
+
+#[derive(Debug, Args)]
+struct PairArgs {
+    /// Node ID printed by `o node pair` on the offering machine. Omit to create an offer.
+    peer_node_id: Option<String>,
+    /// Read the passcode from one line of standard input instead of a hidden terminal prompt.
+    #[arg(long)]
+    passcode_stdin: bool,
+    /// Direct pairing endpoint for routed networks (for example 203.0.113.8:7340).
+    #[arg(long)]
+    address: Option<String>,
+    /// Deliberately replace an existing paired pin (for renewal or interrupted-pairing recovery).
+    #[arg(long)]
+    replace: bool,
+    /// Listener endpoint when creating an offer.
+    #[arg(long, default_value = "0.0.0.0:7340")]
+    bind: String,
+    /// Local hosted service port recorded for later automatic connections.
+    #[arg(long, default_value_t = DEFAULT_LAN_NODE_PORT)]
+    service_port: u16,
+    /// Seconds before an unanswered pairing offer expires.
+    #[arg(long, default_value_t = 300)]
+    offer_timeout_seconds: u64,
+    /// Seconds allowed for each pairing protocol read/write step.
+    #[arg(long, default_value_t = 15)]
+    io_timeout_seconds: u64,
+    /// Milliseconds to search the LAN for the named offering node.
+    #[arg(long, default_value_t = 3_000)]
+    discovery_timeout_millis: u64,
 }
 
 #[derive(Debug, Args)]
@@ -213,10 +257,13 @@ struct ServeArgs {
     /// Disable discovery, enrollment, automatic identities, and automatic V2 setup.
     #[arg(long)]
     manual: bool,
+    /// Legacy compatibility: expose a shared client private key to LAN-reachable callers.
+    #[arg(long, conflicts_with = "manual")]
+    lan_open: bool,
     /// Keep automatic configuration but do not advertise on the LAN.
     #[arg(long)]
     no_discovery: bool,
-    /// Keep automatic configuration but do not expose LAN enrollment credentials.
+    /// With --lan-open, keep automatic configuration but suppress the legacy bootstrap service.
     #[arg(long)]
     no_bootstrap: bool,
     /// Enable durable session protocol V2 using this capability-first state root.
@@ -247,10 +294,11 @@ struct ServeArgs {
 
 fn main() -> Result<()> {
     match Cli::parse().command {
-        Command::Start => start_detached_node(),
+        Command::Start(args) => start_detached_node(args),
         Command::Stop => stop_detached_node(),
         Command::Status => detached_node_status(true).map(|_| ()),
-        Command::Restart => restart_detached_node(),
+        Command::Restart(args) => restart_detached_node(args),
+        Command::Pair(args) => pair_node(args),
         Command::Pki(args) => match args.command {
             PkiCommand::Init(args) => init_development_pki(args),
         },
@@ -283,6 +331,9 @@ struct LanOpenNodeMaterial {
     state_dir: PathBuf,
     node_signing_key: PathBuf,
     node_public_key: PathBuf,
+    pairing_ca: PathBuf,
+    pairing_ca_key: PathBuf,
+    client_ca_bundle: PathBuf,
 }
 
 fn ensure_lan_open_material() -> Result<LanOpenNodeMaterial> {
@@ -303,8 +354,8 @@ fn ensure_lan_open_material() -> Result<LanOpenNodeMaterial> {
         "client-key.pem",
     ];
     let complete = required_pki.iter().all(|name| pki_dir.join(name).is_file());
-    let matching_name = fs::read_to_string(&server_name_path)
-        .is_ok_and(|value| value.trim() == server_name);
+    let matching_name =
+        fs::read_to_string(&server_name_path).is_ok_and(|value| value.trim() == server_name);
     if !complete || !matching_name {
         if pki_dir.exists() {
             let backup = sibling_backup_path(&pki_dir, "stale-pki")?;
@@ -327,6 +378,13 @@ fn ensure_lan_open_material() -> Result<LanOpenNodeMaterial> {
         })?;
         fs::write(&server_name_path, format!("{server_name}\n"))?;
     }
+
+    // Pairing client authentication is intentionally separate from the
+    // historical LAN-open CA. Generate it as an independent, stable migration
+    // so adding these files can never rotate the existing node certificate.
+    let (pairing_ca, pairing_ca_key) = ensure_pairing_ca(&pki_dir)?;
+    let client_ca_bundle = pki_dir.join("client-ca-bundle.pem");
+    refresh_client_ca_bundle(&pairing_ca, &pki_dir.join("ca.pem"), &client_ca_bundle)?;
 
     let state_dir = lan_open_v2_state_dir();
     let node_signing_key = state_dir.join("node-signing-key.v2");
@@ -369,7 +427,135 @@ fn ensure_lan_open_material() -> Result<LanOpenNodeMaterial> {
         state_dir,
         node_signing_key,
         node_public_key,
+        pairing_ca,
+        pairing_ca_key,
+        client_ca_bundle,
     })
+}
+
+fn ensure_pairing_ca(pki_dir: &Path) -> Result<(PathBuf, PathBuf)> {
+    let certificate = pki_dir.join("pairing-ca.pem");
+    let private_key = pki_dir.join("pairing-ca-key.pem");
+    let certificate_exists = secure_regular_file_exists(&certificate)?;
+    let private_key_exists = secure_regular_file_exists(&private_key)?;
+    match (certificate_exists, private_key_exists) {
+        (true, true) => {
+            secure_key(private_key.clone())?;
+            verify_pairing_ca(pki_dir)?;
+            return Ok((certificate, private_key));
+        }
+        (true, false) | (false, true) => {
+            bail!(
+                "automatic pairing CA is incomplete (certificate={} key={}); refusing to rotate it because that would invalidate paired nodes",
+                certificate.display(),
+                private_key.display()
+            );
+        }
+        (false, false) => {}
+    }
+
+    let temporary = create_private_temp_dir(pki_dir)?;
+    fs::write(
+        temporary.path().join("pairing-ca.cnf"),
+        "[req]\nprompt=no\ndistinguished_name=dn\nx509_extensions=v3_ca\n[dn]\nCN=Ostadix Paired Client Authentication CA\n[v3_ca]\nbasicConstraints=critical,CA:TRUE,pathlen:0\nkeyUsage=critical,keyCertSign,cRLSign\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid:always,issuer\n",
+    )?;
+    run_openssl(
+        Path::new("openssl"),
+        temporary.path(),
+        &[
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:3072",
+            "-sha256",
+            "-days",
+            "3650",
+            "-nodes",
+            "-keyout",
+            "pairing-ca-key.pem",
+            "-out",
+            "pairing-ca.pem",
+            "-config",
+            "pairing-ca.cnf",
+        ],
+    )?;
+    secure_key(temporary.path().join("pairing-ca-key.pem"))?;
+
+    let mut installed = Vec::new();
+    for name in ["pairing-ca-key.pem", "pairing-ca.pem"] {
+        let target = pki_dir.join(name);
+        if let Err(error) = fs::hard_link(temporary.path().join(name), &target) {
+            for created in &installed {
+                let _ = fs::remove_file(created);
+            }
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to install stable pairing CA file `{}`",
+                    target.display()
+                )
+            });
+        }
+        installed.push(target);
+    }
+    verify_pairing_ca(pki_dir)?;
+    Ok((certificate, private_key))
+}
+
+fn secure_regular_file_exists(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                bail!(
+                    "pairing identity path `{}` must be a regular file",
+                    path.display()
+                );
+            }
+            Ok(true)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("failed to inspect `{}`", path.display())),
+    }
+}
+
+fn verify_pairing_ca(pki_dir: &Path) -> Result<()> {
+    let openssl = Path::new("openssl");
+    run_openssl(
+        openssl,
+        pki_dir,
+        &["x509", "-in", "pairing-ca.pem", "-noout", "-checkend", "0"],
+    )?;
+    run_openssl(
+        openssl,
+        pki_dir,
+        &["verify", "-CAfile", "pairing-ca.pem", "pairing-ca.pem"],
+    )?;
+    let certificate_public = run_openssl_capture(
+        openssl,
+        pki_dir,
+        &["x509", "-in", "pairing-ca.pem", "-pubkey", "-noout"],
+    )?;
+    let key_public = run_openssl_capture(
+        openssl,
+        pki_dir,
+        &["pkey", "-in", "pairing-ca-key.pem", "-pubout"],
+    )?;
+    if certificate_public != key_public {
+        bail!("pairing CA certificate and private key do not match; refusing silent rotation");
+    }
+    Ok(())
+}
+
+fn refresh_client_ca_bundle(pairing_ca: &Path, legacy_ca: &Path, destination: &Path) -> Result<()> {
+    let mut bytes = fs::read(pairing_ca)
+        .with_context(|| format!("failed to read pairing CA `{}`", pairing_ca.display()))?;
+    if !bytes.ends_with(b"\n") {
+        bytes.push(b'\n');
+    }
+    bytes.extend(
+        fs::read(legacy_ca)
+            .with_context(|| format!("failed to read legacy LAN CA `{}`", legacy_ca.display()))?,
+    );
+    write_file_atomic(destination, &bytes, false)
 }
 
 fn load_or_create_automatic_node_id(path: &Path, server_name: &str) -> Result<String> {
@@ -378,11 +564,8 @@ fn load_or_create_automatic_node_id(path: &Path, server_name: &str) -> Result<St
             .with_context(|| format!("failed to read `{}`", path.display()))?
             .trim()
             .to_owned();
-        if o_lang::hosted_remote::NodeProfileV1::local(
-            candidate.clone(),
-            DEFAULT_MAX_CONNECTIONS,
-        )
-        .is_ok()
+        if o_lang::hosted_remote::NodeProfileV1::local(candidate.clone(), DEFAULT_MAX_CONNECTIONS)
+            .is_ok()
         {
             return Ok(candidate);
         }
@@ -404,7 +587,6 @@ fn load_or_create_automatic_node_id(path: &Path, server_name: &str) -> Result<St
     options.write(true).create_new(true);
     #[cfg(unix)]
     options.mode(0o600);
-    use std::io::Write;
     match options.open(path) {
         Ok(mut file) => {
             file.write_all(format!("{generated}\n").as_bytes())?;
@@ -418,15 +600,11 @@ fn load_or_create_automatic_node_id(path: &Path, server_name: &str) -> Result<St
                 .with_context(|| format!("failed to read raced-in `{}`", path.display()))?
                 .trim()
                 .to_owned();
-            o_lang::hosted_remote::NodeProfileV1::local(
-                candidate.clone(),
-                DEFAULT_MAX_CONNECTIONS,
-            )
-            .context("concurrently created automatic node identity is invalid")?;
+            o_lang::hosted_remote::NodeProfileV1::local(candidate.clone(), DEFAULT_MAX_CONNECTIONS)
+                .context("concurrently created automatic node identity is invalid")?;
             Ok(candidate)
         }
-        Err(error) => Err(error)
-            .with_context(|| format!("failed to create `{}`", path.display())),
+        Err(error) => Err(error).with_context(|| format!("failed to create `{}`", path.display())),
     }
 }
 
@@ -441,7 +619,9 @@ fn generate_automatic_node_id(server_name: &str) -> Result<String> {
 }
 
 fn sibling_backup_path(path: &Path, label: &str) -> Result<PathBuf> {
-    let parent = path.parent().context("automatic state path has no parent")?;
+    let parent = path
+        .parent()
+        .context("automatic state path has no parent")?;
     let name = path
         .file_name()
         .and_then(|value| value.to_str())
@@ -490,7 +670,11 @@ fn automatic_server_name() -> Result<String> {
         }
     }
     let host = host.trim_matches('-');
-    let host = if host.is_empty() { "ostadix-node" } else { host };
+    let host = if host.is_empty() {
+        "ostadix-node"
+    } else {
+        host
+    };
     let name = format!("{host}.local");
     certificate_san(&name)?;
     Ok(name)
@@ -529,6 +713,471 @@ fn lan_bootstrap_bundle(
     Ok(bundle)
 }
 
+fn pair_node(args: PairArgs) -> Result<()> {
+    validate_pair_args(&args)?;
+    let material = ensure_lan_open_material()?;
+    match args.peer_node_id.as_deref() {
+        None => offer_pairing(&material, &args),
+        Some(peer_node_id) => join_pairing(&material, peer_node_id, &args),
+    }
+}
+
+fn validate_pair_args(args: &PairArgs) -> Result<()> {
+    if args.service_port == 0 {
+        bail!("--service-port must be nonzero");
+    }
+    if !(1..=600).contains(&args.offer_timeout_seconds) {
+        bail!("--offer-timeout-seconds must be between 1 and 600");
+    }
+    if !(1..=60).contains(&args.io_timeout_seconds) {
+        bail!("--io-timeout-seconds must be between 1 and 60");
+    }
+    if !(1..=60_000).contains(&args.discovery_timeout_millis) {
+        bail!("--discovery-timeout-millis must be between 1 and 60000");
+    }
+    if args.peer_node_id.is_none() {
+        if args.passcode_stdin {
+            bail!("--passcode-stdin is only valid when joining a named node");
+        }
+        if args.address.is_some() {
+            bail!("--address is only valid when joining a named node");
+        }
+    }
+    Ok(())
+}
+
+fn offer_pairing(material: &LanOpenNodeMaterial, args: &PairArgs) -> Result<()> {
+    let listener = TcpListener::bind(&args.bind)
+        .with_context(|| format!("failed to bind pairing listener `{}`", args.bind))?;
+    listener
+        .set_nonblocking(true)
+        .context("failed to configure expiring pairing listener")?;
+    let listen_address = listener.local_addr()?;
+    let passcode = Zeroizing::new(generate_pairing_passcode()?);
+    println!("Pairing node: {}", material.node_id);
+    println!("Passcode: {}", passcode.as_str());
+    println!(
+        "Expires in {} seconds after one connection attempt.",
+        args.offer_timeout_seconds
+    );
+    println!("On the other node run: o node pair {}", material.node_id);
+    if listen_address.port() != DEFAULT_LAN_PAIRING_PORT {
+        println!(
+            "Custom listener port: pass `--address <this-node-ip>:{}` on the other node.",
+            listen_address.port()
+        );
+    }
+    io::stdout().flush()?;
+
+    let deadline = Instant::now() + Duration::from_secs(args.offer_timeout_seconds);
+    let (stream, source) = loop {
+        match listener.accept() {
+            Ok(connection) => break connection,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    bail!("pairing offer expired before another node connected");
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+            Err(error) => {
+                return Err(error).context("pairing listener failed");
+            }
+        }
+    };
+
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        bail!("pairing offer expired as the one-use connection was accepted");
+    }
+    let io_timeout = Duration::from_secs(args.io_timeout_seconds).min(remaining);
+    let outcome = accept_pairing_once(
+        stream,
+        passcode.as_str(),
+        &material.node_id,
+        io_timeout,
+        |peer| prepare_pairing_local_identity(material, &peer.node_id, args.service_port),
+        |peer| sign_pairing_client_csr(material, peer),
+    );
+    let result = outcome.context("pairing attempt failed; the one-use offer was consumed")?;
+    verify_and_store_pairing(material, source.ip(), &result, args.replace)?;
+    if let Err(error) = remember_preferred_pair(&result.peer.node_id) {
+        eprintln!(
+            "o-node: pairing succeeded, but the preferred-node marker could not be updated: {error:#}"
+        );
+    }
+    println!("Paired with {}.", result.peer.node_id);
+    println!("Both nodes retained their own private keys and saved reciprocal public identities.");
+    Ok(())
+}
+
+fn join_pairing(material: &LanOpenNodeMaterial, peer_node_id: &str, args: &PairArgs) -> Result<()> {
+    let passcode = read_pairing_passcode(args.passcode_stdin)?;
+    let candidates = pairing_candidates(peer_node_id, args)?;
+    let timeout = Duration::from_secs(args.io_timeout_seconds);
+    let mut failures = Vec::new();
+    let mut connected = None;
+    for address in candidates {
+        match TcpStream::connect_timeout(&address, timeout) {
+            Ok(stream) => {
+                connected = Some((stream, address));
+                break;
+            }
+            Err(error) => failures.push(format!("{address}: {error}")),
+        }
+    }
+    let Some((stream, address)) = connected else {
+        bail!(
+            "could not reach pairing offer for `{peer_node_id}`{}",
+            if failures.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", failures.join("; "))
+            }
+        );
+    };
+
+    let local = prepare_pairing_local_identity(material, peer_node_id, args.service_port)?;
+    let outcome = join_pairing_once(
+        stream,
+        passcode.as_str(),
+        peer_node_id,
+        timeout,
+        local,
+        |peer| sign_pairing_client_csr(material, peer),
+    );
+    let result = outcome.context("pairing authentication failed")?;
+    verify_and_store_pairing(material, address.ip(), &result, args.replace)?;
+    if let Err(error) = remember_preferred_pair(&result.peer.node_id) {
+        eprintln!(
+            "o-node: pairing succeeded, but the preferred-node marker could not be updated: {error:#}"
+        );
+    }
+    println!("Paired with {}.", result.peer.node_id);
+    println!("Future `o node profile`, `run`, and `session` commands can reuse this identity.");
+    Ok(())
+}
+
+fn read_pairing_passcode(from_stdin: bool) -> Result<Zeroizing<String>> {
+    let mut passcode = if from_stdin {
+        let mut line = Zeroizing::new(String::new());
+        io::stdin()
+            .lock()
+            .read_line(&mut line)
+            .context("failed to read pairing passcode from standard input")?;
+        line
+    } else {
+        Zeroizing::new(
+            rpassword::prompt_password("Passcode: ")
+                .context("failed to read pairing passcode from the terminal")?,
+        )
+    };
+    let trimmed_len = passcode.trim_end_matches(['\r', '\n']).len();
+    passcode.truncate(trimmed_len);
+    if passcode.is_empty() {
+        bail!("pairing passcode cannot be empty");
+    }
+    Ok(passcode)
+}
+
+fn pairing_candidates(peer_node_id: &str, args: &PairArgs) -> Result<Vec<SocketAddr>> {
+    if let Some(address) = &args.address {
+        let mut addresses = address
+            .to_socket_addrs()
+            .with_context(|| format!("failed to resolve pairing endpoint `{address}`"))?
+            .collect::<Vec<_>>();
+        addresses.sort();
+        addresses.dedup();
+        if addresses.is_empty() {
+            bail!("pairing endpoint `{address}` resolved to no socket addresses");
+        }
+        return Ok(addresses);
+    }
+
+    let mut matches = discover_lan_nodes(Duration::from_millis(args.discovery_timeout_millis))?
+        .into_iter()
+        .filter(|node| node.advertisement.node_id == peer_node_id)
+        .map(|node| {
+            if node.advertisement.is_pairing_required() {
+                node.bootstrap_address()
+            } else {
+                SocketAddr::new(node.source_ip, DEFAULT_LAN_PAIRING_PORT)
+            }
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by(|left, right| {
+        left.ip()
+            .is_loopback()
+            .cmp(&right.ip().is_loopback())
+            .then_with(|| left.to_string().cmp(&right.to_string()))
+    });
+    matches.dedup();
+    if matches.is_empty() {
+        bail!(
+            "node `{peer_node_id}` was not discovered; start it first or pass `--address HOST:PORT`"
+        );
+    }
+    Ok(matches)
+}
+
+fn prepare_pairing_local_identity(
+    material: &LanOpenNodeMaterial,
+    peer_node_id: &str,
+    service_port: u16,
+) -> Result<PairingLocalIdentityV1> {
+    let temporary = create_private_temp_dir(&material.pki_dir)?;
+    let digest = Sha256::digest(format!("{}\0{peer_node_id}", material.node_id).as_bytes());
+    let subject = format!("/CN=ostadix-pair-{}", hex::encode(&digest[..12]));
+    run_openssl(
+        Path::new("openssl"),
+        temporary.path(),
+        &[
+            "req",
+            "-new",
+            "-newkey",
+            "rsa:3072",
+            "-sha256",
+            "-nodes",
+            "-keyout",
+            "client-key.pem",
+            "-out",
+            "client.csr",
+            "-subj",
+            &subject,
+        ],
+    )?;
+    secure_key(temporary.path().join("client-key.pem"))?;
+    run_openssl(
+        Path::new("openssl"),
+        temporary.path(),
+        &["req", "-in", "client.csr", "-noout", "-verify"],
+    )?;
+
+    let node_receipt_public_key = fs::read_to_string(&material.node_public_key)
+        .with_context(|| {
+            format!(
+                "failed to read local receipt public key `{}`",
+                material.node_public_key.display()
+            )
+        })?
+        .trim()
+        .to_owned();
+    let public = PairingPublicIdentityV1 {
+        node_id: material.node_id.clone(),
+        server_name: material.server_name.clone(),
+        service_port,
+        supports_v2: true,
+        server_ca_pem: fs::read_to_string(material.pki_dir.join("ca.pem"))?,
+        client_issuer_ca_pem: fs::read_to_string(&material.pairing_ca)?,
+        client_csr_pem: fs::read_to_string(temporary.path().join("client.csr"))?,
+        node_receipt_public_key,
+    };
+    public.validate()?;
+    PairingLocalIdentityV1::new(public, fs::read(temporary.path().join("client-key.pem"))?)
+}
+
+fn sign_pairing_client_csr(
+    material: &LanOpenNodeMaterial,
+    peer: &PairingPublicIdentityV1,
+) -> Result<String> {
+    peer.validate()?;
+    let temporary = create_private_temp_dir(&material.pki_dir)?;
+    fs::write(
+        temporary.path().join("peer.csr"),
+        peer.client_csr_pem.as_bytes(),
+    )?;
+    fs::write(
+        temporary.path().join("client-ext.cnf"),
+        "[client_ext]\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=clientAuth\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid,issuer\n",
+    )?;
+    run_openssl(
+        Path::new("openssl"),
+        temporary.path(),
+        &["req", "-in", "peer.csr", "-noout", "-verify"],
+    )?;
+    let mut serial = [0_u8; 16];
+    getrandom::fill(&mut serial).context("failed to generate pairing certificate serial")?;
+    let serial = format!("0x{}", hex::encode(serial));
+    let pairing_ca = material
+        .pairing_ca
+        .to_str()
+        .context("pairing CA path is not valid Unicode")?;
+    let pairing_ca_key = material
+        .pairing_ca_key
+        .to_str()
+        .context("pairing CA key path is not valid Unicode")?;
+    run_openssl(
+        Path::new("openssl"),
+        temporary.path(),
+        &[
+            "x509",
+            "-req",
+            "-in",
+            "peer.csr",
+            "-CA",
+            pairing_ca,
+            "-CAkey",
+            pairing_ca_key,
+            "-set_serial",
+            &serial,
+            "-out",
+            "client-cert.pem",
+            "-days",
+            "397",
+            "-sha256",
+            "-extfile",
+            "client-ext.cnf",
+            "-extensions",
+            "client_ext",
+        ],
+    )?;
+    run_openssl(
+        Path::new("openssl"),
+        temporary.path(),
+        &[
+            "verify",
+            "-CAfile",
+            pairing_ca,
+            "-purpose",
+            "sslclient",
+            "client-cert.pem",
+        ],
+    )?;
+    let csr_public = run_openssl_capture(
+        Path::new("openssl"),
+        temporary.path(),
+        &["req", "-in", "peer.csr", "-pubkey", "-noout"],
+    )?;
+    let certificate_public = run_openssl_capture(
+        Path::new("openssl"),
+        temporary.path(),
+        &["x509", "-in", "client-cert.pem", "-pubkey", "-noout"],
+    )?;
+    if csr_public != certificate_public {
+        bail!("issued pairing certificate does not contain the authenticated CSR public key");
+    }
+    fs::read_to_string(temporary.path().join("client-cert.pem"))
+        .context("failed to read issued pairing client certificate")
+}
+
+fn verify_and_store_pairing(
+    material: &LanOpenNodeMaterial,
+    peer_ip: std::net::IpAddr,
+    result: &PairingResultV1,
+    replace: bool,
+) -> Result<()> {
+    result.peer.validate()?;
+    let temporary = create_private_temp_dir(&material.pki_dir)?;
+    fs::write(
+        temporary.path().join("server-ca.pem"),
+        result.peer.server_ca_pem.as_bytes(),
+    )?;
+    fs::write(
+        temporary.path().join("client-issuer-ca.pem"),
+        result.peer.client_issuer_ca_pem.as_bytes(),
+    )?;
+    fs::write(
+        temporary.path().join("client-cert.pem"),
+        result.local_issued_client_cert_pem.as_bytes(),
+    )?;
+    fs::write(
+        temporary.path().join("client-key.pem"),
+        result.local_private_client_key_pem(),
+    )?;
+    secure_key(temporary.path().join("client-key.pem"))?;
+    run_openssl(
+        Path::new("openssl"),
+        temporary.path(),
+        &[
+            "verify",
+            "-CAfile",
+            "client-issuer-ca.pem",
+            "-purpose",
+            "sslclient",
+            "client-cert.pem",
+        ],
+    )?;
+    let certificate_public = run_openssl_capture(
+        Path::new("openssl"),
+        temporary.path(),
+        &["x509", "-in", "client-cert.pem", "-pubkey", "-noout"],
+    )?;
+    let key_public = run_openssl_capture(
+        Path::new("openssl"),
+        temporary.path(),
+        &["pkey", "-in", "client-key.pem", "-pubout"],
+    )?;
+    if certificate_public != key_public {
+        bail!("paired client certificate does not match the locally retained private key");
+    }
+    build_client_config(&ClientTlsIdentity {
+        ca_path: temporary.path().join("server-ca.pem"),
+        cert_path: temporary.path().join("client-cert.pem"),
+        key_path: temporary.path().join("client-key.pem"),
+        server_name: result.peer.server_name.clone(),
+    })
+    .context("paired TLS identity is unusable")?;
+
+    let service_address = SocketAddr::new(peer_ip, result.peer.service_port);
+    let peers_root = lan_peers_config_dir();
+    let stored_paths = StoredLanPeerPathsV1::for_root(&peers_root, &result.peer.node_id)?;
+    let replace_existing = if replace {
+        match fs::symlink_metadata(&stored_paths.directory) {
+            Ok(_) => load_stored_lan_peer(&peers_root, &result.peer.node_id)?
+                .0
+                .is_paired(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to inspect existing paired identity `{}`",
+                        stored_paths.directory.display()
+                    )
+                })
+            }
+        }
+    } else {
+        false
+    };
+    if replace_existing {
+        replace_paired_lan_peer(
+            &peers_root,
+            service_address,
+            &result.peer.node_id,
+            &result.peer.server_name,
+            result.peer.service_port,
+            result.peer.supports_v2,
+            &result.peer.server_ca_pem,
+            &result.local_issued_client_cert_pem,
+            result.local_private_client_key_pem(),
+            Some(&result.peer.node_receipt_public_key),
+        )?;
+    } else {
+        store_paired_lan_peer(
+            &peers_root,
+            service_address,
+            &result.peer.node_id,
+            &result.peer.server_name,
+            result.peer.service_port,
+            result.peer.supports_v2,
+            &result.peer.server_ca_pem,
+            &result.local_issued_client_cert_pem,
+            result.local_private_client_key_pem(),
+            Some(&result.peer.node_receipt_public_key),
+        )?;
+    }
+    Ok(())
+}
+
+fn remember_preferred_pair(node_id: &str) -> Result<()> {
+    let root = lan_peers_config_dir();
+    ensure_private_directory(&root)?;
+    write_file_atomic(
+        &root.join("_preferred"),
+        format!("{node_id}\n").as_bytes(),
+        true,
+    )
+}
+
 fn detached_node_paths() -> (PathBuf, PathBuf, PathBuf) {
     let directory = lan_node_process_dir();
     (
@@ -538,7 +1187,7 @@ fn detached_node_paths() -> (PathBuf, PathBuf, PathBuf) {
     )
 }
 
-fn start_detached_node() -> Result<()> {
+fn start_detached_node(args: StartArgs) -> Result<()> {
     #[cfg(not(unix))]
     bail!("detached o-node start is currently supported on Unix-like systems");
     #[cfg(unix)]
@@ -565,6 +1214,9 @@ fn start_detached_node() -> Result<()> {
             .stdin(Stdio::null())
             .stdout(Stdio::from(log.try_clone()?))
             .stderr(Stdio::from(log));
+        if args.lan_open {
+            command.arg("--lan-open");
+        }
         // SAFETY: setsid is async-signal-safe and the closure performs no
         // allocation or lock-taking after fork.
         unsafe {
@@ -588,17 +1240,21 @@ fn start_detached_node() -> Result<()> {
         }
         println!("o-node started: {}", material.node_id);
         println!("log: {}", log_path.display());
-        println!("LAN clients can now use `octl node profile` without connection flags");
+        if args.lan_open {
+            println!("legacy LAN-open enrollment enabled explicitly");
+        } else {
+            println!("pair from this machine with `o node pair`");
+        }
         Ok(())
     }
 }
 
-fn restart_detached_node() -> Result<()> {
+fn restart_detached_node(args: StartArgs) -> Result<()> {
     stop_detached_node()?;
     if detached_node_status(false)? {
         bail!("o-node is still running after stop; refusing to start a duplicate")
     }
-    start_detached_node()
+    start_detached_node(args)
 }
 
 fn stop_detached_node() -> Result<()> {
@@ -982,9 +1638,7 @@ fn doctor(mut args: DoctorArgs) -> Result<()> {
         args.tls
             .key
             .get_or_insert_with(|| material.pki_dir.join("node-key.pem"));
-        args.tls
-            .client_ca
-            .get_or_insert_with(|| material.pki_dir.join("ca.pem"));
+        args.tls.client_ca.get_or_insert(material.pairing_ca);
     }
     let (shim_dir, _shim_guard) = resolve_shim_dir(args.runtime.shim_dir.clone())?;
     let runtime = runtime_from_args(args.runtime, shim_dir)?;
@@ -1016,8 +1670,9 @@ fn doctor(mut args: DoctorArgs) -> Result<()> {
 }
 
 fn serve(mut args: ServeArgs) -> Result<()> {
-    let lan_open = !args.manual;
-    let automatic = if lan_open {
+    let automatic_mode = !args.manual;
+    let legacy_lan_open = automatic_mode && args.lan_open;
+    let automatic = if automatic_mode {
         let material = ensure_lan_open_material()?;
         args.runtime.node_id.get_or_insert(material.node_id.clone());
         args.tls
@@ -1026,9 +1681,13 @@ fn serve(mut args: ServeArgs) -> Result<()> {
         args.tls
             .key
             .get_or_insert_with(|| material.pki_dir.join("node-key.pem"));
-        args.tls
-            .client_ca
-            .get_or_insert_with(|| material.pki_dir.join("ca.pem"));
+        args.tls.client_ca.get_or_insert_with(|| {
+            if legacy_lan_open {
+                material.client_ca_bundle.clone()
+            } else {
+                material.pairing_ca.clone()
+            }
+        });
         args.bind
             .get_or_insert_with(|| format!("0.0.0.0:{DEFAULT_LAN_NODE_PORT}"));
         args.v2_state_dir
@@ -1056,27 +1715,43 @@ fn serve(mut args: ServeArgs) -> Result<()> {
     let mut _discovery = None;
     let mut _bootstrap = None;
     if let Some(material) = automatic.as_ref() {
-        eprintln!(
-            "{}",
-            concat!(
-                "o-node: LAN-open mode enabled -- LAN reachability is treated as permission ",
-                "to enroll and execute; use --manual for explicit trust configuration"
-            )
-        );
+        if legacy_lan_open {
+            eprintln!(
+                "{}",
+                concat!(
+                    "o-node: legacy LAN-open mode enabled explicitly -- LAN reachability is ",
+                    "treated as permission to download a shared private key and execute"
+                )
+            );
+        } else {
+            eprintln!(
+                "o-node: paired mode enabled -- run `o node pair` on one machine, then enter its one-use passcode on the other"
+            );
+        }
         if !args.no_discovery {
-            let advertisement = LanNodeAdvertisementV1::new(
-                material.node_id.clone(),
-                material.server_name.clone(),
-                service_port,
-                DEFAULT_LAN_BOOTSTRAP_PORT,
-                args.v2_state_dir.is_some(),
-            )?;
+            let advertisement = if legacy_lan_open {
+                LanNodeAdvertisementV1::new(
+                    material.node_id.clone(),
+                    material.server_name.clone(),
+                    service_port,
+                    DEFAULT_LAN_BOOTSTRAP_PORT,
+                    args.v2_state_dir.is_some(),
+                )?
+            } else {
+                LanNodeAdvertisementV1::pairing_required(
+                    material.node_id.clone(),
+                    material.server_name.clone(),
+                    service_port,
+                    DEFAULT_LAN_PAIRING_PORT,
+                    args.v2_state_dir.is_some(),
+                )?
+            };
             _discovery = Some(spawn_lan_discovery_responder(
                 advertisement,
                 DEFAULT_LAN_DISCOVERY_PORT,
             )?);
         }
-        if !args.no_bootstrap {
+        if legacy_lan_open && !args.no_bootstrap {
             _bootstrap = Some(spawn_lan_bootstrap_server(
                 SocketAddr::from((Ipv4Addr::UNSPECIFIED, DEFAULT_LAN_BOOTSTRAP_PORT)),
                 lan_bootstrap_bundle(material, service_port)?,
@@ -1095,10 +1770,10 @@ fn serve(mut args: ServeArgs) -> Result<()> {
             .v2_node_signing_key
             .unwrap_or_else(|| state_dir.join("node-signing-key.v2"));
         let signer = read_node_signing_key_v2(&node_key_path)?;
-        let authorizer: Arc<dyn PlacementProofAuthorizerV2> = if lan_open {
+        let authorizer: Arc<dyn PlacementProofAuthorizerV2> = if automatic_mode {
             if args.v2_authority_public_key.is_some() {
                 eprintln!(
-                    "o-node: --v2-authority-public-key is ignored in LAN-open mode; use --manual to pin it"
+                    "o-node: --v2-authority-public-key is ignored in automatic LAN mode; use --manual to pin it"
                 );
             }
             Arc::new(LanOpenPlacementAuthorizerV2)
@@ -1442,6 +2117,69 @@ fn run_openssl(
     )
 }
 
+fn run_openssl_capture(executable: &Path, directory: &Path, args: &[&str]) -> Result<Vec<u8>> {
+    let output = ProcessCommand::new(executable)
+        .current_dir(directory)
+        .args(args)
+        .output()
+        .with_context(|| format!("failed to launch OpenSSL `{}`", executable.display()))?;
+    if output.status.success() {
+        let mut bytes = output.stdout;
+        while bytes.last().is_some_and(u8::is_ascii_whitespace) {
+            bytes.pop();
+        }
+        return Ok(bytes);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let detail = stderr.chars().take(4096).collect::<String>();
+    bail!(
+        "OpenSSL subcommand `{}` failed with {}: {}{}",
+        args.first().copied().unwrap_or("<none>"),
+        output.status,
+        detail.trim(),
+        if stderr.chars().count() > 4096 {
+            " [truncated]"
+        } else {
+            ""
+        }
+    )
+}
+
+fn write_file_atomic(path: &Path, bytes: &[u8], private: bool) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("atomic file destination has no parent")?;
+    ensure_private_directory(parent)?;
+    let mut random = [0_u8; 8];
+    getrandom::fill(&mut random).context("failed to generate atomic-file staging name")?;
+    let temporary = parent.join(format!(
+        ".{}.{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("pairing"),
+        hex::encode(random)
+    ));
+    let write_result = (|| -> Result<()> {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(if private { 0o600 } else { 0o644 });
+        let mut file = options
+            .open(&temporary)
+            .with_context(|| format!("failed to create `{}`", temporary.display()))?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, path)
+            .with_context(|| format!("failed to atomically install `{}`", path.display()))?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    write_result
+}
+
 fn secure_key(path: PathBuf) -> Result<()> {
     #[cfg(unix)]
     {
@@ -1532,6 +2270,27 @@ mod tests {
     use super::*;
 
     use clap::CommandFactory;
+
+    #[test]
+    fn pairing_cli_requires_explicit_replacement_and_keeps_passcode_out_of_arguments() {
+        let cli = Cli::try_parse_from([
+            "o-node",
+            "pair",
+            "ostadix-peer",
+            "--passcode-stdin",
+            "--replace",
+            "--address",
+            "203.0.113.8:7340",
+        ])
+        .unwrap();
+        let Command::Pair(args) = cli.command else {
+            panic!("pair subcommand was not parsed");
+        };
+        assert_eq!(args.peer_node_id.as_deref(), Some("ostadix-peer"));
+        assert!(args.passcode_stdin);
+        assert!(args.replace);
+        assert_eq!(args.address.as_deref(), Some("203.0.113.8:7340"));
+    }
 
     #[test]
     fn v2_node_generation_help_defines_a_stable_state_epoch() {

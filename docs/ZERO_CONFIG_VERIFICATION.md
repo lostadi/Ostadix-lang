@@ -1,5 +1,62 @@
 # Zero-configuration LAN verification record
 
+## Reciprocal passcode-pairing validation — August 23, 2026
+
+The reciprocal-pairing change was validated from a detached worktree rooted at
+`f2ef9efd99f57ac9f5dcc93b3b95c64ba9c618bf`, with the exact working-tree Rust
+and lockfile patch applied there. No Cargo command ran in the live development
+checkout.
+
+The isolated Rust gates completed successfully:
+
+```bash
+cargo check --workspace --all-targets --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --all-targets --locked
+```
+
+The full workspace test command passed, including the pairing protocol's
+correct-code, wrong-code, transcript-tampering, secret-redaction, and passcode-
+shape tests; paired-store conflict, replacement, rollback, permission, legacy-
+downgrade, and symlink-boundary tests; the real emitted-Cargo fixture; and all
+other workspace targets. The changed Rust files also passed direct
+`rustfmt --check`. Repository-wide `cargo fmt --all -- --check` remains blocked
+by pre-existing formatting drift in `crates/ostadix-api/src/hosted_remote/v2/auth.rs`
+and `tests/hosted_remote_cli.rs`, neither changed by this pairing work.
+
+The local non-Cargo gates completed successfully:
+
+```bash
+bash -n scripts/o-cli.sh scripts/smoke-zero-config-lan-netns.sh o-node-quickstart.sh
+python3 -m unittest -v tests.test_o_cli_dispatch tests.test_contract_surfaces
+```
+
+Those 24 Python tests verify exact dispatcher forwarding, the no-positional-
+passcode boundary, the explicit `--replace` and routed-pairing flags, and the
+required Linux smoke markers.
+
+A two-process acceptance run then used separate HOME/XDG configuration and
+state roots for two node identities. It proved initial direct pairing over
+`--address`, bidirectional TLS 1.3 mutual-X.509 profiles with discovery
+disabled, route-only `--node ... --address ...` reuse of stored identity, a
+restart using remembered state, and explicit `--replace` recovery after one
+side's peer directory was moved aside. Both directions succeeded after that
+one-sided recovery. This is process and loopback evidence on macOS, not a
+physical two-host or router/NAT claim.
+
+The Linux non-loopback gate remains
+`scripts/smoke-zero-config-lan-netns.sh`. It now checks wrong-code/no-state,
+directly routed pairing on a veth address, reciprocal public material with
+distinct locally retained private keys, one-use listener consumption, closed
+legacy bootstrap ports in both directions, bidirectional restart reconnect,
+explicit one-sided `--replace` recovery with key rotation, and a severed-link
+failure. The script passed shell syntax validation but was
+not executed on this macOS host: Docker was not running and was not restarted,
+and the designated Multipass VM did not complete startup. Linux CI remains the
+execution substrate for that gate.
+
+## Historical zero-configuration integration record
+
 This record applies to the two source snapshots used during this repair:
 
 - `bca0667d724c12b4c36ea8919608ceeba1e1b097`, the snapshot on which the
@@ -85,12 +142,12 @@ o node session run examples/hello.O
 The required `rust-hosted` CI lane also runs
 `scripts/smoke-zero-config-lan-netns.sh`. That gate gives a multi-homed client
 a silent decoy network as its default and multicast route while the real node
-is reachable only through a non-default `192.0.2.0/30` veth. It profiles the
-node through ordinary automatic discovery and enrollment, verifies the stored
-route is the non-loopback node address, and then removes the real client link
-and requires the same command to fail. This is Linux veth evidence; it does not
-replace the physical two-host acceptance path for Wi-Fi, router, firewall,
-macOS, IPv6, NAT, or cross-subnet behavior.
+is reachable only through a non-default `192.0.2.0/30` veth. It exercises the
+passcode-paired default, direct veth pairing, reciprocal stored identities,
+closed plaintext bootstrap ports, bidirectional reconnect after restart, and
+a severed-link failure. This is Linux veth evidence; it does not replace the
+physical two-host acceptance path for Wi-Fi, router, firewall, macOS, IPv6,
+NAT, or cross-subnet behavior.
 
 Acceptance requires that ordinary client commands request no address, port,
 hostname, CA, certificate, key, receipt key, capability, lease, operation ID,

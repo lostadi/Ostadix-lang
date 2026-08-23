@@ -331,6 +331,41 @@
   launch. Registry
   `profile-local` records default to 45 seconds and accept integer lifetimes
   from 1 through 60 seconds.
+- The ordinary node projection is pairing-required by default. Both machines
+  run `o node start`; one runs `o node pair`, and the other runs
+  `o node pair NODE_ID` and enters the hidden ten-digit passcode. An offer is
+  one-use and expires after five minutes. `--passcode-stdin` provides
+  noninteractive input, while `--address HOST:7340` permits a known routed
+  pairing endpoint only when it is directly TCP-reachable; there is no
+  router-crossing discovery, NAT traversal, relay, or hole punching.
+- Pairing uses SPAKE2 plus explicit directional confirmation to bind both node
+  identities, public bundles, SPAKE2 messages, CSRs, and destination-issued
+  certificates. Only public CA, CSR, certificate, and Hosted V2 receipt-key
+  material crosses the channel; each side's fresh per-peer private key remains
+  local. Later ordinary commands reuse the reciprocal pinned server CA,
+  expected server name, and receipt public key. Discovery remains
+  unauthenticated routing metadata and cannot rotate those pins. Duplicate or
+  spoofed advertisements can impair route availability but cannot replace the
+  paired identity.
+- Destination-issued pairing client certificates are valid for 397 days.
+  Renewal, or recovery when only one side retained pairing state, requires a
+  fresh offer using `o node pair --replace` on the offerer and
+  `o node pair NODE_ID --replace` on the joiner. Ordinary pairing refuses
+  changed pins; only the explicit replacement path can replace an existing
+  record, while a missing side performs its ordinary first store.
+- For an existing paired record,
+  `octl ... --node NODE_ID --address HOST:PORT` overrides only the route for
+  that invocation. It retains the stored paired CA, expected server name,
+  client credential, and receipt-key pin and does not persist a new identity.
+- Pairing is not a production membership or authorization system. Ostadix has
+  not independently audited the `spake2` dependency. Inbound client trust is
+  pairing-CA-wide, not limited to a stored leaf; pairing v1 has no leaf
+  allowlist, unpair operation, or revocation mechanism, so replacement does not
+  revoke an already issued certificate before expiry. The automatic Hosted V2
+  placement authorizer remains permissive after transport pairing. Pairing
+  creates no persistent node mesh. Plaintext shared-key bootstrap is disabled
+  by default and survives only behind the explicit legacy `--lan-open`
+  compatibility switch.
 - Frozen transport V1, exposed as `octl node run`, sends one operator-selected node a
   `RemotePreparedOperationV1` binding exact source SHA-256, task/attempt
   identities, the full descriptive backend-catalog digest, deadline, and output
@@ -347,10 +382,13 @@
   commands require a signed `StateControlLeaseV2`; execute requires a signed,
   one-use `PlacementLeaseV2`. `SignedPlacementLeaseV2` authenticates the
   canonical authority, exact hosted command, full placement evidence, and the
-  open-session state-capacity observation when present. The current node pins
-  one Ed25519 placement-authority key and requires the profile, capacity,
-  warrants, and state-capacity record to name that issuer. This is a bounded
-  single-issuer adapter, not production enrollment, rotation, revocation, a
+  open-session state-capacity observation when present. A manual node pins one
+  Ed25519 placement-authority key and requires the profile, capacity, warrants,
+  and state-capacity record to name that issuer. The automatic paired mode does
+  not inherit that restriction: its automatic authorizer accepts any signer
+  whose self-consistent, unexpired lease matches the exact live command. Pairing
+  therefore authenticates transport identity without becoming placement
+  authority. Neither mode is production enrollment, rotation, revocation, a
   multi-key chain, discovery, or scheduler-selected placement.
 - Before V2 execution authorization, the node parses, lowers, solves, admits,
   and seals the exact submitted source as one non-cloneable
@@ -473,9 +511,11 @@
 - V1's self-digested `HostedOperationReceiptV1` has no detached node signature:
   it is tamper-evident after capture but not independently attributable or
   offline-verifiable. V2 responses instead carry node-signed journal receipts
-  checked against an explicitly pinned node receipt key. Neither path performs
-  automatic registry discovery, target selection, retry, alternate-node
-  selection, or local fallback.
+  checked against an explicitly pinned node receipt key. Neither transport
+  protocol performs automatic registry discovery, target selection, retry,
+  alternate-node selection, or local fallback. The separate ordinary CLI
+  projection can discover a route or reuse a remembered paired address; it does
+  not turn that routing behavior into scheduler policy.
 - The co-located `authority dev-mint` bridge derives current self-attested proof
   bundles for open, execute, and the bounded checkpoint-recovery path. Each can
   optionally mint and submit in one invocation so the four-second development
@@ -490,10 +530,12 @@
   WorldFS, G1 or G10 evidence, a physical-machine or hardware-isolation proof,
   a global exactly-once protocol, arbitrary project/HGraph-island placement,
   cross-session global-effect isolation, persistent-actor migration, safepoint
-  migration, cancellation, or rematerialization. It contains no network
-  registry/discovery service, automatic scheduler, production authority
-  enrollment, multi-key placement chain, automatic GC, retry, or fallback. Its
-  exact boundary is documented in
+  migration, cancellation, or rematerialization. The Hosted Placement core
+  contains no network registry/discovery service, automatic scheduler,
+  production authority enrollment, multi-key placement chain, automatic GC,
+  retry, or fallback. The separate pairing/discovery projection is routing and
+  reciprocal transport identity, not those missing services. Its exact
+  boundary is documented in
   [`HOSTED_PLACEMENT_V6.md`](HOSTED_PLACEMENT_V6.md).
 - Native value crossings are conservative: `Fidelity::NativeCapsule` in
   `crates/ostadix-api/src/value.rs` and `crates/ostadix-api/src/hgraph/solve.rs` prevents claiming general

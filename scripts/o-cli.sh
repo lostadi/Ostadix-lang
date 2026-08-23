@@ -24,6 +24,7 @@ Repository commands:
   why FILE.O P<N> [options]       Explain one admitted plan operation
   node start|stop|status|restart
                                   Run this machine as a zero-config LAN node
+  node pair [NODE_ID]             Offer or join one passcode pairing
   node list|use|profile|doctor|run|session ...
                                   Discover and use LAN nodes without connection flags
   node-host <command> ...         Expert alias for the raw o-node service CLI
@@ -80,7 +81,7 @@ case "${1:-}" in
     node)
         shift
         case "${1:-}" in
-            start|stop|status|restart|serve|pki|identity|admin)
+            start|stop|status|restart|pair|serve|pki|identity|admin)
                 if [[ ! -x "$NODE_BIN" ]]; then
                     printf 'error: hosted node service is missing or not executable: %s\n' "$NODE_BIN" >&2
                     exit 1
