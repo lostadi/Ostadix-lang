@@ -80,6 +80,19 @@ A DHCP address change therefore changes routing, not semantic node identity.
 The node ID is generated once and persisted independently of the current host
 address.
 
+Discovery is interface-aware. On multi-homed machines, including hosts whose
+default route is a VPN, Ostadix opens a probe socket on every active IPv4
+interface. It sends directed broadcast and multicast probes from each one, and
+the node joins the multicast group on every active IPv4 interface. The source
+address of the node's reply remains the routing coordinate, so a client on the
+physical LAN does not receive a VPN-only or loopback address merely because
+that route is preferred by the host.
+
+This is zero-configuration discovery for directly connected IPv4 networks; it
+does not cross routers, VLAN boundaries, NAT, or the public Internet. For a
+routed node, use the expert `--address` and TLS identity flags or provide a
+network-level multicast relay deliberately.
+
 ## Deliberately weak LAN trust model
 
 Automatic mode is named `lan-open` because its boundary is intentionally

@@ -36,8 +36,14 @@ class ContractSurfacesTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             result.stdout.splitlines(),
-            ["bash", "clang", "openssl", "python3", "sqlite3"],
+            ["bash", "clang", "ip", "openssl", "python3", "sqlite3"],
         )
+
+    def test_rust_hosted_requires_the_non_loopback_lan_smoke(self) -> None:
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        job = contracts.workflow_job_body(workflow, "rust-hosted")
+        self.assertEqual(job.count("bash scripts/smoke-zero-config-lan-netns.sh"), 1)
+        self.assertIn("iproute2", job)
 
     def test_openssl_probe_uses_the_authoritative_version_subcommand(self) -> None:
         probe = contracts.runtime_probes()["openssl"]
