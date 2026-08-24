@@ -197,7 +197,9 @@ impl PlacementProofAuthorizerV2 for LanOpenPlacementAuthorizerV2 {
         let actor_generation = match command.purpose {
             PlacementPurposeV2::OpenSession => None,
             PlacementPurposeV2::Recover => context.current_actor_generation.clone(),
-            PlacementPurposeV2::Execute if context.session_state_tier == SessionStateTierV2::Stateless => {
+            PlacementPurposeV2::Execute
+                if context.session_state_tier == SessionStateTierV2::Stateless =>
+            {
                 let fragment = context
                     .prepared_fragment
                     .as_ref()
@@ -220,10 +222,9 @@ impl PlacementProofAuthorizerV2 for LanOpenPlacementAuthorizerV2 {
                     if fragment.environment().is_fresh() {
                         bail!("stateful LAN-open session requires a persistent environment");
                     }
-                    let logical_environment = logical_environment_requirement(
-                        fragment.requirement_footprint(),
-                    )?
-                    .context("stateful LAN-open fragment omits its logical environment")?;
+                    let logical_environment =
+                        logical_environment_requirement(fragment.requirement_footprint())?
+                            .context("stateful LAN-open fragment omits its logical environment")?;
                     Some(ActorGenerationIdV1::new(
                         logical_environment,
                         fragment.backend_implementation_sha256().clone(),

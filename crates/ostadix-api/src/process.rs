@@ -511,6 +511,15 @@ fn python_shim_command(shim_path: &Path, sandbox: &BackendSandboxPolicy) -> Resu
     #[cfg(not(target_os = "macos"))]
     let mut command = Command::new(&python);
 
+    // A no-file-read macOS profile denies metadata traversal of the caller's
+    // arbitrary working directory. Python asks for getcwd() during bootstrap,
+    // so anchor it inside the already admitted immutable shim runtime root.
+    // Relative user-file access remains unavailable under the same profile.
+    #[cfg(target_os = "macos")]
+    if !sandbox.contains(crate::value::BackendAuthority::FileRead) {
+        command.current_dir(&runtime_root);
+    }
+
     command
         .arg("-c")
         .arg(PYTHON_POLICY_BOOTSTRAP)
@@ -522,7 +531,7 @@ fn python_shim_command(shim_path: &Path, sandbox: &BackendSandboxPolicy) -> Resu
         )
         .env(
             "O_BACKEND_RUNTIME_ROOTS",
-            serde_json::to_string(&[runtime_root])?,
+            serde_json::to_string(std::slice::from_ref(&runtime_root))?,
         );
     Ok(command)
 }

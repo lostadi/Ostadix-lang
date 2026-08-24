@@ -356,6 +356,7 @@ class SetupScriptTests(unittest.TestCase):
             self.assertIn("cargo build --release --locked", output)
             for binary in (
                 "O",
+                "o-cli",
                 "olangc",
                 "ocorec",
                 "o-link",

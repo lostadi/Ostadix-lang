@@ -9,7 +9,8 @@ There are three active, supported hosted `.O` implementations plus O-core:
 - **Rust hosted engine** (`crates/ostadix-api/`) is authoritative for the
   parser, OIR planner/evaluator, backend registry, scheduler, runtime assets,
   and advanced APIs. The root `src/` package is its compatibility/CLI shell and
-  provides `O`, linker tools, notebook server, `olangc`, and `ocorec`.
+  provides `O`, the compiled `o-cli` intent orchestrator, linker tools,
+  notebook server, `olangc`, and `ocorec`.
 - **C17 hosted implementation** (`c_cpp/`) is active and supported. `make` or CMake build the interpreter `O` and AOT compiler `olangc` from C sources.
 - **Python hosted implementation** (`o_lang/`) is active and supported as a readable semantic reference and cross-check target.
 - **O-core** (`crates/ostadix-api/src/ocore/`, `docs/OCORE.md`) is a freestanding native systems
@@ -29,6 +30,7 @@ cargo run -- examples/hello.O backends
 
 # Rust binaries
 cargo build --all-targets --all-features
+cargo run --bin o-cli -- run examples/hello.O --no-record
 cargo run --bin olangc -- examples/hello.O -o build/hello_rust_aot
 cargo run --bin ocorec -- --help
 
@@ -59,7 +61,12 @@ c_cpp/O examples/hello.O backends
 - `crates/ostadix-api/src/shims.rs` supports embedded/extracted shim assets for compiled hosted programs.
 - `crates/ostadix-api/src/nix_ops.rs` and `crates/ostadix-api/src/nixos_ops.rs` implement Nix and NixOS operations used by builtins.
 - `crates/ostadix-api/src/ocore/` contains the O-core lexer, parser, AST, HIR, type checker, MIR, codegen, driver, and capability bridge.
-- Binaries: `src/main.rs` is `O`; `src/bin/olangc.rs`, `ocorec.rs`, `olink.rs` (`o-link`), `ounlink.rs` (`o-unlink`), `ogit.rs`, and `o-notebook.rs` provide compiler, native, linker, Git, and notebook entry points.
+- Binaries: `src/main.rs` is `O`; `src/bin/o-cli.rs` owns validated intent
+  `run`/`plan`/`explain`/`inspect`; `olangc.rs`, `ocorec.rs`, `olink.rs`
+  (`o-link`), `ounlink.rs` (`o-unlink`), `ogit.rs`, and `o-notebook.rs` provide
+  compiler, native, linker, Git, and notebook entry points. The Bash
+  `scripts/o-cli.sh` dispatcher remains the installed lowercase `o` front door
+  so macOS case-insensitivity cannot collapse `O` and `o`.
 
 ## Environment semantics
 

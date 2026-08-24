@@ -26,6 +26,7 @@ pub mod hosted_remote;
 pub mod information;
 pub mod information_bridge;
 pub mod information_provenance;
+pub mod intent;
 pub mod ir;
 pub mod kernel_world;
 pub mod live_system;

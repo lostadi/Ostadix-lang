@@ -164,6 +164,11 @@ layer = 13
 allowed_dependencies = ["evidence", "information", "ir", "world"]
 
 [[root]]
+name = "intent"
+layer = 14
+allowed_dependencies = ["backend_catalog", "canonical_cbor", "eval", "evidence", "execution_contract", "hgraph", "hosted_remote", "ir", "parser", "project", "runtime_exec", "value"]
+
+[[root]]
 name = "ir"
 layer = 3
 allowed_dependencies = ["backend_catalog", "environment", "parser", "value"]

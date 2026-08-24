@@ -215,12 +215,14 @@ pub enum RouteExecutionError {
     DeadlineExceeded { route_id: String, timeout: Duration },
     #[error("failed to spawn `{command}`")]
     Spawn {
+        route_id: String,
         command: String,
         #[source]
         source: io::Error,
     },
     #[error("failed waiting on `{command}`")]
     Wait {
+        route_id: String,
         command: String,
         #[source]
         source: io::Error,
@@ -654,6 +656,42 @@ pub fn is_timeout_error(err: &anyhow::Error) -> bool {
         .is_some_and(|error| matches!(error, RouteExecutionError::DeadlineExceeded { .. }))
 }
 
+/// Credential-safe projection for persistent observations and remote status.
+///
+/// Direct executor callers retain the historical [`Display`] text (including
+/// argv), while this projection deliberately excludes command arguments that
+/// may have arrived through a route declaration.
+pub fn public_route_execution_diagnostic(err: &anyhow::Error) -> String {
+    let Some(error) = err.downcast_ref::<RouteExecutionError>() else {
+        return err.to_string();
+    };
+    match error {
+        RouteExecutionError::Configuration { detail } => {
+            format!("route execution configuration is invalid: {detail}")
+        }
+        RouteExecutionError::Cancelled { route_id } => {
+            format!("route `{route_id}` was canceled")
+        }
+        RouteExecutionError::DeadlineExceeded { route_id, timeout } => {
+            format!("route `{route_id}` exceeded its wall-clock timeout of {timeout:?}")
+        }
+        RouteExecutionError::Spawn {
+            route_id, source, ..
+        } => format!("failed to spawn route `{route_id}` command: {source}"),
+        RouteExecutionError::Wait {
+            route_id, source, ..
+        } => format!("failed while waiting on route `{route_id}` command: {source}"),
+        RouteExecutionError::OutputCapture {
+            route_id,
+            stream,
+            detail,
+        } => format!("route `{route_id}` {stream} capture failed: {detail}"),
+        RouteExecutionError::ProcessTreeTermination { route_id, detail } => {
+            format!("route `{route_id}` process terminality failed: {detail}")
+        }
+    }
+}
+
 fn spawn_route(
     route: &RouteSpec,
     workspace: &Workspace,
@@ -695,6 +733,7 @@ fn spawn_route(
             detail: "wall-clock timeout overflows the monotonic clock".to_string(),
         })?;
     let child = cmd.spawn().map_err(|source| RouteExecutionError::Spawn {
+        route_id: route.id.clone(),
         command: command.join(" "),
         source,
     })?;
@@ -813,6 +852,7 @@ fn spawn_route(
                 stdout?;
                 stderr?;
                 return Err(RouteExecutionError::Wait {
+                    route_id: route.id.clone(),
                     command: command.join(" "),
                     source,
                 }
@@ -1253,6 +1293,7 @@ impl OwnedRouteProcess {
             cleanup = self.wait_for_owned_group_quiescence(grace);
         }
         let status = self.wait().map_err(|source| RouteExecutionError::Wait {
+            route_id: route.id.clone(),
             command: route.full_command().join(" "),
             source,
         })?;
@@ -1324,10 +1365,12 @@ impl OwnedRouteProcess {
         }
         let force_error = force_result.err();
         let status = self.wait().map_err(|source| RouteExecutionError::Wait {
+            route_id: route.id.clone(),
             command: route.full_command().join(" "),
             source,
         })?;
         leader_exited_after_grace.map_err(|source| RouteExecutionError::Wait {
+            route_id: route.id.clone(),
             command: route.full_command().join(" "),
             source,
         })?;

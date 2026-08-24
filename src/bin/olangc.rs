@@ -559,37 +559,13 @@ fn compile_or_run_project(cli: &Cli, input_is_dir: bool, source: &str) -> Result
                     "--grounding for project inputs is deferred to the PR9 project-grounding view"
                 );
             }
-            let project = o_lang::project::build_project_hgraph(
+            let rendered = o_lang::intent::render_project_static_plan(
                 &bundle,
                 cli.route.as_deref(),
                 policy_override,
             )
-            .map_err(anyhow::Error::msg)
-            .context("failed to build logical project HGraph")?;
-            let logical = project
-                .logical_v1()
-                .context("failed to normalize LogicalHGraphV1")?;
-            let logical_digest = logical
-                .digest()
-                .context("failed to digest LogicalHGraphV1")?;
-            let deployment = o_lang::project::DeploymentPlanV1::hosted(&logical)
-                .context("failed to construct hosted DeploymentPlanV1")?;
-            let deployment_digest = deployment
-                .digest()
-                .context("failed to digest hosted DeploymentPlanV1")?;
-            println!("; LogicalHGraphV1");
-            println!(
-                "logical schema={} sha256={}",
-                logical.schema_version,
-                logical_digest.as_sha256()
-            );
-            println!("; DeploymentPlanV1");
-            println!(
-                "deployment schema={} sha256={}",
-                deployment.schema_version,
-                deployment_digest.as_sha256()
-            );
-            print!("{}{}", project.to_text(), deployment.to_text());
+            .context("failed to render static project plan")?;
+            print!("{rendered}");
             Ok(())
         }
         CompileTarget::Dot => {
@@ -1259,8 +1235,7 @@ fn run_as_script(
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn dump_ir(source: &str) -> Result<()> {
-    let (program, _plan, graph) = inspect_ir(source)?;
-    print!("{}\n{}", program.to_text(), graph.to_execution_text());
+    print!("{}", o_lang::intent::render_ordinary_static_plan(source)?);
     Ok(())
 }
 

@@ -187,12 +187,12 @@ non-claim boundaries are documented in
 
 ### Peer-mesh execution for whole projects
 
-After the nodes are running and paired, `o-link` can place a source-closed
-project route on an authenticated peer:
+After the nodes are running and paired, the unified intent front door can place
+a source-closed project route on an authenticated peer:
 
 ```bash
-o-link ./large-codebase --project --run --route build \
-  --mesh --explain-mesh --mesh-trace-out mesh-attempt.json
+o run ./large-codebase --parallel auto --route build \
+  --explain-mesh --mesh-trace-out mesh-attempt.json
 ```
 
 The default is `prefer` with two additional remote attempts and local fallback
@@ -204,6 +204,13 @@ acceptable. Discovery is limited to LAN advertisements and the paired-peer
 registry—there is no NAT traversal or Internet gossip. The protocol, replay
 matrix, CLI flags, and nonclaims are in [Project mesh
 V1](docs/PROJECT_MESH_V1.md).
+
+The same front door accepts ordinary `.O` files and lifted project bundles.
+For an ordinary `.O`, `--parallel auto` uses only the local HGraph worker pool
+and performs no discovery or remote RPC. Planning is static by default; use
+`o plan INPUT --parallel auto --live` only for bounded readiness/discovery
+observations. No `run` or `plan` form starts `o-node`. See the complete
+[Unified Intent Front Door V1 contract](docs/UNIFIED_INTENT_FRONT_DOOR_V1.md).
 
 ### Independent Rust runtime engine
 
@@ -337,8 +344,10 @@ octl node session principal|open|exec|status|actors|reset|recover|close ...
 
 After normal setup, the lowercase wrapper routes node lifecycle and pairing
 commands to `o-node`, ordinary node use to `octl`, and `o node-host ...` to the
-raw expert server CLI. `o run ...` remains the explicit local execution path. See
-[Zero-configuration LAN nodes](docs/ZERO_CONFIG_LAN.md).
+raw expert server CLI. `o run FILE.O` is local; `o run PROJECT --parallel auto`
+uses already-running authenticated peers in mesh-prefer mode with safe local
+fallback. No form starts a node implicitly. See [Zero-configuration LAN
+nodes](docs/ZERO_CONFIG_LAN.md).
 
 ### Hosted V2 development quickstart
 
@@ -613,9 +622,13 @@ fragment and a catalogued stateless backend; `CheckpointRestore` requires a
 persistent environment and the exact catalogued semantic-snapshot codec;
 `LiveActorOnly` requires catalogued external-pinned state and does not survive
 actor loss. `ReplayReconstructible` is represented on the wire but rejected in
-this release. There is still no automatic registry discovery, scheduler-driven
-target selection, retry, local fallback, cross-node actor migration, or project-
-bundle dispatch. For a development-only loopback setup, `o-node pki init`,
+this release. This Hosted V2 state-tier path does not independently perform
+automatic registry discovery, scheduler-driven target selection, retry, local
+fallback, cross-node live-process migration, or project-bundle dispatch. Those
+bounded placement/retry capabilities belong to the source-closed Project Mesh
+path exposed by `o-link` and `o run PROJECT`; its migration is a policy-checked
+new actor generation, not migration of a live process image. For a
+development-only loopback setup, `o-node pki init`,
 `o-node identity init`, and the clearly labeled co-located authority helper
 provision the necessary identities and full proof bundle without being a
 production enrollment, discovery, or scheduling service. The helper mints open
@@ -1832,7 +1845,8 @@ needs QEMU and the local Rust linker toolchain.
 | Binary | Location | What it does |
 |--------|----------|--------------|
 | `O` | `target/release/O` | Runs `.O` documents and provides the interactive REPL. |
-| `o` | `scripts/o-cli.sh` through an installed wrapper | Unifies `run`, `plan`, `why`, `node`, `node-host`, `registry`, `info`, `live`, `receipt`, and `kernel`; unknown command forms retain lowercase evaluator compatibility. |
+| `o-cli` | `target/release/o-cli` | Compiled intent orchestrator for validated `run`, static/live `plan`, verified `explain`, and strict JSON `inspect`. |
+| `o` | `scripts/o-cli.sh` through an installed wrapper | Routes the stateful intent commands to `o-cli`, preserves `why`, node, registry, information, live, receipt, and kernel tools, and retains evaluator compatibility for unknown command forms. |
 | `olangc` | `target/release/olangc` | Produces native hosted binaries, WASI modules, script execution, OIR dumps, or Graphviz DOT hypergraph export. |
 | `ocorec` | `target/release/ocorec` | Compiles `.oc` modules through AST, typed HIR, and SSA MIR to freestanding ELF64 objects for the primary x86_64 and bounded AArch64 targets. |
 | `o-link` | `target/release/o-link` | Recursively literal-links and runs a bare single directory; `--project` creates an inert route-preserving bundle. |
@@ -3084,10 +3098,13 @@ same bundle and selection. Planning validates project references and exact
 bundle/policy provenance but deliberately does not run a guard, prerequisite,
 or command.
 
-`olangc --target ir` is the direct project planner interface.
+`olangc --target ir` remains the direct compiler planner interface.
 `scripts/o-cli.sh` is the repository-owned lowercase dispatcher: `setup.sh`
-installs an `o` wrapper that delegates to it, so `o plan` reaches `olangc` while
-all other arguments retain the historical lowercase evaluator behavior. Keep
+installs an `o` wrapper that delegates to it, and the dispatcher routes `run`,
+`plan`, `explain`, and `inspect` to the compiled `o-cli` orchestrator. The
+orchestrator reuses the exact `olangc` planning renderers; static planning does
+not execute, discover peers, or open run history. Other command families and
+unknown arguments retain their historical compatibility behavior. Keep
 `~/.local/bin` (or `~/.cargo/bin`) before `target/release` in `PATH`: on a
 case-insensitive filesystem the raw release binary named `O` is also reachable
 as lowercase `o` and would otherwise shadow the dispatcher.

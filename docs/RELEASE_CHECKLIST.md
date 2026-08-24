@@ -43,7 +43,7 @@ bash scripts/smoke-project-hgraph-exec.sh
 cargo test --package o-lang --test parser_proptest
 cargo test --package ostadix-api --lib ocore::driver::tests::ocore_object_is_byte_reproducible_across_source_directories -- --exact
 cargo check --manifest-path fuzz/Cargo.toml
-cargo build --release --locked --package o-lang --bin O --bin olangc --bin o-info
+cargo build --release --locked --package o-lang --bin O --bin o-cli --bin olangc --bin o-info
 cargo test --locked --manifest-path mcp/ostadix_lang_mcp_server/Cargo.toml
 cargo clippy --locked --manifest-path mcp/ostadix_lang_mcp_server/Cargo.toml -- -D warnings
 cargo build --release --locked --manifest-path mcp/ostadix_lang_mcp_server/Cargo.toml

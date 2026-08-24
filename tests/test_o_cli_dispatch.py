@@ -26,6 +26,7 @@ class LowercaseCliDispatchTests(unittest.TestCase):
         self.fake.chmod(0o755)
         self.environment = os.environ.copy()
         for variable in (
+            "O_LANG_OCLI_BIN",
             "O_LANG_EVALUATOR_BIN",
             "O_LANG_LIVE_BIN",
             "O_LANG_OGIT_BIN",
@@ -52,8 +53,16 @@ class LowercaseCliDispatchTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines(), [f"arg=<{arg}>" for arg in expected])
 
-    def test_local_run_does_not_forward_the_dispatch_word(self) -> None:
-        self.assert_dispatch(("run", "program.O", "backends"), ["program.O", "backends"])
+    def test_intent_commands_route_whole_argv_to_the_compiled_front_door(self) -> None:
+        for arguments in (
+            ("run", "program.O", "backends"),
+            ("run", "project", "--parallel", "auto"),
+            ("plan", "--parallel", "auto", "project", "--live"),
+            ("explain", "last-run"),
+            ("inspect", "last-run", "--trace"),
+        ):
+            with self.subTest(arguments=arguments):
+                self.assert_dispatch(arguments, list(arguments))
 
     def test_hosted_client_and_service_have_unambiguous_routes(self) -> None:
         self.assert_dispatch(("node", "doctor", "--address", "node:7337"), [
@@ -99,14 +108,10 @@ class LowercaseCliDispatchTests(unittest.TestCase):
             ],
         )
 
-    def test_help_advertises_hosted_v2_sessions(self) -> None:
-        result = self.run_cli("help")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("node start|stop|status|restart", result.stdout)
-        self.assertIn("node pair [NODE_ID]", result.stdout)
-        self.assertIn("node list|use|profile|doctor|run|session", result.stdout)
-        self.assertNotIn("node pair PASSCODE", result.stdout)
-        self.assertNotIn("node pair [NODE_ID] PASSCODE", result.stdout)
+    def test_help_spellings_share_the_compiled_front_door(self) -> None:
+        self.assert_dispatch(("help",), ["help"])
+        self.assert_dispatch(("--help",), ["--help"])
+        self.assert_dispatch(("-h",), ["-h"])
 
     def test_registry_and_live_commands_forward_exact_arguments(self) -> None:
         self.assert_dispatch(("registry", "verify", "--state", "store.cbor"), [
@@ -135,10 +140,8 @@ class LowercaseCliDispatchTests(unittest.TestCase):
             "2",
         ])
 
-    def test_run_without_a_source_fails_before_invoking_the_evaluator(self) -> None:
-        result = self.run_cli("run")
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("usage: o run FILE.O", result.stderr)
+    def test_unknown_command_forms_still_fall_through_to_the_evaluator(self) -> None:
+        self.assert_dispatch(("program.O", "backends"), ["program.O", "backends"])
 
 
 class NodeQuickstartDispatchTests(unittest.TestCase):

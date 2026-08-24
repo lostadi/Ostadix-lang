@@ -81,6 +81,41 @@ pub(crate) enum CacheMode {
     Strict,
 }
 
+/// Parse the compatibility backend-grant grammar without minting a live
+/// capability. Intent preflight uses this so malformed grants cannot allocate
+/// a run ID or change `last-run` before the evaluator is entered.
+pub(crate) fn validate_backend_grant_spec(spec: &str) -> Result<()> {
+    parse_backend_grant_spec(spec).map(|_| ())
+}
+
+fn parse_backend_grant_spec(spec: &str) -> Result<(&str, &str, Vec<BackendAuthority>)> {
+    let (name, grant) = spec.split_once('=').ok_or_else(|| {
+        anyhow::anyhow!("backend grant must be NAME=LANG[:RIGHT,...], got `{spec}`")
+    })?;
+    if !is_o_identifier(name) {
+        bail!("backend grant binding `{name}` is not an O identifier");
+    }
+    let (language, permissions) = grant.split_once(':').unwrap_or((grant, ""));
+    if language.is_empty() {
+        bail!("backend grant `{spec}` has no language");
+    }
+    let mut parsed = Vec::new();
+    for permission in permissions
+        .split(',')
+        .map(str::trim)
+        .filter(|permission| !permission.is_empty())
+    {
+        parsed.push(BackendAuthority::parse(permission).ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown backend authority `{permission}`; expected fs_read, fs_write, network, or process"
+            )
+        })?);
+    }
+    parsed.sort();
+    parsed.dedup();
+    Ok((name, language, parsed))
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // exec_nix_kind — thread-safe Nix-family dispatcher
 //
@@ -1186,30 +1221,7 @@ impl Evaluator {
         spec: &str,
         scope: &mut HashMap<String, OValue>,
     ) -> Result<()> {
-        let (name, grant) = spec.split_once('=').ok_or_else(|| {
-            anyhow::anyhow!("backend grant must be NAME=LANG[:RIGHT,...], got `{spec}`")
-        })?;
-        if !is_o_identifier(name) {
-            bail!("backend grant binding `{name}` is not an O identifier");
-        }
-        let (language, permissions) = grant.split_once(':').unwrap_or((grant, ""));
-        if language.is_empty() {
-            bail!("backend grant `{spec}` has no language");
-        }
-        let mut parsed = Vec::new();
-        for permission in permissions
-            .split(',')
-            .map(str::trim)
-            .filter(|permission| !permission.is_empty())
-        {
-            parsed.push(BackendAuthority::parse(permission).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "unknown backend authority `{permission}`; expected fs_read, fs_write, network, or process"
-                )
-            })?);
-        }
-        parsed.sort();
-        parsed.dedup();
+        let (name, language, parsed) = parse_backend_grant_spec(spec)?;
         let capability = self.issue_backend_execution_capability(language, parsed)?;
         scope.insert(name.to_string(), capability);
         Ok(())
@@ -2374,12 +2386,40 @@ impl Evaluator {
         self.eval_ir_program_with_scope(program, &mut scope)
     }
 
-    fn eval_ir_program_with_scope(
+    /// Execute a lowered program with a caller-owned scope, following the
+    /// configured local executor (`O_EXECUTOR`, graph by default).
+    ///
+    /// This is the embedding counterpart to [`Self::eval_document_with_scope`]
+    /// for callers that already performed exact OIR preflight.
+    pub fn eval_ir_program_with_scope(
         &mut self,
         program: &OIrProgram,
         scope: &mut HashMap<String, OValue>,
     ) -> Result<OValue> {
         self.eval_ir_program_with_mode(program, scope, None, None)
+    }
+
+    /// Execute an already-lowered program through the local HGraph
+    /// coordinator regardless of the ambient `O_EXECUTOR` value.
+    ///
+    /// This is intentionally a local-only selector. It performs no peer
+    /// discovery and cannot route an ordinary OIR operation to `o-node`.
+    pub fn eval_ir_program_graph_with_scope(
+        &mut self,
+        program: &OIrProgram,
+        scope: &mut HashMap<String, OValue>,
+    ) -> Result<OValue> {
+        self.eval_ir_program_with_mode(program, scope, Some(false), None)
+    }
+
+    /// Execute an already-lowered program through the serial differential
+    /// reference engine regardless of the ambient `O_EXECUTOR` value.
+    pub fn eval_ir_program_serial_with_scope(
+        &mut self,
+        program: &OIrProgram,
+        scope: &mut HashMap<String, OValue>,
+    ) -> Result<OValue> {
+        self.eval_ir_program_with_mode(program, scope, Some(true), None)
     }
 
     /// Project, validate, and execute a lowered program. `forced` overrides the
