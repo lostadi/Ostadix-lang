@@ -2,7 +2,7 @@
 # O-lang container image
 #
 # Multi-stage build: a pinned Rust builder compiles the hosted toolchain, and a
-# slim runtime stage ships the three binaries, Python 3, and the backend shim
+# slim runtime stage ships the four binaries, Python 3, and the backend shim
 # adapters. The minimal image does not install every runtime those adapters can
 # delegate to (for example rustc, Node.js, Ruby, a JDK, or C/C++ compilers).
 #
@@ -44,7 +44,8 @@ COPY backends ./backends
 
 # olangc embeds the runtime sources, Cargo.lock, and shim scripts at compile
 # time (include_str!/include_bytes!), so everything above must be present.
-RUN cargo build --release --locked --package o-lang --bin O --bin olangc --bin o-link
+RUN cargo build --release --locked --package o-lang \
+    --bin O --bin o-cli --bin olangc --bin o-link
 
 # ── Stage 2: runtime ─────────────────────────────────────────────────────────
 FROM debian:bookworm-slim
@@ -55,11 +56,22 @@ RUN apt-get update \
     && ln -sf /usr/bin/python3 /usr/local/bin/python
 
 COPY --from=builder /src/target/release/O      /usr/local/bin/O
+COPY --from=builder /src/target/release/o-cli  /usr/local/bin/o-cli
 COPY --from=builder /src/target/release/olangc /usr/local/bin/olangc
 COPY --from=builder /src/target/release/o-link /usr/local/bin/o-link
 
-# `o` wrapper so shebang lines (`#!/usr/bin/env o`) and docs work unchanged.
-RUN ln -s /usr/local/bin/O /usr/local/bin/o
+# Keep the lowercase compatibility front door as a dispatcher. Stateful intent
+# commands reach the compiled orchestrator; every other shape retains the raw
+# evaluator fallback, including shebang lines (`#!/usr/bin/env o`).
+RUN printf '%s\n' \
+    '#!/bin/sh' \
+    'set -e' \
+    'case "${1:-}" in' \
+    '  run|plan|explain|inspect|help|--help|-h) exec o-cli "$@" ;;' \
+    '  *) exec O "$@" ;;' \
+    'esac' \
+    > /usr/local/bin/o \
+    && chmod +x /usr/local/bin/o
 
 # Backend shim adapters. The environment variable is the image-wide authority
 # for their stable path, including when callers override ENTRYPOINT with o-link.
@@ -75,7 +87,7 @@ RUN printf '%s\n' \
     'if [ "$#" -eq 0 ]; then exec O --repl "$SHIMS"; fi' \
     'case "$1" in --repl|-i) exec O "$1" "${2:-$SHIMS}";; esac' \
     'if [ "$#" -eq 1 ] && [ -f "$1" ]; then exec O "$1" "$SHIMS"; fi' \
-    'exec O "$@"' \
+    'exec o "$@"' \
     > /usr/local/bin/o-entrypoint \
     && chmod +x /usr/local/bin/o-entrypoint
 

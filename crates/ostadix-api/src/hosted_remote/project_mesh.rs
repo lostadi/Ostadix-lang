@@ -6,7 +6,9 @@
 //! prerequisites move together so build products remain in one workspace.
 
 use std::cmp::Reverse;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::error::Error as StdError;
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -38,6 +40,7 @@ use crate::project::runtime::{
 };
 
 pub const MESH_EXECUTION_TRACE_SCHEMA_V1: &str = "ostadix.project-mesh-trace/v1";
+pub const MESH_READ_ONLY_DISCOVERY_SCHEMA_V1: &str = "ostadix.mesh-read-only-discovery/v1";
 
 /// Whether a caller merely prefers the mesh or requires a remote provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,6 +111,170 @@ impl MeshExecutionConfig {
     }
 }
 
+/// Read-only bounds for a live placement preview.
+///
+/// Unlike [`MeshExecutionConfig`], this type has no retry, fallback, actor, or
+/// trace-output controls because this path cannot execute. LAN advertisements
+/// are only endpoint hints for identities already present in the pinned peer
+/// registry.
+#[derive(Debug, Clone)]
+pub struct MeshReadOnlyDiscoveryConfig {
+    pub discover_lan: bool,
+    pub discovery_timeout: Duration,
+    pub peer_root: Option<PathBuf>,
+}
+
+impl Default for MeshReadOnlyDiscoveryConfig {
+    fn default() -> Self {
+        Self {
+            discover_lan: true,
+            discovery_timeout: Duration::from_millis(750),
+            peer_root: None,
+        }
+    }
+}
+
+impl MeshReadOnlyDiscoveryConfig {
+    fn validate(&self) -> Result<()> {
+        if self.discovery_timeout.is_zero() {
+            bail!("mesh discovery timeout must be positive");
+        }
+        if self.discovery_timeout > Duration::from_secs(60) {
+            bail!("mesh discovery timeout may not exceed 60 seconds");
+        }
+        Ok(())
+    }
+}
+
+impl From<&MeshExecutionConfig> for MeshReadOnlyDiscoveryConfig {
+    fn from(config: &MeshExecutionConfig) -> Self {
+        Self {
+            discover_lan: config.discover_lan,
+            discovery_timeout: config.discovery_timeout,
+            peer_root: config.peer_root.clone(),
+        }
+    }
+}
+
+/// Stable reason that an authenticated live peer is not currently eligible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MeshLivePeerRejectionV1 {
+    NoAvailableSlots,
+}
+
+/// Stable stage at which a pinned peer could not be observed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MeshLivePeerErrorV1 {
+    Unreachable,
+    ProfileQueryFailed,
+    ProfileIdentityMismatch,
+    CapacityQueryFailed,
+    CapacityInvalid,
+}
+
+/// One authenticated peer observation made without any execution-side RPC.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MeshLivePeerObservationV1 {
+    pub node_id: String,
+    /// Deterministically ordered endpoints. Advertised endpoints appear here
+    /// only when they match this already-pinned node id and TLS server name.
+    pub endpoint_hints: Vec<String>,
+    pub selected_endpoint: Option<String>,
+    pub profile: Option<MeshNodeProfileV1>,
+    pub capacity: Option<MeshCapacityV1>,
+    pub observed_latency_micros: Option<u64>,
+    pub eligible: bool,
+    pub rejection: Option<MeshLivePeerRejectionV1>,
+    pub error: Option<MeshLivePeerErrorV1>,
+    /// Diagnostic transport text. Policy should branch on `rejection` or
+    /// `error`, whose values are stable across platforms.
+    pub detail: Option<String>,
+}
+
+/// Bounded live discovery plus authenticated profile/capacity reads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MeshReadOnlyDiscoveryV1 {
+    pub schema: String,
+    pub lan_discovery_attempted: bool,
+    pub lan_discovery_error: Option<String>,
+    pub peers: Vec<MeshLivePeerObservationV1>,
+}
+
+impl MeshReadOnlyDiscoveryV1 {
+    pub fn validate(&self) -> Result<()> {
+        if self.schema != MESH_READ_ONLY_DISCOVERY_SCHEMA_V1 {
+            bail!("mesh read-only discovery has an unsupported schema");
+        }
+        if !self.lan_discovery_attempted && self.lan_discovery_error.is_some() {
+            bail!("disabled LAN discovery cannot retain a discovery error");
+        }
+        if self
+            .lan_discovery_error
+            .as_ref()
+            .is_some_and(|detail| detail.is_empty())
+        {
+            bail!("mesh read-only discovery retained an empty discovery error");
+        }
+        let mut previous = None;
+        for peer in &self.peers {
+            if peer.node_id.is_empty() {
+                bail!("mesh read-only discovery contains an empty node id");
+            }
+            if previous.is_some_and(|value: &String| value >= &peer.node_id) {
+                bail!("mesh read-only discovery peers are not strictly node-id ordered");
+            }
+            previous = Some(&peer.node_id);
+            if peer.endpoint_hints.is_empty()
+                || !peer.endpoint_hints.windows(2).all(|pair| pair[0] < pair[1])
+            {
+                bail!("mesh read-only discovery endpoint hints are not strictly ordered");
+            }
+            match (&peer.profile, &peer.capacity) {
+                (Some(profile), Some(capacity)) => {
+                    profile.validate()?;
+                    capacity.validate_against(profile)?;
+                    if profile.node_id != peer.node_id
+                        || peer.selected_endpoint.is_none()
+                        || peer.observed_latency_micros.is_none()
+                        || peer.error.is_some()
+                        || peer.detail.is_some()
+                        || !peer
+                            .selected_endpoint
+                            .as_ref()
+                            .is_some_and(|selected| peer.endpoint_hints.contains(selected))
+                    {
+                        bail!("mesh read-only discovery contains an inconsistent live peer");
+                    }
+                    let has_capacity = capacity.available_slots > 0;
+                    if peer.eligible != has_capacity
+                        || peer.rejection
+                            != (!has_capacity).then_some(MeshLivePeerRejectionV1::NoAvailableSlots)
+                    {
+                        bail!("mesh read-only discovery eligibility disagrees with capacity");
+                    }
+                }
+                (None, None) => {
+                    if peer.eligible
+                        || peer.rejection.is_some()
+                        || peer.error.is_none()
+                        || peer.selected_endpoint.is_some()
+                        || peer.observed_latency_micros.is_some()
+                        || peer.detail.as_ref().is_none_or(|detail| detail.is_empty())
+                    {
+                        bail!("mesh read-only discovery contains an inconsistent failed peer");
+                    }
+                }
+                _ => bail!("mesh read-only discovery retained only half of a live profile"),
+            }
+        }
+        Ok(())
+    }
+}
+
 /// A current, eligible execution target observed by the mesh resolver.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MeshTargetCandidateV1 {
@@ -170,6 +337,19 @@ pub enum MeshTraceEventV1 {
         node_id: String,
         succeeded: bool,
     },
+    /// One bounded remote generation failed either before or after the first
+    /// admission RPC. `submitted=false` proves no `Dispatched` event exists
+    /// for this generation while still retaining the retry's causal reason.
+    AttemptFailed {
+        route_id: String,
+        actor_id: String,
+        generation: u32,
+        node_id: String,
+        submitted: bool,
+        delivery: String,
+        replay_contract: String,
+        reason: String,
+    },
     Migrated {
         route_id: String,
         actor_id: String,
@@ -189,6 +369,7 @@ pub enum MeshTraceEventV1 {
         route_id: String,
         actor_id: String,
         after_generation: u32,
+        replay_contract: String,
         reason: String,
     },
 }
@@ -216,7 +397,409 @@ impl MeshExecutionTraceV1 {
         std::fs::write(path, bytes)
             .with_context(|| format!("failed to write mesh trace {}", path.display()))
     }
+
+    /// Validate the versioned observation before it is persisted or embedded
+    /// in a higher-level run record.
+    pub fn validate(&self) -> Result<()> {
+        if self.schema != MESH_EXECUTION_TRACE_SCHEMA_V1 {
+            bail!("mesh execution trace has an unsupported schema");
+        }
+        validate_lower_hex("mesh execution id", &self.execution_id, 32)?;
+        validate_lower_hex("mesh bundle sha256", &self.bundle_sha256, 64)?;
+        if self.target.is_empty() {
+            bail!("mesh execution trace has an empty target");
+        }
+        let parsed_policy = RoutePolicy::parse_checked(&self.policy)
+            .map_err(anyhow::Error::msg)
+            .context("mesh execution trace has an invalid route policy")?;
+        if parsed_policy.token() != self.policy {
+            bail!("mesh execution trace route policy is not canonical");
+        }
+        let mut previous = None;
+        let mut eligible_nodes = BTreeSet::new();
+        for candidate in &self.candidates {
+            if candidate.node_id.is_empty() {
+                bail!("mesh execution trace contains an empty candidate node id");
+            }
+            if previous.is_some_and(|value: &String| value >= &candidate.node_id) {
+                bail!("mesh execution trace candidates are not strictly node-id ordered");
+            }
+            previous = Some(&candidate.node_id);
+            if candidate.detail.is_empty() {
+                bail!("mesh execution trace candidate detail is empty");
+            }
+            if candidate.eligible {
+                eligible_nodes.insert(candidate.node_id.clone());
+            }
+        }
+        let mut actor_routes = BTreeMap::<String, String>::new();
+        let mut dispatched = BTreeMap::<(String, u32), (String, String, bool)>::new();
+        let mut failed_attempts = BTreeSet::<(String, u32)>::new();
+        let mut last_dispatch = BTreeMap::<String, (u32, String)>::new();
+        let mut pending_migrations = BTreeMap::<String, (u32, u32, String, String)>::new();
+        let mut terminal_actors = BTreeSet::<String>::new();
+        for event in &self.events {
+            let (route_id, actor_id, node_id) = match event {
+                MeshTraceEventV1::Dispatched {
+                    route_id,
+                    actor_id,
+                    node_id,
+                    ..
+                }
+                | MeshTraceEventV1::Settled {
+                    route_id,
+                    actor_id,
+                    node_id,
+                    ..
+                }
+                | MeshTraceEventV1::AttemptFailed {
+                    route_id,
+                    actor_id,
+                    node_id,
+                    ..
+                } => (route_id, actor_id, Some(node_id.as_str())),
+                MeshTraceEventV1::Migrated {
+                    route_id,
+                    actor_id,
+                    from_node_id,
+                    to_node_id,
+                    replay_contract,
+                    ..
+                } => {
+                    if from_node_id.is_empty()
+                        || to_node_id.is_empty()
+                        || replay_contract.is_empty()
+                    {
+                        bail!("mesh execution trace migration event is incomplete");
+                    }
+                    (route_id, actor_id, None)
+                }
+                MeshTraceEventV1::RetryDenied {
+                    route_id,
+                    actor_id,
+                    reason,
+                    ..
+                } => {
+                    if reason.is_empty() {
+                        bail!("mesh execution trace decision event has an empty reason");
+                    }
+                    (route_id, actor_id, None)
+                }
+                MeshTraceEventV1::LocalFallback {
+                    route_id,
+                    actor_id,
+                    reason,
+                    replay_contract,
+                    ..
+                } => {
+                    if reason.is_empty() || replay_contract.is_empty() {
+                        bail!("mesh execution trace fallback event is incomplete");
+                    }
+                    (route_id, actor_id, None)
+                }
+            };
+            if route_id.is_empty() || node_id.is_some_and(str::is_empty) {
+                bail!("mesh execution trace event has an empty route or node id");
+            }
+            validate_lower_hex("mesh actor id", actor_id, 64)?;
+            if actor_routes
+                .insert(actor_id.clone(), route_id.clone())
+                .is_some_and(|known| known != *route_id)
+            {
+                bail!("mesh actor id is reused across different routes");
+            }
+            if terminal_actors.contains(actor_id) {
+                bail!("mesh execution trace records an event after an actor became terminal");
+            }
+
+            match event {
+                MeshTraceEventV1::Dispatched {
+                    generation,
+                    node_id,
+                    ..
+                } => {
+                    if *generation == 0 || !eligible_nodes.contains(node_id) {
+                        bail!("mesh dispatch names generation zero or an ineligible candidate");
+                    }
+                    let previous_dispatch = last_dispatch.get(actor_id);
+                    if previous_dispatch.is_some_and(|(previous, _)| *generation <= *previous)
+                        || dispatched.contains_key(&(actor_id.clone(), *generation))
+                    {
+                        bail!("mesh actor dispatch generations are not strictly increasing");
+                    }
+                    if previous_dispatch.is_none() {
+                        if pending_migrations.contains_key(actor_id) {
+                            bail!("first mesh dispatch unexpectedly has migration evidence");
+                        }
+                    } else {
+                        let Some((last_generation, last_node)) = last_dispatch.get(actor_id) else {
+                            bail!("mesh migration has no preceding dispatch");
+                        };
+                        if last_node == node_id {
+                            if pending_migrations.remove(actor_id).is_some() {
+                                bail!("same-node mesh retry must not claim actor migration");
+                            }
+                        } else {
+                            let Some((from_generation, to_generation, from_node, to_node)) =
+                                pending_migrations.remove(actor_id)
+                            else {
+                                bail!(
+                                    "cross-node mesh retry is missing its preceding migration event"
+                                );
+                            };
+                            if from_generation != *last_generation
+                                || to_generation != *generation
+                                || from_node != *last_node
+                                || to_node != *node_id
+                            {
+                                bail!("mesh migration does not connect consecutive dispatches");
+                            }
+                        }
+                    }
+                    dispatched.insert(
+                        (actor_id.clone(), *generation),
+                        (route_id.clone(), node_id.clone(), false),
+                    );
+                    last_dispatch.insert(actor_id.clone(), (*generation, node_id.clone()));
+                }
+                MeshTraceEventV1::Settled {
+                    generation,
+                    node_id,
+                    succeeded,
+                    ..
+                } => {
+                    let Some((known_route, known_node, settled)) =
+                        dispatched.get_mut(&(actor_id.clone(), *generation))
+                    else {
+                        bail!("mesh settlement has no matching dispatch");
+                    };
+                    if *settled || known_route != route_id || known_node != node_id {
+                        bail!("mesh settlement disagrees with or repeats its dispatch");
+                    }
+                    *settled = true;
+                    if *succeeded {
+                        terminal_actors.insert(actor_id.clone());
+                    }
+                }
+                MeshTraceEventV1::AttemptFailed {
+                    generation,
+                    node_id,
+                    submitted,
+                    delivery,
+                    replay_contract,
+                    reason,
+                    ..
+                } => {
+                    if *generation == 0
+                        || !eligible_nodes.contains(node_id)
+                        || !matches!(
+                            delivery.as_str(),
+                            "proven_not_started" | "ambiguous" | "executed"
+                        )
+                        || !matches!(replay_contract.as_str(), "unproven" | "declared_idempotent")
+                        || reason.is_empty()
+                        || !failed_attempts.insert((actor_id.clone(), *generation))
+                    {
+                        bail!("mesh failed-attempt observation is invalid");
+                    }
+                    let matching_dispatch = dispatched
+                        .get(&(actor_id.clone(), *generation))
+                        .is_some_and(|(known_route, known_node, settled)| {
+                            known_route == route_id && known_node == node_id && !settled
+                        });
+                    if *submitted != matching_dispatch {
+                        bail!("mesh failed-attempt submission state disagrees with its dispatch");
+                    }
+                }
+                MeshTraceEventV1::Migrated {
+                    from_generation,
+                    to_generation,
+                    from_node_id,
+                    to_node_id,
+                    ..
+                } => {
+                    let Some((last_generation, last_node)) = last_dispatch.get(actor_id) else {
+                        bail!("mesh migration has no preceding dispatch");
+                    };
+                    if *from_generation != *last_generation
+                        || *to_generation <= *from_generation
+                        || from_node_id != last_node
+                        || from_node_id == to_node_id
+                        || !eligible_nodes.contains(to_node_id)
+                        || pending_migrations
+                            .insert(
+                                actor_id.clone(),
+                                (
+                                    *from_generation,
+                                    *to_generation,
+                                    from_node_id.clone(),
+                                    to_node_id.clone(),
+                                ),
+                            )
+                            .is_some()
+                    {
+                        bail!("mesh migration lifecycle is inconsistent");
+                    }
+                }
+                MeshTraceEventV1::RetryDenied { generation, .. } => {
+                    if last_dispatch.get(actor_id).map(|(value, _)| value) != Some(generation)
+                        || pending_migrations.contains_key(actor_id)
+                    {
+                        bail!("mesh retry denial does not follow its last dispatch");
+                    }
+                    terminal_actors.insert(actor_id.clone());
+                }
+                MeshTraceEventV1::LocalFallback {
+                    after_generation, ..
+                } => {
+                    let observed = last_dispatch
+                        .get(actor_id)
+                        .map_or(0, |(generation, _)| *generation);
+                    if observed != *after_generation || pending_migrations.contains_key(actor_id) {
+                        bail!("mesh local fallback disagrees with the last remote generation");
+                    }
+                    terminal_actors.insert(actor_id.clone());
+                }
+            }
+        }
+        if !pending_migrations.is_empty() {
+            bail!("mesh execution trace ends with an incomplete migration");
+        }
+        Ok(())
+    }
 }
+
+fn validate_lower_hex(field: &str, value: &str, expected_len: usize) -> Result<()> {
+    if value.len() != expected_len
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        bail!("{field} must be exactly {expected_len} lowercase hexadecimal characters");
+    }
+    Ok(())
+}
+
+/// Successful mesh results together with the exact discovery/placement trace.
+#[derive(Debug)]
+pub struct MeshExecutionOutcome {
+    pub execution: ConfiguredProjectExecution,
+    pub trace: MeshExecutionTraceV1,
+}
+
+/// An execution-phase mesh failure retaining every observation recorded before
+/// failure. Errors before trace construction remain ordinary preflight errors.
+#[derive(Debug)]
+pub struct MeshExecutionError {
+    message: String,
+    public_message: String,
+    source: anyhow::Error,
+    class: MeshExecutionFailureClass,
+    pub trace: MeshExecutionTraceV1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MeshExecutionFailureClass {
+    Semantic,
+    Infrastructure,
+}
+
+impl MeshExecutionError {
+    fn new(source: anyhow::Error, trace: MeshExecutionTraceV1) -> Self {
+        let class = classify_mesh_failure(&trace);
+        let public_message = if source
+            .downcast_ref::<RequiredMeshPlacementUnavailable>()
+            .is_some()
+        {
+            REQUIRED_MESH_PLACEMENT_UNAVAILABLE.to_string()
+        } else {
+            "project mesh execution failed after observed placement; detailed transport diagnostic omitted from persistent observation"
+                .to_string()
+        };
+        Self {
+            message: format!("{source:#}"),
+            public_message,
+            source,
+            class,
+            trace,
+        }
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// Credential-safe causal diagnostic suitable for CLI output and
+    /// persistent unsigned observations.
+    pub fn public_message(&self) -> &str {
+        &self.public_message
+    }
+
+    pub fn source_error(&self) -> &anyhow::Error {
+        &self.source
+    }
+
+    pub const fn class(&self) -> MeshExecutionFailureClass {
+        self.class
+    }
+}
+
+fn classify_mesh_failure(trace: &MeshExecutionTraceV1) -> MeshExecutionFailureClass {
+    let dispatched = trace
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            MeshTraceEventV1::Dispatched {
+                actor_id,
+                generation,
+                ..
+            } => Some((actor_id.as_str(), *generation)),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let settled = trace
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            MeshTraceEventV1::Settled {
+                actor_id,
+                generation,
+                ..
+            } => Some((actor_id.as_str(), *generation)),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    if !settled.is_empty() && dispatched == settled {
+        MeshExecutionFailureClass::Semantic
+    } else {
+        MeshExecutionFailureClass::Infrastructure
+    }
+}
+
+impl fmt::Display for MeshExecutionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl StdError for MeshExecutionError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+const REQUIRED_MESH_PLACEMENT_UNAVAILABLE: &str = "mesh placement is required, but discovery found no authenticated peer eligible for this bundle, execution policy, and actor slot";
+
+#[derive(Debug)]
+struct RequiredMeshPlacementUnavailable;
+
+impl fmt::Display for RequiredMeshPlacementUnavailable {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(REQUIRED_MESH_PLACEMENT_UNAVAILABLE)
+    }
+}
+
+impl StdError for RequiredMeshPlacementUnavailable {}
 
 /// Strongest replay statement available for an entire route/prerequisite
 /// island. Every member must be covered because they share one workspace and
@@ -445,6 +1028,152 @@ fn client_identity(paths: &StoredLanPeerPathsV1, peer: &StoredLanPeerV1) -> Clie
         key_path: paths.client_key.clone(),
         server_name: peer.server_name.clone(),
     }
+}
+
+/// Observe already-pinned peers for live planning without changing either end
+/// of the mesh. This path performs only LAN advertisement reads, pinned-registry
+/// reads, mutual-TLS connection setup, and authenticated profile/capacity RPCs.
+/// It does not bootstrap identities, upload CAS objects, probe routes, create
+/// fences, submit actors, retrieve results, or start a node.
+pub fn observe_mesh_peers_read_only(
+    config: &MeshReadOnlyDiscoveryConfig,
+) -> Result<MeshReadOnlyDiscoveryV1> {
+    config.validate()?;
+    let peers_root = config
+        .peer_root
+        .clone()
+        .unwrap_or_else(lan_peers_config_dir);
+    let (discovered, lan_discovery_error) = if config.discover_lan {
+        match discover_lan_nodes(config.discovery_timeout) {
+            Ok(nodes) => (nodes, None),
+            Err(error) => (Vec::new(), Some(format!("{error:#}"))),
+        }
+    } else {
+        (Vec::new(), None)
+    };
+    let known = list_stored_lan_peers(&peers_root).with_context(|| {
+        format!(
+            "mesh peer registry {} is unreadable or corrupt",
+            peers_root.display()
+        )
+    })?;
+
+    let mut peers = Vec::with_capacity(known.len());
+    for (peer, paths) in known {
+        let mut endpoint_hints = discovered
+            .iter()
+            .filter(|node| {
+                node.advertisement.node_id == peer.node_id
+                    && node.advertisement.server_name == peer.server_name
+            })
+            .map(|node| node.service_address().to_string())
+            .collect::<Vec<_>>();
+        endpoint_hints.push(peer.address.clone());
+        endpoint_hints.sort();
+        endpoint_hints.dedup();
+
+        let identity = client_identity(&paths, &peer);
+        let mut failures = Vec::new();
+        let mut strongest_error = MeshLivePeerErrorV1::Unreachable;
+        let mut selected = None;
+        for address in &endpoint_hints {
+            let client = MeshNodeClient::new(
+                address.clone(),
+                identity.clone(),
+                Duration::from_secs(5),
+                Duration::from_secs(10),
+            );
+            let started = Instant::now();
+            let mut connection = match client.connect() {
+                Ok(connection) => connection,
+                Err(error) => {
+                    failures.push(format!("{address}: {error:#}"));
+                    continue;
+                }
+            };
+            let profile = match connection.profile() {
+                Ok(profile) => profile,
+                Err(error) => {
+                    strongest_error = strongest_error.max(MeshLivePeerErrorV1::ProfileQueryFailed);
+                    failures.push(format!("{address}: profile query failed: {error:#}"));
+                    continue;
+                }
+            };
+            if profile.node_id != peer.node_id {
+                strongest_error = strongest_error.max(MeshLivePeerErrorV1::ProfileIdentityMismatch);
+                failures.push(format!(
+                    "{address}: authenticated profile node id `{}` differs from pinned peer `{}`",
+                    profile.node_id, peer.node_id
+                ));
+                continue;
+            }
+            let capacity = match connection.capacity() {
+                Ok(capacity) => capacity,
+                Err(error) => {
+                    strongest_error = strongest_error.max(MeshLivePeerErrorV1::CapacityQueryFailed);
+                    failures.push(format!("{address}: capacity query failed: {error:#}"));
+                    continue;
+                }
+            };
+            if let Err(error) = capacity.validate_against(&profile) {
+                strongest_error = strongest_error.max(MeshLivePeerErrorV1::CapacityInvalid);
+                failures.push(format!(
+                    "{address}: invalid capacity observation: {error:#}"
+                ));
+                continue;
+            }
+            selected = Some((
+                address.clone(),
+                profile,
+                capacity,
+                started.elapsed().as_micros().try_into().unwrap_or(u64::MAX),
+            ));
+            break;
+        }
+
+        peers.push(match selected {
+            Some((selected_endpoint, profile, capacity, observed_latency_micros)) => {
+                let eligible = capacity.available_slots > 0;
+                MeshLivePeerObservationV1 {
+                    node_id: peer.node_id,
+                    endpoint_hints,
+                    selected_endpoint: Some(selected_endpoint),
+                    profile: Some(profile),
+                    capacity: Some(capacity),
+                    observed_latency_micros: Some(observed_latency_micros),
+                    eligible,
+                    rejection: (!eligible).then_some(MeshLivePeerRejectionV1::NoAvailableSlots),
+                    error: None,
+                    detail: None,
+                }
+            }
+            None => MeshLivePeerObservationV1 {
+                node_id: peer.node_id,
+                endpoint_hints,
+                selected_endpoint: None,
+                profile: None,
+                capacity: None,
+                observed_latency_micros: None,
+                eligible: false,
+                rejection: None,
+                error: Some(strongest_error),
+                detail: Some(if failures.is_empty() {
+                    "pinned peer has no usable endpoint".to_string()
+                } else {
+                    failures.join("; ")
+                }),
+            },
+        });
+    }
+
+    let observation = MeshReadOnlyDiscoveryV1 {
+        schema: MESH_READ_ONLY_DISCOVERY_SCHEMA_V1.to_string(),
+        lan_discovery_attempted: config.discover_lan,
+        lan_discovery_error,
+        peers,
+    };
+    observation.validate()?;
+    Ok(observation)
 }
 
 /// Join the live LAN advertisements with the durable paired-peer registry.
@@ -1143,7 +1872,10 @@ fn dispatch_route_actor(
         let outcome =
             execute_remote_attempt(peer, upload, &requirements, actor, &cancel, opts, || {
                 submitted = true;
-                if let Some(from_node) = migration_from.as_ref() {
+                if let Some(from_node) = migration_from
+                    .as_ref()
+                    .filter(|from_node| *from_node != &peer.node_id)
+                {
                     trace_event(
                         events,
                         MeshTraceEventV1::Migrated {
@@ -1203,6 +1935,24 @@ fn dispatch_route_actor(
                 .into())
             }
             RemoteAttemptOutcome::Failed { delivery, detail } => {
+                trace_event(
+                    events,
+                    MeshTraceEventV1::AttemptFailed {
+                        route_id: route_id.to_string(),
+                        actor_id: actor_id.clone(),
+                        generation: generation_u32,
+                        node_id: peer.node_id.clone(),
+                        submitted,
+                        delivery: match delivery {
+                            AttemptDeliveryState::ProvenNotStarted => "proven_not_started",
+                            AttemptDeliveryState::Ambiguous => "ambiguous",
+                            AttemptDeliveryState::Executed => "executed",
+                        }
+                        .to_string(),
+                        replay_contract: replay.token().to_string(),
+                        reason: detail.clone(),
+                    },
+                );
                 last_delivery = merge_delivery_state(last_delivery, delivery);
                 last_failure = detail;
                 if delivery != AttemptDeliveryState::ProvenNotStarted {
@@ -1230,6 +1980,7 @@ fn dispatch_route_actor(
                 route_id: route_id.to_string(),
                 actor_id,
                 after_generation: attempted_generations,
+                replay_contract: replay.token().to_string(),
                 reason: last_failure.clone(),
             },
         );
@@ -1249,19 +2000,15 @@ fn dispatch_route_actor(
 /// Execute a resolved route selection through discovered mesh peers, with
 /// bounded retry and a policy-governed local provider. The transport-backed
 /// implementation is below the pure scheduling helpers in this module.
-pub fn execute_mesh_selection(
+pub fn execute_mesh_selection_observed(
     bundle: &ProjectBundle,
     target: Option<&str>,
     policy_override: Option<RoutePolicy>,
     opts: &RunOptions,
     config: &MeshExecutionConfig,
-) -> Result<ConfiguredProjectExecution> {
+) -> Result<MeshExecutionOutcome> {
     config.validate()?;
     let selection = resolve_selection(bundle, target, policy_override)?;
-    let potential_route_executions =
-        potential_route_execution_count(bundle, &selection.alternatives)?;
-    opts.limits
-        .validate_route_execution_set(potential_route_executions)?;
     let bundle_bytes = crate::project::bundle::serialize(bundle)?;
     let bundle_sha256 = hex::encode(Sha256::digest(&bundle_bytes));
     let execution_id = random_execution_id()?;
@@ -1271,6 +2018,27 @@ pub fn execute_mesh_selection(
         selection.target.clone(),
         &selection.policy,
     );
+    let limit_validation = potential_route_execution_count(bundle, &selection.alternatives)
+        .and_then(|count| {
+            opts.limits
+                .validate_route_execution_set(count)
+                .map_err(anyhow::Error::new)
+        });
+    if let Err(error) = limit_validation {
+        let trace_retention = trace.validate().and_then(|()| {
+            config
+                .trace_out
+                .as_deref()
+                .map_or(Ok(()), |path| trace.write(path))
+        });
+        let error = match trace_retention {
+            Ok(()) => error,
+            Err(trace_error) => error.context(format!(
+                "additionally failed to validate or retain mesh trace: {trace_error:#}"
+            )),
+        };
+        return Err(anyhow::Error::new(MeshExecutionError::new(error, trace)));
+    }
 
     let execution = execute_mesh_policy(
         bundle,
@@ -1281,21 +2049,44 @@ pub fn execute_mesh_selection(
         config,
         &mut trace,
     );
-    if let Some(path) = config.trace_out.as_deref() {
-        if let Err(trace_error) = trace.write(path) {
-            return match execution {
-                Ok(_) => Err(trace_error),
-                Err(error) => Err(error.context(format!(
-                    "additionally failed to retain mesh trace: {trace_error:#}"
-                ))),
-            };
+    let trace_retention = trace.validate().and_then(|()| {
+        config
+            .trace_out
+            .as_deref()
+            .map_or(Ok(()), |path| trace.write(path))
+    });
+
+    match (execution, trace_retention) {
+        (Ok(results), Ok(())) => Ok(MeshExecutionOutcome {
+            execution: ConfiguredProjectExecution {
+                results,
+                trace: None,
+            },
+            trace,
+        }),
+        (Ok(_), Err(error)) | (Err(error), Ok(())) => {
+            Err(anyhow::Error::new(MeshExecutionError::new(error, trace)))
+        }
+        (Err(error), Err(trace_error)) => {
+            let error = error.context(format!(
+                "additionally failed to validate or retain mesh trace: {trace_error:#}"
+            ));
+            Err(anyhow::Error::new(MeshExecutionError::new(error, trace)))
         }
     }
-    let results = execution?;
-    Ok(ConfiguredProjectExecution {
-        results,
-        trace: None,
-    })
+}
+
+/// Compatibility wrapper retaining the result-plus-project-trace surface.
+/// Mesh-aware callers should use [`execute_mesh_selection_observed`] so the
+/// mesh trace is not discarded on success.
+pub fn execute_mesh_selection(
+    bundle: &ProjectBundle,
+    target: Option<&str>,
+    policy_override: Option<RoutePolicy>,
+    opts: &RunOptions,
+    config: &MeshExecutionConfig,
+) -> Result<ConfiguredProjectExecution> {
+    Ok(execute_mesh_selection_observed(bundle, target, policy_override, opts, config)?.execution)
 }
 
 fn execute_mesh_policy(
@@ -1336,9 +2127,7 @@ fn execute_mesh_policy(
         }
     });
     if config.requirement == MeshRequirement::Required && peers.is_empty() {
-        bail!(
-            "mesh placement is required, but discovery found no authenticated peer eligible for this bundle, execution policy, and actor slot"
-        );
+        return Err(RequiredMeshPlacementUnavailable.into());
     }
     if config.explain {
         eprintln!(
@@ -1740,7 +2529,7 @@ mod tests {
 
     #[test]
     fn target_rank_is_capacity_first_and_deterministic() {
-        let mut candidates = vec![
+        let mut candidates = [
             MeshTargetCandidateV1 {
                 node_id: "slow".into(),
                 is_local: false,
@@ -1768,6 +2557,115 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["fast", "slow", "small"]
         );
+    }
+
+    #[test]
+    fn same_node_retry_is_not_mislabeled_as_actor_migration() {
+        let actor_id = "c".repeat(64);
+        let mut trace = MeshExecutionTraceV1 {
+            schema: MESH_EXECUTION_TRACE_SCHEMA_V1.to_string(),
+            execution_id: "a".repeat(32),
+            bundle_sha256: "b".repeat(64),
+            target: "route".to_string(),
+            policy: "explicit:route".to_string(),
+            candidates: vec![MeshTraceCandidateV1 {
+                node_id: "only-node".to_string(),
+                address: None,
+                available_slots: 1,
+                observed_latency_micros: 1,
+                eligible: true,
+                detail: "authenticated candidate".to_string(),
+            }],
+            events: vec![
+                MeshTraceEventV1::Dispatched {
+                    route_id: "route".to_string(),
+                    actor_id: actor_id.clone(),
+                    generation: 1,
+                    node_id: "only-node".to_string(),
+                },
+                MeshTraceEventV1::Settled {
+                    route_id: "route".to_string(),
+                    actor_id: actor_id.clone(),
+                    generation: 1,
+                    node_id: "only-node".to_string(),
+                    succeeded: false,
+                },
+                MeshTraceEventV1::Dispatched {
+                    route_id: "route".to_string(),
+                    actor_id: actor_id.clone(),
+                    generation: 2,
+                    node_id: "only-node".to_string(),
+                },
+                MeshTraceEventV1::Settled {
+                    route_id: "route".to_string(),
+                    actor_id,
+                    generation: 2,
+                    node_id: "only-node".to_string(),
+                    succeeded: true,
+                },
+            ],
+        };
+        trace.validate().unwrap();
+
+        trace.events.insert(
+            2,
+            MeshTraceEventV1::Migrated {
+                route_id: "route".to_string(),
+                actor_id: "c".repeat(64),
+                from_generation: 1,
+                to_generation: 2,
+                from_node_id: "only-node".to_string(),
+                to_node_id: "only-node".to_string(),
+                replay_contract: "declared_idempotent".to_string(),
+            },
+        );
+        assert!(trace.validate().is_err());
+    }
+
+    #[test]
+    fn read_only_discovery_does_not_create_or_enroll_a_registry() {
+        let temp = tempfile::tempdir().unwrap();
+        let peer_root = temp.path().join("absent-peers");
+        let observation = observe_mesh_peers_read_only(&MeshReadOnlyDiscoveryConfig {
+            discover_lan: false,
+            discovery_timeout: Duration::from_millis(10),
+            peer_root: Some(peer_root.clone()),
+        })
+        .unwrap();
+        assert_eq!(observation.schema, MESH_READ_ONLY_DISCOVERY_SCHEMA_V1);
+        assert!(!observation.lan_discovery_attempted);
+        assert!(observation.peers.is_empty());
+        assert!(
+            !peer_root.exists(),
+            "read-only planning must not create an empty peer registry"
+        );
+        observation.validate().unwrap();
+    }
+
+    #[test]
+    fn observed_required_mesh_failure_retains_a_valid_partial_trace() {
+        let temp = tempfile::tempdir().unwrap();
+        let error = execute_mesh_selection_observed(
+            &bundle_with_chain(),
+            Some("run"),
+            None,
+            &RunOptions::default(),
+            &MeshExecutionConfig {
+                requirement: MeshRequirement::Required,
+                discover_lan: false,
+                peer_root: Some(temp.path().join("absent-peers")),
+                ..MeshExecutionConfig::default()
+            },
+        )
+        .unwrap_err();
+        let observed = error
+            .downcast_ref::<MeshExecutionError>()
+            .expect("post-preflight mesh failure must retain its trace");
+        assert!(observed.message().contains("mesh placement is required"));
+        assert_eq!(observed.trace.target, "run");
+        assert_eq!(observed.trace.policy, "explicit:run");
+        assert!(observed.trace.candidates.is_empty());
+        observed.trace.validate().unwrap();
     }
 
     #[test]

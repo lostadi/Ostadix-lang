@@ -46,7 +46,7 @@ pub use executor::{
     execute_project_hgraph, execute_project_hgraph_selection, execute_project_hgraph_world_bound,
     execute_selection_with_configured_executor, run_selection_with_configured_executor,
     write_project_attempt_trace, ConfiguredProjectExecution, ProjectCoordinator,
-    ProjectExecutionError, ProjectExecutionOutcome,
+    ProjectExecutionError, ProjectExecutionFailureClass, ProjectExecutionOutcome,
 };
 pub use launch::{
     HostedWorldCoordinatorObserverV1, HostedWorldCurrentV1, HostedWorldLaunchError,

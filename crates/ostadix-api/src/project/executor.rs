@@ -28,7 +28,10 @@ use super::model::{
 use super::plan::{
     build_project_hgraph, ProjectDependency, ProjectHGraph, ProjectPlanOperation, RoutePlanFacts,
 };
-use super::runtime::{execute_route_in_workspace, is_skipped_result, run_selection, RunOptions};
+use super::runtime::{
+    execute_route_in_workspace, is_skipped_result, public_route_execution_diagnostic,
+    run_selection, RunOptions,
+};
 use super::trace::{
     project_deployment_digest, project_hosted_deployment_digest, project_logical_graph_digest,
     ProjectAttemptIdentity, ProjectAttemptTrace, ProjectAttemptTraceHeader,
@@ -53,10 +56,18 @@ pub struct ProjectExecutionOutcome {
 #[derive(Debug)]
 pub struct ProjectExecutionError {
     message: String,
+    public_message: String,
+    class: ProjectExecutionFailureClass,
     pub trace: ProjectAttemptTrace,
     settled_results: BTreeMap<NodeId, OExecutionResult>,
     materialized_outputs: BTreeSet<NodeId>,
     failed_outputs: BTreeSet<NodeId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProjectExecutionFailureClass {
+    Semantic,
+    Infrastructure,
 }
 
 impl ProjectExecutionError {
@@ -64,10 +75,35 @@ impl ProjectExecutionError {
         &self.message
     }
 
+    /// Credential-safe diagnostic suitable for a durable observation.
+    /// Direct executor Display remains source-compatible and may include the
+    /// exact route argv; callers that persist errors must use this projection.
+    pub fn public_message(&self) -> &str {
+        &self.public_message
+    }
+
+    pub const fn class(&self) -> ProjectExecutionFailureClass {
+        self.class
+    }
+
     /// A valid route result published before the graph stalled, indexed by
     /// the producing operation's ordinary value-output node.
     pub fn settled_result(&self, output: NodeId) -> Option<&OExecutionResult> {
         self.settled_results.get(&output)
+    }
+
+    /// Iterate every ordinary route result published before the coordinator
+    /// stalled, in ascending HGraph `NodeId` order.
+    ///
+    /// The stable order is part of this observation surface: callers may
+    /// serialize a failed attempt without depending on hash-map iteration or
+    /// rediscovering output nodes from the trace.
+    pub fn settled_results(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = (NodeId, &OExecutionResult)> + ExactSizeIterator {
+        self.settled_results
+            .iter()
+            .map(|(output, result)| (*output, result))
     }
 
     /// Whether the coordinator materialized this graph output before stalling.
@@ -181,8 +217,10 @@ pub struct ProjectCoordinator<'a> {
     values: BTreeMap<NodeId, ProjectRuntimeValue>,
     workspaces: BTreeMap<usize, Workspace>,
     failures: BTreeMap<PlanNodeId, String>,
+    public_failures: BTreeMap<PlanNodeId, String>,
     branch_assessments: BTreeMap<usize, Vec<BranchRouteAssessment>>,
     continuation_denied: bool,
+    infrastructure_failure_observed: bool,
     /// Exact snapshot-derived deployment for the bounded World-hosted path.
     /// `None` retains the compatibility hosted-unbound trace contract.
     deployment: Option<&'a DeploymentPlanV1>,
@@ -320,8 +358,10 @@ impl<'a> ProjectCoordinator<'a> {
             values: BTreeMap::new(),
             workspaces: BTreeMap::new(),
             failures: BTreeMap::new(),
+            public_failures: BTreeMap::new(),
             branch_assessments: BTreeMap::new(),
             continuation_denied: false,
+            infrastructure_failure_observed: false,
             deployment,
             trace,
             cancel: CancellationToken::new(),
@@ -942,26 +982,24 @@ impl<'a> ProjectCoordinator<'a> {
             self.failed_outputs.insert(output, ready.plan_node);
         }
         if matches!(status, SettledRouteStatus::NonZero) {
-            self.failures.insert(
-                ready.plan_node,
-                format!(
-                    "route `{}` settled unsuccessfully with exit code {exit_code:?}",
-                    identity.route_id.as_deref().unwrap_or("<unknown>")
-                ),
+            let description = format!(
+                "route `{}` settled unsuccessfully with exit code {exit_code:?}",
+                identity.route_id.as_deref().unwrap_or("<unknown>")
             );
+            self.failures.insert(ready.plan_node, description.clone());
+            self.public_failures.insert(ready.plan_node, description);
         }
         if continuation_denied {
             self.continuation_denied = true;
-            self.failures.insert(
-                ready.plan_node,
-                format!(
-                    "route `{route_id}` settled unsuccessfully, but continuation to `{}` was denied because branch {branch} contains executed routes without a declared_idempotent contract",
-                    continuation
-                        .as_ref()
-                        .expect("denied continuation exists")
-                        .next_route_id
-                ),
+            let description = format!(
+                "route `{route_id}` settled unsuccessfully, but continuation to `{}` was denied because branch {branch} contains executed routes without a declared_idempotent contract",
+                continuation
+                    .as_ref()
+                    .expect("denied continuation exists")
+                    .next_route_id
             );
+            self.failures.insert(ready.plan_node, description.clone());
+            self.public_failures.insert(ready.plan_node, description);
         }
         Ok(())
     }
@@ -973,8 +1011,10 @@ impl<'a> ProjectCoordinator<'a> {
         error: &anyhow::Error,
         outcome: Option<ProjectRouteOutcome>,
     ) -> Result<()> {
+        self.infrastructure_failure_observed = true;
         self.ensure_outputs_unpublished(ready)?;
         let description = error.to_string();
+        let public_description = public_route_execution_diagnostic(error);
 
         // An abort has no operation value. Its terminal trace event and the
         // withholding of every graph output form the local commit.
@@ -984,6 +1024,8 @@ impl<'a> ProjectCoordinator<'a> {
             self.failed_outputs.insert(*output, ready.plan_node);
         }
         self.failures.insert(ready.plan_node, description);
+        self.public_failures
+            .insert(ready.plan_node, public_description);
         Ok(())
     }
 
@@ -1033,10 +1075,23 @@ impl<'a> ProjectCoordinator<'a> {
         for (plan_node, failure) in &self.failures {
             details.push(format!("p{} failed: {failure}", plan_node.0));
         }
+        let mut public_details = details
+            .iter()
+            .take(details.len().saturating_sub(self.failures.len()))
+            .cloned()
+            .collect::<Vec<_>>();
+        for (plan_node, failure) in &self.public_failures {
+            public_details.push(format!("p{} failed: {failure}", plan_node.0));
+        }
         let message = if details.is_empty() {
             "project HGraph stalled without a materialized selected-result root".to_string()
         } else {
             format!("project HGraph stalled: {}", details.join("; "))
+        };
+        let public_message = if public_details.is_empty() {
+            "project HGraph stalled without a materialized selected-result root".to_string()
+        } else {
+            format!("project HGraph stalled: {}", public_details.join("; "))
         };
         let settled_results = self
             .values
@@ -1048,6 +1103,12 @@ impl<'a> ProjectCoordinator<'a> {
             .collect();
         anyhow::Error::new(ProjectExecutionError {
             message,
+            public_message,
+            class: if self.infrastructure_failure_observed || self.failures.is_empty() {
+                ProjectExecutionFailureClass::Infrastructure
+            } else {
+                ProjectExecutionFailureClass::Semantic
+            },
             trace: self.trace.clone(),
             settled_results,
             materialized_outputs: self.materialized.clone(),

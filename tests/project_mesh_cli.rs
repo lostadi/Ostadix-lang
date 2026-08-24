@@ -8,7 +8,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use o_lang::hosted_remote::{
-    store_paired_lan_peer, ClientTlsIdentity, MeshNodeClient, StoredLanPeerPathsV1,
+    observe_mesh_peers_read_only, store_paired_lan_peer, ClientTlsIdentity, MeshNodeClient,
+    MeshReadOnlyDiscoveryConfig, StoredLanPeerPathsV1,
 };
 
 mod support;
@@ -258,22 +259,110 @@ fn register_node(peer_root: &Path, node: &TestNode) {
     assert!(paths.metadata.is_file());
 }
 
-fn run_olink(project: &Path, peer_root: &Path, trace: &Path, args: &[&str]) -> Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_o-link"));
+fn run_o_cli_mesh_no_record(
+    project: &Path,
+    peer_root: &Path,
+    trace: &Path,
+    state: &Path,
+    args: &[&str],
+) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_o-cli"));
     command
+        .arg("run")
         .arg(project)
-        .args(["--project", "--run"])
         .args(args)
         .arg("--mesh-peer-root")
         .arg(peer_root)
-        .arg("--mesh-no-lan-discovery")
+        .arg("--closed-registry")
         .arg("--mesh-trace-out")
-        .arg(trace);
+        .arg(trace)
+        .args(["--no-record", "--json"])
+        .env("XDG_STATE_HOME", state);
+    command.output().unwrap()
+}
+
+fn run_o_cli_auto(project: &Path, peer_root: &Path, trace: &Path, state: &Path) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_o-cli"));
+    command
+        .args(["run"])
+        .arg(project)
+        .args([
+            "--parallel",
+            "auto",
+            "--route",
+            "parallel",
+            "--routes-policy",
+            "all",
+            "--mesh-retries=0",
+            "--closed-registry",
+        ])
+        .arg("--mesh-peer-root")
+        .arg(peer_root)
+        .arg("--mesh-trace-out")
+        .arg(trace)
+        .env("XDG_STATE_HOME", state);
+    command.output().unwrap()
+}
+
+fn run_o_cli_required_retry(
+    project: &Path,
+    peer_root: &Path,
+    trace: &Path,
+    state: &Path,
+) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_o-cli"));
+    command
+        .args(["run"])
+        .arg(project)
+        .args([
+            "--route",
+            "retry",
+            "--mesh=required",
+            "--mesh-retries=1",
+            "--closed-registry",
+        ])
+        .arg("--mesh-peer-root")
+        .arg(peer_root)
+        .arg("--mesh-trace-out")
+        .arg(trace)
+        .env("XDG_STATE_HOME", state);
+    command.output().unwrap()
+}
+
+fn run_o_cli_evidence(state: &Path, args: &[&str]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_o-cli"));
+    command.env("XDG_STATE_HOME", state).args(args);
     command.output().unwrap()
 }
 
 fn read_trace(path: &Path) -> serde_json::Value {
     serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+}
+
+fn snapshot_tree(root: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
+    fn visit(root: &Path, path: &Path, snapshot: &mut Vec<(PathBuf, Option<Vec<u8>>)>) {
+        if !path.exists() {
+            return;
+        }
+        let relative = path.strip_prefix(root).unwrap().to_path_buf();
+        if path.is_dir() {
+            snapshot.push((relative, None));
+            let mut entries = fs::read_dir(path)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect::<Vec<_>>();
+            entries.sort();
+            for entry in entries {
+                visit(root, &entry, snapshot);
+            }
+        } else {
+            snapshot.push((relative, Some(fs::read(path).unwrap())));
+        }
+    }
+
+    let mut snapshot = Vec::new();
+    visit(root, root, &mut snapshot);
+    snapshot
 }
 
 #[test]
@@ -308,6 +397,10 @@ command = ["bash", "-c", "if [ \"$MESH_NODE\" = mesh-node-a ]; then printf 'gene
 failure_continuation = "declared_idempotent"
 
 [[routes]]
+id = "retry-denied"
+command = ["bash", "-c", "printf 'unproven-effects\\n' >&2; exit 76"]
+
+[[routes]]
 id = "local"
 command = ["bash", "-c", "printf 'local-fallback\\n'"]
 
@@ -326,20 +419,38 @@ policy = "all"
     register_node(&peer_root, &node_a);
     register_node(&peer_root, &node_b);
 
-    let parallel_trace = root.path().join("parallel-trace.json");
-    let parallel = run_olink(
-        &project,
-        &peer_root,
-        &parallel_trace,
-        &[
-            "--route",
-            "parallel",
-            "--routes-policy",
-            "all",
-            "--mesh=required",
-            "--mesh-retries=0",
-        ],
+    let registry_before = snapshot_tree(&peer_root);
+    let node_a_before = snapshot_tree(&node_a.state.join("mesh-v1"));
+    let node_b_before = snapshot_tree(&node_b.state.join("mesh-v1"));
+    let live_preview = observe_mesh_peers_read_only(&MeshReadOnlyDiscoveryConfig {
+        discover_lan: false,
+        discovery_timeout: Duration::from_millis(100),
+        peer_root: Some(peer_root.clone()),
+    })
+    .unwrap();
+    assert_eq!(
+        live_preview
+            .peers
+            .iter()
+            .map(|peer| (
+                peer.node_id.as_str(),
+                peer.profile.as_ref().unwrap().node_id.as_str(),
+                peer.capacity.as_ref().unwrap().available_slots,
+            ))
+            .collect::<Vec<_>>(),
+        [
+            ("mesh-node-a", "mesh-node-a", 2),
+            ("mesh-node-b", "mesh-node-b", 1),
+        ]
     );
+    assert!(live_preview.peers.iter().all(|peer| peer.eligible));
+    assert_eq!(snapshot_tree(&peer_root), registry_before);
+    assert_eq!(snapshot_tree(&node_a.state.join("mesh-v1")), node_a_before);
+    assert_eq!(snapshot_tree(&node_b.state.join("mesh-v1")), node_b_before);
+
+    let front_door_state = root.path().join("front-door-state");
+    let parallel_trace = root.path().join("parallel-trace.json");
+    let parallel = run_o_cli_auto(&project, &peer_root, &parallel_trace, &front_door_state);
     assert!(
         parallel.status.success(),
         "parallel mesh failed\nstdout:\n{}\nstderr:\n{}\nnode-a:\n{}\nnode-b:\n{}",
@@ -371,12 +482,7 @@ policy = "all"
     // failure. The island's explicit idempotence contract authorizes replay of
     // generation 2 on node-b.
     let retry_trace = root.path().join("retry-trace.json");
-    let retry = run_olink(
-        &project,
-        &peer_root,
-        &retry_trace,
-        &["--route", "retry", "--mesh=required", "--mesh-retries=1"],
-    );
+    let retry = run_o_cli_required_retry(&project, &peer_root, &retry_trace, &front_door_state);
     assert!(
         retry.status.success(),
         "mesh retry failed\nstdout:\n{}\nstderr:\n{}",
@@ -414,13 +520,57 @@ policy = "all"
         .iter()
         .any(|event| { event["event"] == "local_fallback" || event["event"] == "retry_denied" }));
 
+    // A settled command without an explicit replay contract must never be
+    // migrated, even when the retry budget would otherwise permit it. Run
+    // through the root front door and request its causal explanation too.
+    node_a.wait_for_full_capacity();
+    node_b.wait_for_full_capacity();
+    let denied_trace = root.path().join("retry-denied-trace.json");
+    let denied = run_o_cli_mesh_no_record(
+        &project,
+        &peer_root,
+        &denied_trace,
+        &front_door_state,
+        &[
+            "--route",
+            "retry-denied",
+            "--mesh=required",
+            "--mesh-retries=1",
+            "--explain-mesh",
+        ],
+    );
+    assert!(
+        !denied.status.success(),
+        "non-idempotent retry unexpectedly succeeded\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&denied.stdout),
+        String::from_utf8_lossy(&denied.stderr),
+    );
+    let denied_summary: serde_json::Value = serde_json::from_slice(&denied.stdout).unwrap();
+    assert_eq!(denied_summary["disposition"], "execution_failed");
+    assert_eq!(denied_summary["recording"]["status"], "disabled");
+    assert!(
+        String::from_utf8_lossy(&denied.stderr).contains("o mesh: retry denied route retry-denied"),
+        "--explain-mesh omitted retry causality: {}",
+        String::from_utf8_lossy(&denied.stderr)
+    );
+    let denied_trace = read_trace(&denied_trace);
+    let denied_events = denied_trace["events"].as_array().unwrap();
+    assert!(denied_events
+        .iter()
+        .any(|event| event["event"] == "retry_denied"));
+    assert!(!denied_events
+        .iter()
+        .any(|event| event["event"] == "migrated"));
+    assert!(!denied_events.iter().any(|event| event["generation"] == 2));
+
     fs::create_dir_all(&empty_peer_root).unwrap();
     let fallback_trace = root.path().join("fallback-trace.json");
-    let fallback = run_olink(
+    let fallback = run_o_cli_mesh_no_record(
         &project,
         &empty_peer_root,
         &fallback_trace,
-        &["--route", "local", "--mesh=prefer", "--mesh-retries=0"],
+        &front_door_state,
+        &["--parallel", "auto", "--route", "local", "--mesh-retries=0"],
     );
     assert!(
         fallback.status.success(),
@@ -428,7 +578,9 @@ policy = "all"
         String::from_utf8_lossy(&fallback.stdout),
         String::from_utf8_lossy(&fallback.stderr),
     );
-    assert!(String::from_utf8_lossy(&fallback.stdout).contains("local-fallback"));
+    let fallback_summary: serde_json::Value = serde_json::from_slice(&fallback.stdout).unwrap();
+    assert_eq!(fallback_summary["disposition"], "succeeded");
+    assert_eq!(fallback_summary["recording"]["status"], "disabled");
     let fallback_trace = read_trace(&fallback_trace);
     assert!(fallback_trace["candidates"].as_array().unwrap().is_empty());
     let fallback_events = fallback_trace["events"].as_array().unwrap();
@@ -439,8 +591,78 @@ policy = "all"
         .iter()
         .any(|event| event["event"] == "dispatched"));
 
+    let required_trace = root.path().join("required-empty-trace.json");
+    let required = run_o_cli_mesh_no_record(
+        &project,
+        &empty_peer_root,
+        &required_trace,
+        &front_door_state,
+        &["--route", "local", "--mesh=required", "--mesh-retries=0"],
+    );
+    assert!(
+        !required.status.success(),
+        "required mesh unexpectedly fell back with an empty registry\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&required.stdout),
+        String::from_utf8_lossy(&required.stderr),
+    );
+    let required_summary: serde_json::Value = serde_json::from_slice(&required.stdout).unwrap();
+    assert_eq!(required_summary["disposition"], "infrastructure_failed");
+    assert_eq!(required_summary["recording"]["status"], "disabled");
+    let required_reason =
+        "mesh placement is required, but discovery found no authenticated peer eligible";
+    assert!(
+        String::from_utf8_lossy(&required.stderr).contains(required_reason),
+        "required-mode diagnostic lost its exact safe cause: {}",
+        String::from_utf8_lossy(&required.stderr)
+    );
+    assert!(required_summary["failure"]["message"]
+        .as_str()
+        .unwrap()
+        .contains(required_reason));
+    let required_trace = read_trace(&required_trace);
+    assert!(required_trace["candidates"].as_array().unwrap().is_empty());
+    assert!(required_trace["events"].as_array().unwrap().is_empty());
+
     node_a.guard.shutdown();
     node_b.guard.shutdown();
     assert!(node_a.state.join("mesh-v1/actors").is_dir());
     assert!(node_b.state.join("mesh-v1/actors").is_dir());
+
+    // Retained evidence must be self-contained: remove both the input bundle
+    // and every peer hint after the nodes are offline, then prove explanation
+    // and strict trace inspection are read-only and still tell the retry story.
+    fs::remove_dir_all(&project).unwrap();
+    fs::remove_dir_all(&peer_root).unwrap();
+    let history_before = snapshot_tree(&front_door_state);
+    let explanation = run_o_cli_evidence(&front_door_state, &["explain", "last-run"]);
+    assert!(
+        explanation.status.success(),
+        "offline explanation failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&explanation.stdout),
+        String::from_utf8_lossy(&explanation.stderr)
+    );
+    let explanation = String::from_utf8_lossy(&explanation.stdout);
+    for expected in [
+        "settled on node `mesh-node-a` with succeeded=false",
+        "migrated route `retry`",
+        "node `mesh-node-b`",
+        "succeeded=true",
+        "unsigned_observation",
+    ] {
+        assert!(
+            explanation.contains(expected),
+            "offline explanation omitted {expected:?}:\n{explanation}"
+        );
+    }
+    let inspection = run_o_cli_evidence(&front_door_state, &["inspect", "last-run", "--trace"]);
+    assert!(inspection.status.success());
+    let inspection: serde_json::Value = serde_json::from_slice(&inspection.stdout).unwrap();
+    assert_eq!(inspection["state"], "terminal");
+    assert_eq!(inspection["trace"]["schema"], "ostadix.run-trace/v1");
+    assert_eq!(inspection["trace"]["payload"]["engine"], "project_mesh");
+    assert_eq!(
+        snapshot_tree(&front_door_state),
+        history_before,
+        "read-only explain/inspect changed run history"
+    );
 }

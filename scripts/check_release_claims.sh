@@ -458,8 +458,17 @@ require_fixed docs/HGRAPH_EXECUTOR_PLAN.md \
     'The trace itself remains unsigned' \
     'the trace could be misread as the signed World receipt'
 require_fixed scripts/o-cli.sh \
-    'exec "$OLANGC_BIN" "$1" --target ir "${@:2}"' \
-    'the repository-owned o plan dispatcher no longer reaches project IR planning'
+    'exec "$OCLI_BIN" "$@"' \
+    'the repository-owned intent commands no longer reach the compiled Ostadix front door'
+require_fixed src/bin/o-cli.rs \
+    'Plan(PlanArgs)' \
+    'the compiled Ostadix front door no longer owns the plan grammar'
+require_fixed Dockerfile \
+    '--bin O --bin o-cli --bin olangc --bin o-link' \
+    'the runtime image no longer builds the compiled Ostadix front door'
+require_fixed Dockerfile \
+    'COPY --from=builder /src/target/release/o-cli  /usr/local/bin/o-cli' \
+    'the runtime image no longer installs the compiled Ostadix front door'
 require_fixed scripts/o-cli.sh \
     'exec "$OLANGC_BIN" "$1" --target ir --why "$2" "${@:3}"' \
     'the repository-owned o why dispatcher no longer reaches the focused admission query'

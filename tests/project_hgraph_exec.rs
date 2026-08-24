@@ -559,6 +559,14 @@ fn failed_prerequisite_blocks_the_main_route() {
             .exit_code,
         Some(23)
     );
+    assert_eq!(
+        failed_attempt
+            .settled_results()
+            .map(|(output, result)| (output, result.route_id.as_str(), result.exit_code))
+            .collect::<Vec<_>>(),
+        [(prepare_value, "prepare", Some(23))],
+        "failed-attempt results must be exposed in deterministic NodeId order"
+    );
     assert!(failed_attempt.is_materialized(prepare_value));
     assert!(!failed_attempt.is_failed(prepare_value));
     assert!(!failed_attempt.is_materialized(prepare_completion));

@@ -637,6 +637,7 @@ class WorkspaceFacadeReleaseValidationTests(unittest.TestCase):
         self.assertFalse(release.is_allowed_release_path("crates/private/Cargo.toml"))
         self.assertFalse(release.is_allowed_release_path("crates/ostadix-api/notes.txt"))
         self.assertTrue(release.is_allowed_release_path("src/lib.rs"))
+        self.assertTrue(release.is_allowed_release_path("src/bin/o-cli.rs"))
         self.assertTrue(release.is_allowed_release_path("src/bin/olangc.rs"))
         self.assertFalse(release.is_allowed_release_path("src/eval.rs"))
         self.assertFalse(release.is_allowed_release_path("src/world/identity.rs"))
@@ -750,6 +751,7 @@ class SourceReleaseTests(unittest.TestCase):
             "docs/HOSTED_LIVE_REFERENCE.md": "fixture hosted reference\n",
             "docs/HOSTED_PLACEMENT_V6.md": "fixture hosted placement contract\n",
             "docs/PROJECT_MESH_V1.md": "fixture project mesh contract\n",
+            "docs/UNIFIED_INTENT_FRONT_DOOR_V1.md": "fixture unified intent front door contract\n",
             "docs/KERNEL_WORLD_CONTRACT.md": "fixture kernel World contract\n",
             "docs/HOSTED_WORLD_REFERENCE_PROFILE.md": WORLD_NORMATIVE_BYTES[
                 "docs/HOSTED_WORLD_REFERENCE_PROFILE.md"
@@ -938,8 +940,12 @@ class SourceReleaseTests(unittest.TestCase):
             "crates/ostadix-api/src/eval.rs": "// fixture evaluator state bridge\n",
             "crates/ostadix-api/src/eval_core.rs": "// fixture evaluator-independent graph contract\n",
             "crates/ostadix-api/src/execution_contract.rs": "// fixture canonical execution contract\n",
+            "crates/ostadix-api/src/intent/mod.rs": "// fixture unified intent API\n",
+            "crates/ostadix-api/src/intent/record.rs": "// fixture private run-record schema\n",
+            "crates/ostadix-api/src/intent/store.rs": "// fixture private run-record store\n",
             "crates/ostadix-api/src/runtime_exec.rs": "// fixture direct-launch executable authority\n",
             "crates/ostadix-api/src/syntax_dialect.rs": "// fixture parser syntax dialect\n",
+            "src/bin/o-cli.rs": "// fixture compiled intent front door\n",
             "src/bin/o-info.rs": "// fixture local information CLI\n",
             "src/bin/o-node.rs": "// fixture direct hosted-node CLI\n",
             "src/bin/o-registry.rs": "// fixture signed local registry CLI\n",
@@ -1058,6 +1064,9 @@ class SourceReleaseTests(unittest.TestCase):
             "tests/test_ostadix_media_writer.py": "# fixture media-writer tests\n",
             "tests/test_ostadix_physical_evidence.py": "# fixture physical-evidence tests\n",
             "tests/test_o_cli_dispatch.py": "# fixture lowercase CLI dispatch tests\n",
+            "tests/unified_intent_acceptance.rs": "#[test] fn unified_intent_acceptance_fixture() {}\n",
+            "tests/o_cli_intent_blackbox.rs": "#[test] fn o_cli_intent_blackbox_fixture() {}\n",
+            "tests/unified_plan_boundaries.rs": "#[test] fn unified_plan_boundaries_fixture() {}\n",
             "tests/test_release_evidence.py": "# fixture release evidence tests\n",
             "tests/test_setup.py": "# fixture setup tests\n",
             "tests/test_bundled_shim_protocol.py": "# fixture bundled shim protocol tests\n",
@@ -1285,6 +1294,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "docs/HOSTED_LIVE_REFERENCE.md",
                 "docs/HOSTED_PLACEMENT_V6.md",
                 "docs/PROJECT_MESH_V1.md",
+                "docs/UNIFIED_INTENT_FRONT_DOOR_V1.md",
                 "docs/HOSTED_WORLD_REFERENCE_PROFILE.md",
                 "docs/KERNEL_WORLD_CONTRACT.md",
                 "docs/O_MACHINE_CONTRACT.md",
@@ -1417,8 +1427,12 @@ class SourceReleaseTests(unittest.TestCase):
                 "crates/ostadix-api/src/eval.rs",
                 "crates/ostadix-api/src/eval_core.rs",
                 "crates/ostadix-api/src/execution_contract.rs",
+                "crates/ostadix-api/src/intent/mod.rs",
+                "crates/ostadix-api/src/intent/record.rs",
+                "crates/ostadix-api/src/intent/store.rs",
                 "crates/ostadix-api/src/runtime_exec.rs",
                 "crates/ostadix-api/src/syntax_dialect.rs",
+                "src/bin/o-cli.rs",
                 "src/bin/o-info.rs",
                 "src/bin/o-node.rs",
                 "src/bin/o-registry.rs",
@@ -1534,6 +1548,9 @@ class SourceReleaseTests(unittest.TestCase):
                 "tests/test_ostadix_media_writer.py",
                 "tests/test_ostadix_physical_evidence.py",
                 "tests/test_o_cli_dispatch.py",
+                "tests/unified_intent_acceptance.rs",
+                "tests/o_cli_intent_blackbox.rs",
+                "tests/unified_plan_boundaries.rs",
                 "tests/test_release_evidence.py",
                 "tests/test_setup.py",
                 "tests/test_bundled_shim_protocol.py",
@@ -2529,6 +2546,24 @@ class SourceReleaseTests(unittest.TestCase):
         ):
             self._build("missing-prepared-task-pool.zip")
 
+    def test_unified_intent_front_door_contract_and_acceptance_are_required(
+        self,
+    ) -> None:
+        required = (
+            "docs/UNIFIED_INTENT_FRONT_DOOR_V1.md",
+            "tests/unified_intent_acceptance.rs",
+            "tests/o_cli_intent_blackbox.rs",
+            "tests/unified_plan_boundaries.rs",
+        )
+        self._commit()
+        self._git("rm", *required)
+        self._git("commit", "-q", "-m", "remove unified intent release closure")
+
+        self._assert_missing_required_paths(
+            "missing-unified-intent-front-door.zip",
+            required,
+        )
+
     def test_project_hgraph_hosted_surface_is_required(self) -> None:
         self._commit()
         self._git(
@@ -2539,6 +2574,7 @@ class SourceReleaseTests(unittest.TestCase):
             "scripts/smoke-project-hgraph-exec.sh",
             "scripts/smoke-project-hgraph.sh",
             ".github/workflows/ci.yml",
+            "src/bin/o-cli.rs",
             "src/bin/olangc.rs",
             "src/bin/olink.rs",
             "crates/ostadix-api/src/hgraph/graph.rs",
@@ -2572,6 +2608,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "scripts/install-o-cli-wrapper.sh",
                 "scripts/smoke-project-hgraph-exec.sh",
                 "scripts/smoke-project-hgraph.sh",
+                "src/bin/o-cli.rs",
                 "src/bin/olangc.rs",
                 "src/bin/olink.rs",
                 "crates/ostadix-api/src/hgraph/graph.rs",

@@ -26,8 +26,8 @@ use crate::backend_catalog::BackendRegistry;
 use crate::executor::CancellationToken;
 use crate::project::model::b64_bytes;
 use crate::project::runtime::{
-    is_cancellation_error, run_route_cancellable, EnvironmentPolicy, ExecutionLimits,
-    GuardBehavior, ProcessTreePolicy, RunOptions,
+    is_cancellation_error, public_route_execution_diagnostic, run_route_cancellable,
+    EnvironmentPolicy, ExecutionLimits, GuardBehavior, ProcessTreePolicy, RunOptions,
 };
 use crate::project::{
     build_project_hgraph, LogicalHGraphV1, ProjectBundle, RouteGuard, RoutePolicy,
@@ -1744,9 +1744,17 @@ impl MeshNodeRuntime {
                 run_route_cancellable(&bundle, &spec.route_id, &run_options, cancellation).map_err(
                     |error| {
                         if is_cancellation_error(&error) {
-                            mesh_error("route-cancelled", format!("{error:#}"), false)
+                            mesh_error(
+                                "route-cancelled",
+                                public_route_execution_diagnostic(&error),
+                                false,
+                            )
                         } else {
-                            mesh_error("route-execution", format!("{error:#}"), false)
+                            mesh_error(
+                                "route-execution",
+                                public_route_execution_diagnostic(&error),
+                                false,
+                            )
                         }
                     },
                 )

@@ -868,6 +868,19 @@ impl OExecutionResult {
 
     /// A compact, human-readable one-run summary.
     pub fn summary(&self) -> String {
+        self.render_summary(true)
+    }
+
+    /// Human result rendering suitable for persistent unsigned observations.
+    /// Foreign argv and host workspace paths are omitted because either may
+    /// contain credentials or other ambient values. Captured process output,
+    /// decoded values, and artifact evidence remain byte/evidence complete on
+    /// the structured result stored alongside this rendering.
+    pub fn observation_summary(&self) -> String {
+        self.render_summary(false)
+    }
+
+    fn render_summary(&self, include_provenance: bool) -> String {
         let mut out = String::new();
         let status = match (self.disposition, self.exit_code) {
             (RouteExecutionDisposition::GuardSkipped, _) => "skipped".to_string(),
@@ -881,11 +894,13 @@ impl OExecutionResult {
             status,
             self.duration_ns / 1_000_000,
         ));
-        out.push_str(&format!(
-            "  command: {}\n",
-            self.provenance.command.join(" ")
-        ));
-        out.push_str(&format!("  cwd: {}\n", self.provenance.cwd.display()));
+        if include_provenance {
+            out.push_str(&format!(
+                "  command: {}\n",
+                self.provenance.command.join(" ")
+            ));
+            out.push_str(&format!("  cwd: {}\n", self.provenance.cwd.display()));
+        }
         let stdout = self.stdout_text();
         if !stdout.trim().is_empty() {
             out.push_str("  stdout:\n");

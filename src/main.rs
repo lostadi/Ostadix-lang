@@ -553,7 +553,7 @@ fn print_scope(scope: &HashMap<String, OValue>, color: bool) {
 }
 
 fn preview_value(val: &OValue, color: bool) -> String {
-    let full = format_value(val, color, 0);
+    let full = o_lang::intent::format_ordinary_value(val, color, 0);
     // Flatten newlines and cap at 60 chars for inline display
     let flat: String = full
         .chars()
@@ -599,131 +599,10 @@ fn fmt_err(msg: &str, color: bool) -> String {
 /// Strings and HTML are emitted raw. Structured values get a dim type badge.
 fn print_result(value: &OValue) {
     let color = io::stdout().is_terminal();
-
-    match value {
-        OValue::Text { v } => print!("{}", v.utf8),
-        OValue::Html { v } => print!("{v}"),
-        OValue::Null => {
-            println!("{}", if color { "\x1b[2mnull\x1b[0m" } else { "null" });
-        }
-        OValue::Bool { v } => println!("{}", colored(v, "\x1b[33m", color)),
-        OValue::List { v } => println!("{}", format_list(v, color, 0)),
-        OValue::Map { v } => println!("{}", format_map(v, color, 0)),
-        other => {
-            let t = other.type_name();
-            let d = format!("{other}");
-            if color {
-                println!("\x1b[90m[{t}]\x1b[0m {d}")
-            } else {
-                println!("[{t}] {d}")
-            }
-        }
-    }
-}
-
-fn colored(v: &dyn std::fmt::Display, code: &str, color: bool) -> String {
-    if color {
-        format!("{code}{v}\x1b[0m")
-    } else {
-        v.to_string()
-    }
-}
-
-fn format_list(items: &[OValue], color: bool, depth: usize) -> String {
-    if items.is_empty() {
-        return if color {
-            "\x1b[90m[]\x1b[0m".into()
-        } else {
-            "[]".into()
-        };
-    }
-    let indent = "  ".repeat(depth + 1);
-    let close = "  ".repeat(depth);
-    let (open_b, close_b) = if color {
-        ("\x1b[90m[\x1b[0m", "\x1b[90m]\x1b[0m")
-    } else {
-        ("[", "]")
-    };
-    let mut out = format!("{open_b}\n");
-    for item in items {
-        out.push_str(&indent);
-        out.push_str(&format_value(item, color, depth + 1));
-        out.push_str(",\n");
-    }
-    out.push_str(&close);
-    out.push_str(close_b);
-    out
-}
-
-fn format_map(map: &HashMap<String, OValue>, color: bool, depth: usize) -> String {
-    if map.is_empty() {
-        return if color {
-            "\x1b[90m{}\x1b[0m".into()
-        } else {
-            "{}".into()
-        };
-    }
-    let indent = "  ".repeat(depth + 1);
-    let close = "  ".repeat(depth);
-    let (open_b, close_b) = if color {
-        ("\x1b[90m{\x1b[0m", "\x1b[90m}\x1b[0m")
-    } else {
-        ("{", "}")
-    };
-    let mut pairs: Vec<_> = map.iter().collect();
-    pairs.sort_by_key(|(k, _)| k.as_str());
-    let mut out = format!("{open_b}\n");
-    for (k, v) in pairs {
-        out.push_str(&indent);
-        if color {
-            out.push_str(&format!("\x1b[35m\"{k}\"\x1b[0m: "))
-        } else {
-            out.push_str(&format!("{k:?}: "))
-        }
-        out.push_str(&format_value(v, color, depth + 1));
-        out.push_str(",\n");
-    }
-    out.push_str(&close);
-    out.push_str(close_b);
-    out
-}
-
-fn format_value(v: &OValue, color: bool, depth: usize) -> String {
-    match v {
-        OValue::Null => {
-            if color {
-                "\x1b[2mnull\x1b[0m".into()
-            } else {
-                "null".into()
-            }
-        }
-        OValue::Bool { v } => colored(v, "\x1b[33m", color),
-        OValue::Text { v } => {
-            if color {
-                format!("\x1b[32m{:?}\x1b[0m", v.utf8)
-            } else {
-                format!("{:?}", v.utf8)
-            }
-        }
-        OValue::Html { v } => {
-            if color {
-                format!("\x1b[32m{v:?}\x1b[0m")
-            } else {
-                format!("{v:?}")
-            }
-        }
-        OValue::List { v } => format_list(v, color, depth),
-        OValue::Map { v } => format_map(v, color, depth),
-        other => {
-            let t = other.type_name();
-            let d = format!("{other}");
-            if color {
-                format!("\x1b[90m[{t}]\x1b[0m {d}")
-            } else {
-                format!("[{t}] {d}")
-            }
-        }
-    }
+    let bytes = o_lang::intent::render_ordinary_value_stdout_with_color(value, color);
+    io::stdout()
+        .write_all(&bytes)
+        .expect("failed to write evaluator result");
 }
 
 // ─── Shared backend list ──────────────────────────────────────────────────────

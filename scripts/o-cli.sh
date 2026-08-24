@@ -4,6 +4,7 @@
 set -euo pipefail
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+OCLI_BIN=${O_LANG_OCLI_BIN:-"$ROOT/target/release/o-cli"}
 OLANGC_BIN=${O_LANG_OLANGC_BIN:-"$ROOT/target/release/olangc"}
 O_BIN=${O_LANG_EVALUATOR_BIN:-"$ROOT/target/release/O"}
 KERNEL_CLI_BIN=${O_LANG_KERNEL_CLI_BIN:-"$ROOT/scripts/o-kernel.sh"}
@@ -14,53 +15,14 @@ OCTL_BIN=${O_LANG_OCTL_BIN:-"$ROOT/target/release/octl"}
 REGISTRY_BIN=${O_LANG_REGISTRY_BIN:-"$ROOT/target/release/o-registry"}
 INFO_BIN=${O_LANG_INFO_BIN:-"$ROOT/target/release/o-info"}
 
-usage() {
-    cat <<'USAGE'
-Usage: o <command> [arguments]
-
-Repository commands:
-  run FILE.O [backends]          Run one local O document
-  plan <project-or-.O> [options]  Print the OIR and execution plan
-  why FILE.O P<N> [options]       Explain one admitted plan operation
-  node start|stop|status|restart
-                                  Run this machine as a zero-config LAN node
-  node pair [NODE_ID]             Offer or join one passcode pairing
-  node list|use|profile|doctor|run|session ...
-                                  Discover and use LAN nodes without connection flags
-  node-host <command> ...         Expert alias for the raw o-node service CLI
-  registry <command> ...          Manage the local signed node registry
-  info <command> ...              Manage the local authority-free information store
-  live <command> ...              Run the hosted live-system control plane
-  receipt [ogit arguments]        Emit the O-Git semantic receipt demo
-  kernel <command>               Build, boot, or verify the O-core kernel
-  help                           Show this help
-
-Any other arguments retain evaluator behavior and are forwarded to the native O
-binary. On case-insensitive filesystems O/o share this dispatcher; use
-ostadix-evaluator when a command word must be treated as evaluator input.
-USAGE
-}
-
 case "${1:-}" in
-    help)
-        usage
-        ;;
-    run)
-        shift
-        if [[ $# -eq 0 ]]; then
-            printf 'usage: o run FILE.O [backends]\n' >&2
-            exit 2
+    help|--help|-h|run|plan|explain|inspect)
+        if [[ ! -x "$OCLI_BIN" ]]; then
+            printf 'error: compiled Ostadix front door is missing or not executable: %s\n' "$OCLI_BIN" >&2
+            exit 1
         fi
         export O_BACKENDS_DIR="${O_BACKENDS_DIR:-$ROOT/backends}"
-        exec "$O_BIN" "$@"
-        ;;
-    plan)
-        shift
-        if [[ $# -eq 0 ]]; then
-            printf 'usage: o plan <project-or-.O> [olangc options]\n' >&2
-            exit 2
-        fi
-        exec "$OLANGC_BIN" "$1" --target ir "${@:2}"
+        exec "$OCLI_BIN" "$@"
         ;;
     why)
         shift
