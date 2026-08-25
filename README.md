@@ -9,33 +9,14 @@
 [![CI](https://github.com/lostadi/Ostadix-lang/actions/workflows/ci.yml/badge.svg)](https://github.com/lostadi/Ostadix-lang/actions/workflows/ci.yml)
 [![Parser fuzz campaign](https://github.com/lostadi/Ostadix-lang/actions/workflows/fuzz.yml/badge.svg)](https://github.com/lostadi/Ostadix-lang/actions/workflows/fuzz.yml)
 
-> **Every expression carries its own interpreter as part of its syntax.**
+> **Every expression carries its evaluator as part of its syntax.**
 
-This repository is the compatibility-preserving integration monorepo for
-**OSTADIX**, the umbrella system. Its component names remain distinct:
-
-- **Ostadix-lang** is the hosted polyglot language and evidence-bound HGraph
-  runtime.
-- **O-core** is the freestanding native systems language.
-- **OKernel** is the sovereign kernel built through O-core.
-- **O-Machine** is the architecture-specific machine-resource and
-  virtualization substrate.
-- A governed **World** is OSTADIX's distributed runtime ontology.
-
-The first integrated system release is named **OSTADIX Alpha**. `World`
-continues to name runtime identities, resources, namespaces, contracts, and an
-elastic governed computer; it is not part of the release name. Existing
-Ostadix-lang commands, package identities, URLs, and citation metadata remain
-compatible.
-
-The bounded v0.3.0 release record, verification boundary, and explicit
-nonclaims are in [docs/releases/v0.3.0.md](docs/releases/v0.3.0.md).
-
-Ostadix-lang is a language system built on one
-radical idea: the language an expression is written in is a structural part
-of the expression itself, not a file extension, not a global mode switch, not
-a pragma. You write the language name directly around the code, and the
-runtime dispatches to that language's evaluator on the spot.
+I created Ostadix-lang to make a whole polyglot program one typed expression
+tree. A language boundary appears where computation changes language, and the
+result crosses that boundary as an `OValue`. The same source becomes an
+admitted operation graph, receives an explicit placement, executes through
+persistent evaluators or native machinery, and leaves evidence that can be
+inspected independently of the prose describing it.
 
 ```O
 html^(
@@ -45,47 +26,156 @@ __oval_result__ = sum(x*x for x in range(10))
 )_html
 ```
 
-The `python^( ... )_python` block is not a string, not a template, not a code
-fence. It is an *expression*. Its parenthesis shape, `LANG^(` ... `)_LANG`, is
-the syntax that says "evaluate this in Python." The result is an OValue that
-HTML can embed directly, without either side knowing about the other's type
-system.
+`LANG^( body )_LANG` is an expression form. The parser records the evaluator
+tag and nested source in one tree. The evaluator runs the inner Python block,
+lifts its result into `OValue`, and renders that value according to the
+receiving HTML expression. The nesting itself is the interface.
 
-**Start here:** [Quickstart](#quickstart) ·
-[Full setup](#getting-started-full-setup-guide) · [Docker](#docker) ·
-[Architecture](#architecture) · [Semantic custody](docs/SEMANTIC_CUSTODY.md) ·
-[Information Kernel V1](docs/INFORMATION_KERNEL_V1.md) ·
-[Versioning](docs/VERSIONING.md) · [Testing](#running-the-tests) ·
-[Evidence claims](docs/CLAIMS.md) ·
-[Zero-config LAN nodes](docs/ZERO_CONFIG_LAN.md) ·
-[Project mesh V1](docs/PROJECT_MESH_V1.md) ·
-[Hosted Placement V6](docs/HOSTED_PLACEMENT_V6.md)
+The system has two computational languages:
 
-Ostadix-lang now has two computation layers that share one project but do different
-jobs:
+1. **O orchestration**, written in `.O`, composes hosted languages, persistent
+   evaluator environments, deferred work, project routes, operating-system
+   values, and distributed placement through typed parentheses and `OValue`.
+2. **O-core**, written in `.oc`, compiles statically typed machine computation
+   through resolved HIR and SSA MIR into freestanding x86_64 and bounded
+   AArch64 objects. OKernel is built through this pipeline.
 
-1. **O orchestration**, written in `.O` files, composes real hosted languages,
-   persistent environments, deferred computations, Nix operations, and
-   operating-system values through typed parentheses and OValue.
-2. **O-core**, written in `.oc` files, is the statically typed native systems
-   language. It compiles through typed HIR and SSA MIR into freestanding
-   ELF64 object files for its primary x86_64 target and bounded AArch64 G2
-   subset. It is capable of building a kernel without Python, JSON,
-   subprocesses, a filesystem, libc, or Rust `std` in the target image.
+OIR models orchestration among evaluators. O-core MIR models control flow,
+memory, ABI, atomics, hardware operations, and native execution. That division
+lets Python, Rust, Nix, SQL, HTML, and the other hosted evaluators remain rich
+user-space participants while the native target remains freestanding.
 
-This separation is deliberate. OIR describes orchestration between language
-runtimes. O-core MIR describes machine computation, control flow, memory, and
-hardware. Hosted blocks such as `python^`, `rust^`, `nix^`, and `sql^` remain
-available in user space without becoming kernel dependencies.
+**OSTADIX** names the integrated system. **Ostadix-lang** is its hosted
+language and evidence-bound HGraph runtime. **O-core** is its native systems
+language. **OKernel** is the capability-oriented kernel. **O-Machine** names
+the architecture-specific resource and virtualization substrate. A governed
+**World** names the distributed identity, resource, namespace, and execution
+ontology. The first integrated-system release that satisfies the G0 through
+G13 qualification gates is named **OSTADIX Alpha**.
 
-**Portability.** Hosted Ostadix-lang is architecture-portable through its
-Rust/Cargo, C17, and Python implementations, subject to availability of the
-evaluator runtimes used by a program. It has been developed and run on macOS
-ARM64, Android ARM64 on a rooted Pixel 8 Pro, and Intel x86_64 Linux. O-core's
-broad compiler/kernel target remains x86_64, while G2 adds a bounded,
-conservative `aarch64-unknown-none` scalar backend and single-vCPU QEMU/TCG
-execution. Those native target boundaries do not apply to hosted `.O`
-execution.
+### Read the technical artifact set
+
+- [Technical whitepaper PDF](Ostadix-lang_Technical_Whitepaper.pdf)
+- [Technical whitepaper TeX source](docs/Ostadix-lang_Technical_Whitepaper.tex)
+- [Compiler-emitted O-linked HGraph as DOT](docs/figures/o-linked-codebase-hgraph.dot)
+- [Rendered O-linked HGraph as SVG](docs/figures/o-linked-codebase-hgraph.svg)
+- [Hosted language specification](SPEC.md)
+- [O-core language and ABI specification](docs/OCORE.md)
+- [Architecture](ARCHITECTURE.md)
+- [Claim and evidence index](docs/CLAIMS.md)
+
+The artifact set is pinned to master commit
+`36787b16476bc0c8c4ddf665c7228b314d04e716`. At that snapshot,
+`ostadix-api` owns 42 engine modules. Its 36 public module identities are
+reexported by the root compatibility library. The root Cargo package declares
+14 binaries, including `ogit` and `ocore-kernel-world-record`. The backend
+catalog contains 30 canonical backends and six aliases, including canonical
+`ubuntu_vm` with the `ubuntu` alias. Current master tracks 44 recursively
+discovered `.O` examples. The in-checkout MCP server exposes 10 tools. Native
+release evidence contains 26 required portable QEMU gates and one supplemental
+hardware gate.
+
+The isolated current-master Rust audit recorded 1,351 passing tests and three
+ignored tests. The current-master portable native aggregate recorded 26 of 26
+required gates passing. The exact validation scope and the checked-in G0
+historical evidence continuity defect are recorded in
+[Validation at the audited master](#validation-at-the-audited-master) and
+[Exact implementation boundaries](#exact-implementation-boundaries).
+
+## How to read Ostadix-lang
+
+Read the system from left to right:
+
+**source → admitted graph → placement → execution → evidence**
+
+```mermaid
+flowchart LR
+    S["Source<br/>.O document or lifted project"]
+    P["Parse and close source<br/>ONode or ProjectBundle"]
+    G["Construct graph<br/>OIR and Logical HGraph"]
+    A["Admit graph<br/>Evidence V6 and Admission V6"]
+    L{"Place admitted work"}
+    X["Execute<br/>local workers, Hosted V2, or mesh peer"]
+    R["Observe<br/>OValue and RuntimeGraph"]
+    E["Prove<br/>trace, receipt, DOT, and release gates"]
+
+    S --> P --> G --> A --> L --> X --> R --> E
+```
+
+The arrows represent custody of one exact computation. Each stage adds a
+stronger artifact while retaining the identities required to connect it to the
+source that created it.
+
+### 1. Source is executable structure
+
+A `.O` document is a recursive evaluator tree. Each typed parenthesis chooses
+the evaluator for that expression. Bindings, environment indices, lazy
+requests, coordination groups, and nested expressions are parsed into one
+structural document. A directory can enter the system through `o-link` as a
+literal linked program or as a lossless route-preserving `ProjectBundle`.
+
+The novelty is structural evaluator composition. The unit of composition is
+the expression itself, so language selection, nesting, value transfer, and
+source location remain visible to the parser and compiler.
+
+### 2. The source becomes an admitted graph
+
+The compiler lowers ordinary `.O` source into OIR, an `ExecutionPlan`, and an
+executable HGraph. Project input becomes a canonical Project Logical HGraph
+whose operations carry route, prerequisite, input, output, environment, and
+effect declarations. Evidence V6 binds the exact source, backend catalog,
+adapter identities, graph, and policy. Admission V6 checks that evidence and
+produces the authority-bearing `AdmittedExecution` consumed by dispatch.
+
+This makes graph construction and execution two observable phases. The graph
+can be rendered, explained, hashed, and rejected before an operation starts.
+
+### 3. Placement is a decision over admitted work
+
+The unified lowercase `o` front door accepts a `.O` file, a directory, or an
+already lifted project. It resolves the intended route, constructs the graph,
+performs fresh admission, and selects local workers, a directly addressed
+Hosted V2 session, or a paired Project Mesh V1 peer. Placement profiles bind
+backend requirements to exact executable realizations and short-lived capacity
+proofs.
+
+The placement unit for a project is a source-closed route and prerequisite
+island bound to the canonical project graph. A retry creates a new actor
+generation with fresh authority and evidence.
+
+### 4. Execution preserves evaluator and resource identity
+
+Inline evaluators execute structural forms. Hosted evaluators run through
+persistent length-prefixed canonical-CBOR processes, preserving explicitly
+indexed environments across calls. The readiness-driven HGraph executor starts
+operations as their value, completion, and resource-state dependencies become
+available. Project execution records the dynamic `RuntimeGraphV1` that actually
+occurred.
+
+O-core follows its own native pipeline from AST to HIR to SSA MIR to object
+code. OKernel then exercises process isolation, scheduling, IPC, loader and
+OVFS, native services, personality RPC, World codecs, and KernelWorld objects
+through booted gates.
+
+### 5. Evidence is part of the execution model
+
+Ostadix-lang records exact source and graph identities, backend and adapter
+digests, admission decisions, placement leases, normalized outcomes, resource
+transitions, and terminal receipts. `olangc --target ir` exposes the plan.
+`olangc --target dot` exposes the HGraph. `o explain` exposes why an operation
+was admitted and placed. Hosted V2 journals and World receipt formats bind
+longer-lived execution facts. The native gate manifest binds positive claims
+to exact transcript markers.
+
+The evidence layer turns an implementation claim into a reproducible route
+from source bytes to observed execution.
+
+**Continue:** [Quickstart](#quickstart) ·
+[Full setup](#getting-started-full-setup-guide) ·
+[Hosted Placement V6](#hosted-placement-v6) ·
+[Compiler and composition tools](#compiler-and-composition-tools) ·
+[O-core](#o-core-native-systems-language) ·
+[Tests](#running-the-tests)
 
 ## Quickstart
 
@@ -106,10 +196,8 @@ O examples/hello.O "$PWD/backends"
 O version --json
 ```
 
-`O version --json` reports compiled compatibility coordinates—package,
-toolchain, admission, catalog, Hosted, and World schema versions. It is
-descriptive: it does not prove that optional backend runtimes are installed,
-that a placement is authorized, or that a World is live.
+`O version --json` reports the package, toolchain, admission, catalog, Hosted,
+and World schema coordinates compiled into that executable.
 
 ### Zero-configuration LAN execution
 
@@ -133,11 +221,10 @@ at the hidden prompt:
 o node pair NODE_ID
 ```
 
-`--passcode-stdin` is available for noninteractive input. If ordinary LAN
-discovery cannot cross the route, keep the same authenticated exchange and
+`--passcode-stdin` is available for noninteractive input. When ordinary LAN
+discovery does not cross the route, keep the same authenticated exchange and
 name the directly TCP-reachable pairing endpoint with `--address HOST:7340`.
-This is routed pairing, not NAT traversal, relay, or hole punching; later
-reconnect also requires a reachable hosted-service route.
+Later commands use the paired identity over a reachable hosted-service route.
 
 Later ordinary commands reuse the reciprocal pinned identities without another
 passcode, address, certificate, key, capability, lease, operation ID, or proof
@@ -173,16 +260,13 @@ you need to choose among several semantic nodes. Explicit transport and trust
 configuration remains available through `--manual` and `o node-host` for
 operators who deliberately need it.
 
-The default is pairing-required: UDP discovery supplies only an unauthenticated
-routing hint, while SPAKE2 plus explicit confirmation binds the immutable
-server-CA, server-name, and receipt-key pins. Only public CA, CSR, certificate,
-and receipt material crosses the pairing channel; fresh per-peer private keys
-stay local. The former plaintext shared-key bootstrap is available only through
-the explicit legacy `--lan-open` switch. Duplicate or spoofed discovery replies
-can disrupt route selection but cannot replace a paired pin. Inbound client
-authentication is pairing-CA-wide: there is not yet a leaf-certificate
-allowlist, unpair operation, or revocation mechanism. The exact security and
-non-claim boundaries are documented in
+The default is pairing-required. UDP discovery supplies a routing hint. SPAKE2
+plus explicit confirmation binds the server CA, server name, and receipt-key
+pins. Public CA, CSR, certificate, and receipt material crosses the pairing
+channel; fresh per-peer private keys stay local. The explicit `--lan-open`
+switch retains the former shared-key bootstrap for compatibility. A discovery
+reply can select a route, while the persisted pairing pins decide identity.
+The full transport and trust contract is documented in
 [Zero-configuration LAN nodes](docs/ZERO_CONFIG_LAN.md).
 
 ### Peer-mesh execution for whole projects
@@ -195,21 +279,44 @@ o run ./large-codebase --parallel auto --route build \
   --explain-mesh --mesh-trace-out mesh-attempt.json
 ```
 
-The default is `prefer` with two additional remote attempts and local fallback
-only when execution is proven not to have started. The transferred actor is the
-exact project bundle plus a route/prerequisite island bound to its canonical
-Project Logical HGraph; retry creates a fresh actor generation rather than
-moving a live process image. Use `--mesh=required` when local fallback is not
-acceptable. Discovery is limited to LAN advertisements and the paired-peer
-registry—there is no NAT traversal or Internet gossip. The protocol, replay
-matrix, CLI flags, and nonclaims are in [Project mesh
+The default `prefer` policy permits two additional remote attempts and allows
+local fallback while the evidence proves execution has not started. The
+transferred actor is the exact project bundle plus a route and prerequisite
+island bound to its canonical Project Logical HGraph. Every retry receives a
+fresh actor generation. `--mesh=required` makes peer placement mandatory. LAN
+advertisements and the paired-peer registry supply the candidate set. The
+protocol, replay matrix, and CLI flags are in [Project mesh
 V1](docs/PROJECT_MESH_V1.md).
 
+```mermaid
+flowchart LR
+    D["UDP discovery<br/>routing hint"]
+    P["SPAKE2 pairing<br/>explicit confirmation"]
+    K["Pinned peer identity<br/>CA, name, receipt key"]
+    C["Source closure<br/>ProjectBundle"]
+    H["Logical HGraph<br/>selected route island"]
+    A["Fresh admission<br/>actor generation"]
+    M{"Mesh placement"}
+    R["Authenticated peer execution"]
+    F["Eligible local fallback"]
+    E["Trace and receipt"]
+
+    D --> P --> K
+    C --> H --> A --> M
+    K --> M
+    M --> R --> E
+    M --> F --> E
+```
+
+Read the upper path as identity establishment and the lower path as project
+custody. They meet at placement, where a paired identity and an admitted graph
+are both required for remote execution.
+
 The same front door accepts ordinary `.O` files and lifted project bundles.
-For an ordinary `.O`, `--parallel auto` uses only the local HGraph worker pool
-and performs no discovery or remote RPC. Planning is static by default; use
+For an ordinary `.O`, `--parallel auto` uses the local HGraph worker pool.
+Planning is static by default; use
 `o plan INPUT --parallel auto --live` only for bounded readiness/discovery
-observations. No `run` or `plan` form starts `o-node`. See the complete
+observations. Node lifecycle remains an explicit `o node` operation. See the complete
 [Unified Intent Front Door V1 contract](docs/UNIFIED_INTENT_FRONT_DOOR_V1.md).
 
 ### Independent Rust runtime engine
@@ -230,12 +337,13 @@ let mut runtime = Runtime::new("/absolute/path/to/backends");
 let value: OValue = runtime.evaluate("text^(hello)_text")?;
 ```
 
-Direct engine users may also import the public `parser`, `ir`, `hgraph`,
-`evidence`, `eval`, `executor`, `hosted_remote`, `project`, `world`, and other
-runtime modules from `ostadix_api`. Historical `o_lang::<module>` paths are
-explicit reexports of those same nominal types; there is no second evaluator or
-parallel value model. Reflected diagnostic paths such as `type_name` may name
-the defining `ostadix_api` crate even when code imports the compatibility path.
+Direct engine users may import the 36 public runtime modules from
+`ostadix_api`, including `parser`, `ir`, `hgraph`, `evidence`, `eval`,
+`executor`, `hosted_remote`, `project`, and `world`. Historical
+`o_lang::<module>` paths explicitly reexport the same nominal types. Reflected
+diagnostic paths such as `type_name` name the defining `ostadix_api` crate even
+when code imports the compatibility path. Six additional engine modules remain
+crate-private implementation structure.
 
 Registry publication order is now `ostadix-api` first, verify that exact version
 is available, then publish its `o-lang` shell dependent. This dependency
@@ -267,24 +375,45 @@ Choose the next path according to what you want to inspect:
 | O-core compiler and OKernel gates | Bounded research implementation; see exact QEMU nonclaims |
 | O-Machine and elastic governed World | Research direction with bounded offline records and milestone proofs |
 
-“Experimental” here does not mean simulated: these surfaces have executable
-implementations and tests. It means their compatibility, operational, or
-distributed guarantees are narrower than the supported hosted core. See
-[claims and nonclaims](docs/CLAIMS.md) for the exact evidence boundary.
+Experimental surfaces have executable implementations and tests. Their
+compatibility, operational, and distributed guarantees are still being
+hardened around the supported hosted core. See
+[claims and evidence](docs/CLAIMS.md) for the exact qualification boundary.
 
 ## Hosted Placement V6
 
-Package 0.3 uses local `oexec.evidence/v6` and `oexec.admission/v6` through
-Graph V2 for uppercase `O`, the evaluator/coordinator, CLI, and MCP execution.
-It preserves typed fidelity, exposes Why V2, and freshly prepares placement V2
-fragments. Graph V1/Evidence and Admission V5 remain explicit archival
-inspection APIs and are never converted into current authority. Hosted
-Placement V6 is a separate milestone name: it adds
-a transport-independent descriptor, requirement, warrant, capacity, and lease
-core. Its direct-node V1 compatibility path executes one fresh source document;
-its opt-in V2 path combines a locally prepared single-shim fragment with the
-complete signed placement proof and a durable, explicitly closed session. None
-of these coordinates is silently translated into another.
+The current execution path uses Graph V2, `oexec.evidence/v6`, and
+`oexec.admission/v6` across uppercase `O`, the evaluator and coordinator, the
+CLI, and MCP intent execution. Evidence V6 preserves typed fidelity and Why V2,
+then prepares placement V2 fragments. Hosted Placement V6 adds
+transport-independent target descriptors, requirements, warrants, capacity
+proofs, and leases. The direct-node V1 compatibility path executes one fresh
+source document. The V2 path combines a locally prepared single-shim fragment,
+a complete signed placement proof, and a durable explicitly closed session.
+
+```mermaid
+flowchart TD
+    I["User intent<br/>o run, o plan, or MCP handle"]
+    S["Exact source closure"]
+    G["Graph V2<br/>OIR or Project Logical HGraph"]
+    E["Evidence V6<br/>digests, types, provenance, policy"]
+    A["Admission V6<br/>AdmittedExecution"]
+    P["Placement V2<br/>descriptor, warrant, capacity, lease"]
+    D{"Dispatch target"}
+    L["Local HGraph workers"]
+    N["Direct Hosted V2 node"]
+    M["Paired Project Mesh peer"]
+    T["RuntimeGraph and terminal evidence"]
+
+    I --> S --> G --> E --> A --> P --> D
+    D --> L --> T
+    D --> N --> T
+    D --> M --> T
+```
+
+Read downward until the dispatch diamond. Every path above that diamond is a
+fresh source-bound authority decision. The three branches below it are
+placement choices over the same admitted computation.
 
 Current durable Hosted V2 state roots carry an exact package-0.3 execution
 authority marker for Graph V2, Evidence/Admission V6, and placement-admission
@@ -304,12 +433,12 @@ authorize candidate selection or warrant discharge. There is no digest
 relabeling or silent V4-to-V5 uplift. V4 remains the archival generation that
 added each backend's state-support tier and snapshot-compatibility identity.
 V5 extends that frozen projection with one explicit optional bounded
-backend-morphism profile: Python, JavaScript, and Rust are profiled, while the
-other 27 canonical backends explicitly are not. The Catalog V5 rollover itself
-changed catalog identity without changing `BackendInterface` or execution
-behavior at that rollover. Package 0.3 separately makes Graph V2/Evidence V6
-current; that path still does not enforce the shadow morphism profiles. Rebuild
-the runtime and MCP server, then regenerate
+backend-morphism profile. Python, JavaScript, and Rust carry that profile; the
+field is absent for the other 27 canonical backends. The Catalog V5 rollover
+itself changed catalog identity without changing `BackendInterface` or
+execution behavior at that rollover. Package 0.3 separately makes Graph
+V2/Evidence V6 current; morphism profiles remain shadow metadata on that path.
+Rebuild the runtime and MCP server, then regenerate
 short-lived profiles and all derived placement evidence after this rollover. The
 exact boundary and regeneration sequence are in [Hosted Placement
 V6](docs/HOSTED_PLACEMENT_V6.md#backend-catalog-v5-hard-rollover).
@@ -360,10 +489,11 @@ nodes](docs/ZERO_CONFIG_LAN.md).
 > development and fault diagnosis.
 
 This loopback walkthrough exercises the opt-in durable V2 path with the
-co-located, self-attested development authority. It is not production
-discovery, enrollment, scheduling, or key management. Paste each code block
-separately. If zsh displays `heredoc>`, press `Ctrl-C` before continuing; the
-commands below intentionally avoid heredocs.
+co-located, self-attested development authority. Production deployments supply
+their discovery, enrollment, scheduling, and key-management systems through
+the corresponding explicit interfaces. Paste each code block separately. If
+zsh displays `heredoc>`, press `Ctrl-C` before continuing; the commands below
+intentionally avoid heredocs.
 
 First refresh the installed tools and prove ordinary local execution:
 
@@ -555,7 +685,7 @@ check; ambient process identity is deliberately excluded from the signed
 portable coordinate.
 
 Open fixes the target, exact requirement footprint, backend implementation and
-pipeline, logical environment, trust policy, and compute reservation—not one
+pipeline, logical environment, trust policy, and compute reservation, not one
 source document for the session lifetime. For a stateful session, the first
 execute additionally fixes the physical `ActorGenerationIdV1`, including exact
 sandbox and launch context; later executes must match it. Each execute lease
@@ -617,17 +747,15 @@ signal's default action and forces process termination; work interrupted by
 that escape hatch is classified by the existing restart rules. Graceful node
 shutdown does not close a durable session, delete its payloads, or perform GC.
 
-The current state tiers are deliberately narrow: `Stateless` requires a fresh
-fragment and a catalogued stateless backend; `CheckpointRestore` requires a
-persistent environment and the exact catalogued semantic-snapshot codec;
-`LiveActorOnly` requires catalogued external-pinned state and does not survive
-actor loss. `ReplayReconstructible` is represented on the wire but rejected in
-this release. This Hosted V2 state-tier path does not independently perform
-automatic registry discovery, scheduler-driven target selection, retry, local
-fallback, cross-node live-process migration, or project-bundle dispatch. Those
-bounded placement/retry capabilities belong to the source-closed Project Mesh
-path exposed by `o-link` and `o run PROJECT`; its migration is a policy-checked
-new actor generation, not migration of a live process image. For a
+The current state tiers have exact recovery contracts. `Stateless` requires a
+fresh fragment and a catalogued stateless backend. `CheckpointRestore` requires
+a persistent environment and the exact catalogued semantic-snapshot codec.
+`LiveActorOnly` requires catalogued external-pinned state and ends with actor
+loss. `ReplayReconstructible` is represented on the wire and reserved for a
+future implementation. Automatic registry discovery, scheduler-driven target
+selection, retry, local fallback, and project-bundle dispatch belong to the
+source-closed Project Mesh path exposed by `o-link` and `o run PROJECT`. Mesh
+retry creates a policy-checked new actor generation. For a
 development-only loopback setup, `o-node pki init`,
 `o-node identity init`, and the clearly labeled co-located authority helper
 provision the necessary identities and full proof bundle without being a
@@ -647,9 +775,9 @@ live-only state remain fail-closed.
 The separate `o-registry` CLI manages a local, durable, signed namespace
 registry: `init`, `profile-local`, `publish-profile`, `verify`, `list`,
 `export`, and `import`. Its canonical snapshots support pinned roots and
-prefix-scoped delegation for offline federation, but there is no registry
-network daemon and neither `octl` nor the scheduler discovers or dispatches
-through this store. Normal setup also exposes it as `o registry ...` and
+prefix-scoped delegation for offline federation. Explicit export and import
+connect this local store to other systems; `octl` and scheduler dispatch use
+their own live inputs. Normal setup also exposes it as `o registry ...` and
 installs the native `ostadix-evaluator` alias used for exact runtime
 fingerprinting without treating the case-insensitive `O`/`o` dispatcher as the
 evaluator artifact. `o-node doctor` and `serve` use that same native alias as
@@ -679,12 +807,12 @@ o info verify --pack result.info.cbor --trust .ostadix-keys/info-trust.json
 o info head --state .ostadix-information
 ```
 
-No daemon, cloud service, cluster, VM, or laboratory hardware is involved.
+This workflow is local and offline.
 `o info import` advances a local head only when the signed pack has the exact
 current base and every bounded object proves its canonical type and expected
 base-plus-addition revision. Otherwise it retains the verified pack under
 `historical-packs/`, reports `historical-only`, and leaves the head unchanged.
-Neither a signature nor head membership grants execution authority. See
+Execution authority enters through a separate admitted-execution artifact. See
 [Information Kernel V1](docs/INFORMATION_KERNEL_V1.md) for the exact boundary.
 
 The Unreleased 0.4 engine adds `ostadix_api::information_provenance` as a
@@ -711,10 +839,7 @@ directory and performs no head update. The independent `ostadix-api` engine
 exports these advanced records, and `o_lang::api` reexports that same module;
 generated AOT projects intentionally do not embed the Information roots.
 
-This hosted profile is not a World, Governor, G1/G10, physical-machine,
-exactly-once, global-effect-isolation, project-migration, cancellation, or mid-
-operation-migration claim. Its complete contract, trust rules, user commands,
-and exclusions are in
+Its complete contract, trust rules, user commands, and exact boundary are in
 [Hosted Placement V6](docs/HOSTED_PLACEMENT_V6.md).
 
 ---
@@ -726,11 +851,11 @@ agents: one `.O` program can delegate each subtask to the best hosted language
 while every result flows through the typed OValue boundary. The `O` CLI has an
 agent-oriented surface:
 
-- `O --json program.O` — run and emit a single-line JSON result or structured
+- `O --json program.O`: run and emit a single-line JSON result or structured
   error (`{"ok":false,"stage":"parse"|"eval","error":...}`) on stdout.
-- `O --check program.O` — parse-only validation without executing anything
+- `O --check program.O`: parse-only validation without executing anything
   (combine with `--json` for a machine-readable verdict).
-- `O --eval '<source>'` / `O -e '<source>'` — evaluate an inline expression
+- `O --eval '<source>'` / `O -e '<source>'`: evaluate an inline expression
   without a file.
 
 See [docs/AI_GUIDE.md](docs/AI_GUIDE.md) for the full agent workflow, syntax
@@ -739,9 +864,9 @@ this repository.
 
 ### Local MCP server for AI-agent tools
 
-The repository also includes `ostadix-mcp`, a local stdio
+The repository includes `ostadix-mcp`, a local stdio
 [Model Context Protocol](https://modelcontextprotocol.io/) server under
-`mcp/ostadix_lang_mcp_server/`. It exposes a small, typed tool surface over the
+`mcp/ostadix_lang_mcp_server/`. It exposes 10 typed tools over the
 existing local `O` and `olangc` binaries so an MCP-capable agent can discover
 the Ostadix environment and all canonical backend runtime requirements, run a
 smoke test, execute a `.O` program, or inspect a compiler target without
@@ -753,12 +878,35 @@ reconstructing executable and backend paths by hand.
 | `o_runtimes` | Discovers executable requirements and projects typed value capabilities from the canonical backend catalog compiled into that MCP binary, including alternative runtime sets, without failing because an optional runtime is absent. Rebuild MCP with O after catalog changes. |
 | `o_doctor` | Checks the local toolchain and inventories compatibility shims plus the complete backend runtime report. |
 | `o_smoke` | Runs `examples/hello.O` with an absolute backend path and expects `2`. |
-| `o_analyze_intent` | Nonexecutingly creates a bounded one-use handle for an exact source and stable analyzed graph intent. |
+| `o_analyze_intent` | Analyzes exact source and a stable graph intent, then creates a bounded one-use handle. |
 | `o_execute_intent` | Consumes that handle, requires O to recompute the same Intent V1, then performs a fresh V6 admission before dispatch. |
-| `o_run` | Runs one local `.O` file directly with an explicit working directory and timeout; this remains an ungated compatibility path. |
+| `o_run` | Runs one local `.O` file directly with an explicit working directory and timeout. |
 | `o_olangc` | Runs `olangc` with the resolved shim directory; supports `ir`, `dot`, `script`, and `wasm`, or the default target. |
 | `o_search_run` | Runs a named search program from an external `a18re` work tree when that optional tree is present. |
-| `o_information_inspect` | Runs fixed local `o-info head` against one existing non-symlink state root with bounded input, output, and timeout; returns sanitized object IDs/count only, never the state path, raw stderr, cloud/network access, logical/content/inode/mode/mtime mutation, or authority. Atime is untested. |
+| `o_information_inspect` | Runs fixed local `o-info head` against one existing non-symlink state root with bounded input, output, and timeout. It returns sanitized object IDs and counts while preserving entries, content, inode, mode, and mtime. |
+
+```mermaid
+sequenceDiagram
+    participant Agent as MCP agent
+    participant MCP as ostadix-mcp
+    participant Analyzer as O intent analyzer
+    participant Runtime as O runtime
+
+    Agent->>MCP: o_analyze_intent(source)
+    MCP->>Analyzer: parse, lower, solve, fingerprint
+    Analyzer-->>MCP: Intent V1 plus one-use handle
+    MCP-->>Agent: opaque bounded handle
+    Agent->>MCP: o_execute_intent(handle, same source)
+    MCP->>Runtime: recompute Intent V1
+    Runtime->>Runtime: fresh Evidence V6 and Admission V6
+    Runtime-->>MCP: terminal OValue or structured failure
+    MCP-->>Agent: result and consumed handle status
+```
+
+Read the sequence from top to bottom. Analysis produces an opaque one-use
+handle. Execution accepts the handle only after recomputing the same intent and
+performing a fresh admission, so an old analysis result never substitutes for
+dispatch-time validation.
 
 The normal setup builds this separate, lockfile-pinned Rust crate and, unless
 wrappers are disabled, copies the executable to
@@ -834,20 +982,17 @@ o_olangc {"path":"/absolute/path/to/Ostadix-lang/examples/hello.O","target":"ir"
 o_information_inspect {"state":"/absolute/path/to/existing-information-state","head":"main"}
 ```
 
-These are MCP tool names and argument objects, not shell commands. `o_smoke`
-should return `SMOKE_OK` and show the program result `2`.
+Enter these names and argument objects through the MCP client's tool-call
+interface. `o_smoke` should return `SMOKE_OK` and show the program result `2`.
 
-`ostadix-mcp` is a local child process, not a hosted service. It has no network
-listener or authentication layer and executes local programs with the
-authority inherited from the MCP client. It preserves the client's `PATH`,
+`ostadix-mcp` runs as a local child process over stdio and executes local
+programs with the authority inherited from the MCP client. It preserves the client's `PATH`,
 then appends existing local Homebrew, Nix, language-manager, and per-runtime
 locations so GUI-launched clients can see the same runtimes as terminal tools.
 Set `OSTADIX_RUNTIME_PATH` to add explicit search directories. Discovery checks
 executable presence; the selected backend adapter remains the execution
-authority and reports launch or runtime failures. The MCP surface does not
-expose `o-link`, `o-unlink`, `ocorec`, kernel boot gates, repository editing, or
-a separate arbitrary-shell tool. A `.O` program run through `o_run` can still
-invoke any configured backend, including shell backends.
+authority and reports launch or runtime failures. A `.O` program run through
+`o_run` can invoke any configured backend, including shell backends.
 
 ---
 
@@ -1088,6 +1233,31 @@ backends, Python execution, the Nix value ladder, lazy and deferred requests,
 shebang handling, and AOT packaging. The Rust edition remains authoritative
 for OIR planning, coordination-group concurrency, the full backend registry,
 the notebook, and O-core.
+
+### Embedding the Python and C17 editions
+
+The Python package exports its complete root API from `o_lang/__init__.py`:
+
+- Evaluation and syntax: `run`, `parse`, `evaluate_document`, `EvalContext`,
+  `pretty`, and `reconstruct_source`.
+- Environment coordinates: `EPHEMERAL_ENV_ID`, `LINKER_ISOLATED_ENV_ID`, and
+  `MAX_PERSISTENT_ENV_ID`.
+- Syntax nodes: `Document`, `ExpressionNode`, and `TextPart`.
+- Values: `OValue`, `ONull`, `OBool`, `OInt`, `OFloat`, `OStr`, `OHtml`,
+  `OStorePath`, `OList`, `OMap`, `OScope`, `OBlob`, and `OExpr`.
+- Conversions and rendering: `from_python`, `to_python`, `render_plain`, and
+  `to_json_str`.
+
+The C17 edition exposes six public header families:
+
+| Header | Declared surface |
+|---|---|
+| `c_cpp/include/value.h` | Owned tagged OValues, constructors, retain/release, typed access, maps, splice rendering, content identity, JSON, length-prefixed CBOR wire messages, SHA-256, and Base64. |
+| `c_cpp/include/parser.h` | Typed AST nodes, backend-name sets, parser lifecycle, document parsing, destruction, and source reconstruction. |
+| `c_cpp/include/eval.h` | Evaluator lifecycle, registered-backend selection, document/source evaluation, error state, child rendering, and shim lookup. |
+| `c_cpp/include/process.h` | Backend-process lifecycle, framed callback steps, execution, persistent process registry, environment cleanup, and global cleanup. |
+| `c_cpp/include/scheduler.h` | Disk cache, autonomous scheduler lifecycle, parallelism, cached execution, callback evaluation, and transitive-request collection. |
+| `c_cpp/include/nix_ops.h` | Nix instantiation, realization, activation or dry activation, and current-system inspection. |
 
 ### Option D: Build and boot O-core
 
@@ -1377,6 +1547,14 @@ not receive or verify those external bytes. `tests/kernel_world_contract.rs`
 executes those semantic rules and the deterministic `OKWORLD1` normal-form
 codec.
 
+The KernelWorld validator also enforces the relationships among those fields.
+`max_requests_per_generation` is at least `max_outstanding_requests`. Every
+world declares at least one export and at least one capability request. A
+device-plane export names an existing `device.*` capability request, and the
+number of distinct device authorities fits within the device quota. These
+checks make exportable device behavior a consequence of a named request and an
+admitted quota.
+
 Mode 20's `smoke-kernel-world-qemu.sh` parses the actual embedded hash-pinned
 normal form, keeps verified package and canonical manifest digests distinct,
 and applies native default-deny supervisor admission keyed by exact package
@@ -1412,6 +1590,34 @@ publication, rotates generation-bound service bearers on upgrade, rollback, and
 restart, reconstructs the active set from verified digests, and composes
 packaged runtime worlds through pure, boot-persistable OValues.
 
+The CLI defaults to a five-second health deadline, a five-second invocation
+deadline, and a 64 KiB structural `OValue` limit. Configuration can raise the
+deadlines to 60 seconds and the structural limit to 512 KiB. `status`
+reconstructs its view from the active-set record, content-addressed package
+objects, and policy. Rollback atomically swaps the active set to the one
+retained healthy root. These bounds make health, invocation, and value
+structure part of the supervisor contract instead of ambient process behavior.
+OValue and composition-plan files first pass a 512 KiB input-byte ceiling,
+then pass the configured structural OValue limit.
+
+Hosted activation validates the package against the running machine. The
+manifest architecture equals the host architecture, `runtime.kind` is
+`native_test_runtime`, `runtime.abi` is `ocore.runtime-service/v1`,
+`health.protocol` is `ocore.health/v1`, and the declared health timeout fits
+within the active supervisor ceiling. `runtime.entry` is an absolute
+package-internal path resolved beneath the captured payload.
+
+The durable and worker-facing records are strict:
+
+| Record | Bound fields and role |
+|---|---|
+| `ocore.store-object/v1` | Algorithm and digest identify one immutable CAS object. |
+| `ocore.store-alias/v1` | Alias, algorithm, and digest bind a stable name to an immutable object. |
+| `ocore.hosted-active-set/v1` | A monotonic revision guards compare-and-swap mutation; `active` carries current package roots and `rollback` carries one retained healthy root per package, with nested service records. |
+| `ocore.runtime-program/v1` | World identity, health behavior, and a bounded operation map define the fixed hosted test runtime. |
+| Runtime request enum | `health`, `invoke`, and `shutdown` are the complete strict request vocabulary. |
+| Runtime response enum | `healthy`, `unhealthy`, `result`, `error`, and `stopped` are the complete strict response vocabulary. |
+
 On Unix, every stateful `o-live-host` command holds one process-shared advisory
 lock from before any reconstruction or mutation through the complete operation,
 serializing cooperating CLI writers for that state directory. The direct
@@ -1428,35 +1634,59 @@ and reconstruction gate with:
 ./scripts/smoke-hosted-live-reference.sh
 ```
 
-Those workers are host processes. This reference does not run inside booted
-O-core and is not evidence for the independently gated native IPC, loader/VFS,
-or live-system claims above. See
+Those workers are host processes and serve as the hosted differential oracle.
+Native IPC, loader/OVFS, and live-system results come from their respective
+booted O-core gates. See
 [`docs/HOSTED_LIVE_REFERENCE.md`](docs/HOSTED_LIVE_REFERENCE.md) for its exact
 boundary and lifecycle CLI.
 
 ### OSTADIX Alpha native constitution
 
-The normative target is a native, replicated, capability-governed World whose
-boundary is governed membership rather than a chassis. The full-stack program,
-crossing kinds, consistency model, physical OSTADIX Alpha requirements, G0--G13 gate
-ladder, and explicit non-claims are pinned in
+OSTADIX Alpha defines a native, replicated, capability-governed World whose
+boundary is governed membership. The constitution fixes its identities,
+crossing kinds, consistency model, machine-resource contracts, and G0 through
+G13 qualification ladder in
 [`docs/OSTADIX_WORLD.md`](docs/OSTADIX_WORLD.md). The machine-readable
 qualification registry is
 [`evidence/world_alpha_gates.toml`](evidence/world_alpha_gates.toml).
-Its byte-sealed historical text still contains a 24-gate component comment.
-The current unsealed component manifest and generated status table define 26
-required portable gates; the seal is preserved as historical evidence rather
-than silently rewritten.
 
-Hosted World work is retained only as a simulator, differential oracle,
+The Information Kernel and World layers carry different kinds of knowledge.
+Information V1 maintains local content-addressed heads and signed offline delta
+packs. Bounded bridge projections lift verified descriptive facts into typed
+metadata. World identity records bind those facts to World, Governor, node,
+domain, process, object, capability-description, namespace, attempt, and
+receipt coordinates. `OWPROTO`, `OWVALUE`, and `OWRECEIPT` then give those
+coordinates canonical cross-implementation byte forms. Governor admission and
+live capabilities supply execution authority.
+
+```mermaid
+flowchart LR
+    F["Local facts and artifacts"]
+    I["Information Kernel V1<br/>content-addressed heads"]
+    B["Bounded bridge projections<br/>typed descriptive metadata"]
+    W["OWIDENT V1<br/>20 World identity atoms"]
+    P["OWPROTO V1<br/>bounded negotiation records"]
+    V["OWVALUE V1<br/>canonical portable values"]
+    R["OWRECEIPT V1<br/>execution receipt bytes"]
+    G["Governor and capabilities<br/>live authority"]
+    X["World-bound execution"]
+    Q["Native conformance gates<br/>Modes 27 through 32"]
+
+    F --> I --> B --> W
+    W --> P --> V --> R
+    W --> G --> X --> R
+    P --> Q
+    V --> Q
+    R --> Q
+```
+
+Read the upper line as the evolution from local information to portable World
+records. Read the lower line as the authority path. They join at a receipt,
+where canonical descriptive evidence records the outcome of authorized work.
+
+The hosted World profile serves as a simulator, differential oracle,
 protocol-fuzz target, and development console under
 [`docs/HOSTED_WORLD_REFERENCE_PROFILE.md`](docs/HOSTED_WORLD_REFERENCE_PROFILE.md).
-It earns no OSTADIX Alpha gate credit. The current repository does not yet
-provide a replicated Governor, native node-membership transport, WorldFS,
-distributed HGraph execution, real Linux KernelWorld boot, physical-device
-assignment and DMA/IOMMU isolation, a native Debian personality, or physical
-multinode convergence. Names, inventory, and namespace lookup do not grant
-authority, and aggregate node memory is never presented as coherent local RAM.
 
 Validate the constitution and its evidence-class substitution rules with:
 
@@ -1464,17 +1694,14 @@ Validate the constitution and its evidence-class substitution rules with:
 python3 scripts/world_alpha_evidence.py
 ```
 
-The checked-in result defines 14 entries--the G0 constitutional baseline plus
-13 integration gates through G13. Registry schema v4 admits typed,
-content-addressed attestations and currently passes only G0 and its dependent
-AArch64 QEMU/TCG gate G2; the other 12 remain defined. The executable G0
-composition is [`evidence/world_contract_v2.toml`](evidence/world_contract_v2.toml):
-it imports the byte-frozen
+The registry defines 14 entries: the G0 constitutional baseline and 13
+integration gates through G13. Registry schema v4 carries typed,
+content-addressed attestations. The executable G0 composition is
+[`evidence/world_contract_v2.toml`](evidence/world_contract_v2.toml), which
+imports the byte-frozen
 [`evidence/world_contract_v1.toml`](evidence/world_contract_v1.toml) vocabulary
-and the separately versioned O-Machine contract. Unrelated
-bounded gates do not become G0--G13 evidence by proximity or addition, and G2
-is not physical AArch64, KVM/SVM, SMP, Linux/Plan 9 boot, foreign-ABI,
-PCI/DMA/IOMMU, or device-assignment evidence.
+and the separately versioned O-Machine contract. The current validator result
+is recorded in [Validation at the audited master](#validation-at-the-audited-master).
 
 Run the bounded shared World-identity gate with:
 
@@ -1504,11 +1731,9 @@ selection, one disjoint rejection, and all 16 identity conformance records and
 converges byte-for-byte under QEMU TCG. The codec uses deterministic big-endian
 framing, four fixed kinds, a 16 KiB hard maximum, caller/negotiated limits,
 strict canonical decoding, and an offline function that chooses the highest
-common schema and smaller record limit or an exact no-overlap rejection. It is
-not a stream or network transport, live
-handshake, authenticated session, authority channel, OValue/extension envelope,
-receipt codec, Governor, consensus implementation, or Workstream A acceptance;
-it passes no G0--G13 gate.
+common schema and smaller record limit or an exact no-overlap rejection. Its
+implemented scope is deterministic bounded record encoding, decoding, and
+offline schema negotiation.
 
 Run the bounded canonical World-value gate with:
 
@@ -1517,8 +1742,8 @@ Run the bounded canonical World-value gate with:
 ```
 
 Mode 29 implements the PR4 `OWVALUE` v1 value and full-record SHA-256 oracle in
-Rust and native `.oc`. It is a separate self-framed format, not a fifth
-`OWPROTO` v1 kind. The portable schema has a 4096-byte record maximum, depth-16
+Rust and native `.oc`. Its separate self-framing leaves the four-kind
+`OWPROTO` v1 schema unchanged. The portable schema has a 4096-byte record maximum, depth-16
 and 128-node limits, an explicit allowlist, canonical ordered records and
 scalar-key maps, and a root-only inert versioned extension whose payload must
 also be portable. Its fixed 19-record, 928-byte corpus is 1856 lowercase hex
@@ -1527,10 +1752,9 @@ digits with concatenated SHA-256
 converges byte-for-byte and by full-record SHA-256 under QEMU TCG; strict
 decode/reencode rejects malformed and noncanonical data, and
 hosted conversion rejects capabilities, capsules, live references, requests,
-and other effectful values. This is an offline codec/hash oracle, not transport,
-a live M9 crossing, authority, receipt, Governor, consensus, WorldFS,
-Workstream A acceptance, or G0--G13 passage. It does not make the full hosted
-`OValue` enum portable or replace the canonical-CBOR shim wire format.
+and other effectful values. Its implemented scope is the portable allowlist and
+offline canonical codec and hash oracle. The hosted `OValue` enum and
+canonical-CBOR shim wire remain separate formats.
 
 Run the bounded canonical World-receipt gate with:
 
@@ -1548,17 +1772,11 @@ digits; SHA-256
 `1edd90bf881cd42d08e2031482baae4e7c9a95bd78cfa65f0cbe14147c0a2604`) and
 the same 1,575-byte current and 1,546-byte stale signing preimages.
 The hosted oracle uses a pinned, explicitly non-secret conformance key to test
-real Ed25519 signing, verification, tamper rejection, and wrong-key rejection;
-native Mode 30 validates the canonical receipt and signature-envelope structure
-but is not a freestanding Ed25519 verifier.
-
-This Mode 30 corpus is constructed offline and is not evidence that another
-subsystem emitted a receipt. A valid signature does not grant authority,
-establish trusted signer policy, prove current World state, or enforce
-replay/commit fencing. Mode 30
-provides no production key lifecycle, transport, Governor, consensus, WorldFS,
-typed OSTADIX Alpha attestation, Acceptance A, or G0--G13 passage, and QEMU TCG is
-not physical or hardware-isolation evidence.
+real Ed25519 signing, verification, tamper rejection, and wrong-key rejection.
+Native Mode 30 validates the canonical receipt and signature-envelope
+structure. The Mode 30 corpus is an offline conformance fixture. The separate
+World-project path below supplies a live emitted receipt for native structural
+and semantic comparison.
 
 The separate World-project hosted-reference path now emits a live canonical
 OWRECEIPT after terminal project coordination. It uses a caller-supplied
@@ -1577,10 +1795,11 @@ required no-argument gate generates the hosted fixture before entering Mode 32:
 ./ocore/kernel/smoke-world-project-receipt-qemu.sh RECEIPT_HEX_FILE EXPECTED_SEMANTIC_SHA256
 ```
 
-Mode 32 does not execute the project or verify Ed25519 natively. This path is no
-Governor admission/commit, capability or lease grant, reservation, remote
-dispatch, recovery, or exactly-once protocol. QEMU TCG is not physical hardware,
-and the slice passes neither G1 nor Workstream A acceptance.
+The hosted coordinator executes the project and performs Ed25519 signing.
+Native Mode 32 performs canonical receipt decode, re-encode, signing-preimage
+construction, fence validation, and semantic hash comparison. The exact World
+qualification boundary is collected in
+[Exact implementation boundaries](#exact-implementation-boundaries).
 
 The shared identity/effect/grounding foundation can also be inspected without
 execution:
@@ -1611,10 +1830,9 @@ generation freshness. No production lowering currently emits these
 governed keys, so ordinary hosted `.O` plans retain residual `HostWorld` and
 report `governed-effects none`.
 
-This hosted gate is not O-core Mode 31, a ResourceKey wire format, native or
-QEMU evidence, device assignment, DMA/IOMMU isolation, Governor authority,
-Acceptance gate A, G0/G1 passage, project placement, or a World-execution
-surface. `CapabilityState` is descriptive identity only and carries no grant.
+The gate establishes the hosted repository contract for typed ResourceKey
+lowering. `CapabilityState` carries descriptive identity; authenticated World
+admission supplies authority through its own evidence path.
 
 ### Project HGraph planning and ordered hosted execution gates
 
@@ -1654,13 +1872,13 @@ domain-separated SHA-256 identity. The schema records exact bundle/selection
 binding, typed value-versus-success dependencies, project operations, route
 facts including executable/evaluator/entrypoint requirements, declared
 input/output paths, and the complete effect-resource vocabulary.
-This is an exact-source-bound projection identity, not a whitespace-insensitive
-source-semantic hash: source bytes, file modes, and manifest formatting feed the
-bundle digest and therefore change the logical digest. Permissive decode plus
-canonical re-encoding normalizes only the `LogicalHGraphV1` JSON record.
-Unknown hosted work remains an explicit `HostWorld` read/write, and the hosted
-profile emits no governed authority requirements. Planner-local logical IDs are
-not World task identities.
+This exact-source-bound projection identity includes source bytes, file modes,
+and manifest formatting in the bundle digest and therefore in the logical
+digest. Permissive decode plus canonical re-encoding normalizes the
+`LogicalHGraphV1` JSON record. Unknown hosted work remains an explicit
+`HostWorld` read/write, and the hosted profile emits an empty governed-authority
+requirement set. Planner-local logical IDs identify graph operations; a World
+launch supplies separate `TaskIdentity` values.
 
 World PR8-2 adds canonical `PlacementSnapshotV1` and `DeploymentPlanV1`
 records. For policies implemented by the current hosted coordinator, the
@@ -1750,9 +1968,9 @@ also records the assessed route prefix, proposed next route,
 allow/deny decision. On this ordinary opt-in path, trace v5 additionally binds
 the canonical hosted-unbound `DeploymentPlanV1` schema/digest before execution;
 plan-aware replay recomputes it and rejects substitution of that exact artifact.
-This ordinary trace does not bind or execute a snapshot-derived plan, attach
-World identity, or turn the fresh diagnostic execution-attempt identifier into
-a World `TaskIdentity`. A denied
+The ordinary opt-in trace binds the canonical hosted-unbound plan and a fresh
+diagnostic execution-attempt identifier. The snapshot-derived World launch
+path supplies World identity and explicit `TaskIdentity` values. A denied
 decision is persisted before the command reports
 that no route succeeded. Structural replay checks lifecycle shape only;
 plan-aware replay against the trusted HGraph verifies all bindings, recomputes
@@ -1842,6 +2060,10 @@ needs QEMU and the local Rust linker toolchain.
 
 ### What gets built
 
+The root Cargo package declares 14 binaries. The table also shows the installed
+lowercase wrapper, the independently locked MCP executable, and the two C17
+products so every public command surface has an explicit home.
+
 | Binary | Location | What it does |
 |--------|----------|--------------|
 | `O` | `target/release/O` | Runs `.O` documents and provides the interactive REPL. |
@@ -1851,11 +2073,13 @@ needs QEMU and the local Rust linker toolchain.
 | `ocorec` | `target/release/ocorec` | Compiles `.oc` modules through AST, typed HIR, and SSA MIR to freestanding ELF64 objects for the primary x86_64 and bounded AArch64 targets. |
 | `o-link` | `target/release/o-link` | Recursively literal-links and runs a bare single directory; `--project` creates an inert route-preserving bundle. |
 | `o-unlink` | `target/release/o-unlink` | Restores safe project bundles and legacy literal link sections. |
+| `ogit` | `target/release/ogit` | Produces and compares the bounded O-Git semantic-receipt demonstration. |
 | `o-live-host` | `target/release/o-live-host` | Runs the hosted package-store, activation, service-supervision, and cross-world semantic oracle. |
 | `o-node` | `target/release/o-node` | Starts a pairing-required LAN execution node, offers or joins one-use passcode pairing, and retains explicit PKI, identity, readiness, serving, legacy LAN-open, and administration controls. |
 | `octl` | `target/release/octl` | Uses discovery as a routing hint, reuses reciprocally paired identities, remembers peers, and invokes nodes automatically; retains the exact manual Hosted V1/V2 controls. |
 | `o-registry` | `target/release/o-registry` | Generates local placement profiles and creates, signs, verifies, lists, exports, and imports local registry snapshots. |
 | `o-info` | `target/release/o-info` | Maintains a local authority-free information head and exchanges signed canonical offline delta packs. |
+| `ocore-kernel-world-record` | `target/release/ocore-kernel-world-record` | Encodes a verified package and payload as the deterministic native KernelWorld admission record. |
 | `o-notebook` | feature-gated Cargo binary | Runs the local notebook server when built with `--features notebook`. |
 | `ostadix-mcp` | `mcp/ostadix_lang_mcp_server/target/release/ostadix-mcp` | Exposes the local agent tools above through MCP stdio; normal setup also installs `~/.local/bin/ostadix-mcp`. |
 | `O` | `c_cpp/O` | Runs `.O` through the standalone C17 edition. |
@@ -2012,8 +2236,8 @@ nix^( builtins.nixVersion )_nix
 sql^( SELECT 40 + 2 AS answer; )_sql
 ```
 
-These are not escape sequences inside another language. They are first-class
-expressions, and they nest freely:
+These typed-parenthesis forms are first-class expressions, and they nest
+freely:
 
 ```O
 html^(
@@ -2021,9 +2245,11 @@ html^(
 )_html
 ```
 
-The Python expression is evaluated first, its result is converted to
-something HTML can embed, and then the HTML expression completes. **No
-pairwise FFI. No template bridge. The nesting is the interface.**
+The Python expression is evaluated first, its result crosses the boundary as
+an `OValue`, the HTML renderer receives that typed value, and then the HTML
+expression completes. The nesting itself defines the composition interface,
+so every evaluator joins the same value protocol instead of requiring an
+adapter for every language pair.
 
 ### 2. OValue: the universal exchange type
 
@@ -2141,7 +2367,8 @@ Python can also call `O.scope()` to capture the current O bindings or
 
 ### 5. Orchestration and machine computation have different IRs
 
-Ostadix-lang does not force every kind of computation into the same abstraction.
+Ostadix-lang assigns orchestration and machine computation distinct
+intermediate representations.
 
 Hosted `.O` programs lower into OIR. OIR names text, loads, stores, builtin
 calls, backend execution, structural dependencies, sequencing dependencies,
@@ -2489,6 +2716,7 @@ receive the literal shell expression `$PATH` rather than an O-level splice.
 | `tex` | `latex` |
 | `plain` | `text` |
 | `o` | `O` |
+| `ubuntu` | `ubuntu_vm` |
 
 Aliases retain their source spelling in the closer but resolve to the same
 backend and environment namespace.
@@ -2668,9 +2896,10 @@ activate($cap, $path)     -> OSystem by real activation with an embedding guard
 ```
 
 `nix^` remains the immediate evaluation form. `nix_expr^` captures Nix source
-and its dependencies without evaluating it. `instantiate` uses `nix eval` to
-obtain a derivation, `realise` uses `nix build`, and `activate` invokes the
-closure's `switch-to-configuration switch` entry point.
+and its dependencies without evaluating it. `instantiate` runs
+`nix eval --raw --impure` and then `nix derivation show`. `realise` builds the
+single `<drv>^out` output with `nix build --no-link --print-out-paths`.
+`activate` invokes the closure's `switch-to-configuration switch` entry point.
 
 `activate(path[, profile])` performs a real host switch using the same ambient
 authority available to this process from a shell. `dry_activate(path[, profile])`
@@ -2882,26 +3111,25 @@ groups, and other O-specific values back across the boundary without reducing
 them to display strings. The handle does not mint authority; a capability
 identity still has to resolve in the evaluator's private live table.
 
-This is deliberately not a claim that ordinary OValue equality is already
-fully abstract for every observable fact about a program. OExpr preserves
-source, OCapability preserves authority, OScope preserves a namespace, and an
-ordinary returned value does not encode divergence, timing, or a complete
-effect trace. Extending the result to full O semantics requires an observation
-carrier that includes effects and divergence, followed by a proof that its
-equality is exactly the intended behavioral equivalence. The OValue enum has a
-finite set of registered variants, but its carrier is not finite because
-strings, blobs, lists, maps, expressions, and scopes are unbounded.
+Ordinary OValue equality compares returned data. OExpr preserves source,
+OCapability preserves authority identity, and OScope preserves a namespace.
+Behavioral equivalence across divergence, timing, and effects requires an
+observation carrier that records those facts and an equality defined over that
+carrier. The OValue enum has a finite set of registered variants, while
+strings, blobs, lists, maps, expressions, and scopes give those variants
+unbounded carriers.
 
-OCapability is descriptive on the ordinary hosted wire. A serialized identity
-does not become kernel authority by being parsed. The O-core capability bridge
-requires that identity to already be bound inside a live authenticated kernel
-session before it can resolve to a generation-tagged kernel handle.
+OCapability is descriptive on the ordinary hosted wire. The O-core capability
+bridge resolves that identity to a generation-tagged kernel handle only when a
+live authenticated kernel session already binds it.
 
 ---
 
 ## Hosted backends
 
-The Rust runtime currently registers the following languages. Inline backends
+Backend Catalog V5 registers 30 canonical backends and six aliases: `o`, `md`,
+`tex`, `plain`, `py`, and `ubuntu`. The Rust runtime executes the following
+canonical languages. Inline backends
 run inside the evaluator. Hosted backends run as Rust backend processes through
 length-prefixed canonical CBOR IPC and require their local runtime to be
 installed. A few compatibility adapters still bridge to legacy Python code for
@@ -2920,6 +3148,7 @@ semantics that are not a plain external command, such as live Python `O.eval`.
 | `nix` | Rust backend runner plus Nix CLI | Evaluates Nix expressions and converts JSON results to OValue. |
 | `nix_store` | Rust backend runner plus Nix CLI | Realizes derivations and returns OStorePath. |
 | `nixos_test` | Rust bridge to Nix test-driver adapter | Runs NixOS VM test expressions. |
+| `ubuntu_vm` | Python adapter plus Multipass | Executes Bash inside a session-derived persistent Ubuntu instance and records external-pinned state. Alias: `ubuntu`. |
 | `bash` | Rust backend runner plus Bash | Executes Bash with scalar O bindings exported as environment variables. |
 | `shell` | Rust backend runner plus POSIX `sh` | Executes portable shell source with scalar bindings. |
 | `rust` | Rust backend runner plus `rustc` | Compiles a temporary Rust program, runs it, and returns stdout. |
@@ -2939,8 +3168,8 @@ semantics that are not a plain external command, such as live Python `O.eval`.
 | `javascript` | Rust backend runner plus Node.js | Executes JavaScript with O bindings injected as constants. |
 | `ocaml` | Rust backend runner plus OCaml toolchain | Interprets or compiles OCaml and returns stdout. |
 
-These are executing backends, not parse-only registrations. A missing target
-runtime produces an explicit backend error. The default example suite
+Every row names an executing backend implementation. A missing target runtime
+produces an explicit backend error. The default example suite
 exercises Python, Bash, POSIX shell, JavaScript, SQL, HTML, Nix-independent
 orchestration, and the structural backends. Backends requiring optional local
 toolchains are available when those toolchains are installed.
@@ -2988,10 +3217,10 @@ with `O`.
 | Target | Command | Result |
 |--------|---------|--------|
 | `binary` | `olangc app.O -o target/app` | Builds a native hosted executable containing the program and Rust O runtime. |
-| `wasm` | `olangc app.O --target wasm -o target/app.wasm` | Builds for `wasm32-wasip1`; suited to programs that do not require unavailable WASI subprocess runtimes. |
+| `wasm` | `olangc app.O --target wasm -o target/app.wasm` | Builds a `wasm32-wasip1` module. Compilation succeeds at the audited master; the produced program currently exits under Wasmtime on this host when it tries to locate `O`. |
 | `script` | `olangc app.O --target script` | Parses and executes directly inside the `olangc` process. |
 | `ir` | `olangc app.O --target ir` | Prints lowered OIR, its ExecutionPlan, and its directed executable HGraph; for a directory or lifted project, prints the deterministic ProjectExecutionPlan and project HGraph. Nothing executes. |
-| `dot` | `olangc app.O --target dot` | Emits Graphviz DOT for an ordinary OIR HGraph or a directory/lifted-project HGraph. Pipe to `dot -Tpng` for a rendered graph. Nothing executes. |
+| `dot` | `olangc app.O --target dot` | Emits Graphviz DOT for an ordinary OIR HGraph or a directory/lifted-project HGraph. Pipe to `dot -Tsvg` for a scalable rendered graph. Nothing executes. |
 
 Native hosted binaries contain the `.O` source, runtime modules, lockfile
 dependency versions, and bundled core shims. Python, Nix, and other language
@@ -3002,13 +3231,32 @@ native hosted binaries as a compatibility hook. Compiled binaries mint fresh
 process-local default backend authority at startup instead of embedding
 serialized authority.
 
+#### Public output forms
+
+The public `-o` spellings are explicit across the implementations and
+composition tools:
+
+| Surface | Output form |
+|---|---|
+| Rust hosted AOT | `olangc INPUT.O -o PROGRAM` or `--output PROGRAM` |
+| Rust WASI AOT | `olangc INPUT.O --target wasm -o PROGRAM.wasm` or `--output PROGRAM.wasm` |
+| Rust script, IR, and DOT | Script evaluates in process; IR and DOT write to stdout; `-o` is ignored for these three targets. |
+| O-core AST, HIR, and MIR | `ocorec INPUT.oc --emit ast\|hir\|mir -o -` for stdout, or replace `-` with a file path; `--output` is the long form. |
+| O-core assembly and object | `ocorec INPUT.oc --emit asm\|obj -o PATH` or `--output PATH` |
+| Literal or project link | `o-link INPUTS... -o PROGRAM.O` or `--output PROGRAM.O` |
+| Unlink | `o-unlink PROGRAM.O -o RESTORED_DIRECTORY` or `--output-dir RESTORED_DIRECTORY` |
+| KernelWorld record | `ocore-kernel-world-record --manifest M --payload P -o RECORD` or `--output RECORD` |
+| Python reference renderer | `python3 -m o_lang INPUT.O -o OUTPUT` or `--output OUTPUT`, with `--as auto\|text\|html\|markdown\|latex\|json`; `-V` or `--version` reports the edition version. |
+| C17 hosted AOT | `c_cpp/olangc INPUT.O -o PROGRAM` with optional `--shim-dir` and `--keep-build-dir` |
+
 ### `o-link`: isolated literal execution, explicit parallelism, and safe projects
 
-`o-link` treats a bare single directory as a **sequence of scripts**: it
-recursively literal-links every selected UTF-8 file, writes `combined.O`, and
-immediately executes that combined program. This is intentionally an unsafe
-default because setup programs, migrations, test harnesses, installers, and
-obsolete bootstraps can run merely because a directory walk discovered them:
+`o-link` gives a bare single directory literal-execution semantics. It
+recursively selects readable UTF-8 source, wraps every file in an isolated
+typed expression, writes `combined.O`, and immediately executes the combined
+program. Supplying `-o` changes the destination path and retains that execution
+behavior. Review `.gitignore`, `.olinkignore`, and `--verbose-skips` before
+using this form on a codebase:
 
 ```bash
 o-link src/                         # writes combined.O and runs it now
@@ -3017,6 +3265,76 @@ o-link src/ -o sequential.O        # writes sequential.O and runs it now
 # Explicit --literal retains the same linker but suppresses the inferred run:
 o-link src/ --literal -o sequential.O
 ```
+
+The whitepaper lifts the current-master project fixture as one lossless,
+route-preserving O program and asks the compiler to emit the selected `main`
+route:
+
+```bash
+mkdir -p output/current-master
+./target/release/o-link tests/fixtures/project_hgraph --project \
+  -o output/current-master/o-linked-project.O
+./target/release/olangc output/current-master/o-linked-project.O \
+  --target dot --route main \
+  --shim-dir backends \
+  > output/current-master/o-linked-codebase-hgraph.dot
+
+./target/release/olangc tests/fixtures/project_hgraph --target dot \
+  --route main --shim-dir backends \
+  > output/current-master/project-hgraph-direct.dot
+cmp output/current-master/o-linked-codebase-hgraph.dot \
+  output/current-master/project-hgraph-direct.dot
+
+cp output/current-master/o-linked-codebase-hgraph.dot \
+  docs/figures/o-linked-codebase-hgraph.dot
+dot -Tsvg output/current-master/o-linked-codebase-hgraph.dot \
+  -o docs/figures/o-linked-codebase-hgraph.svg
+```
+
+The direct-directory and lifted-project commands produced byte-identical DOT.
+The published graph contains 53 vertices and 62 directed edges. Twelve rose
+`Execute` boxes carry the executable project operations; the other 41 vertices
+carry values, completions, and versioned resources. The audited artifacts are
+content-addressed as follows:
+
+| Artifact | SHA-256 |
+|---|---|
+| Lifted project, generated as `output/current-master/o-linked-project.O` | `a6d97fd5b95b829c3e3a754722767960f2963e0644ba8c89da7c15d48d922bb1` |
+| Compiler DOT | `bf16748f53a377e950a67b9c27d48ff260dcc987a69d86c5f29ca6289df7f00b` |
+| Rendered SVG | `44d7d33abf7d34ed73e3f4f37ebee77dbe5545f52cfc0077c64c021015310d01` |
+
+The DOT under `output/current-master/` and the linked publication copy under
+`docs/figures/` have the same `bf16748f...` digest.
+
+[Open the DOT source](docs/figures/o-linked-codebase-hgraph.dot) or
+[open the rendered SVG](docs/figures/o-linked-codebase-hgraph.svg).
+
+![Compiler-emitted HGraph for an O-linked codebase](docs/figures/o-linked-codebase-hgraph.svg)
+
+Read the graph from left to right in five passes:
+
+1. Trace `E0` through `E4`. This is the first implementation branch:
+   materialize the project, build and run `prepare`, then build and run
+   `impl-a`.
+2. Trace `E5` through `E9`. This is the second implementation branch, with a
+   fresh materialization, the shared preparation route, and `impl-b`.
+3. Follow both branch results into `E10`, `compare-route-results`. This node
+   makes equivalence an explicit operation in the admitted graph.
+4. Follow the comparison result into `E11`,
+   `select-route:verify_equivalent`. This node applies the route-set policy and
+   produces the selected `main` result.
+5. Read the surrounding shapes as distinct dependency kinds. Blue ellipses
+   carry values, green diamonds carry completion, and cyan hexagons version
+   `HostWorld`, project files, build outputs, and the required environment.
+   Arrow direction is causality; edge labels state whether an operation
+   consumes a value, a completion token, or a resource state.
+
+The graph makes the route policy executable and inspectable. Values,
+completion, mutable resource versions, two candidate implementations,
+comparison, and selection remain separate facts in one admitted HGraph. That
+separation lets the executor identify the exact dependency that makes each
+operation ready and the exact evidence on which `verify_equivalent` selects a
+result.
 
 Each literal wrapper uses `LANG[*]^(...)_LANG[*]`, so files remain evaluator-
 isolated without synthesizing a persistent numeric identity. Existing numeric
@@ -3055,8 +3373,8 @@ Detected import/include dependencies remain execution barriers: the linker
 emits topological waves and batches only same-wave antichains. Cycles keep
 stable source order and are serialized rather than being guessed apart.
 
-Use explicit `--project` whenever the directory must be captured without
-executing arbitrary files:
+Use explicit `--project` to capture the directory as a lossless,
+route-preserving project:
 
 ```bash
 o-link src/ --project -o project.O
@@ -3081,7 +3399,7 @@ Project execution is an explicit operation through `--project --run`. An
 already-lifted project `.O` file remains self-identifying and is detected
 automatically.
 
-Project planning is a separate nonexecuting inspection path. Select a route or
+Project planning is a separate inspection path. Select a route or
 route set with `--route`; an optional checked `--routes-policy` override accepts
 `explicit`/`explicit:ROUTE`, `default`, `fallback`, `any_success`,
 `race_success`, `race_settle`, `all`, `verify_equivalent`, or
@@ -3092,6 +3410,11 @@ olangc src/ --target ir --route main
 olangc project.O --target dot --route main > project.dot
 ./scripts/o-cli.sh plan src/ --route main
 ```
+
+The second command is the project-lift DOT route: `o-link --project` preserves
+the route table inside `project.O`, and `olangc --target dot --route main`
+projects the selected route and its prerequisite island into the logical
+HGraph.
 
 Directory and losslessly lifted inputs produce the same logical plan for the
 same bundle and selection. Planning validates project references and exact
@@ -3208,7 +3531,7 @@ cargo run --features notebook --bin o-notebook -- backends
 Ostadix-lang has two compiler and execution pipelines with a deliberate boundary
 between them. [Bounded semantic custody](docs/SEMANTIC_CUSTODY.md) identifies
 which transformations are digest-linked today and the authority each artifact
-does—or deliberately does not—carry.
+does, or deliberately does not, carry.
 
 After a fresh build, materialize the inspectable hosted custody chain with:
 
@@ -3245,21 +3568,26 @@ Native computation
 
 ```text
 Ostadix-lang/
-├── src/
-│   ├── main.rs                 # O interpreter and REPL
+├── crates/ostadix-api/src/
+│   ├── lib.rs                  # 42 engine modules, 36 public
 │   ├── parser.rs               # hosted typed-parenthesis parser
 │   ├── value.rs                # OValue and hosted wire protocol
-│   ├── capability.rs           # live bearer identity generation
-│   ├── ir.rs                   # OIR, ExecutionPlan, backend registry
+│   ├── ir.rs                   # OIR and ExecutionPlan
+│   ├── hgraph/                 # logical graph, evidence, and planning structures
 │   ├── eval.rs                 # evaluator and rendering semantics
 │   ├── process.rs              # persistent backend IPC
-│   ├── backend.rs              # Rust hosted backend runner
-│   ├── scheduler.rs            # dependency scheduling and caches
-│   ├── nix_ops.rs              # instantiate and realise
-│   ├── nixos_ops.rs            # activation and system references
-│   ├── live_system/            # hosted package, CAS, protocol, and supervisor oracle
-│   ├── ocore/                  # native front end, IRs, codegen, capability bridge
-│   └── bin/                    # compilers, bundle tools, notebook, hosted live CLI
+│   ├── scheduler.rs            # readiness-driven graph execution
+│   ├── hosted_remote/          # Hosted V1/V2 placement and lifecycle
+│   ├── project/                # project lift, routes, mesh, and RuntimeGraph
+│   ├── information/            # Information Kernel V1
+│   ├── world/                  # World identities, values, and hosted references
+│   ├── live_system/            # package CAS, policy, and supervisor oracle
+│   └── ocore/                  # native front end, IRs, codegen, capability bridge
+├── src/
+│   ├── lib.rs                  # 36 public compatibility reexports
+│   ├── main.rs                 # O interpreter and REPL
+│   └── bin/                    # the other 13 declared root binaries
+├── mcp/ostadix_lang_mcp_server/ # separate locked MCP crate with 10 tools
 ├── backends/                   # compatibility hosted-language adapters
 ├── ocore/                      # freestanding runtime and kernel proof
 ├── c_cpp/                      # standalone C17 hosted implementation
@@ -3463,9 +3791,9 @@ the emitted hosted-task layers; `predicted-width` is the largest layer and
 `predicted-span` is the number of layers. The record includes its admission
 SHA-256 and exact layer membership. It is derived after admission and remains
 outside that digest; `admission-sha256` is a reference to the enclosing
-admission rather than a circular self-binding. This is a static topology model,
-not a duration estimate, resource-capacity proof, dispatch trace, or overlap
-claim.
+admission rather than a circular self-binding. This static topology model
+describes the weighted admitted DAG. Runtime records supply observed duration,
+resource capacity, dispatch, and overlap evidence.
 
 For a focused explanation of one admitted plan operation, use:
 
@@ -3475,8 +3803,8 @@ o why FILE.O P3 [olangc options]
 olangc FILE.O --target ir --why P3 [olangc options]
 ```
 
-The repository `o` command is only a dispatcher for that compiler invocation;
-it does not parse or independently derive scheduler evidence. `--why` and
+The repository `o` command dispatches that compiler invocation; `olangc`
+parses the source and derives the scheduler evidence. `--why` and
 `--explain-schedule` are mutually exclusive. The focused report projects the
 selected operation, its exact admitted HGraph blocker/producer witnesses,
 immediate dependents, retained source-sequence constraints, and its static
@@ -3535,9 +3863,40 @@ belong to O-core MIR.
 
 ## O-core native systems language
 
-O-core is the statically typed, ahead-of-time systems member of Ostadix-lang. Its
-first target is `x86_64-unknown-none`, using ELF64, the LP64 data model, and
-the System V AMD64 calling convention.
+O-core is the statically typed, ahead-of-time systems member of Ostadix-lang.
+Its first target is `x86_64-unknown-none`, using ELF64, the LP64 data model,
+and the System V AMD64 calling convention. `ocorec --target` accepts both
+`x86_64-unknown-none` and `x86_64-unknown-none-elf`; the bounded AArch64 target
+likewise accepts `aarch64-unknown-none` and `aarch64-unknown-none-elf`.
+
+The compiler and evidence ladder form one continuous native path:
+
+```mermaid
+flowchart TD
+    S[".oc modules"] --> A["AST and name resolution"]
+    A --> H["Typed HIR"] --> M["SSA MIR"]
+    M --> X["x86_64 ELF objects"]
+    M --> G2["AArch64 G2 objects"]
+    X --> B["M0 bootstrap<br/>CPL3, syscall, timer, memory"]
+    B --> P["M1 processes"] --> C["M2 scheduler"] --> I["M3 IPC"]
+    I --> L["M4 loader and OVFS"] --> V["M5 live services"]
+    V --> F["M6 personalities and bounded views"]
+    F --> N["M7 Linux to 9P and LogicalRead"]
+    N --> W["Modes 27 to 32<br/>World identity, protocol, value, receipt, runtime"]
+    W --> BI["Mode 33 BootInfo"] --> SMP["Mode 34 four-vCPU startup and barrier"]
+    F --> KW["KernelWorld Modes 20, 22, and 23"]
+    G2 --> Q["Required portable manifest"]
+    SMP --> Q
+    KW --> Q
+    Q --> E["26 required QEMU gates<br/>201 exact transcript markers"]
+    KW -.-> HW["Mode 21 supplemental<br/>AMD SVM and KVM"]
+```
+
+Read from source at the top to evidence at the bottom. The central column grows
+the native operating substrate milestone by milestone. The AArch64 and
+KernelWorld branches rejoin at the manifest-defined evidence aggregate. Every
+required gate must exit successfully and satisfy each expected transcript
+marker exactly once.
 
 ### Modules, items, and control flow
 
@@ -3926,7 +4285,8 @@ capability contract is in [docs/OCORE.md](docs/OCORE.md).
 ## Included examples
 
 [`examples/manifest.json`](examples/manifest.json) is the authoritative,
-complete classification for this tree. For every `.O` example it declares the
+complete classification for the 44 `.O` examples tracked at the audited master.
+For every tracked example the manifest declares the
 supported editions, unit/integration/manual class, backend and host/authority
 requirements, timeout, and edition-specific result or output oracle. Rust,
 Python, and C17 test entrypoints consume that file; an unknown backend returning
@@ -3980,7 +4340,9 @@ edition supports every file.
 | `examples/lazy_request_basic.O` | Lazy-wrapped Nix request chain. |
 | `examples/coordination_groups.O` | Batch, all, any, and race values. |
 | `examples/group_pipeline/main.O` | O-Git semantic receipt group pipeline. |
+| `examples/group_pipeline/main.eager.O` | Eager semantic-policy variant used by the O-Git meaning-level comparison. |
 | `examples/os_as_participant_basic.O` | OSystem and activation boundary. |
+| `examples/plan9_browser.O` | Plan 9 browser workflow executed through the external-pinned `ubuntu_vm` backend. |
 | `examples/nixos_test.O` | Single-machine NixOS VM test. |
 | `examples/nixos_test_two_machine.O` | Two-machine NixOS VM test. |
 
@@ -4002,7 +4364,7 @@ multipass exec moral-gaur -- bash -lc 'set -euo pipefail; cd /home/ubuntu/Ostadi
 ```
 
 The runtime-probe manifest owns both each executable and its exact probe
-arguments—notably `openssl version`, rather than a universal `--version`.
+arguments, notably `openssl version`, rather than a universal `--version`.
 Validate the projections and inspect the probes directly with:
 
 ```bash
@@ -4202,6 +4564,61 @@ python3 scripts/release_evidence.py validate
 ./boot-and-test.sh smoke
 ```
 <!-- END GENERATED: REQUIRED_QEMU_EVIDENCE -->
+
+### Validation at the audited master
+
+This README and the accompanying whitepaper use master commit
+`36787b16476bc0c8c4ddf665c7228b314d04e716`, tree
+`5bd6625fc0cac91b414caec9f6a4aad027d28cfd`, as their implementation snapshot.
+
+| Validation surface | Observed result |
+|---|---|
+| Isolated current-master Rust audit | 1,351 passed, 3 ignored |
+| Root Rust quality gates | `cargo fmt --check`, locked all-target/all-feature check, and clippy with warnings denied passed |
+| Release binary surface | `cargo build --release --workspace --bins --all-features --locked` passed in 3 minutes 13 seconds |
+| Root binary boundary audit | All 14 binaries executed: 13 accepted `--help`; `o-notebook` served its UI and API successfully |
+| Standalone MCP crate | Locked build and clippy passed; all 29 Rust tests passed |
+| Real MCP server smoke | All 10 advertised tools completed against the exact built stdio server |
+| C17 Make suite | 5 interpreter cases and 3 AOT cases passed; 2 manifest-declared cases skipped |
+| C17 CMake suite | 4 of 4 tests passed |
+| Python edition | 18 parser tests and 46 evaluator tests passed; `compileall` passed |
+| Rust example manifest | 39 examples passed and 5 manifest-declared examples skipped |
+| Recursive `.O` inventory | All 44 current-master tracked examples were discovered and classified |
+| Source-release validation | 77 of 77 required release entries passed |
+| `olangc` target matrix | All five public targets were exercised: binary, wasm, script, IR, and DOT |
+| Hosted integration smokes | Hosted Live, Project HGraph, and World smoke suites passed |
+| Docker | Image build and container smoke passed |
+| `python3 scripts/release_evidence.py validate` | PASS, 26 required portable QEMU gates |
+| `./boot-and-test.sh smoke` | 26 required, 26 present, 26 passed, 0 failed |
+| Native transcript verification | 201 expected markers observed exactly once across the 26 gates |
+| Portable native aggregate duration | 361.11 seconds wall time on the audited host |
+| `olangc --target wasm` | `wasm32-wasip1` compilation succeeded and repeated builds were byte-identical |
+| Wasmtime execution on the audited host | The produced module started and failed while locating `O` |
+| Direct World-alpha validator | Historical evidence continuity failure described below |
+
+The current execution result is complete for the required portable native
+manifest: every required gate passed. The checked-in World-alpha historical
+registry has a separate continuity defect. Direct execution of
+`scripts/world_alpha_evidence.py` reports:
+
+```text
+evidence/world/g0-independent-engine-2026-08-17.toml.source digests do not resolve to one working tree, base commit, or descendant commit
+```
+
+The focused World-alpha tests recorded 30 passes, one failure, and one error.
+The checked-in registry therefore cannot validate G0 or its dependent G2 for
+that source-digest lineage. The schema-v2 validator snapshot digest beginning
+`c25d38c` also does not resolve to accepted repository history. This is a
+checked-in historical evidence continuity defect. It does not change the fresh
+current-master observation that all 26 required portable QEMU execution gates
+passed.
+
+The binary boundary audit exercised every root Cargo binary. Thirteen binaries
+accepted their public `--help` boundary. `o-notebook`, whose first argument is
+the backend directory, was exercised as a running server: `/` returned the
+title `O · Notebook`, `/eval` evaluated `text^(42)_text` as type `text` with
+display `"42"`, and `/reset` returned `{"ok":true}`. The server was then
+stopped.
 
 ### Implemented
 
@@ -4413,10 +4830,69 @@ python3 scripts/release_evidence.py validate
   local compiler products excluded while `.O` source and intentional visual
   assets remain tracked.
 
-### Current boundaries
+## Exact implementation boundaries
 
-These are the boundaries of the current implementation, not descriptions of
-features that are already present:
+This final section collects distinctions that a reader could reasonably
+confuse with the implemented mechanisms described above.
+
+- `O version --json` reports compiled compatibility coordinates. Runtime
+  discovery, placement authority, and live World state each have their own
+  fresh evidence path.
+- Graph V1, Evidence V5, Admission V5, and Why V1 are archival inspection
+  surfaces. Current execution authority is Graph V2 with Evidence and
+  Admission V6.
+- Zero-configuration discovery operates on a LAN routing hint. It provides no
+  NAT traversal, relay, hole punching, or Internet gossip. Inbound paired
+  client authentication is currently pairing-CA-wide; leaf-certificate
+  allowlisting, unpair, and revocation commands remain future lifecycle work.
+- Project Mesh V1 transfers a source-closed route island and starts a fresh
+  actor generation. It does not migrate a running process image or its live
+  memory. Local fallback is eligible only while execution-start evidence
+  remains absent.
+- `ostadix-mcp` is a local stdio child process that inherits the MCP client's
+  authority. Its ten tools expose environment, runtime, doctor, smoke, intent,
+  direct run, compiler, optional search, and bounded Information inspection
+  functions. It has no network listener or MCP-level authentication layer. The
+  direct `o_run` tool is the compatibility execution path; the one-use
+  `o_analyze_intent` and `o_execute_intent` pair supplies intent recomputation
+  and fresh V6 admission. Information inspection does not expose the state path
+  or raw stderr, and access-time preservation remains untested.
+- Hosted Live-World status reconstructs from the active-set record, CAS, and
+  policy rather than an operation journal. Rollback can swap to the one retained
+  healthy root. The current CLI has no rebuild command.
+- The current WASI target compiles `wasm32-wasip1` modules. On the audited host,
+  Wasmtime execution of the produced program fails while locating `O`, so the
+  compile result is the established WASI result for this snapshot.
+- The World-alpha registry's checked-in G0 source-digest lineage is not
+  continuous in accepted repository history. G0 and dependent G2 therefore do
+  not validate through `scripts/world_alpha_evidence.py` at this snapshot. This
+  historical registry defect is separate from the 26 of 26 fresh portable
+  native execution gates that passed at the same master commit.
+- The standalone MCP crate passed all 29 Rust tests, and the real built server
+  passed a smoke of all ten tools. Separately, root Python
+  `tests.test_mcp_smoke` recorded four passes and one brittle assertion failure:
+  its exact command-substring expectation omits the current `--bin o-cli`
+  insertion between `--bin olangc` and `--bin o-info`. The failure is in that
+  test expectation; the real server smoke exercised the current command.
+- `cargo check --manifest-path fuzz/Cargo.toml` passed in the disposable audit
+  worktree, while Cargo rewrote the stale tracked `fuzz/Cargo.lock` during
+  resolution. The file was restored exactly and the audit tree finished clean.
+  Current master therefore has a locked-fuzz reproducibility defect in that
+  manifest, while the fuzz target itself compiles.
+- `cargo build --release --workspace --bins --all-features --locked` passed and
+  builds the complete optimized binary surface. Adding `--all-targets` is not a
+  passing release-build command at this snapshot: integration-harness
+  compilation reaches `tests/hosted_remote_v2.rs`, which calls two runtime
+  injection methods gated by `cfg(debug_assertions)` and therefore absent from
+  the release dependency. The independent all-target, all-feature test command
+  passed with 1,351 tests and 3 declared ignores.
+- The byte-sealed historical World record contains its original 24-component
+  comment. The current unsealed component manifest defines 26 required portable
+  gates. The historical seal remains byte-preserved.
+- Ostadix-lang, O-core, OKernel, O-Machine, World, and OSTADIX Alpha name the
+  specific layers defined in the opening. Hosted World work is a simulator and
+  differential oracle. Native World qualification follows the G0 through G13
+  registry.
 
 - `O.eval` uses either the caller snapshot or an explicit OScope and reuses live
   backend environments. A callback cannot recursively execute the same persistent
@@ -4514,8 +4990,10 @@ features that are already present:
 - The exact per-mode `KernelWorld` evidence boundaries are projected in the
   generated status table above from `evidence/gates.toml`; detailed contracts
   remain in `docs/KERNEL_WORLD_CONTRACT.md`. Hardware-only Mode 21 is
-  supplemental and stays outside the required portable set. No portable gate
-  may be read beyond its manifest non-claims.
+  supplemental and stays outside the required portable set. It was not
+  executed in this host audit because its writable `/dev/kvm` and AMD SVM/NPT
+  substrate was unavailable. No portable gate may be read beyond its manifest
+  non-claims.
 
 See [SPEC.md](SPEC.md) for the hosted language contract,
 [ARCHITECTURE.md](ARCHITECTURE.md) for the repository architecture, and
@@ -4539,8 +5017,8 @@ The normative future host-EL1-to-EL2 machine-resource ABI, including
 resource-class-specific asynchronous revocation and the G7 no-guest-HVC
 boundary, is in [docs/O_MACHINE_CONTRACT.md](docs/O_MACHINE_CONTRACT.md); it is
 a design contract and not a claim that G7 or G8 is implemented.
-The design proposal for containing and utilizing foreign kernels — Linux,
-Android, XNU/Darwin, and Windows NT — as O-Domain personalities is in
+The design proposal for containing and utilizing foreign kernels, including
+Linux, Android, XNU/Darwin, and Windows NT as O-Domain personalities, is in
 [okernel-multikernel/MULTIKERNEL_PERSONALITY_PROPOSAL.md](okernel-multikernel/MULTIKERNEL_PERSONALITY_PROPOSAL.md).
 It is an architecture note against the existing `ocore` runtime and
 `ODOMAIN_PLAN` roadmap; it claims nothing the milestone gates have not proven.
@@ -4603,8 +5081,8 @@ identify different archived objects. For each archival source release:
    `CITATION.cff` and into this section of the README. Do not replace the
    existing preprint/package DOI under `preferred-citation`.
 
-Evaluation artifacts associated with any paper — benchmark scripts, inputs,
-raw results, and reproduction instructions — should be deposited on Zenodo as
+Evaluation artifacts associated with any paper, including benchmark scripts,
+inputs, raw results, and reproduction instructions, should be deposited on Zenodo as
 their own archived, DOI-bearing artifact alongside the software release.
 Software Heritage archival can additionally be requested to obtain a
 content-addressed persistent identifier for the source itself.
