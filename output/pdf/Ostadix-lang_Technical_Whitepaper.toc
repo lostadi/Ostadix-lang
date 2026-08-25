@@ -1,0 +1,111 @@
+\contentsline {section}{Audience and reading paths}{ii}{Item.8}%
+\contentsline {section}{\numberline {1}Implementation basis and method}{1}{section.1}%
+\contentsline {subsection}{\numberline {1.1}Source coordinate}{1}{subsection.1.1}%
+\contentsline {subsection}{\numberline {1.2}Contribution map}{1}{subsection.1.2}%
+\contentsline {subsection}{\numberline {1.3}Architectural path through the implementation}{1}{subsection.1.3}%
+\contentsline {section}{\numberline {2}The language system in one view}{2}{section.2}%
+\contentsline {subsection}{\numberline {2.1}Hosted orchestration}{2}{subsection.2.1}%
+\contentsline {subsection}{\numberline {2.2}Project execution}{2}{subsection.2.2}%
+\contentsline {subsection}{\numberline {2.3}Native systems execution}{2}{subsection.2.3}%
+\contentsline {subsection}{\numberline {2.4}World layers}{2}{subsection.2.4}%
+\contentsline {section}{\numberline {3}The current execution constitution}{3}{section.3}%
+\contentsline {subsection}{\numberline {3.1}Independent \texttt {ostadix-api} ownership}{3}{subsection.3.1}%
+\contentsline {subsection}{\numberline {3.2}The unified lowercase \texttt {o} front door}{3}{subsection.3.2}%
+\contentsline {subsection}{\numberline {3.3}Graph V2, Evidence V6, Admission V6, and Why V2}{4}{subsection.3.3}%
+\contentsline {subsection}{\numberline {3.4}The ten-tool Ostadix MCP}{5}{subsection.3.4}%
+\contentsline {subsection}{\numberline {3.5}Reciprocal LAN pairing and pinned TLS}{6}{subsection.3.5}%
+\contentsline {subsection}{\numberline {3.6}Capacity-first Project Mesh}{7}{subsection.3.6}%
+\contentsline {subsection}{\numberline {3.7}Information Kernel, Bridge, and Provenance}{8}{subsection.3.7}%
+\contentsline {subsection}{\numberline {3.8}Registry V1}{9}{subsection.3.8}%
+\contentsline {subsection}{\numberline {3.9}World identities, values, protocols, and receipts}{9}{subsection.3.9}%
+\contentsline {section}{\numberline {4}Hosted surface language}{10}{section.4}%
+\contentsline {subsection}{\numberline {4.1}Implemented structural grammar}{10}{subsection.4.1}%
+\contentsline {subsubsection}{\numberline {4.1.1}Exact tag symmetry}{11}{subsubsection.4.1.1}%
+\contentsline {subsubsection}{\numberline {4.1.2}Structural versus opaque contexts}{11}{subsubsection.4.1.2}%
+\contentsline {subsubsection}{\numberline {4.1.3}Intentional smallness}{11}{subsubsection.4.1.3}%
+\contentsline {subsection}{\numberline {4.2}First example: evaluator-indexed expressions}{12}{subsection.4.2}%
+\contentsline {subsection}{\numberline {4.3}Bindings and dependencies}{12}{subsection.4.3}%
+\contentsline {subsection}{\numberline {4.4}Persistent and ephemeral evaluators}{13}{subsection.4.4}%
+\contentsline {section}{\numberline {5}Hosted dynamic semantics}{13}{section.5}%
+\contentsline {subsection}{\numberline {5.1}Evaluation order}{13}{subsection.5.1}%
+\contentsline {subsection}{\numberline {5.2}Quotation and meta-evaluation}{14}{subsection.5.2}%
+\contentsline {subsection}{\numberline {5.3}Demand policies and requests}{14}{subsection.5.3}%
+\contentsline {subsection}{\numberline {5.4}Coordination groups}{15}{subsection.5.4}%
+\contentsline {section}{\numberline {6}The OValue semantic boundary}{16}{section.6}%
+\contentsline {subsection}{\numberline {6.1}Authorable tagged OValue schema}{17}{subsection.6.1}%
+\contentsline {subsection}{\numberline {6.2}Fidelity}{18}{subsection.6.2}%
+\contentsline {subsection}{\numberline {6.3}Representation-sensitive identity}{18}{subsection.6.3}%
+\contentsline {subsection}{\numberline {6.4}Wire protocol}{19}{subsection.6.4}%
+\contentsline {section}{\numberline {7}Backends, actors, and authority}{19}{section.7}%
+\contentsline {subsection}{\numberline {7.1}Static registry}{19}{subsection.7.1}%
+\contentsline {subsection}{\numberline {7.2}Actor process model}{20}{subsection.7.2}%
+\contentsline {subsection}{\numberline {7.3}Hosted authority model}{20}{subsection.7.3}%
+\contentsline {section}{\numberline {8}OIR, plans, effects, and HGraph execution}{21}{section.8}%
+\contentsline {subsection}{\numberline {8.1}OIR is orchestration IR}{21}{subsection.8.1}%
+\contentsline {subsection}{\numberline {8.2}Execution plan}{21}{subsection.8.2}%
+\contentsline {subsection}{\numberline {8.3}State-complete HGraph}{22}{subsection.8.3}%
+\contentsline {subsection}{\numberline {8.4}Effects and explicit resource state}{22}{subsection.8.4}%
+\contentsline {section}{\numberline {9}Projects, linking, and route policies}{23}{section.9}%
+\contentsline {subsection}{\numberline {9.1}Project lifting and literal linking}{23}{subsection.9.1}%
+\contentsline {subsection}{\numberline {9.2}Compiler-emitted Project HGraph from an o-linked codebase}{23}{subsection.9.2}%
+\contentsline {subsection}{\numberline {9.3}Bundle model}{31}{subsection.9.3}%
+\contentsline {subsection}{\numberline {9.4}Routes}{31}{subsection.9.4}%
+\contentsline {subsubsection}{\numberline {9.4.1}Authoring project routes}{32}{subsubsection.9.4.1}%
+\contentsline {subsection}{\numberline {9.5}Unlinking}{33}{subsection.9.5}%
+\contentsline {section}{\numberline {10}Toolchain and implementation editions}{34}{section.10}%
+\contentsline {subsection}{\numberline {10.1}Public binaries}{34}{subsection.10.1}%
+\contentsline {subsection}{\numberline {10.2}What olangc targets mean}{34}{subsection.10.2}%
+\contentsline {subsection}{\numberline {10.3}Reference implementations}{35}{subsection.10.3}%
+\contentsline {subsection}{\numberline {10.4}REPL and notebook state}{36}{subsection.10.4}%
+\contentsline {subsection}{\numberline {10.5}O-Git}{36}{subsection.10.5}%
+\contentsline {section}{\numberline {11}O-core: the native language}{37}{section.11}%
+\contentsline {subsection}{\numberline {11.1}Language surface}{37}{subsection.11.1}%
+\contentsline {subsection}{\numberline {11.2}Static semantics}{38}{subsection.11.2}%
+\contentsline {subsubsection}{\numberline {11.2.1}Types, aggregates, and layout}{38}{subsubsection.11.2.1}%
+\contentsline {subsubsection}{\numberline {11.2.2}Name, conversion, storage, and call semantics}{38}{subsubsection.11.2.2}%
+\contentsline {subsubsection}{\numberline {11.2.3}Machine operations and linkage}{39}{subsubsection.11.2.3}%
+\contentsline {subsection}{\numberline {11.3}Compiler pipeline}{39}{subsection.11.3}%
+\contentsline {subsection}{\numberline {11.4}Current compiler profile}{39}{subsection.11.4}%
+\contentsline {section}{\numberline {12}Kernel, capabilities, and native execution}{40}{section.12}%
+\contentsline {subsection}{\numberline {12.1}Freestanding kernel substrate}{40}{subsection.12.1}%
+\contentsline {subsection}{\numberline {12.2}Native capability model}{40}{subsection.12.2}%
+\contentsline {section}{\numberline {13}Live-World and KernelWorld}{42}{section.13}%
+\contentsline {subsection}{\numberline {13.1}Three different layers}{42}{subsection.13.1}%
+\contentsline {subsection}{\numberline {13.2}Live-World command and state model}{43}{subsection.13.2}%
+\contentsline {subsection}{\numberline {13.3}Authorable Live-World schemas}{43}{subsection.13.3}%
+\contentsline {subsection}{\numberline {13.4}KernelWorld authority chain}{46}{subsection.13.4}%
+\contentsline {subsection}{\numberline {13.5}Native execution ladder}{48}{subsection.13.5}%
+\contentsline {subsection}{\numberline {13.6}Mode 20 and Mode 21}{49}{subsection.13.6}%
+\contentsline {subsection}{\numberline {13.7}Modes 22 through 34}{50}{subsection.13.7}%
+\contentsline {section}{\numberline {14}Reproducibility and current-master evidence}{51}{section.14}%
+\contentsline {subsection}{\numberline {14.1}Evidence classes}{52}{subsection.14.1}%
+\contentsline {subsection}{\numberline {14.2}Current snapshot checks}{52}{subsection.14.2}%
+\contentsline {subsection}{\numberline {14.3}Exact reproduction commands}{54}{subsection.14.3}%
+\contentsline {subsection}{\numberline {14.4}Coverage accounting}{55}{subsection.14.4}%
+\contentsline {section}{\numberline {15}Implemented capabilities}{55}{section.15}%
+\contentsline {section}{\numberline {16}Design rationale}{56}{section.16}%
+\contentsline {subsection}{\numberline {16.1}Why evaluator identity is syntax}{56}{subsection.16.1}%
+\contentsline {subsection}{\numberline {16.2}Why graph state is explicit}{56}{subsection.16.2}%
+\contentsline {subsection}{\numberline {16.3}Why analysis and authority are separate objects}{56}{subsection.16.3}%
+\contentsline {subsection}{\numberline {16.4}Why the engine owns the types}{56}{subsection.16.4}%
+\contentsline {subsection}{\numberline {16.5}Why admission is typed across layers}{57}{subsection.16.5}%
+\contentsline {subsection}{\numberline {16.6}Why placement begins with capacity}{57}{subsection.16.6}%
+\contentsline {section}{\numberline {17}Conclusion}{57}{section.17}%
+\contentsline {section}{\numberline {A}Compact hosted-language reference}{57}{appendix.A}%
+\contentsline {subsection}{\numberline {A.1}Exact builtin signatures}{58}{subsection.A.1}%
+\contentsline {section}{\numberline {B}Public command reference}{59}{appendix.B}%
+\contentsline {section}{\numberline {C}Example atlas}{61}{appendix.C}%
+\contentsline {section}{\numberline {D}Source map}{62}{appendix.D}%
+\contentsline {section}{\numberline {E}Complete \texttt {ostadix-api} module inventory}{64}{appendix.E}%
+\contentsline {section}{\numberline {F}Architectural position among neighboring systems}{65}{appendix.F}%
+\contentsline {paragraph}{Primary reference points.}{65}{paragraph*.27}%
+\contentsline {section}{\numberline {G}Reproduction commands}{65}{appendix.G}%
+\contentsline {subsection}{\numberline {G.1}Pin the source and qualify the Rust workspace}{66}{subsection.G.1}%
+\contentsline {subsection}{\numberline {G.2}Run the language and unified front door}{66}{subsection.G.2}%
+\contentsline {subsection}{\numberline {G.3}Qualify the independent engine and MCP}{66}{subsection.G.3}%
+\contentsline {subsection}{\numberline {G.4}Generate and read the o-linked Project HGraph}{67}{subsection.G.4}%
+\contentsline {subsection}{\numberline {G.5}Run Project HGraph, Live-World, and World gates}{67}{subsection.G.5}%
+\contentsline {subsection}{\numberline {G.6}Run compiler targets}{67}{subsection.G.6}%
+\contentsline {subsection}{\numberline {G.7}Run the Python and C17 editions}{68}{subsection.G.7}%
+\contentsline {subsection}{\numberline {G.8}Inspect Information, Registry, and node surfaces}{68}{subsection.G.8}%
+\contentsline {section}{\numberline {H}Current host, integration, and proof boundaries}{68}{appendix.H}%
