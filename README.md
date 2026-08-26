@@ -201,12 +201,20 @@ and World schema coordinates compiled into that executable.
 
 ### Zero-configuration LAN execution
 
-Ordinary LAN use keeps transport and proof coordinates internal. Start a node
-on both machines:
+Ordinary LAN use keeps transport and proof coordinates internal. On Unix-like
+hosts (including WSL), start a node on both machines:
 
 ```bash
 o node start
 ```
+
+For a newly launched node, `start` returns success only after the hosted TCP
+listener is bound. Configuration and spawn errors are returned directly. If
+the launched child fails or times out, the command prints diagnostics from that
+launch and retains the complete private log path. Durable recovery is allowed
+120 seconds by default; use `--startup-timeout-seconds N` for an unusually
+large state root. If a managed PID already exists, `start` reports it without
+re-probing listener readiness.
 
 On the first machine, open a one-use five-minute pairing offer:
 

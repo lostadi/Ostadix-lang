@@ -1,4 +1,4 @@
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -115,6 +115,7 @@ pub fn serve_node_dual_until_shutdown(
         mesh_runtime,
         tls_identity,
         shutdown,
+        |_| Ok(()),
     )
 }
 
@@ -124,6 +125,21 @@ pub fn serve_owned_node_dual_until_shutdown(
     config: HostedOwnedDualNodeServerConfig,
     shutdown: HostedDualNodeShutdown,
 ) -> Result<()> {
+    serve_owned_node_dual_until_shutdown_with_listener_ready(config, shutdown, |_| Ok(()))
+}
+
+/// Serve with unique Hosted V2 lifecycle ownership and invoke
+/// `listener_ready` exactly once after the shared TCP listener is bound and
+/// made nonblocking, before accepting connections, unless shutdown was already
+/// requested during startup.
+pub fn serve_owned_node_dual_until_shutdown_with_listener_ready<F>(
+    config: HostedOwnedDualNodeServerConfig,
+    shutdown: HostedDualNodeShutdown,
+    listener_ready: F,
+) -> Result<()>
+where
+    F: FnOnce(SocketAddr) -> Result<()>,
+{
     let HostedOwnedDualNodeServerConfig {
         bind_address,
         v1_runtime,
@@ -138,6 +154,7 @@ pub fn serve_owned_node_dual_until_shutdown(
         mesh_runtime,
         tls_identity,
         shutdown,
+        listener_ready,
     )
 }
 
@@ -162,14 +179,18 @@ impl DualRuntimeAuthorityV2 {
     }
 }
 
-fn serve_node_dual_with_runtime(
+fn serve_node_dual_with_runtime<F>(
     bind_address: String,
     v1_runtime: HostedNodeRuntime,
     v2_runtime: DualRuntimeAuthorityV2,
     mesh_runtime: Option<MeshNodeRuntime>,
     tls_identity: ServerTlsIdentity,
     shutdown: HostedDualNodeShutdown,
-) -> Result<()> {
+    listener_ready: F,
+) -> Result<()>
+where
+    F: FnOnce(SocketAddr) -> Result<()>,
+{
     let v2_handle = v2_runtime.handle();
 
     let setup = (|| -> Result<_> {
@@ -184,9 +205,12 @@ fn serve_node_dual_with_runtime(
         listener.set_nonblocking(true).with_context(|| {
             format!("failed to make dual hosted listener `{bind_address}` nonblocking")
         })?;
-        Ok((listener, tls_config))
+        let listening_address = listener.local_addr().with_context(|| {
+            format!("failed to inspect dual hosted listener bound from `{bind_address}`")
+        })?;
+        Ok((listener, tls_config, listening_address))
     })();
-    let (listener, tls_config) = match setup {
+    let (listener, tls_config, listening_address) = match setup {
         Ok(setup) => setup,
         Err(error) => {
             return finish_dual_node_server(
@@ -199,6 +223,26 @@ fn serve_node_dual_with_runtime(
         }
     };
 
+    if shutdown.is_requested() {
+        drop(listener);
+        return finish_dual_node_server(
+            None,
+            &v2_runtime,
+            mesh_runtime.as_ref(),
+            Vec::new(),
+            Vec::new(),
+        );
+    }
+    if let Err(error) = listener_ready(listening_address) {
+        drop(listener);
+        return finish_dual_node_server(
+            Some(error.context("dual hosted listener-ready hook failed")),
+            &v2_runtime,
+            mesh_runtime.as_ref(),
+            Vec::new(),
+            Vec::new(),
+        );
+    }
     let maximum = v1_runtime.max_concurrent_connections;
     let v1_runtime = Arc::new(v1_runtime);
     let active = Arc::new(AtomicUsize::new(0));
@@ -436,10 +480,146 @@ impl Drop for ActiveDualConnectionGuard {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::io::Read;
+    use std::path::{Path, PathBuf};
     use std::time::Duration;
 
+    use crate::hosted_remote::tls::test_server_tls_identity;
+    use crate::hosted_remote::v2::{
+        DenyAllPlacementAuthorizerV2, DurableSessionStoreV2, HostedNodeSignerV2,
+        HostedV2RuntimeClosedV2, HostedV2RuntimeConfig,
+    };
+    use crate::placement::{GenerationV1, StateQuotaLimitsV2};
+
     use super::*;
+
+    fn test_owned_server_config(
+        root: &Path,
+        bind_address: String,
+        tls_identity: ServerTlsIdentity,
+    ) -> (HostedOwnedDualNodeServerConfig, HostedV2RuntimeHandle) {
+        let store = DurableSessionStoreV2::open(
+            root.join("state"),
+            HostedNodeSignerV2::generate().unwrap(),
+        )
+        .unwrap();
+        let state_quotas =
+            StateQuotaLimitsV2::new(4, 1, 1024 * 1024, 4 * 1024 * 1024, 8 * 1024 * 1024).unwrap();
+        let owner = HostedV2RuntimeOwner::open(
+            HostedV2RuntimeConfig {
+                node_id: "listener-ready-v2-test".to_owned(),
+                node_generation: GenerationV1::new(1).unwrap(),
+                shim_dir: PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+                runtime_executable: std::env::current_exe().unwrap(),
+                state_quota_generation: GenerationV1::new(1).unwrap(),
+                state_quotas,
+            },
+            store,
+            Arc::new(DenyAllPlacementAuthorizerV2),
+        )
+        .unwrap();
+        let handle = owner.handle();
+        let config = HostedOwnedDualNodeServerConfig {
+            bind_address,
+            v1_runtime: HostedNodeRuntime {
+                node_id: "listener-ready-v1-test".to_owned(),
+                shim_dir: PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+                runtime_executable: std::env::current_exe().unwrap(),
+                max_concurrent_connections: 1,
+            },
+            v2_runtime: owner,
+            mesh_runtime: None,
+            tls_identity,
+        };
+        (config, handle)
+    }
+
+    fn assert_runtime_closed(handle: &HostedV2RuntimeHandle) {
+        let error = handle.node_id().unwrap_err();
+        assert!(
+            error.downcast_ref::<HostedV2RuntimeClosedV2>().is_some(),
+            "unexpected runtime error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn pre_requested_shutdown_skips_listener_ready_hook() {
+        let directory = tempfile::tempdir().unwrap();
+        let (_tls_directory, tls_identity) = test_server_tls_identity().unwrap();
+        let (config, handle) =
+            test_owned_server_config(directory.path(), "127.0.0.1:0".to_owned(), tls_identity);
+        let shutdown = HostedDualNodeShutdown::new();
+        assert!(shutdown.request());
+        let invoked = Cell::new(false);
+
+        serve_owned_node_dual_until_shutdown_with_listener_ready(config, shutdown, |_| {
+            invoked.set(true);
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(!invoked.get());
+        assert_runtime_closed(&handle);
+    }
+
+    #[test]
+    fn listener_ready_error_releases_listener_and_shuts_down_runtime() {
+        let directory = tempfile::tempdir().unwrap();
+        let (_tls_directory, tls_identity) = test_server_tls_identity().unwrap();
+        let (config, handle) =
+            test_owned_server_config(directory.path(), "127.0.0.1:0".to_owned(), tls_identity);
+        let reported_address = Cell::new(None);
+
+        let error = serve_owned_node_dual_until_shutdown_with_listener_ready(
+            config,
+            HostedDualNodeShutdown::new(),
+            |address| {
+                assert_eq!(
+                    TcpListener::bind(address).unwrap_err().kind(),
+                    std::io::ErrorKind::AddrInUse
+                );
+                reported_address.set(Some(address));
+                anyhow::bail!("injected dual listener-ready failure")
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "dual hosted listener-ready hook failed");
+        assert!(error
+            .chain()
+            .any(|cause| cause.to_string() == "injected dual listener-ready failure"));
+        let rebound = TcpListener::bind(reported_address.get().unwrap()).unwrap();
+        drop(rebound);
+        assert_runtime_closed(&handle);
+    }
+
+    #[test]
+    fn dual_bind_failure_does_not_invoke_listener_ready_hook() {
+        let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = reservation.local_addr().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let (_tls_directory, tls_identity) = test_server_tls_identity().unwrap();
+        let (config, handle) =
+            test_owned_server_config(directory.path(), address.to_string(), tls_identity);
+        let invoked = Cell::new(false);
+
+        let error = serve_owned_node_dual_until_shutdown_with_listener_ready(
+            config,
+            HostedDualNodeShutdown::new(),
+            |_| {
+                invoked.set(true);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("failed to bind dual hosted node"));
+        assert!(!invoked.get());
+        assert_runtime_closed(&handle);
+    }
 
     #[test]
     fn worker_spawn_failure_releases_capacity_and_drops_accepted_stream() {

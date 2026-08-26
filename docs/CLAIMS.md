@@ -331,13 +331,14 @@
   launch. Registry
   `profile-local` records default to 45 seconds and accept integer lifetimes
   from 1 through 60 seconds.
-- The ordinary node projection is pairing-required by default. Both machines
-  run `o node start`; one runs `o node pair`, and the other runs
-  `o node pair NODE_ID` and enters the hidden ten-digit passcode. An offer is
-  one-use and expires after five minutes. `--passcode-stdin` provides
-  noninteractive input, while `--address HOST:7340` permits a known routed
-  pairing endpoint only when it is directly TCP-reachable; there is no
-  router-crossing discovery, NAT traversal, relay, or hole punching.
+- The ordinary node projection is pairing-required by default. On Unix-like
+  hosts (including WSL), both machines run `o node start`; one runs
+  `o node pair`, and the other runs `o node pair NODE_ID` and enters the hidden
+  ten-digit passcode. An offer is one-use and expires after five minutes.
+  `--passcode-stdin` provides noninteractive input, while
+  `--address HOST:7340` permits a known routed pairing endpoint only when it is
+  directly TCP-reachable; there is no router-crossing discovery, NAT traversal,
+  relay, or hole punching.
 - Pairing uses SPAKE2 plus explicit directional confirmation to bind both node
   identities, public bundles, SPAKE2 messages, CSRs, and destination-issued
   certificates. Only public CA, CSR, certificate, and Hosted V2 receipt-key

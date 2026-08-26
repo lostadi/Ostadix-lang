@@ -628,6 +628,17 @@ class WorkspaceFacadeReleaseValidationTests(unittest.TestCase):
         ):
             release._validate_workspace_facade_release_surface(files)
 
+    def test_hosted_tls_test_identity_is_required(self) -> None:
+        for path in release.HOSTED_TLS_TEST_IDENTITY_PATHS:
+            with self.subTest(path=path):
+                files = self.fixture_files()
+                del files[path]
+                with self.assertRaisesRegex(
+                    release.ReleaseError,
+                    rf"workspace engine release surface is incomplete; missing: {path}",
+                ):
+                    release._validate_workspace_facade_release_surface(files)
+
     def test_engine_release_allowlist_is_scoped_not_crates_wide(self) -> None:
         for path in release.OSTADIX_API_RELEASE_PATHS:
             self.assertTrue(release.is_allowed_release_path(path))
@@ -650,6 +661,11 @@ class SourceReleaseTests(unittest.TestCase):
         self.repo = self.root / "repo"
         self.repo.mkdir()
         self._git("init", "-q")
+        # These disposable one-commit repositories never benefit from Git's
+        # detached maintenance. A background auto-GC can otherwise recreate
+        # `.git/info/*` while TemporaryDirectory is removing the fixture.
+        self._git("config", "gc.auto", "0")
+        self._git("config", "maintenance.auto", "false")
         self._git("config", "user.name", "Source Release Test")
         self._git("config", "user.email", "source-release@example.invalid")
 
@@ -1100,6 +1116,8 @@ class SourceReleaseTests(unittest.TestCase):
             contents.setdefault(path, "// fixture engine root module\n")
         for path in release.OSTADIX_API_RUNTIME_ASSET_PATHS:
             contents.setdefault(path, b"fixture runtime asset\n")
+        for path in release.HOSTED_TLS_TEST_IDENTITY_PATHS:
+            contents.setdefault(path, b"fixture hosted TLS test identity\n")
         if files:
             contents.update(files)
         for index in range(FIXTURE_EVIDENCE_GATE_COUNT):
