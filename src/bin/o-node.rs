@@ -1,16 +1,26 @@
 use std::env;
 use std::fs;
+#[cfg(unix)]
+use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::{self, BufRead, Write};
+#[cfg(unix)]
+use std::io::{Read, Seek, SeekFrom};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::process::{Command as ProcessCommand, Stdio};
+use std::process::Command as ProcessCommand;
+#[cfg(unix)]
+use std::process::{Child, Stdio};
+#[cfg(unix)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
@@ -19,10 +29,12 @@ use clap::{Args, Parser, Subcommand};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
+#[cfg(unix)]
+use o_lang::hosted_remote::lan_node_process_dir;
 use o_lang::hosted_remote::mesh::{MeshNodeRuntime, MeshNodeRuntimeConfig};
 use o_lang::hosted_remote::v2::{
     default_hosted_v2_state_dir, read_node_signing_key_v2, read_placement_public_key_v2,
-    serve_owned_node_dual_until_shutdown, write_new_node_public_key_v2,
+    serve_owned_node_dual_until_shutdown_with_listener_ready, write_new_node_public_key_v2,
     write_new_node_signing_key_v2, DurableSessionStoreV2, HostedDualNodeShutdown,
     HostedNodeSignerV2, HostedOwnedDualNodeServerConfig, HostedV2RuntimeConfig,
     HostedV2RuntimeOwner, LanOpenPlacementAuthorizerV2, PinnedEd25519PlacementAuthorizerV2,
@@ -34,8 +46,8 @@ use o_lang::hosted_remote::{
     accept_mutual_tls, accept_pairing_once, build_client_config, build_server_config,
     connect_mutual_tls, default_ca_path, default_node_cert_path, default_node_key_path,
     discover_lan_nodes, generate_pairing_passcode, hosted_config_dir, join_pairing_once,
-    lan_node_process_dir, lan_open_config_dir, lan_open_v2_state_dir, lan_peers_config_dir,
-    load_stored_lan_peer, replace_paired_lan_peer, serve_node, spawn_lan_bootstrap_server,
+    lan_open_config_dir, lan_open_v2_state_dir, lan_peers_config_dir, load_stored_lan_peer,
+    replace_paired_lan_peer, serve_node_with_listener_ready, spawn_lan_bootstrap_server,
     spawn_lan_discovery_responder, store_paired_lan_peer, ClientTlsIdentity, HostedNodeRuntime,
     HostedNodeServerConfig, LanBootstrapBundleV1, LanNodeAdvertisementV1, NodeDoctorCheckV1,
     PairingLocalIdentityV1, PairingPublicIdentityV1, PairingResultV1, ServerTlsIdentity,
@@ -48,6 +60,17 @@ use o_lang::runtime_exec::validate_native_runtime_binary;
 use o_lang::shims::ExtractedShims;
 
 const V2_NODE_EPOCH_HELP: &str = "Stable node-state/deployment epoch bound into durable V2 session identity. Reuse it across normal process restarts. To bump it, use a new state root or archive the old root first; changing this value never evicts or migrates existing sessions.";
+const DEFAULT_DETACHED_STARTUP_TIMEOUT_SECONDS: u64 = 120;
+#[cfg(unix)]
+const DETACHED_STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(25);
+#[cfg(unix)]
+const DETACHED_STARTUP_TERMINATION_GRACE: Duration = Duration::from_secs(2);
+#[cfg(unix)]
+const DETACHED_STARTUP_LOG_EXCERPT_BYTES: usize = 16 * 1024;
+#[cfg(unix)]
+const DETACHED_STARTUP_LOG_POLL_BYTES: usize = 64 * 1024;
+const DETACHED_LISTENER_READY_LOG_PREFIX: &str = "o-node: listener ready token=";
+const DETACHED_LAUNCH_TOKEN_BYTES: usize = 16;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -91,6 +114,13 @@ struct StartArgs {
     /// Legacy compatibility: let any LAN-reachable client download a shared private key.
     #[arg(long)]
     lan_open: bool,
+    /// Seconds allowed for durable recovery and listener initialization.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_DETACHED_STARTUP_TIMEOUT_SECONDS,
+        value_parser = clap::value_parser!(u64).range(1..=3600)
+    )]
+    startup_timeout_seconds: u64,
 }
 
 #[derive(Debug, Args)]
@@ -267,6 +297,9 @@ struct ServeArgs {
     /// With --lan-open, keep automatic configuration but suppress the legacy bootstrap service.
     #[arg(long)]
     no_bootstrap: bool,
+    /// Internal identity binding for a detached child launched by `start`.
+    #[arg(long, hide = true, value_name = "TOKEN")]
+    managed_start_token: Option<String>,
     /// Enable durable session protocol V2 using this capability-first state root.
     #[arg(long)]
     v2_state_dir: Option<PathBuf>,
@@ -342,6 +375,78 @@ struct LanOpenNodeMaterial {
     pairing_ca: PathBuf,
     pairing_ca_key: PathBuf,
     client_ca_bundle: PathBuf,
+}
+
+struct LanServicesAfterBind {
+    material: Option<LanOpenNodeMaterial>,
+    service_port: u16,
+    supports_v2: bool,
+    legacy_lan_open: bool,
+    no_discovery: bool,
+    no_bootstrap: bool,
+}
+
+impl LanServicesAfterBind {
+    fn start(self) -> Result<()> {
+        let Some(material) = self.material else {
+            return Ok(());
+        };
+        // Discovery is the publication boundary. Start any legacy enrollment
+        // endpoint first so no advertisement can name an incomplete service.
+        if self.legacy_lan_open && !self.no_bootstrap {
+            let _ = spawn_lan_bootstrap_server(
+                SocketAddr::from((Ipv4Addr::UNSPECIFIED, DEFAULT_LAN_BOOTSTRAP_PORT)),
+                lan_bootstrap_bundle(&material, self.service_port)?,
+            )?;
+        }
+        if !self.no_discovery {
+            let advertisement = if self.legacy_lan_open {
+                LanNodeAdvertisementV1::new(
+                    material.node_id.clone(),
+                    material.server_name.clone(),
+                    self.service_port,
+                    DEFAULT_LAN_BOOTSTRAP_PORT,
+                    self.supports_v2,
+                )?
+            } else {
+                LanNodeAdvertisementV1::pairing_required(
+                    material.node_id.clone(),
+                    material.server_name.clone(),
+                    self.service_port,
+                    DEFAULT_LAN_PAIRING_PORT,
+                    self.supports_v2,
+                )?
+            };
+            let _ = spawn_lan_discovery_responder(advertisement, DEFAULT_LAN_DISCOVERY_PORT)?;
+        }
+        Ok(())
+    }
+}
+
+fn report_listener_ready(
+    listening_address: SocketAddr,
+    node_id: &str,
+    maximum_connections: usize,
+    service_summary: &str,
+    lan_services: LanServicesAfterBind,
+    shutdown: Option<&HostedDualNodeShutdown>,
+    managed_start_token: Option<&str>,
+) -> Result<()> {
+    lan_services.start()?;
+    if shutdown.is_some_and(HostedDualNodeShutdown::is_requested) {
+        bail!("o-node shutdown was requested before listener readiness publication");
+    }
+    let mut output = format!(
+        "o-node: serving {node_id} on {listening_address} ({service_summary}; max {maximum_connections} connections)\n"
+    );
+    if let Some(token) = managed_start_token {
+        output.push_str(&format!(
+            "{DETACHED_LISTENER_READY_LOG_PREFIX}{token} address={listening_address}; node={node_id}; {service_summary}; max {maximum_connections} connections\n"
+        ));
+    }
+    let mut stderr = io::stderr().lock();
+    stderr.write_all(output.as_bytes())?;
+    Ok(())
 }
 
 fn ensure_lan_open_material() -> Result<LanOpenNodeMaterial> {
@@ -1186,6 +1291,7 @@ fn remember_preferred_pair(node_id: &str) -> Result<()> {
     )
 }
 
+#[cfg(unix)]
 fn detached_node_paths() -> (PathBuf, PathBuf, PathBuf) {
     let directory = lan_node_process_dir();
     (
@@ -1195,78 +1301,475 @@ fn detached_node_paths() -> (PathBuf, PathBuf, PathBuf) {
     )
 }
 
-fn start_detached_node(args: StartArgs) -> Result<()> {
-    #[cfg(not(unix))]
-    bail!("detached o-node start is currently supported on Unix-like systems");
-    #[cfg(unix)]
-    {
-        if detached_node_status(false)? {
-            println!("o-node is already running");
+#[cfg(unix)]
+fn ensure_detached_process_directory(path: &Path) -> Result<()> {
+    ensure_private_directory(path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("failed to set mode 0700 on `{}`", path.display()))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn acquire_detached_lifecycle_lock(path: &Path) -> Result<File> {
+    let lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("failed to open startup lock `{}`", path.display()))?;
+    lock.set_permissions(fs::Permissions::from_mode(0o600))?;
+    loop {
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return Ok(lock);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error)
+                .with_context(|| format!("failed to lock startup lock `{}`", path.display()));
+        }
+    }
+}
+
+#[cfg(unix)]
+fn register_detached_startup_interrupts() -> Result<Arc<AtomicBool>> {
+    use signal_hook::consts::{SIGINT, SIGTERM};
+
+    let interrupted = Arc::new(AtomicBool::new(false));
+    // These registrations intentionally live until this short-lived `start`
+    // command exits. Unregistering signal-hook actions does not restore the
+    // previous/default disposition.
+    let _ = signal_hook::flag::register(SIGINT, Arc::clone(&interrupted))
+        .context("failed to register SIGINT handling for detached startup")?;
+    let _ = signal_hook::flag::register(SIGTERM, Arc::clone(&interrupted))
+        .context("failed to register SIGTERM handling for detached startup")?;
+    Ok(interrupted)
+}
+
+#[cfg(unix)]
+struct DetachedStartupLogObserver {
+    file: File,
+    ready_line_prefix: Vec<u8>,
+    matching_line_prefix: bool,
+    matched_prefix_bytes: usize,
+    ready_line_prefix_matched: bool,
+    listener_ready: bool,
+}
+
+#[cfg(unix)]
+impl DetachedStartupLogObserver {
+    fn open(path: &Path, start_offset: u64, launch_token: &str) -> io::Result<Self> {
+        let mut file = File::open(path)?;
+        file.seek(SeekFrom::Start(start_offset))?;
+        Ok(Self {
+            file,
+            ready_line_prefix: format!(
+                "{DETACHED_LISTENER_READY_LOG_PREFIX}{launch_token} address="
+            )
+            .into_bytes(),
+            matching_line_prefix: true,
+            matched_prefix_bytes: 0,
+            ready_line_prefix_matched: false,
+            listener_ready: false,
+        })
+    }
+
+    fn poll_listener_ready(&mut self) -> io::Result<bool> {
+        if self.listener_ready {
+            return Ok(true);
+        }
+        let prefix = &self.ready_line_prefix;
+        let mut buffer = [0_u8; 4096];
+        let mut remaining_bytes = DETACHED_STARTUP_LOG_POLL_BYTES;
+        while remaining_bytes > 0 {
+            let read_length = buffer.len().min(remaining_bytes);
+            let length = self.file.read(&mut buffer[..read_length])?;
+            if length == 0 {
+                return Ok(self.listener_ready);
+            }
+            remaining_bytes -= length;
+            for byte in &buffer[..length] {
+                if *byte == b'\n' {
+                    if self.ready_line_prefix_matched {
+                        self.listener_ready = true;
+                        return Ok(true);
+                    }
+                    self.matching_line_prefix = true;
+                    self.matched_prefix_bytes = 0;
+                    self.ready_line_prefix_matched = false;
+                    continue;
+                }
+                if !self.matching_line_prefix {
+                    continue;
+                }
+                if *byte != prefix[self.matched_prefix_bytes] {
+                    self.matching_line_prefix = false;
+                    continue;
+                }
+                self.matched_prefix_bytes += 1;
+                if self.matched_prefix_bytes == prefix.len() {
+                    self.matching_line_prefix = false;
+                    self.ready_line_prefix_matched = true;
+                }
+            }
+        }
+        Ok(false)
+    }
+}
+
+#[cfg(unix)]
+struct DetachedStartupChildGuard {
+    child: Child,
+    pid_path: PathBuf,
+    pid: u32,
+    armed: bool,
+}
+
+#[cfg(unix)]
+impl DetachedStartupChildGuard {
+    fn new(child: Child, pid_path: PathBuf) -> Self {
+        let pid = child.id();
+        Self {
+            child,
+            pid_path,
+            pid,
+            armed: true,
+        }
+    }
+
+    fn child_mut(&mut self) -> &mut Child {
+        &mut self.child
+    }
+
+    fn cleanup(&mut self) -> io::Result<()> {
+        if !self.armed {
             return Ok(());
         }
-        // Provision synchronously so configuration errors are shown in this
-        // terminal instead of being buried in a detached log.
-        let material = ensure_lan_open_material()?;
-        let (directory, pid_path, log_path) = detached_node_paths();
-        ensure_private_directory(&directory)?;
-        let log = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .open(&log_path)
-            .with_context(|| format!("failed to open `{}`", log_path.display()))?;
-        let current = env::current_exe().context("failed to locate o-node executable")?;
-        let mut command = ProcessCommand::new(current);
-        command
-            .arg("serve")
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(log.try_clone()?))
-            .stderr(Stdio::from(log));
-        if args.lan_open {
-            command.arg("--lan-open");
-        }
-        // SAFETY: setsid is async-signal-safe and the closure performs no
-        // allocation or lock-taking after fork.
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setsid() == -1 {
-                    return Err(std::io::Error::last_os_error());
+        if self.child.try_wait()?.is_none() {
+            let signal_result = unsafe { libc::kill(self.pid as i32, libc::SIGTERM) };
+            if signal_result != 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(error);
                 }
-                Ok(())
-            });
+            }
+            let deadline = Instant::now() + DETACHED_STARTUP_TERMINATION_GRACE;
+            while Instant::now() < deadline {
+                if self.child.try_wait()?.is_some() {
+                    break;
+                }
+                thread::sleep(DETACHED_STARTUP_POLL_INTERVAL);
+            }
+            if self.child.try_wait()?.is_none() {
+                self.child.kill()?;
+                self.child.wait()?;
+            }
         }
-        let mut child = command.spawn().context("failed to detach o-node serve")?;
-        fs::write(&pid_path, format!("{}\n", child.id()))?;
-        fs::set_permissions(&pid_path, fs::Permissions::from_mode(0o600))?;
-        thread::sleep(Duration::from_millis(450));
-        if let Some(status) = child.try_wait()? {
-            let _ = fs::remove_file(&pid_path);
+        remove_pid_file_if_matches(&self.pid_path, self.pid)?;
+        self.armed = false;
+        Ok(())
+    }
+
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for DetachedStartupChildGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.cleanup();
+        }
+    }
+}
+
+#[cfg(unix)]
+fn remove_pid_file_if_matches(path: &Path, expected_pid: u32) -> io::Result<()> {
+    match fs::read_to_string(path) {
+        Ok(value)
+            if value
+                .lines()
+                .next()
+                .and_then(|line| line.trim().parse::<u32>().ok())
+                == Some(expected_pid) =>
+        {
+            fs::remove_file(path)
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+fn new_detached_launch_token() -> Result<String> {
+    let mut bytes = [0_u8; DETACHED_LAUNCH_TOKEN_BYTES];
+    getrandom::fill(&mut bytes).context("failed to generate detached launch identity")?;
+    Ok(hex::encode(bytes))
+}
+
+fn validate_detached_launch_token(token: &str) -> Result<()> {
+    if token.len() != DETACHED_LAUNCH_TOKEN_BYTES * 2
+        || !token
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("invalid detached launch identity")
+    }
+    Ok(())
+}
+
+fn start_detached_node(args: StartArgs) -> Result<()> {
+    #[cfg(not(unix))]
+    {
+        let _ = args;
+        bail!("detached o-node start is currently supported on Unix-like systems");
+    }
+    #[cfg(unix)]
+    {
+        let (directory, pid_path, log_path) = detached_node_paths();
+        ensure_detached_process_directory(&directory)?;
+        let _lifecycle_lock =
+            acquire_detached_lifecycle_lock(&directory.join("o-node.lifecycle.lock"))?;
+        start_detached_node_locked(args, pid_path, log_path)
+    }
+}
+
+#[cfg(unix)]
+fn start_detached_node_locked(args: StartArgs, pid_path: PathBuf, log_path: PathBuf) -> Result<()> {
+    if detached_node_status_locked(false, &pid_path, &log_path)? {
+        println!("o-node is already running (managed PID exists; readiness was not re-probed)");
+        return Ok(());
+    }
+    // Provision synchronously so configuration errors are shown in this
+    // terminal instead of being buried in a detached log.
+    let material = ensure_lan_open_material()?;
+    let mut log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&log_path)
+        .with_context(|| format!("failed to open `{}`", log_path.display()))?;
+    let log_metadata = log.metadata()?;
+    if !log_metadata.is_file() {
+        bail!(
+            "detached node log `{}` is not a regular file",
+            log_path.display()
+        );
+    }
+    log.set_permissions(fs::Permissions::from_mode(0o600))?;
+    if log_metadata.len() > 0 {
+        writeln!(&mut log)?;
+    }
+    writeln!(&mut log, "=== o-node detached start ===")?;
+    log.flush()?;
+    let startup_log_offset = log.metadata()?.len();
+    let launch_token = new_detached_launch_token()?;
+    let mut startup_log =
+        DetachedStartupLogObserver::open(&log_path, startup_log_offset, &launch_token)
+            .with_context(|| format!("failed to observe `{}`", log_path.display()))?;
+    let startup_interrupted = register_detached_startup_interrupts()?;
+    let current = env::current_exe().context("failed to locate o-node executable")?;
+    let mut command = ProcessCommand::new(current);
+    command
+        .arg("serve")
+        .arg("--managed-start-token")
+        .arg(&launch_token)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log.try_clone()?))
+        .stderr(Stdio::from(log));
+    if args.lan_open {
+        command.arg("--lan-open");
+    }
+    // SAFETY: setsid is async-signal-safe and the closure performs no
+    // allocation or lock-taking after fork.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = command.spawn().context("failed to detach o-node serve")?;
+    let mut child = DetachedStartupChildGuard::new(child, pid_path.clone());
+    if let Err(error) = write_file_atomic(
+        &pid_path,
+        format!("{}\n{launch_token}\n", child.child_mut().id()).as_bytes(),
+        true,
+    ) {
+        let error = error.context("failed to persist detached o-node PID");
+        if let Err(cleanup_error) = child.cleanup() {
+            return Err(error).context(format!(
+                "startup cleanup also failed; retained PID tracking at `{}`: {cleanup_error}",
+                pid_path.display()
+            ));
+        }
+        return Err(error);
+    }
+    let startup_timeout = Duration::from_secs(args.startup_timeout_seconds);
+    if let Err(error) = wait_for_detached_node_startup(
+        child.child_mut(),
+        &mut startup_log,
+        &log_path,
+        startup_log_offset,
+        startup_timeout,
+        &startup_interrupted,
+    ) {
+        if let Err(cleanup_error) = child.cleanup() {
+            return Err(error).context(format!(
+                "startup cleanup also failed; retained PID tracking at `{}`: {cleanup_error}",
+                pid_path.display()
+            ));
+        }
+        return Err(error);
+    }
+    if startup_interrupted.load(Ordering::SeqCst) {
+        let error = anyhow::anyhow!(
+            "o-node startup interrupted by SIGINT or SIGTERM{}",
+            format_startup_diagnostics(&log_path, startup_log_offset)
+        );
+        if let Err(cleanup_error) = child.cleanup() {
+            return Err(error).context(format!(
+                "startup cleanup also failed; retained PID tracking at `{}`: {cleanup_error}",
+                pid_path.display()
+            ));
+        }
+        return Err(error);
+    }
+    child.disarm();
+    println!("o-node started: {}", material.node_id);
+    println!("log: {}", log_path.display());
+    println!(
+        "scheduler/actor mesh: {} (automatic)",
+        material.state_dir.join("mesh-v1").display()
+    );
+    if args.lan_open {
+        println!("legacy LAN-open enrollment enabled explicitly");
+    } else {
+        println!("pair from this machine with `o node pair`");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn wait_for_detached_node_startup(
+    child: &mut Child,
+    startup_log: &mut DetachedStartupLogObserver,
+    log_path: &Path,
+    startup_log_offset: u64,
+    timeout: Duration,
+    interrupted: &AtomicBool,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if interrupted.load(Ordering::SeqCst) {
             bail!(
-                "o-node exited during startup with {status}; inspect {}",
-                log_path.display()
+                "o-node startup interrupted by SIGINT or SIGTERM{}",
+                format_startup_diagnostics(log_path, startup_log_offset)
             );
         }
-        println!("o-node started: {}", material.node_id);
-        println!("log: {}", log_path.display());
-        println!(
-            "scheduler/actor mesh: {} (automatic)",
-            material.state_dir.join("mesh-v1").display()
-        );
-        if args.lan_open {
-            println!("legacy LAN-open enrollment enabled explicitly");
-        } else {
-            println!("pair from this machine with `o node pair`");
+        if let Some(status) = child.try_wait()? {
+            bail!(
+                "o-node exited during startup with {status}{}",
+                format_startup_diagnostics(log_path, startup_log_offset)
+            );
         }
-        Ok(())
+        if startup_log.poll_listener_ready()? {
+            // Resolve an exit racing with the readiness write before reporting
+            // success to the caller.
+            if let Some(status) = child.try_wait()? {
+                bail!(
+                    "o-node exited during startup with {status}{}",
+                    format_startup_diagnostics(log_path, startup_log_offset)
+                );
+            }
+            if interrupted.load(Ordering::SeqCst) {
+                bail!(
+                    "o-node startup interrupted by SIGINT or SIGTERM{}",
+                    format_startup_diagnostics(log_path, startup_log_offset)
+                );
+            }
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "o-node did not bind its hosted listener within {} seconds{}",
+                timeout.as_secs(),
+                format_startup_diagnostics(log_path, startup_log_offset)
+            );
+        }
+        thread::sleep(DETACHED_STARTUP_POLL_INTERVAL);
+    }
+}
+
+#[cfg(unix)]
+fn format_startup_diagnostics(path: &Path, start_offset: u64) -> String {
+    match read_startup_log_excerpt(path, start_offset, DETACHED_STARTUP_LOG_EXCERPT_BYTES) {
+        Ok(Some(excerpt)) => format!(
+            "\nstartup diagnostics:\n{excerpt}\nfull log: {}",
+            path.display()
+        ),
+        Ok(None) => format!("; inspect {}", path.display()),
+        Err(error) => format!(
+            "; inspect {} (failed to read startup diagnostics: {error})",
+            path.display()
+        ),
+    }
+}
+
+#[cfg(unix)]
+fn read_startup_log_excerpt(
+    path: &Path,
+    start_offset: u64,
+    maximum_bytes: usize,
+) -> io::Result<Option<String>> {
+    if maximum_bytes == 0 {
+        return Ok(None);
+    }
+    let mut file = File::open(path)?;
+    let end_offset = file.metadata()?.len();
+    if end_offset <= start_offset {
+        return Ok(None);
+    }
+    let maximum_bytes = u64::try_from(maximum_bytes).unwrap_or(u64::MAX);
+    let read_offset = start_offset.max(end_offset.saturating_sub(maximum_bytes));
+    file.seek(SeekFrom::Start(read_offset))?;
+    let mut bytes = Vec::new();
+    file.take(maximum_bytes).read_to_end(&mut bytes)?;
+    let excerpt = String::from_utf8_lossy(&bytes);
+    let excerpt = excerpt.trim();
+    if excerpt.is_empty() {
+        return Ok(None);
+    }
+    if read_offset > start_offset {
+        Ok(Some(format!("[... startup log truncated ...]\n{excerpt}")))
+    } else {
+        Ok(Some(excerpt.to_owned()))
     }
 }
 
 fn restart_detached_node(args: StartArgs) -> Result<()> {
-    stop_detached_node()?;
-    if detached_node_status(false)? {
-        bail!("o-node is still running after stop; refusing to start a duplicate")
+    #[cfg(not(unix))]
+    {
+        let _ = args;
+        bail!("detached o-node restart is currently supported on Unix-like systems");
     }
-    start_detached_node(args)
+    #[cfg(unix)]
+    {
+        let (directory, pid_path, log_path) = detached_node_paths();
+        ensure_detached_process_directory(&directory)?;
+        let _lifecycle_lock =
+            acquire_detached_lifecycle_lock(&directory.join("o-node.lifecycle.lock"))?;
+        stop_detached_node_locked(&pid_path)?;
+        if detached_node_status_locked(false, &pid_path, &log_path)? {
+            bail!("o-node is still running after stop; refusing to start a duplicate")
+        }
+        start_detached_node_locked(args, pid_path, log_path)
+    }
 }
 
 fn stop_detached_node() -> Result<()> {
@@ -1274,89 +1777,218 @@ fn stop_detached_node() -> Result<()> {
     bail!("detached o-node stop is currently supported on Unix-like systems");
     #[cfg(unix)]
     {
-        let (_, pid_path, _) = detached_node_paths();
-        let Some(pid) = read_detached_pid(&pid_path)? else {
-            println!("o-node is not running");
-            return Ok(());
-        };
-        if !process_is_detached_node(pid) {
-            let _ = fs::remove_file(&pid_path);
-            println!("o-node was not running; removed stale PID file");
-            return Ok(());
-        }
-        if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
-            return Err(std::io::Error::last_os_error()).context("failed to signal o-node");
-        }
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline {
-            if !process_is_alive(pid) {
-                let _ = fs::remove_file(&pid_path);
-                println!("o-node stopped");
-                return Ok(());
-            }
-            thread::sleep(Duration::from_millis(100));
-        }
-        bail!("o-node is still draining accepted work after 10 seconds")
+        let (directory, pid_path, _) = detached_node_paths();
+        ensure_detached_process_directory(&directory)?;
+        let _lifecycle_lock =
+            acquire_detached_lifecycle_lock(&directory.join("o-node.lifecycle.lock"))?;
+        stop_detached_node_locked(&pid_path)
     }
 }
 
+#[cfg(unix)]
+fn stop_detached_node_locked(pid_path: &Path) -> Result<()> {
+    let Some(identity) = read_detached_pid(pid_path)? else {
+        println!("o-node is not running");
+        return Ok(());
+    };
+    let pid = identity.pid;
+    if !process_is_detached_node(&identity)? {
+        remove_pid_file_if_matches(pid_path, pid as u32)?;
+        println!("o-node was not running; removed stale PID file");
+        return Ok(());
+    }
+    if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("failed to signal o-node");
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if !process_is_alive(pid) {
+            remove_pid_file_if_matches(pid_path, pid as u32)?;
+            println!("o-node stopped");
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    bail!("o-node is still draining accepted work after 10 seconds")
+}
+
 fn detached_node_status(print: bool) -> Result<bool> {
-    let (_, pid_path, log_path) = detached_node_paths();
-    let Some(pid) = read_detached_pid(&pid_path)? else {
+    #[cfg(not(unix))]
+    {
+        let _ = print;
+        bail!("detached o-node status is currently supported on Unix-like systems");
+    }
+    #[cfg(unix)]
+    {
+        let (directory, pid_path, log_path) = detached_node_paths();
+        if !directory.exists() {
+            if print {
+                println!("stopped (no managed PID; unmanaged listeners are not probed)");
+            }
+            return Ok(false);
+        }
+        ensure_detached_process_directory(&directory)?;
+        let _lifecycle_lock =
+            acquire_detached_lifecycle_lock(&directory.join("o-node.lifecycle.lock"))?;
+        detached_node_status_locked(print, &pid_path, &log_path)
+    }
+}
+
+#[cfg(unix)]
+fn detached_node_status_locked(print: bool, pid_path: &Path, log_path: &Path) -> Result<bool> {
+    let Some(identity) = read_detached_pid(pid_path)? else {
         if print {
-            println!("stopped");
+            println!("stopped (no managed PID; unmanaged listeners are not probed)");
         }
         return Ok(false);
     };
-    let running = process_is_detached_node(pid);
+    let pid = identity.pid;
+    let running = process_is_detached_node(&identity)?;
     if !running {
-        let _ = fs::remove_file(&pid_path);
+        remove_pid_file_if_matches(pid_path, pid as u32)?;
     }
     if print {
         if running {
             println!("running pid={pid} log={}", log_path.display());
         } else {
-            println!("stopped (stale PID removed)");
+            println!("stopped (stale managed PID removed; unmanaged listeners are not probed)");
         }
     }
     Ok(running)
 }
 
-fn read_detached_pid(path: &Path) -> Result<Option<i32>> {
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DetachedProcessIdentity {
+    pid: i32,
+    launch_token: Option<String>,
+}
+
+#[cfg(unix)]
+fn read_detached_pid(path: &Path) -> Result<Option<DetachedProcessIdentity>> {
     if !path.is_file() {
         return Ok(None);
     }
     let value = fs::read_to_string(path)?;
-    let pid = value
+    let mut lines = value.lines();
+    let pid = lines
+        .next()
+        .context("o-node PID file is empty")?
         .trim()
         .parse::<i32>()
         .with_context(|| format!("invalid o-node PID file `{}`", path.display()))?;
     if pid <= 0 {
         bail!("invalid o-node PID {pid}");
     }
-    Ok(Some(pid))
+    let launch_token = lines.next().map(str::trim).map(str::to_owned);
+    if lines.next().is_some() {
+        bail!("invalid o-node PID file `{}`", path.display());
+    }
+    if let Some(token) = launch_token.as_deref() {
+        validate_detached_launch_token(token)
+            .with_context(|| format!("invalid o-node PID file `{}`", path.display()))?;
+    }
+    Ok(Some(DetachedProcessIdentity { pid, launch_token }))
 }
 
+#[cfg(unix)]
 fn process_is_alive(pid: i32) -> bool {
-    #[cfg(unix)]
-    {
-        let result = unsafe { libc::kill(pid, 0) };
-        result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    let result = unsafe { libc::kill(pid, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(unix)]
+fn inspect_live_process_with_ps(pid: i32, field: &str) -> Result<Option<String>> {
+    let pid_value = pid.to_string();
+    let field_specification = format!("{field}=");
+    let output = ProcessCommand::new("ps")
+        .args(["-ww", "-p", &pid_value, "-o", &field_specification])
+        .output();
+    let output = match output {
+        Ok(output) => output,
+        Err(_) if !process_is_alive(pid) => return Ok(None),
+        Err(error) => {
+            return Err(error).context(format!(
+                "failed to inspect managed o-node PID {pid} field `{field}`"
+            ))
+        }
+    };
+    if !output.status.success() {
+        if !process_is_alive(pid) {
+            return Ok(None);
+        }
+        bail!(
+            "could not inspect live managed o-node PID {pid}: `ps -o {field}=` exited with {}",
+            output.status
+        );
     }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        false
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if value.is_empty() {
+        if !process_is_alive(pid) {
+            return Ok(None);
+        }
+        bail!("could not inspect live managed o-node PID {pid}: `ps -o {field}=` was empty");
+    }
+    Ok(Some(value))
+}
+
+#[cfg(unix)]
+fn detached_executable_matches(executable: &Path, expected: &Path) -> bool {
+    if executable.is_absolute() && expected.is_absolute() {
+        executable == expected
+    } else {
+        executable
+            .file_name()
+            .zip(expected.file_name())
+            .is_some_and(|(actual, expected)| actual == expected)
     }
 }
 
-fn process_is_detached_node(pid: i32) -> bool {
-    if !process_is_alive(pid) {
-        return false;
+#[cfg(unix)]
+fn detached_ps_command_arguments(
+    observed_executable: &str,
+    expected: &Path,
+    command: &str,
+) -> Option<Vec<String>> {
+    if !detached_executable_matches(Path::new(observed_executable), expected) {
+        return None;
     }
-    let expected = env::current_exe()
-        .ok()
-        .and_then(|path| path.file_name().map(|name| name.to_owned()));
+    let command = command.trim();
+    let expected_text = expected.to_string_lossy();
+    let argument_text = command
+        .strip_prefix(expected_text.as_ref())
+        .and_then(|remainder| {
+            remainder
+                .chars()
+                .next()
+                .is_none_or(char::is_whitespace)
+                .then_some(remainder)
+        });
+    if let Some(argument_text) = argument_text {
+        let mut arguments = vec![expected_text.into_owned()];
+        arguments.extend(argument_text.split_whitespace().map(str::to_owned));
+        return Some(arguments);
+    }
+
+    // If `command=` also exposes only a basename, accept an unambiguous,
+    // whitespace-free argv[0]. A different or truncated path fails closed.
+    let mut fields = command.split_whitespace();
+    let argument_zero = fields.next()?;
+    if !detached_executable_matches(Path::new(argument_zero), expected) {
+        return None;
+    }
+    let mut arguments = vec![expected_text.into_owned()];
+    arguments.extend(fields.map(str::to_owned));
+    Some(arguments)
+}
+
+#[cfg(unix)]
+fn process_is_detached_node(identity: &DetachedProcessIdentity) -> Result<bool> {
+    let pid = identity.pid;
+    if !process_is_alive(pid) {
+        return Ok(false);
+    }
+    let expected = env::current_exe().context("failed to locate the current o-node executable")?;
 
     #[cfg(target_os = "linux")]
     {
@@ -1366,38 +1998,51 @@ fn process_is_detached_node(pid: i32) -> bool {
                 .filter(|part| !part.is_empty())
                 .map(|part| String::from_utf8_lossy(part).into_owned())
                 .collect::<Vec<_>>();
-            return detached_command_matches(&arguments, expected.as_deref());
+            return Ok(detached_command_matches(
+                &arguments,
+                &expected,
+                identity.launch_token.as_deref(),
+            ));
         }
     }
 
-    #[cfg(unix)]
-    {
-        let output = ProcessCommand::new("ps")
-            .args(["-p", &pid.to_string(), "-o", "command="])
-            .output();
-        if let Ok(output) = output {
-            if output.status.success() {
-                let command = String::from_utf8_lossy(&output.stdout);
-                let arguments = command
-                    .split_whitespace()
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>();
-                return detached_command_matches(&arguments, expected.as_deref());
-            }
-        }
-    }
-    false
+    let Some(executable) = inspect_live_process_with_ps(pid, "comm")? else {
+        return Ok(false);
+    };
+    let Some(command) = inspect_live_process_with_ps(pid, "command")? else {
+        return Ok(false);
+    };
+    let arguments = detached_ps_command_arguments(&executable, &expected, &command).with_context(|| {
+        format!(
+            "could not reconcile `ps` executable and command fields for live managed o-node PID {pid}"
+        )
+    })?;
+    Ok(detached_command_matches(
+        &arguments,
+        &expected,
+        identity.launch_token.as_deref(),
+    ))
 }
 
-fn detached_command_matches(arguments: &[String], expected: Option<&std::ffi::OsStr>) -> bool {
+#[cfg(unix)]
+fn detached_command_matches(
+    arguments: &[String],
+    expected: &Path,
+    launch_token: Option<&str>,
+) -> bool {
     let Some(executable) = arguments.first() else {
         return false;
     };
-    let executable_name = Path::new(executable).file_name();
-    let executable_matches = expected
-        .zip(executable_name)
-        .is_some_and(|(expected, actual)| expected == actual);
-    executable_matches && arguments.iter().skip(1).any(|argument| argument == "serve")
+    let executable = Path::new(executable);
+    let executable_matches = detached_executable_matches(executable, expected);
+    let token_matches = launch_token.is_none_or(|expected_token| {
+        arguments
+            .windows(2)
+            .any(|pair| pair[0] == "--managed-start-token" && pair[1].as_str() == expected_token)
+    });
+    executable_matches
+        && token_matches
+        && arguments.iter().skip(1).any(|argument| argument == "serve")
 }
 
 fn gc_closed_session(args: AdminGcClosedArgs) -> Result<()> {
@@ -1682,6 +2327,10 @@ fn doctor(mut args: DoctorArgs) -> Result<()> {
 }
 
 fn serve(mut args: ServeArgs) -> Result<()> {
+    if let Some(token) = args.managed_start_token.as_deref() {
+        validate_detached_launch_token(token)?;
+    }
+    let managed_start_token = args.managed_start_token.take();
     let automatic_mode = !args.manual;
     let legacy_lan_open = automatic_mode && args.lan_open;
     let automatic = if automatic_mode {
@@ -1731,9 +2380,7 @@ fn serve(mut args: ServeArgs) -> Result<()> {
     let (shim_dir, _shim_guard) = resolve_shim_dir(args.runtime.shim_dir.clone())?;
     let v1_runtime = runtime_from_args(args.runtime, shim_dir)?;
 
-    let mut _discovery = None;
-    let mut _bootstrap = None;
-    if let Some(material) = automatic.as_ref() {
+    if automatic.is_some() {
         if legacy_lan_open {
             eprintln!(
                 "{}",
@@ -1747,36 +2394,15 @@ fn serve(mut args: ServeArgs) -> Result<()> {
                 "o-node: paired mode enabled -- run `o node pair` on one machine, then enter its one-use passcode on the other"
             );
         }
-        if !args.no_discovery {
-            let advertisement = if legacy_lan_open {
-                LanNodeAdvertisementV1::new(
-                    material.node_id.clone(),
-                    material.server_name.clone(),
-                    service_port,
-                    DEFAULT_LAN_BOOTSTRAP_PORT,
-                    args.v2_state_dir.is_some(),
-                )?
-            } else {
-                LanNodeAdvertisementV1::pairing_required(
-                    material.node_id.clone(),
-                    material.server_name.clone(),
-                    service_port,
-                    DEFAULT_LAN_PAIRING_PORT,
-                    args.v2_state_dir.is_some(),
-                )?
-            };
-            _discovery = Some(spawn_lan_discovery_responder(
-                advertisement,
-                DEFAULT_LAN_DISCOVERY_PORT,
-            )?);
-        }
-        if legacy_lan_open && !args.no_bootstrap {
-            _bootstrap = Some(spawn_lan_bootstrap_server(
-                SocketAddr::from((Ipv4Addr::UNSPECIFIED, DEFAULT_LAN_BOOTSTRAP_PORT)),
-                lan_bootstrap_bundle(material, service_port)?,
-            )?);
-        }
     }
+    let lan_services = LanServicesAfterBind {
+        material: automatic,
+        service_port,
+        supports_v2: args.v2_state_dir.is_some(),
+        legacy_lan_open,
+        no_discovery: args.no_discovery,
+        no_bootstrap: args.no_bootstrap,
+    };
 
     if let Some(state_dir) = args.v2_state_dir {
         let shutdown = HostedDualNodeShutdown::new();
@@ -1864,24 +2490,22 @@ fn serve(mut args: ServeArgs) -> Result<()> {
                 eprintln!("o-node: retained unreadable V2 session: {diagnostic}");
             }
         }
-        let mesh_status = if let Some(mesh_state_dir) = mesh_state_dir.as_ref() {
+        if let Some(mesh_state_dir) = mesh_state_dir.as_ref() {
             eprintln!(
                 "o-node: scheduler/actor mesh enabled at `{}` with capacity for {} concurrent actors",
                 mesh_state_dir.display(),
                 v1_runtime.max_concurrent_connections
             );
-            "scheduler/actor mesh enabled"
+        }
+        let ready_node_id = v1_runtime.node_id.clone();
+        let ready_maximum_connections = v1_runtime.max_concurrent_connections;
+        let ready_service_summary = if mesh_runtime.is_some() {
+            "TLS 1.3 mTLS; frozen V1 + durable V2; scheduler/actor mesh enabled"
         } else {
-            "scheduler/actor mesh disabled"
+            "TLS 1.3 mTLS; frozen V1 + durable V2; scheduler/actor mesh disabled"
         };
-        eprintln!(
-            "o-node: serving {} on {} (TLS 1.3 mTLS; frozen V1 + durable V2; {}; max {} connections)",
-            v1_runtime.node_id,
-            bind_address,
-            mesh_status,
-            v1_runtime.max_concurrent_connections
-        );
-        return serve_owned_node_dual_until_shutdown(
+        let listener_ready_shutdown = shutdown.clone();
+        return serve_owned_node_dual_until_shutdown_with_listener_ready(
             HostedOwnedDualNodeServerConfig {
                 bind_address,
                 v1_runtime,
@@ -1890,6 +2514,17 @@ fn serve(mut args: ServeArgs) -> Result<()> {
                 tls_identity: tls_identity(args.tls),
             },
             shutdown,
+            move |listening_address| {
+                report_listener_ready(
+                    listening_address,
+                    &ready_node_id,
+                    ready_maximum_connections,
+                    ready_service_summary,
+                    lan_services,
+                    Some(&listener_ready_shutdown),
+                    managed_start_token.as_deref(),
+                )
+            },
         );
     }
     if args.v2_node_signing_key.is_some() || args.v2_authority_public_key.is_some() {
@@ -1900,11 +2535,19 @@ fn serve(mut args: ServeArgs) -> Result<()> {
         runtime: v1_runtime,
         tls_identity: tls_identity(args.tls),
     };
-    eprintln!(
-        "o-node: serving {} on {} (TLS 1.3 mTLS, max {} connections)",
-        config.runtime.node_id, config.bind_address, config.runtime.max_concurrent_connections
-    );
-    serve_node(config)
+    let ready_node_id = config.runtime.node_id.clone();
+    let ready_maximum_connections = config.runtime.max_concurrent_connections;
+    serve_node_with_listener_ready(config, move |listening_address| {
+        report_listener_ready(
+            listening_address,
+            &ready_node_id,
+            ready_maximum_connections,
+            "TLS 1.3 mTLS; frozen V1; scheduler/actor mesh disabled",
+            lan_services,
+            None,
+            managed_start_token.as_deref(),
+        )
+    })
 }
 
 fn resolve_mesh_state_dir(
@@ -2434,20 +3077,322 @@ mod tests {
     }
 
     #[test]
+    fn listener_readiness_is_not_published_after_shutdown_request() {
+        let shutdown = HostedDualNodeShutdown::new();
+        assert!(shutdown.request());
+        let error = report_listener_ready(
+            "127.0.0.1:7337".parse().unwrap(),
+            "shutdown-test",
+            1,
+            "test service",
+            LanServicesAfterBind {
+                material: None,
+                service_port: 7337,
+                supports_v2: true,
+                legacy_lan_open: false,
+                no_discovery: true,
+                no_bootstrap: true,
+            },
+            Some(&shutdown),
+            Some("0123456789abcdef0123456789abcdef"),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "o-node shutdown was requested before listener readiness publication"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn detached_pid_guard_only_matches_this_binary_in_serve_mode() {
-        let expected = std::ffi::OsStr::new("o-node");
+        let expected = Path::new("/tmp/o-node");
         assert!(detached_command_matches(
             &["/tmp/o-node".to_owned(), "serve".to_owned()],
-            Some(expected)
+            expected,
+            None,
         ));
         assert!(!detached_command_matches(
             &["/tmp/o-node".to_owned(), "profile".to_owned()],
-            Some(expected)
+            expected,
+            None,
         ));
         assert!(!detached_command_matches(
             &["/usr/bin/sleep".to_owned(), "serve".to_owned()],
-            Some(expected)
+            expected,
+            None,
         ));
+        assert!(!detached_command_matches(
+            &["/opt/o-node".to_owned(), "serve".to_owned()],
+            expected,
+            None,
+        ));
+        assert!(detached_command_matches(
+            &["o-node".to_owned(), "serve".to_owned()],
+            expected,
+            None,
+        ));
+        let token = "0123456789abcdef0123456789abcdef";
+        let expected_with_spaces = Path::new("/tmp/path with spaces/o-node");
+        assert!(detached_command_matches(
+            &[
+                "/tmp/path with spaces/o-node".to_owned(),
+                "serve".to_owned(),
+                "--managed-start-token".to_owned(),
+                token.to_owned(),
+            ],
+            expected_with_spaces,
+            Some(token),
+        ));
+        assert!(!detached_command_matches(
+            &[
+                "/tmp/path with spaces/not-o-node".to_owned(),
+                "serve".to_owned(),
+                "--managed-start-token".to_owned(),
+                token.to_owned(),
+            ],
+            expected_with_spaces,
+            Some(token),
+        ));
+        assert!(!detached_command_matches(
+            &[
+                "/tmp/path with spaces/o-node".to_owned(),
+                "serve".to_owned(),
+                "--managed-start-token".to_owned(),
+                "ffffffffffffffffffffffffffffffff".to_owned(),
+            ],
+            expected_with_spaces,
+            Some(token),
+        ));
+
+        let ps_arguments = detached_ps_command_arguments(
+            "o-node",
+            expected_with_spaces,
+            &format!("/tmp/path with spaces/o-node serve --managed-start-token {token}"),
+        )
+        .unwrap();
+        assert!(detached_command_matches(
+            &ps_arguments,
+            expected_with_spaces,
+            Some(token),
+        ));
+        assert!(detached_ps_command_arguments(
+            "o-node",
+            expected_with_spaces,
+            "/tmp/different path/o-node serve"
+        )
+        .is_none());
+        assert!(detached_ps_command_arguments(
+            "not-o-node",
+            expected_with_spaces,
+            "/tmp/path with spaces/o-node serve"
+        )
+        .is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detached_startup_log_scope_ignores_prior_attempts() {
+        let launch_token = "0123456789abcdef0123456789abcdef";
+        let prior_launch_token = "ffffffffffffffffffffffffffffffff";
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("o-node.log");
+        fs::write(
+            &path,
+            format!(
+                "{DETACHED_LISTENER_READY_LOG_PREFIX}{prior_launch_token} address=127.0.0.1:7337\nold run\n"
+            ),
+        )
+        .unwrap();
+        let start_offset = fs::metadata(&path).unwrap().len();
+        let mut observer =
+            DetachedStartupLogObserver::open(&path, start_offset, launch_token).unwrap();
+        let mut log = OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(log, "failed to bind current run").unwrap();
+        writeln!(
+            log,
+            "{DETACHED_LISTENER_READY_LOG_PREFIX}{prior_launch_token} address=127.0.0.1:7337"
+        )
+        .unwrap();
+        log.flush().unwrap();
+
+        assert!(!observer.poll_listener_ready().unwrap());
+        let excerpt = read_startup_log_excerpt(&path, start_offset, 1024)
+            .unwrap()
+            .unwrap();
+        assert!(excerpt.starts_with("failed to bind current run\n"));
+        assert!(excerpt.contains(prior_launch_token));
+        assert!(!excerpt.contains("old run"));
+
+        let ready_line_prefix =
+            format!("{DETACHED_LISTENER_READY_LOG_PREFIX}{launch_token} address=");
+        let prefix = ready_line_prefix.as_bytes();
+        let split = prefix.len() / 2;
+        log.write_all(&prefix[..split]).unwrap();
+        log.flush().unwrap();
+        assert!(!observer.poll_listener_ready().unwrap());
+        log.write_all(&prefix[split..]).unwrap();
+        log.flush().unwrap();
+        assert!(!observer.poll_listener_ready().unwrap());
+        writeln!(log, "127.0.0.1:7337").unwrap();
+        log.flush().unwrap();
+        assert!(observer.poll_listener_ready().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detached_startup_observer_does_not_lose_an_early_marker() {
+        let launch_token = "0123456789abcdef0123456789abcdef";
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("o-node.log");
+        fs::write(&path, "attempt starts here\n").unwrap();
+        let start_offset = fs::metadata(&path).unwrap().len();
+        let mut observer =
+            DetachedStartupLogObserver::open(&path, start_offset, launch_token).unwrap();
+        let mut log = OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(
+            log,
+            "{DETACHED_LISTENER_READY_LOG_PREFIX}{launch_token} address=127.0.0.1:7337"
+        )
+        .unwrap();
+        log.write_all(&vec![b'x'; DETACHED_STARTUP_LOG_EXCERPT_BYTES * 2])
+            .unwrap();
+        log.flush().unwrap();
+
+        assert!(observer.poll_listener_ready().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detached_startup_observer_bounds_each_poll() {
+        let launch_token = "0123456789abcdef0123456789abcdef";
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("o-node.log");
+        let mut contents = vec![b'x'; DETACHED_STARTUP_LOG_POLL_BYTES];
+        contents.push(b'\n');
+        contents.extend_from_slice(
+            format!("{DETACHED_LISTENER_READY_LOG_PREFIX}{launch_token} address=127.0.0.1:7337\n")
+                .as_bytes(),
+        );
+        fs::write(&path, contents).unwrap();
+        let mut observer = DetachedStartupLogObserver::open(&path, 0, launch_token).unwrap();
+
+        assert!(!observer.poll_listener_ready().unwrap());
+        assert_eq!(
+            observer.file.stream_position().unwrap(),
+            DETACHED_STARTUP_LOG_POLL_BYTES as u64
+        );
+        assert!(observer.poll_listener_ready().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detached_startup_log_excerpt_is_bounded() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("o-node.log");
+        fs::write(&path, "0123456789abcdef").unwrap();
+        let excerpt = read_startup_log_excerpt(&path, 0, 8).unwrap().unwrap();
+        assert_eq!(excerpt, "[... startup log truncated ...]\n89abcdef");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detached_pid_file_supports_legacy_and_token_bound_records() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("o-node.pid");
+        fs::write(&path, "123\n").unwrap();
+        assert_eq!(
+            read_detached_pid(&path).unwrap(),
+            Some(DetachedProcessIdentity {
+                pid: 123,
+                launch_token: None,
+            })
+        );
+
+        let token = "0123456789abcdef0123456789abcdef";
+        fs::write(&path, format!("456\n{token}\n")).unwrap();
+        assert_eq!(
+            read_detached_pid(&path).unwrap(),
+            Some(DetachedProcessIdentity {
+                pid: 456,
+                launch_token: Some(token.to_owned()),
+            })
+        );
+        fs::write(&path, "456\nnot-a-token\n").unwrap();
+        assert!(read_detached_pid(&path).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detached_lifecycle_lock_serializes_pid_transitions() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("o-node.lifecycle.lock");
+        let _first = acquire_detached_lifecycle_lock(&path).unwrap();
+        let second = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let result = unsafe { libc::flock(second.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(result, -1);
+        let lock_error = io::Error::last_os_error().raw_os_error();
+        assert!(
+            lock_error.is_some_and(|code| { code == libc::EWOULDBLOCK || code == libc::EAGAIN })
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detached_startup_guard_reaps_child_and_only_removes_its_pid() {
+        let root = tempfile::tempdir().unwrap();
+        let pid_path = root.path().join("o-node.pid");
+        let child = ProcessCommand::new("/bin/sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        fs::write(&pid_path, format!("{pid}\n")).unwrap();
+        {
+            let _guard = DetachedStartupChildGuard::new(child, pid_path.clone());
+        }
+        assert!(!process_is_alive(pid as i32));
+        assert!(!pid_path.exists());
+
+        fs::write(&pid_path, "999999\n").unwrap();
+        remove_pid_file_if_matches(&pid_path, pid).unwrap();
+        assert_eq!(fs::read_to_string(&pid_path).unwrap(), "999999\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detached_startup_interrupt_is_observed_before_success() {
+        let launch_token = "0123456789abcdef0123456789abcdef";
+        let root = tempfile::tempdir().unwrap();
+        let log_path = root.path().join("o-node.log");
+        let pid_path = root.path().join("o-node.pid");
+        fs::write(
+            &log_path,
+            format!("{DETACHED_LISTENER_READY_LOG_PREFIX}{launch_token} address=127.0.0.1:7337\n"),
+        )
+        .unwrap();
+        let mut observer = DetachedStartupLogObserver::open(&log_path, 0, launch_token).unwrap();
+        let child = ProcessCommand::new("/bin/sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        fs::write(&pid_path, format!("{pid}\n")).unwrap();
+        let mut child = DetachedStartupChildGuard::new(child, pid_path.clone());
+        let interrupted = AtomicBool::new(true);
+
+        let error = wait_for_detached_node_startup(
+            child.child_mut(),
+            &mut observer,
+            &log_path,
+            0,
+            Duration::from_secs(30),
+            &interrupted,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("startup interrupted"));
+        child.cleanup().unwrap();
+        assert!(!process_is_alive(pid as i32));
+        assert!(!pid_path.exists());
     }
 
     #[test]

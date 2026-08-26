@@ -1,6 +1,6 @@
 //! Hosted node request handling and the bounded synchronous TCP server.
 
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -271,10 +271,29 @@ pub struct HostedNodeServerConfig {
 /// Connections are isolated in bounded worker threads. Excess connections are
 /// closed before TLS, keeping the concurrency cap authoritative.
 pub fn serve_node(config: HostedNodeServerConfig) -> Result<()> {
+    serve_node_with_listener_ready(config, |_| Ok(()))
+}
+
+/// Serve requests and invoke `listener_ready` exactly once after the TCP
+/// listener is successfully bound and inspected, before accepting connections.
+pub fn serve_node_with_listener_ready<F>(
+    config: HostedNodeServerConfig,
+    listener_ready: F,
+) -> Result<()>
+where
+    F: FnOnce(SocketAddr) -> Result<()>,
+{
     config.runtime.validate()?;
     let tls_config = build_server_config(&config.tls_identity)?;
     let listener = TcpListener::bind(&config.bind_address)
         .with_context(|| format!("failed to bind hosted node at `{}`", config.bind_address))?;
+    let listening_address = listener.local_addr().with_context(|| {
+        format!(
+            "failed to inspect hosted listener bound from `{}`",
+            config.bind_address
+        )
+    })?;
+    listener_ready(listening_address).context("hosted listener-ready hook failed")?;
     let runtime = Arc::new(config.runtime);
     let active = Arc::new(AtomicUsize::new(0));
 
@@ -362,7 +381,74 @@ impl Drop for ActiveConnectionGuard {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
+    use crate::hosted_remote::tls::test_server_tls_identity;
+
     use super::*;
+
+    fn test_server_config(
+        bind_address: String,
+        tls_identity: ServerTlsIdentity,
+    ) -> HostedNodeServerConfig {
+        HostedNodeServerConfig {
+            bind_address,
+            runtime: HostedNodeRuntime {
+                node_id: "listener-ready-test".to_owned(),
+                shim_dir: PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+                runtime_executable: std::env::current_exe().unwrap(),
+                max_concurrent_connections: 1,
+            },
+            tls_identity,
+        }
+    }
+
+    #[test]
+    fn listener_ready_hook_runs_after_bind_and_error_releases_listener() {
+        let (_tls_directory, tls_identity) = test_server_tls_identity().unwrap();
+        let reported_address = Cell::new(None);
+        let error = serve_node_with_listener_ready(
+            test_server_config("127.0.0.1:0".to_owned(), tls_identity),
+            |address| {
+                assert!(address.ip().is_loopback());
+                assert_ne!(address.port(), 0);
+                assert_eq!(
+                    TcpListener::bind(address).unwrap_err().kind(),
+                    std::io::ErrorKind::AddrInUse
+                );
+                reported_address.set(Some(address));
+                anyhow::bail!("injected listener-ready failure")
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "hosted listener-ready hook failed");
+        assert!(error
+            .chain()
+            .any(|cause| cause.to_string() == "injected listener-ready failure"));
+        let rebound = TcpListener::bind(reported_address.get().unwrap()).unwrap();
+        drop(rebound);
+    }
+
+    #[test]
+    fn bind_failure_does_not_invoke_listener_ready_hook() {
+        let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = reservation.local_addr().unwrap();
+        let (_tls_directory, tls_identity) = test_server_tls_identity().unwrap();
+        let invoked = Cell::new(false);
+
+        let error = serve_node_with_listener_ready(
+            test_server_config(address.to_string(), tls_identity),
+            |_| {
+                invoked.set(true);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("failed to bind hosted node"));
+        assert!(!invoked.get());
+    }
 
     #[test]
     fn source_mismatch_is_a_digest_bound_rejection_receipt() {

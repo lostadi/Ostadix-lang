@@ -36,6 +36,28 @@ pub struct ServerTlsIdentity {
     pub key_path: PathBuf,
 }
 
+#[cfg(test)]
+pub(crate) fn test_server_tls_identity() -> Result<(tempfile::TempDir, ServerTlsIdentity)> {
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test-assets/hosted_tls");
+    let directory = tempfile::tempdir()?;
+    let key_path = directory.path().join("server-key.pem");
+    let key_body = include_str!("../../test-assets/hosted_tls/server-key.pkcs8.b64");
+    let key_label = "PRIVATE KEY";
+    std::fs::write(
+        &key_path,
+        format!(
+            "-----BEGIN {key_label}-----\n{}\n-----END {key_label}-----\n",
+            key_body.trim()
+        ),
+    )?;
+    let identity = ServerTlsIdentity {
+        client_ca_path: fixture.join("ca.pem"),
+        cert_path: fixture.join("server-cert.pem"),
+        key_path,
+    };
+    Ok((directory, identity))
+}
+
 pub type HostedClientStream = StreamOwned<ClientConnection, TcpStream>;
 pub type HostedServerStream = StreamOwned<ServerConnection, TcpStream>;
 

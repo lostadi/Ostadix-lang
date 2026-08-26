@@ -164,6 +164,14 @@ OSTADIX_API_RUNTIME_ASSET_PATHS = frozenset(
         f"{OSTADIX_API_ROOT}/test-assets/ocore/runtime/x86_64/native_abi.oc",
     }
 )
+HOSTED_TLS_TEST_IDENTITY_PATHS = frozenset(
+    {
+        f"{OSTADIX_API_ROOT}/test-assets/hosted_tls/README.md",
+        f"{OSTADIX_API_ROOT}/test-assets/hosted_tls/ca.pem",
+        f"{OSTADIX_API_ROOT}/test-assets/hosted_tls/server-cert.pem",
+        f"{OSTADIX_API_ROOT}/test-assets/hosted_tls/server-key.pkcs8.b64",
+    }
+)
 OSTADIX_API_RELEASE_PATHS = frozenset(
     {
         f"{OSTADIX_API_ROOT}/Cargo.toml",
@@ -176,7 +184,7 @@ OSTADIX_API_RELEASE_PATHS = frozenset(
         f"{OSTADIX_API_SOURCE_ROOT}/shims.rs",
         f"{OSTADIX_API_ROOT}/tests/public_surface.rs",
     }
-) | OSTADIX_API_RUNTIME_ASSET_PATHS
+) | OSTADIX_API_RUNTIME_ASSET_PATHS | HOSTED_TLS_TEST_IDENTITY_PATHS
 OSTADIX_API_ROOT_MODULE_PATHS = {
     "api": f"{OSTADIX_API_SOURCE_ROOT}/api.rs",
     "backend": f"{OSTADIX_API_SOURCE_ROOT}/backend.rs",

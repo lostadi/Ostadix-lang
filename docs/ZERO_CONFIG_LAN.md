@@ -11,7 +11,7 @@ explicitly chooses manual mode.
 
 ## Ordinary use
 
-Start a node on both machines:
+On Unix-like hosts (including WSL), start a node on both machines:
 
 ```bash
 o node start
@@ -59,13 +59,24 @@ omitted. Pairing records the current endpoint as a reconnect coordinate; a
 later command can therefore reconnect from remembered state even when
 discovery is unavailable.
 
-Inspect or stop the local detached node with:
+On Unix-like hosts (including WSL), inspect or stop the local detached node
+with:
 
 ```bash
 o node status
 o node stop
 o node restart
 ```
+
+`status` describes the PID record under the active Ostadix/XDG state root; it
+does not probe listener ports or discover an expert `o-node serve` process
+absent from that record. For a newly launched node, `start` reports success
+only after its hosted TCP listener is bound. Configuration and spawn errors are
+returned directly; a child failure or timeout prints launch-scoped diagnostics
+plus the path to the complete private log. The default 120-second startup
+window is configurable with `--startup-timeout-seconds N` for large durable
+state roots. An already-managed PID is reported without a fresh listener
+probe.
 
 No CA, certificate, private key, receipt key, capability, placement lease,
 operation ID, task digest, or attempt generation is ordinary user input.
@@ -258,7 +269,7 @@ Automatic node material follows XDG locations where available:
   `~/.local/state/ostadix/lan-open-v2`
 - Automatic client sessions: `$XDG_STATE_HOME/ostadix/client-sessions`,
   otherwise `~/.local/state/ostadix/client-sessions`
-- Detached node PID and log: `$XDG_STATE_HOME/ostadix/node`, otherwise
+- Detached node PID, lifecycle lock, and log: `$XDG_STATE_HOME/ostadix/node`, otherwise
   `~/.local/state/ostadix/node`
 
 Private key and capability files are written with owner-only permissions on
@@ -278,6 +289,7 @@ command surface.
 
 ## Verification status
 
-The checks actually executed for this patch, together with the remaining Rust
-build gate, are recorded in
+The historical pairing and zero-configuration checks are recorded in
 [Zero-configuration LAN patch verification](ZERO_CONFIG_VERIFICATION.md).
+That dated record does not by itself validate later lifecycle or readiness
+changes; those must be rerun against the current source revision.

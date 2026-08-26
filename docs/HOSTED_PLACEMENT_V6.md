@@ -371,12 +371,13 @@ therefore disrupt availability, but cannot replace paired pins.
 
 ### Ordinary passcode pairing projection
 
-Both machines first run `o node start`. One runs `o node pair`, which prints a
-uniform ten-digit code and accepts one connection attempt for five minutes. The
-other runs `o node pair NODE_ID` and enters that code through a hidden prompt;
-`--passcode-stdin` is the noninteractive input path. Directly routed pairing can
-bypass discovery with `--address HOST:7340`, but that endpoint must be directly
-TCP-reachable. There is no NAT traversal, relay, or hole punching.
+On Unix-like hosts (including WSL), both machines first run `o node start`. One
+runs `o node pair`, which prints a uniform ten-digit code and accepts one
+connection attempt for five minutes. The other runs `o node pair NODE_ID` and
+enters that code through a hidden prompt; `--passcode-stdin` is the
+noninteractive input path. Directly routed pairing can bypass discovery with
+`--address HOST:7340`, but that endpoint must be directly TCP-reachable. There
+is no NAT traversal, relay, or hole punching.
 
 The exchange uses SPAKE2 with explicit directional confirmation over both node
 identities, both public bundles, both SPAKE2 messages, both CSRs, and both

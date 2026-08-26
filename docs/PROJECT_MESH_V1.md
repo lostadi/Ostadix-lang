@@ -11,7 +11,8 @@ the `ostadix-mesh/1` ALPN.
 
 ## Quick start
 
-Build Ostadix and start a node on every participating machine:
+On every participating Unix-like host (including WSL), build Ostadix and start
+a node:
 
 ```bash
 ./setup.sh -y --minimal
