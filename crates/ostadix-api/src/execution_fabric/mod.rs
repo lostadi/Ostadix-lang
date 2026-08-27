@@ -8,6 +8,7 @@
 mod codec;
 mod protocol;
 
+pub(crate) use codec::decode_execution_candidate_representation_v1;
 pub use codec::{
     decode_execution_candidate_v1, decode_execution_capsule_v1, encode_execution_candidate_v1,
     encode_execution_capsule_v1, execution_capsule_sha256_v1,

@@ -57,10 +57,22 @@ pub const RUNTIME_EXECUTION_FABRIC_AUTHORITY_SOURCES: &[(&str, &str)] = &[
 // reproducible in an isolated generated source tree.
 pub const RUNTIME_HOSTED_REMOTE_FABRIC_SOURCES: &[(&str, &str)] = &[
     ("mod.rs", include_str!("../hosted_remote/fabric/mod.rs")),
+    (
+        "client.rs",
+        include_str!("../hosted_remote/fabric/client.rs"),
+    ),
+    (
+        "coordinator.rs",
+        include_str!("../hosted_remote/fabric/coordinator.rs"),
+    ),
     ("keys.rs", include_str!("../hosted_remote/fabric/keys.rs")),
     (
         "ledger.rs",
         include_str!("../hosted_remote/fabric/ledger.rs"),
+    ),
+    (
+        "profile.rs",
+        include_str!("../hosted_remote/fabric/profile.rs"),
     ),
     (
         "provider.rs",

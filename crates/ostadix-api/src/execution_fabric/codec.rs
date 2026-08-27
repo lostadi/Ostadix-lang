@@ -45,13 +45,27 @@ pub fn encode_execution_candidate_v1(
 pub fn decode_execution_candidate_v1(
     bytes: &[u8],
 ) -> Result<ExecutionCandidateV1, ExecutionFabricError> {
+    let candidate = decode_execution_candidate_representation_v1(bytes)?;
+    candidate.validate()?;
+    Ok(candidate)
+}
+
+/// Decode only the bounded canonical candidate representation.
+///
+/// Coordinator-side Fabric acceptance deliberately validates attempt,
+/// capsule, contract, OWVALUE, content, and deadline semantics in its ordered
+/// gates. Keeping this structural decoder separate prevents a gate-17 digest
+/// failure from being reported before node authentication at gates 2 and 3.
+pub(crate) fn decode_execution_candidate_representation_v1(
+    bytes: &[u8],
+) -> Result<ExecutionCandidateV1, ExecutionFabricError> {
     let candidate: ExecutionCandidateV1 = decode_canonical(
         "candidate",
         bytes,
         MAX_EXECUTION_CANDIDATE_BYTES,
         MAX_CANDIDATE_ITEMS,
     )?;
-    candidate.validate()?;
+    candidate.validate_representation()?;
     Ok(candidate)
 }
 

@@ -16,6 +16,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 #[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(test)]
 use std::sync::{Condvar, Mutex, MutexGuard};
 #[cfg(test)]
 use std::time::Duration;
@@ -41,6 +43,8 @@ struct ParallelTask {
     overlap_probe: Option<Arc<TestOverlapProbe>>,
     #[cfg(test)]
     pipeline_probe: Option<Arc<TestPipelineProbe>>,
+    #[cfg(test)]
+    local_renderer_probe: Option<Arc<TestLocalRendererProbe>>,
     #[cfg(test)]
     plan_node: PlanNodeId,
 }
@@ -144,6 +148,19 @@ struct TestPipelineState {
 static ACTIVE_PIPELINE_PROBE: Mutex<Option<(std::thread::ThreadId, Arc<TestPipelineProbe>)>> =
     Mutex::new(None);
 
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct TestLocalRendererProbe {
+    invocations: AtomicUsize,
+}
+
+#[cfg(test)]
+static TEST_LOCAL_RENDERER_LOCK: Mutex<()> = Mutex::new(());
+#[cfg(test)]
+static ACTIVE_LOCAL_RENDERER_PROBE: Mutex<
+    Option<(std::thread::ThreadId, Arc<TestLocalRendererProbe>)>,
+> = Mutex::new(None);
+
 /// Exclusive, thread-scoped observation of tasks built by one graph
 /// coordinator test. Matching the builder thread prevents unrelated parallel
 /// tests from contributing to the overlap witness.
@@ -158,6 +175,15 @@ pub(crate) struct TestOverlapSession {
 #[cfg(test)]
 pub(crate) struct TestPipelineSession {
     probe: Arc<TestPipelineProbe>,
+    _guard: MutexGuard<'static, ()>,
+}
+
+/// Thread-scoped proof that an explicit remote attempt never invokes the local
+/// trusted renderer. Tasks capture this probe only when prepared by the test's
+/// coordinator thread, so unrelated parallel tests cannot increment it.
+#[cfg(test)]
+pub(crate) struct TestLocalRendererSession {
+    probe: Arc<TestLocalRendererProbe>,
     _guard: MutexGuard<'static, ()>,
 }
 
@@ -219,6 +245,28 @@ impl TestPipelineSession {
 }
 
 #[cfg(test)]
+impl TestLocalRendererSession {
+    pub(crate) fn begin() -> Self {
+        let guard = TEST_LOCAL_RENDERER_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let probe = Arc::new(TestLocalRendererProbe::default());
+        *ACTIVE_LOCAL_RENDERER_PROBE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some((std::thread::current().id(), Arc::clone(&probe)));
+        Self {
+            probe,
+            _guard: guard,
+        }
+    }
+
+    pub(crate) fn invocations(&self) -> usize {
+        self.probe.invocations.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
 impl Drop for TestOverlapSession {
     fn drop(&mut self) {
         let mut active = ACTIVE_TEST_PROBE
@@ -249,6 +297,21 @@ impl Drop for TestPipelineSession {
 }
 
 #[cfg(test)]
+impl Drop for TestLocalRendererSession {
+    fn drop(&mut self) {
+        let mut active = ACTIVE_LOCAL_RENDERER_PROBE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if active
+            .as_ref()
+            .is_some_and(|(_, probe)| Arc::ptr_eq(probe, &self.probe))
+        {
+            *active = None;
+        }
+    }
+}
+
+#[cfg(test)]
 fn active_test_probe() -> Option<Arc<TestOverlapProbe>> {
     ACTIVE_TEST_PROBE
         .lock()
@@ -261,6 +324,16 @@ fn active_test_probe() -> Option<Arc<TestOverlapProbe>> {
 #[cfg(test)]
 fn active_pipeline_probe() -> Option<Arc<TestPipelineProbe>> {
     ACTIVE_PIPELINE_PROBE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .filter(|(owner, _)| *owner == std::thread::current().id())
+        .map(|(_, probe)| Arc::clone(probe))
+}
+
+#[cfg(test)]
+fn active_local_renderer_probe() -> Option<Arc<TestLocalRendererProbe>> {
+    ACTIVE_LOCAL_RENDERER_PROBE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .as_ref()
@@ -491,6 +564,8 @@ fn build_task(
         #[cfg(test)]
         pipeline_probe: active_pipeline_probe(),
         #[cfg(test)]
+        local_renderer_probe: active_local_renderer_probe(),
+        #[cfg(test)]
         plan_node: id,
     })
 }
@@ -567,6 +642,10 @@ fn execute_prepared(task: &ParallelTask, context: &TaskContext) -> Result<OValue
             canonical,
             parts,
         } => {
+            #[cfg(test)]
+            if let Some(probe) = &task.local_renderer_probe {
+                probe.invocations.fetch_add(1, Ordering::SeqCst);
+            }
             let mut buf = String::new();
             for part in parts {
                 match part {
@@ -639,6 +718,7 @@ mod tests {
                 },
                 overlap_probe: Some(Arc::clone(&session.probe)),
                 pipeline_probe: None,
+                local_renderer_probe: None,
                 plan_node: PlanNodeId(index),
             })
             .collect::<Vec<_>>();
@@ -679,6 +759,7 @@ mod tests {
             },
             overlap_probe: Some(Arc::clone(&session.probe)),
             pipeline_probe: None,
+            local_renderer_probe: None,
             plan_node: PlanNodeId(0),
         };
 

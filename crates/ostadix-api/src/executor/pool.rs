@@ -166,23 +166,27 @@ fn worker_loop(
         let Ok(submission) = submission else {
             return;
         };
-        let (token, task) = submission.into_parts();
+        let (token, physical_attempt, task) = submission.into_parts();
         crate::process::lifecycle_trace("worker.task_received", format!("token={}", token.0));
         let context = TaskContext::new(token, events.clone());
         // This converts panics only in unwind-capable profiles. A panic-abort
         // build terminates the process before Rust can produce a completion.
-        let completion =
+        let outcome =
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| task.execute(&context)))
             {
                 Ok(Err(error)) if crate::process::is_infrastructure_error(&error) => {
-                    TaskCompletion::infrastructure_abort(token, error)
+                    super::task::TaskOutcome::InfrastructureAbort(error)
                 }
-                Ok(outcome) => TaskCompletion::completed(token, outcome),
-                Err(_) => TaskCompletion::infrastructure_abort(
-                    token,
-                    anyhow!("prepared local-worker task panicked"),
-                ),
+                Ok(outcome) => super::task::TaskOutcome::Completed(outcome.map(Box::new)),
+                Err(_) => super::task::TaskOutcome::InfrastructureAbort(anyhow!(
+                    "prepared local-worker task panicked"
+                )),
             };
+        let completion = TaskCompletion {
+            token,
+            physical_attempt,
+            outcome,
+        };
         if events.send(WorkerEvent::Completion(completion)).is_err() {
             return;
         }

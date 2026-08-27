@@ -21,6 +21,7 @@ pub mod trace;
 pub use actor::{ActorKey, ActorTable};
 pub use cancellation::CancellationToken;
 pub use coordinator::Coordinator;
+pub(crate) use driver::{AttemptDriver, PhysicalAttemptAdapterV1, PreparedPhysicalAttemptV1};
 pub use effects::{
     effect_summary_for_plan_node, ActorResourceId, DeclaredPurity, EffectConfidence,
     EffectDeclaration, EffectSummary, EffectTrustPolicy, Fallibility, GovernedResourceKind,

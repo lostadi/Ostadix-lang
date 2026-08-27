@@ -237,14 +237,31 @@ impl PinnedFabricNodeKeyV1 {
         &self.key_id
     }
 
-    pub fn verify_terminal_candidate(
+    pub fn node_id(&self) -> &str {
+        &self.node_id
+    }
+
+    pub fn node_generation(&self) -> GenerationV1 {
+        self.node_generation
+    }
+
+    pub fn execution_cell_incarnation(&self) -> ExecutionCellIncarnationV1 {
+        self.execution_cell_incarnation
+    }
+
+    pub fn public_key(&self) -> [u8; 32] {
+        self.public_key
+    }
+
+    /// Authenticate the exact canonical terminal-receipt envelope against the
+    /// explicitly pinned node key. This intentionally establishes no receipt,
+    /// candidate, lease, attempt, generation, or submission semantics; callers
+    /// that need those facts must validate them as separate ordered gates.
+    pub fn authenticate_terminal_receipt(
         &self,
-        terminal: &FabricTerminalCandidateV1,
-        submission: &FabricSubmissionV1,
+        signed: &SignedTerminalCandidateReceiptV1,
     ) -> Result<(), FabricAuthorityError> {
-        terminal.validate_transport_shape()?;
-        let signed = terminal.signed_receipt();
-        let receipt = signed.receipt();
+        signed.validate_envelope_shape()?;
         if signed.signer_key_id() != self.key_id
             || signed.signer_public_key() != hex::encode(self.public_key)
         {
@@ -254,10 +271,21 @@ impl PinnedFabricNodeKeyV1 {
         }
         verify_signature(
             FABRIC_TERMINAL_RECEIPT_SIGNING_DOMAIN_V1,
-            receipt,
+            signed.receipt(),
             &self.public_key,
             signed.signature(),
-        )?;
+        )
+    }
+
+    pub fn verify_terminal_candidate(
+        &self,
+        terminal: &FabricTerminalCandidateV1,
+        submission: &FabricSubmissionV1,
+    ) -> Result<(), FabricAuthorityError> {
+        terminal.validate_transport_shape()?;
+        let signed = terminal.signed_receipt();
+        let receipt = signed.receipt();
+        self.authenticate_terminal_receipt(signed)?;
 
         receipt.validate()?;
         if receipt.node_id() != self.node_id
