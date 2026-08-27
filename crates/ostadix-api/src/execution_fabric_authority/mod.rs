@@ -10,6 +10,8 @@ mod protocol;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use protocol::validate_node_id;
+
 pub use codec::{
     decode_fabric_request_v1, decode_fabric_response_v1, encode_fabric_request_v1,
     encode_fabric_response_v1, encode_placement_lease_v3, fabric_lease_sha256_v3,

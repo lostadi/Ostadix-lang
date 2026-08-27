@@ -4,16 +4,19 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use thiserror::Error;
 
+use super::super::fabric::{serve_fabric_stream_v1, FabricAttemptProviderV1};
 use super::super::mesh::{serve_mesh_stream, MeshNodeRuntime};
 use super::super::node::{serve_v1_stream, HostedNodeRuntime};
 use super::super::protocol::{read_hosted_frame, write_hosted_frame};
 use super::super::tls::{
-    accept_mutual_tls_versioned, build_dual_server_config, build_dual_server_config_with_mesh,
-    peer_principal_sha256, HostedTlsProtocol, ServerTlsIdentity, DEFAULT_CONNECT_TIMEOUT,
-    DEFAULT_IO_TIMEOUT,
+    accept_mutual_tls_versioned, accept_mutual_tls_with_execution_fabric_v1,
+    build_dual_server_config, build_dual_server_config_with_execution_fabric_v1,
+    build_dual_server_config_with_mesh, build_dual_server_config_with_mesh_and_execution_fabric_v1,
+    peer_principal_sha256, HostedTlsProtocol, HostedTlsRouteV1, ServerTlsIdentity,
+    DEFAULT_CONNECT_TIMEOUT, DEFAULT_IO_TIMEOUT,
 };
 use super::protocol::{HostedProtocolErrorV2, HostedRequestV2, HostedResponseV2};
 use super::runtime::{HostedV2Runtime, HostedV2RuntimeHandle, HostedV2RuntimeOwner};
@@ -37,6 +40,21 @@ pub struct HostedOwnedDualNodeServerConfig {
     pub v2_runtime: HostedV2RuntimeOwner,
     pub mesh_runtime: Option<MeshNodeRuntime>,
     pub tls_identity: ServerTlsIdentity,
+}
+
+/// Explicit Fabric V1 opt-in around the cloneable compatibility dual-node
+/// configuration. Existing dual-node configurations remain Fabric-free.
+#[derive(Clone)]
+pub struct HostedDualNodeWithFabricServerConfigV1 {
+    pub hosted: HostedDualNodeServerConfig,
+    pub fabric_provider: Arc<FabricAttemptProviderV1>,
+}
+
+/// Explicit Fabric V1 opt-in around the preferred uniquely owned dual-node
+/// runtime configuration.
+pub struct HostedOwnedDualNodeWithFabricServerConfigV1 {
+    pub hosted: HostedOwnedDualNodeServerConfig,
+    pub fabric_provider: Arc<FabricAttemptProviderV1>,
 }
 
 /// Cloneable, monotonic request to stop accepting new dual-node connections.
@@ -91,6 +109,23 @@ pub fn serve_owned_node_dual(config: HostedOwnedDualNodeServerConfig) -> Result<
     serve_owned_node_dual_until_shutdown(config, HostedDualNodeShutdown::new())
 }
 
+/// Serve Hosted V1/V2 and Fabric V1 with the compatibility V2 runtime.
+pub fn serve_node_dual_with_execution_fabric_v1(
+    config: HostedDualNodeWithFabricServerConfigV1,
+) -> Result<()> {
+    serve_node_dual_with_execution_fabric_v1_until_shutdown(config, HostedDualNodeShutdown::new())
+}
+
+/// Serve Hosted V1/V2 and Fabric V1 with unique V2 lifecycle ownership.
+pub fn serve_owned_node_dual_with_execution_fabric_v1(
+    config: HostedOwnedDualNodeWithFabricServerConfigV1,
+) -> Result<()> {
+    serve_owned_node_dual_with_execution_fabric_v1_until_shutdown(
+        config,
+        HostedDualNodeShutdown::new(),
+    )
+}
+
 /// Serve frozen V1 and durable V2 until `shutdown` is requested.
 ///
 /// Returning from this function is a deterministic lifecycle barrier. No new
@@ -114,6 +149,36 @@ pub fn serve_node_dual_until_shutdown(
         DualRuntimeAuthorityV2::Compatibility(v2_runtime),
         mesh_runtime,
         tls_identity,
+        shutdown,
+        |_| Ok(()),
+    )
+}
+
+/// Fabric-enabled compatibility dual-node lifecycle barrier. Fabric workers
+/// share the existing connection cap and are joined by the same shutdown
+/// barrier as Hosted and Mesh workers.
+pub fn serve_node_dual_with_execution_fabric_v1_until_shutdown(
+    config: HostedDualNodeWithFabricServerConfigV1,
+    shutdown: HostedDualNodeShutdown,
+) -> Result<()> {
+    let HostedDualNodeWithFabricServerConfigV1 {
+        hosted,
+        fabric_provider,
+    } = config;
+    let HostedDualNodeServerConfig {
+        bind_address,
+        v1_runtime,
+        v2_runtime,
+        mesh_runtime,
+        tls_identity,
+    } = hosted;
+    serve_node_dual_with_runtime_and_execution_fabric_v1(
+        bind_address,
+        v1_runtime,
+        DualRuntimeAuthorityV2::Compatibility(v2_runtime),
+        mesh_runtime,
+        tls_identity,
+        fabric_provider,
         shutdown,
         |_| Ok(()),
     )
@@ -158,6 +223,51 @@ where
     )
 }
 
+/// Fabric-enabled preferred dual-node lifecycle barrier.
+pub fn serve_owned_node_dual_with_execution_fabric_v1_until_shutdown(
+    config: HostedOwnedDualNodeWithFabricServerConfigV1,
+    shutdown: HostedDualNodeShutdown,
+) -> Result<()> {
+    serve_owned_node_dual_with_execution_fabric_v1_until_shutdown_with_listener_ready(
+        config,
+        shutdown,
+        |_| Ok(()),
+    )
+}
+
+/// Fabric-enabled counterpart to
+/// [`serve_owned_node_dual_until_shutdown_with_listener_ready`].
+pub fn serve_owned_node_dual_with_execution_fabric_v1_until_shutdown_with_listener_ready<F>(
+    config: HostedOwnedDualNodeWithFabricServerConfigV1,
+    shutdown: HostedDualNodeShutdown,
+    listener_ready: F,
+) -> Result<()>
+where
+    F: FnOnce(SocketAddr) -> Result<()>,
+{
+    let HostedOwnedDualNodeWithFabricServerConfigV1 {
+        hosted,
+        fabric_provider,
+    } = config;
+    let HostedOwnedDualNodeServerConfig {
+        bind_address,
+        v1_runtime,
+        v2_runtime,
+        mesh_runtime,
+        tls_identity,
+    } = hosted;
+    serve_node_dual_with_runtime_and_execution_fabric_v1(
+        bind_address,
+        v1_runtime,
+        DualRuntimeAuthorityV2::Owned(v2_runtime),
+        mesh_runtime,
+        tls_identity,
+        fabric_provider,
+        shutdown,
+        listener_ready,
+    )
+}
+
 enum DualRuntimeAuthorityV2 {
     Compatibility(HostedV2Runtime),
     Owned(HostedV2RuntimeOwner),
@@ -179,6 +289,17 @@ impl DualRuntimeAuthorityV2 {
     }
 }
 
+fn build_dual_fabric_server_config_v1(
+    identity: &ServerTlsIdentity,
+    mesh_enabled: bool,
+) -> Result<Arc<rustls::ServerConfig>> {
+    if mesh_enabled {
+        build_dual_server_config_with_mesh_and_execution_fabric_v1(identity)
+    } else {
+        build_dual_server_config_with_execution_fabric_v1(identity)
+    }
+}
+
 fn serve_node_dual_with_runtime<F>(
     bind_address: String,
     v1_runtime: HostedNodeRuntime,
@@ -191,11 +312,89 @@ fn serve_node_dual_with_runtime<F>(
 where
     F: FnOnce(SocketAddr) -> Result<()>,
 {
+    serve_node_dual_with_runtime_config(
+        bind_address,
+        v1_runtime,
+        v2_runtime,
+        mesh_runtime,
+        tls_identity,
+        None,
+        shutdown,
+        listener_ready,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn serve_node_dual_with_runtime_and_execution_fabric_v1<F>(
+    bind_address: String,
+    v1_runtime: HostedNodeRuntime,
+    v2_runtime: DualRuntimeAuthorityV2,
+    mesh_runtime: Option<MeshNodeRuntime>,
+    tls_identity: ServerTlsIdentity,
+    fabric_provider: Arc<FabricAttemptProviderV1>,
+    shutdown: HostedDualNodeShutdown,
+    listener_ready: F,
+) -> Result<()>
+where
+    F: FnOnce(SocketAddr) -> Result<()>,
+{
+    serve_node_dual_with_runtime_config(
+        bind_address,
+        v1_runtime,
+        v2_runtime,
+        mesh_runtime,
+        tls_identity,
+        Some(fabric_provider),
+        shutdown,
+        listener_ready,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn serve_node_dual_with_runtime_config<F>(
+    bind_address: String,
+    v1_runtime: HostedNodeRuntime,
+    v2_runtime: DualRuntimeAuthorityV2,
+    mesh_runtime: Option<MeshNodeRuntime>,
+    tls_identity: ServerTlsIdentity,
+    fabric_provider: Option<Arc<FabricAttemptProviderV1>>,
+    shutdown: HostedDualNodeShutdown,
+    listener_ready: F,
+) -> Result<()>
+where
+    F: FnOnce(SocketAddr) -> Result<()>,
+{
     let v2_handle = v2_runtime.handle();
 
     let setup = (|| -> Result<_> {
+        if let Some(provider) = fabric_provider.as_deref() {
+            if v1_runtime.node_id != provider.node_id() {
+                bail!(
+                    "Hosted runtime node identity `{}` differs from Fabric provider identity `{}`",
+                    v1_runtime.node_id,
+                    provider.node_id()
+                );
+            }
+            let v2_node_id = v2_handle.node_id()?;
+            if v2_node_id != provider.node_id() {
+                bail!(
+                    "Hosted V2 runtime node identity `{v2_node_id}` differs from Fabric provider identity `{}`",
+                    provider.node_id()
+                );
+            }
+            let v2_node_generation = v2_handle.node_generation()?;
+            if v2_node_generation != provider.node_generation() {
+                bail!(
+                    "Hosted V2 runtime node generation `{}` differs from Fabric provider generation `{}`",
+                    v2_node_generation.get(),
+                    provider.node_generation().get()
+                );
+            }
+        }
         v1_runtime.validate()?;
-        let tls_config = if mesh_runtime.is_some() {
+        let tls_config = if fabric_provider.is_some() {
+            build_dual_fabric_server_config_v1(&tls_identity, mesh_runtime.is_some())?
+        } else if mesh_runtime.is_some() {
             build_dual_server_config_with_mesh(&tls_identity)?
         } else {
             build_dual_server_config(&tls_identity)?
@@ -294,18 +493,30 @@ where
         let v1_runtime = Arc::clone(&v1_runtime);
         let v2_runtime = v2_handle.clone();
         let mesh_runtime = mesh_runtime.clone();
+        let fabric_provider = fabric_provider.clone();
         let worker_active = Arc::clone(&active);
         if let Ok(worker) = spawn_dual_connection_worker_with(
             Arc::clone(&active),
             move || {
                 let _guard = ActiveDualConnectionGuard(worker_active);
-                if let Err(error) = serve_dual_connection(
-                    tcp,
-                    tls_config,
-                    &v1_runtime,
-                    &v2_runtime,
-                    mesh_runtime.as_ref(),
-                ) {
+                let result = match fabric_provider.as_deref() {
+                    Some(fabric_provider) => serve_dual_connection_with_execution_fabric_v1(
+                        tcp,
+                        tls_config,
+                        &v1_runtime,
+                        &v2_runtime,
+                        mesh_runtime.as_ref(),
+                        fabric_provider,
+                    ),
+                    None => serve_dual_connection(
+                        tcp,
+                        tls_config,
+                        &v1_runtime,
+                        &v2_runtime,
+                        mesh_runtime.as_ref(),
+                    ),
+                };
+                if let Err(error) = result {
                     eprintln!("o-node: hosted connection failed: {error:#}");
                 }
             },
@@ -470,6 +681,56 @@ fn serve_dual_connection(
     }
 }
 
+fn serve_dual_connection_with_execution_fabric_v1(
+    tcp: TcpStream,
+    tls_config: Arc<rustls::ServerConfig>,
+    v1_runtime: &HostedNodeRuntime,
+    v2_runtime: &HostedV2RuntimeHandle,
+    mesh_runtime: Option<&MeshNodeRuntime>,
+    fabric_provider: &FabricAttemptProviderV1,
+) -> Result<()> {
+    let (mut stream, route) = accept_mutual_tls_with_execution_fabric_v1(
+        tcp,
+        tls_config,
+        DEFAULT_CONNECT_TIMEOUT,
+        DEFAULT_IO_TIMEOUT,
+    )?;
+    match route {
+        HostedTlsRouteV1::Hosted(HostedTlsProtocol::V1) => serve_v1_stream(&mut stream, v1_runtime),
+        HostedTlsRouteV1::Hosted(HostedTlsProtocol::V2) => {
+            let principal = peer_principal_sha256(&stream)?;
+            let request = match read_hosted_frame::<_, HostedRequestV2>(&mut stream) {
+                Ok(Some(request)) => request,
+                Ok(None) => anyhow::bail!("authenticated V2 client closed before a request"),
+                Err(error) => {
+                    write_hosted_frame(
+                        &mut stream,
+                        &HostedResponseV2::Error {
+                            error: HostedProtocolErrorV2::new(
+                                "invalid-frame",
+                                format!("{error:#}"),
+                                false,
+                            ),
+                        },
+                    )?;
+                    return Ok(());
+                }
+            };
+            let response = v2_runtime.handle_request(&principal, request);
+            write_hosted_frame(&mut stream, &response).context("failed to write hosted V2 response")
+        }
+        HostedTlsRouteV1::Hosted(HostedTlsProtocol::MeshV1) => {
+            let runtime = mesh_runtime
+                .context("client negotiated the mesh ALPN while the mesh runtime is disabled")?;
+            serve_mesh_stream(&mut stream, runtime)
+        }
+        HostedTlsRouteV1::ExecutionFabricV1 => {
+            let principal = peer_principal_sha256(&stream)?;
+            serve_fabric_stream_v1(&mut stream, fabric_provider, &principal)
+        }
+    }
+}
+
 struct ActiveDualConnectionGuard(Arc<AtomicUsize>);
 
 impl Drop for ActiveDualConnectionGuard {
@@ -485,7 +746,12 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
-    use crate::hosted_remote::tls::test_server_tls_identity;
+    use crate::execution_fabric_authority::{FabricSigningKeyV1, TrustedFabricAuthoritiesV1};
+    use crate::hosted_remote::fabric::FabricAttemptProviderConfigV1;
+    use crate::hosted_remote::tls::{
+        test_server_tls_identity, EXECUTION_FABRIC_TLS_ALPN_V1, HOSTED_TLS_ALPN_MESH_V1,
+        HOSTED_TLS_ALPN_V1, HOSTED_TLS_ALPN_V2,
+    };
     use crate::hosted_remote::v2::{
         DenyAllPlacementAuthorizerV2, DurableSessionStoreV2, HostedNodeSignerV2,
         HostedV2RuntimeClosedV2, HostedV2RuntimeConfig,
@@ -535,12 +801,131 @@ mod tests {
         (config, handle)
     }
 
+    fn test_fabric_provider(
+        root: &Path,
+        node_id: &str,
+        node_generation: GenerationV1,
+    ) -> Arc<FabricAttemptProviderV1> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let authority = FabricSigningKeyV1::from_secret_bytes([0x71; 32]);
+        let mut trusted_authorities = TrustedFabricAuthoritiesV1::new();
+        trusted_authorities.enroll(authority.public_key());
+        Arc::new(
+            FabricAttemptProviderV1::open(FabricAttemptProviderConfigV1 {
+                state_base: root.join("fabric-state"),
+                node_id: node_id.to_owned(),
+                node_generation,
+                node_signer: FabricSigningKeyV1::from_secret_bytes([0x72; 32]),
+                trusted_authorities,
+            })
+            .unwrap(),
+        )
+    }
+
     fn assert_runtime_closed(handle: &HostedV2RuntimeHandle) {
         let error = handle.node_id().unwrap_err();
         assert!(
             error.downcast_ref::<HostedV2RuntimeClosedV2>().is_some(),
             "unexpected runtime error: {error:#}"
         );
+    }
+
+    #[test]
+    fn fabric_dual_tls_config_tracks_mesh_opt_in_exactly() {
+        let (_tls_directory, identity) = test_server_tls_identity().unwrap();
+        let without_mesh = build_dual_fabric_server_config_v1(&identity, false).unwrap();
+        assert_eq!(
+            without_mesh.alpn_protocols,
+            vec![
+                EXECUTION_FABRIC_TLS_ALPN_V1.to_vec(),
+                HOSTED_TLS_ALPN_V2.to_vec(),
+                HOSTED_TLS_ALPN_V1.to_vec(),
+            ]
+        );
+
+        let with_mesh = build_dual_fabric_server_config_v1(&identity, true).unwrap();
+        assert_eq!(
+            with_mesh.alpn_protocols,
+            vec![
+                EXECUTION_FABRIC_TLS_ALPN_V1.to_vec(),
+                HOSTED_TLS_ALPN_MESH_V1.to_vec(),
+                HOSTED_TLS_ALPN_V2.to_vec(),
+                HOSTED_TLS_ALPN_V1.to_vec(),
+            ]
+        );
+    }
+
+    #[test]
+    fn fabric_v2_node_identity_mismatch_fails_before_listener_ready() {
+        let directory = tempfile::tempdir().unwrap();
+        let (_tls_directory, tls_identity) = test_server_tls_identity().unwrap();
+        let (config, handle) =
+            test_owned_server_config(directory.path(), "127.0.0.1:0".to_owned(), tls_identity);
+        let provider = test_fabric_provider(
+            directory.path(),
+            &config.v1_runtime.node_id,
+            GenerationV1::new(1).unwrap(),
+        );
+        let invoked = Cell::new(false);
+
+        let error =
+            serve_owned_node_dual_with_execution_fabric_v1_until_shutdown_with_listener_ready(
+                HostedOwnedDualNodeWithFabricServerConfigV1 {
+                    hosted: config,
+                    fabric_provider: provider,
+                },
+                HostedDualNodeShutdown::new(),
+                |_| {
+                    invoked.set(true);
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("Hosted V2 runtime node identity"));
+        assert!(!invoked.get());
+        assert_runtime_closed(&handle);
+    }
+
+    #[test]
+    fn fabric_v2_node_generation_mismatch_fails_before_listener_ready() {
+        let directory = tempfile::tempdir().unwrap();
+        let (_tls_directory, tls_identity) = test_server_tls_identity().unwrap();
+        let (mut config, handle) =
+            test_owned_server_config(directory.path(), "127.0.0.1:0".to_owned(), tls_identity);
+        config.v1_runtime.node_id = "listener-ready-v2-test".to_owned();
+        let provider = test_fabric_provider(
+            directory.path(),
+            &config.v1_runtime.node_id,
+            GenerationV1::new(2).unwrap(),
+        );
+        let invoked = Cell::new(false);
+
+        let error =
+            serve_owned_node_dual_with_execution_fabric_v1_until_shutdown_with_listener_ready(
+                HostedOwnedDualNodeWithFabricServerConfigV1 {
+                    hosted: config,
+                    fabric_provider: provider,
+                },
+                HostedDualNodeShutdown::new(),
+                |_| {
+                    invoked.set(true);
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("Hosted V2 runtime node generation"));
+        assert!(!invoked.get());
+        assert_runtime_closed(&handle);
     }
 
     #[test]

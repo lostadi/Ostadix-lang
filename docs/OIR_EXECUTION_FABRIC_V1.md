@@ -1,8 +1,9 @@
 # OIR Execution Fabric V1
 
-Status: frozen M2 loopback profile. This document specifies the canonical
-capsule and provisional-candidate boundary implemented by
-`crates/ostadix-api/src/execution_fabric/`.
+Status: frozen M2 loopback profile with additive M3 authority and provider
+staging. This document specifies the canonical capsule and
+provisional-candidate boundary implemented by
+`crates/ostadix-api/src/execution_fabric/`; M3 does not mutate those records.
 
 ## Authority boundary
 
@@ -68,6 +69,14 @@ V1 intentionally admits only one source-closed trusted inline renderer:
 - output: one declared kind and fidelity within an explicit byte limit;
 - time: one nonzero runtime bound and one nonzero coordinator deadline.
 
+For M3 source reconstruction, an exact direct `$slot` token is temporarily
+lowered by the parser as `OIr::Load(slot)`. That lexical representation is not
+general `Load` execution authority. The provider converts only a direct
+renderer-body placeholder to the already frozen input role, requires exact
+role/order/slot equality, and never performs a scope or environment lookup.
+Root or nested loads, computed lookups, and arbitrary OIR remain outside the
+profile.
+
 Byte blobs, tagged values, code references, object references, errors, extension
 records, ambient scope, callbacks, capabilities, and external effects are
 rejected. Excluding byte blobs prevents media-typed bytes from becoming an
@@ -89,18 +98,21 @@ deadline is bound transitively through the canonical capsule digest rather than
 duplicated as an independently mutable field. Validation rejects mismatched or
 substituted attempt and capsule fields, expired deadlines, invalid output kinds
 or fidelity claims, and oversized results. Current-generation, lease, and
-signature authority remain M3 work.
+signature authority are outside the frozen M2 record. The additive M3
+authority envelope and provider supply those checks without changing this
+capsule or candidate schema; coordinator-side remote acceptance remains a
+separate gate.
 
 All `ExecutionFabricError` values classify as infrastructure/authority aborts,
 never ordinary O-language node failures. `CandidateOutcomeV1::Failed` is only
 an untrusted provisional report. The frozen M2 renderer is admitted infallible,
 so even a structurally valid reported failure is rejected as a broken execution
-contract. A later executor-side M3 adapter may map a validated failure to a
-semantic node failure only when the admitted operation is explicitly fallible.
-Malformed encoding, deadline, binding, or fidelity failures must remain
-infrastructure failures. A future M3 adapter must classify stale identity,
-signature, lease, and other authority failures the same way. No such M3 adapter
-exists in this profile.
+contract. An executor-side adapter may map a validated failure to a semantic
+node failure only when the admitted operation is explicitly fallible.
+Malformed encoding, deadline, binding, fidelity, stale identity, signature,
+lease, and other authority failures remain infrastructure failures. The M3b
+provider enforces that classification at its boundary; the coordinator-side
+remote driver is additive and does not reinterpret M2 failures.
 
 ## Loopback evidence
 
@@ -132,6 +144,45 @@ values, exact renderer-part and literal-size boundaries, noncanonical encoding,
 trailing data, duplicate fields, hostile container lengths, and excessive
 nesting.
 
+## Additive M3 provider boundary
+
+M3 wraps the frozen records in canonical `FabricRequestV1` and
+`FabricResponseV1` headers under the opt-in
+`ostadix-execution-fabric/1` ALPN. Fabric clients offer only that ALPN. Ordinary
+Hosted V1, Hosted V1/V2, and Hosted plus Mesh server configurations do not
+advertise it; only explicit Fabric-enabled server builders add the route. TLS
+selection fixes the decoder before application bytes are read, with no
+sniffing or fallback.
+
+Each Fabric message contains one bounded canonical-CBOR header record and one
+separately length-prefixed exact payload record when the variant requires it.
+Exactly one frame is permitted in each TLS write direction. The sender follows
+its frame with TLS `close_notify`, and the receiver requires that authenticated
+end-of-stream before using the message. A trailing byte, second frame, bounded
+end-of-stream timeout, raw TCP EOF without TLS closure, noncanonical CBOR,
+duplicate keys, hostile lengths, truncation, unknown tags, and payload digest
+mismatches all fail closed. No Fabric suffix is interpreted as fallback Hosted
+or Mesh traffic.
+
+An authenticated TLS principal is necessary but insufficient. A configured
+Fabric issuer must sign a V3 lease for the exact capsule, source closure,
+attempt, target node and generation, execution-cell incarnation, runtime, and
+placement bindings. The provider validates wall-clock lease expiry, including
+the fixed skew tolerance, before reconstruction, again before durable
+acceptance, and after the durable `Running` transition immediately before
+realization. An authenticated exact duplicate may still retrieve its
+principal-bound durable status or terminal bytes after expiry; expiry never
+authorizes new work. The provider enforces runtime with only its own monotonic
+clock. Its reported completion wall time and duration are signed evidence, not
+proof that the coordinator received the result in time.
+
+The bounded source closure lets the provider reproduce source identity,
+intent, OIR, plan, the plan-referenced catalog projection, the current inline
+backend implementation, realization pipeline, and exact renderer region. It
+does not contain the complete V6 evidence bundle, so the provider does not
+claim to recompute admission. Instead, the signed lease must bind the exact
+admission digest already carried by the canonically decoded frozen capsule.
+
 ## Retry staging
 
 M3 initially disables automatic retry after ambiguous delivery. This is an MVP
@@ -145,12 +196,17 @@ ambiguity remains fail-closed and may become `Indeterminate`.
 
 ## Explicit nonclaims
 
-V1 does not provide a network endpoint, remote node dispatch, placement,
-one-use leases, retries, cancellation, stale node-generation fencing, artifact
-transfer, distributed HGraph settlement, governed hardware lowering, stateful
-actors, durable journaling, or exactly-once effects. The production coordinator
-continues to use `LocalWorkerDriver`, which wraps the existing persistent
-`WorkerPool` without changing its settlement semantics.
+The frozen M2 profile alone does not provide a network endpoint, remote node
+dispatch, placement authority, leases, or durability. The additive M3 provider
+adds only an explicitly enabled authenticated endpoint, one-use execution
+authority, source reconstruction, and a node-local replay ledger. It does not
+provide arbitrary OIR regions, general `.O` distribution, automatic placement,
+a capacity scheduler, scope transport, object transfer, bulk node-to-node data,
+actors, effects, automatic retry, coordinator crash recovery, governed hardware
+lowering, GPU or camera mediation, cancellation, process migration, shared
+address space, distributed HGraph settlement, physical multinode evidence,
+distinct-kernel evidence, heterogeneous-architecture evidence, or exactly-once
+external effects.
 
-Those capabilities require later profiles and must not be inferred from the M2
-loopback evidence.
+None of those capabilities may be inferred from either the M2 loopback or the
+M3 provider staging. Graph publication and settlement remain coordinator-owned.

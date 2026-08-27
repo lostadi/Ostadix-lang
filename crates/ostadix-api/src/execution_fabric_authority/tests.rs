@@ -569,6 +569,9 @@ mod authority_tests {
             .unwrap_err()
             .to_string()
             .contains("expired"));
+        trusted
+            .authenticate_execution_lease(signed)
+            .expect("expiry does not erase a trusted historical signature");
     }
 
     #[test]

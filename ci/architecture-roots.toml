@@ -156,7 +156,7 @@ allowed_dependencies = ["backend_catalog", "backend_morphism", "dispatch_model",
 [[root]]
 name = "hosted_remote"
 layer = 12
-allowed_dependencies = ["backend_catalog", "backend_state", "canonical_cbor", "environment", "eval", "executor", "parser", "placement", "process", "project", "registry", "runtime_exec", "value", "wire"]
+allowed_dependencies = ["backend_catalog", "backend_state", "canonical_cbor", "environment", "eval", "eval_core", "evidence", "execution_contract", "execution_fabric", "execution_fabric_authority", "executor", "hgraph", "ir", "parser", "placement", "placement_protocol", "process", "project", "registry", "resource_identity", "runtime_exec", "value", "wire", "world"]
 
 [[root]]
 name = "information"
