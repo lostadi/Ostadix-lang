@@ -13,6 +13,7 @@ use crate::eval::Evaluator;
 use crate::parser::Parser;
 use crate::runtime_exec::validate_native_runtime_binary;
 
+use super::fabric::{serve_fabric_stream_v1, FabricAttemptProviderV1};
 use super::protocol::{
     canonical_hosted_bytes, canonical_hosted_sha256, read_hosted_frame, sha256_hex, unix_time_ms,
     write_hosted_frame, HostedFailureStageV1, HostedOperationOutcomeV1, HostedOperationReceiptV1,
@@ -20,8 +21,9 @@ use super::protocol::{
     NodeProfileV1, RemotePreparedOperationV1, NODE_DOCTOR_SCHEMA_V1,
 };
 use super::tls::{
-    accept_mutual_tls, build_server_config, ServerTlsIdentity, DEFAULT_CONNECT_TIMEOUT,
-    DEFAULT_IO_TIMEOUT,
+    accept_mutual_tls, accept_mutual_tls_with_execution_fabric_v1, build_server_config,
+    build_server_config_with_execution_fabric_v1, peer_principal_sha256, HostedTlsProtocol,
+    HostedTlsRouteV1, ServerTlsIdentity, DEFAULT_CONNECT_TIMEOUT, DEFAULT_IO_TIMEOUT,
 };
 
 pub const DEFAULT_NODE_BIND: &str = "127.0.0.1:7337";
@@ -267,6 +269,15 @@ pub struct HostedNodeServerConfig {
     pub tls_identity: ServerTlsIdentity,
 }
 
+/// Explicitly opt frozen Hosted V1 into sharing its listener with Fabric V1.
+/// The existing [`HostedNodeServerConfig`] and serve functions remain
+/// Fabric-free; callers must provide a configured execution authority here.
+#[derive(Clone)]
+pub struct HostedNodeWithFabricServerConfigV1 {
+    pub hosted: HostedNodeServerConfig,
+    pub fabric_provider: Arc<FabricAttemptProviderV1>,
+}
+
 /// Serve requests until the listener fails or the process is terminated.
 /// Connections are isolated in bounded worker threads. Excess connections are
 /// closed before TLS, keeping the concurrency cap authoritative.
@@ -325,6 +336,86 @@ where
     Ok(())
 }
 
+/// Serve frozen Hosted V1 and execution Fabric V1 on one explicitly opted-in
+/// TLS listener. ALPN selects the route before any application bytes are read.
+pub fn serve_node_with_execution_fabric_v1(
+    config: HostedNodeWithFabricServerConfigV1,
+) -> Result<()> {
+    serve_node_with_execution_fabric_v1_and_listener_ready(config, |_| Ok(()))
+}
+
+/// Fabric-enabled counterpart to [`serve_node_with_listener_ready`]. Hosted
+/// and Fabric connections share the same authoritative concurrency counter.
+pub fn serve_node_with_execution_fabric_v1_and_listener_ready<F>(
+    config: HostedNodeWithFabricServerConfigV1,
+    listener_ready: F,
+) -> Result<()>
+where
+    F: FnOnce(SocketAddr) -> Result<()>,
+{
+    let HostedNodeWithFabricServerConfigV1 {
+        hosted,
+        fabric_provider,
+    } = config;
+    if hosted.runtime.node_id != fabric_provider.node_id() {
+        bail!(
+            "Hosted runtime node identity `{}` differs from Fabric provider identity `{}`",
+            hosted.runtime.node_id,
+            fabric_provider.node_id()
+        );
+    }
+    hosted.runtime.validate()?;
+    let tls_config = build_server_config_with_execution_fabric_v1(&hosted.tls_identity)?;
+    let listener = TcpListener::bind(&hosted.bind_address).with_context(|| {
+        format!(
+            "failed to bind hosted/Fabric node at `{}`",
+            hosted.bind_address
+        )
+    })?;
+    let listening_address = listener.local_addr().with_context(|| {
+        format!(
+            "failed to inspect hosted/Fabric listener bound from `{}`",
+            hosted.bind_address
+        )
+    })?;
+    listener_ready(listening_address).context("hosted/Fabric listener-ready hook failed")?;
+    let runtime = Arc::new(hosted.runtime);
+    let active = Arc::new(AtomicUsize::new(0));
+
+    for accepted in listener.incoming() {
+        let tcp = match accepted {
+            Ok(tcp) => tcp,
+            Err(error) => {
+                eprintln!("o-node: hosted/Fabric TCP accept failed: {error}");
+                continue;
+            }
+        };
+        let previous = active.fetch_add(1, Ordering::AcqRel);
+        if previous >= runtime.max_concurrent_connections {
+            active.fetch_sub(1, Ordering::AcqRel);
+            drop(tcp);
+            continue;
+        }
+
+        let runtime = Arc::clone(&runtime);
+        let fabric_provider = Arc::clone(&fabric_provider);
+        let tls_config = Arc::clone(&tls_config);
+        let active = Arc::clone(&active);
+        thread::spawn(move || {
+            let _slot = ActiveConnectionGuard(active);
+            if let Err(error) = serve_connection_with_execution_fabric_v1(
+                tcp,
+                tls_config,
+                &runtime,
+                &fabric_provider,
+            ) {
+                eprintln!("o-node: hosted/Fabric connection failed: {error:#}");
+            }
+        });
+    }
+    Ok(())
+}
+
 fn serve_connection(
     tcp: TcpStream,
     tls_config: Arc<rustls::ServerConfig>,
@@ -333,6 +424,30 @@ fn serve_connection(
     let mut stream =
         accept_mutual_tls(tcp, tls_config, DEFAULT_CONNECT_TIMEOUT, DEFAULT_IO_TIMEOUT)?;
     serve_v1_stream(&mut stream, runtime)
+}
+
+fn serve_connection_with_execution_fabric_v1(
+    tcp: TcpStream,
+    tls_config: Arc<rustls::ServerConfig>,
+    runtime: &HostedNodeRuntime,
+    fabric_provider: &FabricAttemptProviderV1,
+) -> Result<()> {
+    let (mut stream, route) = accept_mutual_tls_with_execution_fabric_v1(
+        tcp,
+        tls_config,
+        DEFAULT_CONNECT_TIMEOUT,
+        DEFAULT_IO_TIMEOUT,
+    )?;
+    match route {
+        HostedTlsRouteV1::Hosted(HostedTlsProtocol::V1) => serve_v1_stream(&mut stream, runtime),
+        HostedTlsRouteV1::ExecutionFabricV1 => {
+            let principal = peer_principal_sha256(&stream)?;
+            serve_fabric_stream_v1(&mut stream, fabric_provider, &principal)
+        }
+        HostedTlsRouteV1::Hosted(protocol) => {
+            bail!("V1/Fabric listener negotiated unsupported Hosted protocol {protocol:?}")
+        }
+    }
 }
 
 pub(crate) fn serve_v1_stream(
@@ -383,7 +498,9 @@ impl Drop for ActiveConnectionGuard {
 mod tests {
     use std::cell::Cell;
 
-    use crate::hosted_remote::tls::test_server_tls_identity;
+    use crate::hosted_remote::tls::{
+        test_server_tls_identity, EXECUTION_FABRIC_TLS_ALPN_V1, HOSTED_TLS_ALPN_V1,
+    };
 
     use super::*;
 
@@ -401,6 +518,22 @@ mod tests {
             },
             tls_identity,
         }
+    }
+
+    #[test]
+    fn fabric_opt_in_adds_only_fabric_beside_hosted_v1() {
+        let (_tls_directory, identity) = test_server_tls_identity().unwrap();
+        let ordinary = build_server_config(&identity).unwrap();
+        assert_eq!(ordinary.alpn_protocols, vec![HOSTED_TLS_ALPN_V1.to_vec()]);
+
+        let fabric = build_server_config_with_execution_fabric_v1(&identity).unwrap();
+        assert_eq!(
+            fabric.alpn_protocols,
+            vec![
+                EXECUTION_FABRIC_TLS_ALPN_V1.to_vec(),
+                HOSTED_TLS_ALPN_V1.to_vec(),
+            ]
+        );
     }
 
     #[test]

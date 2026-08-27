@@ -177,7 +177,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         self.assertEqual(
             result.stdout,
             "architecture dependency boundaries: PASS "
-            "(168 production files, 44 roots, 201 cross-root edges)\n",
+            "(174 production files, 44 roots, 211 cross-root edges)\n",
         )
 
     def test_manifest_inventories_every_current_root_edge_override_and_facade(self) -> None:
@@ -200,7 +200,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         )
         self.assertEqual(len(roots), 44)
         self.assertEqual(
-            sum(len(root["allowed_dependencies"]) for root in roots), 201
+            sum(len(root["allowed_dependencies"]) for root in roots), 211
         )
         api_root = next(root for root in roots if root["name"] == "api")
         self.assertIn("ir", api_root["allowed_dependencies"])
@@ -252,7 +252,35 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         hosted_remote_root = next(
             root for root in roots if root["name"] == "hosted_remote"
         )
-        self.assertIn("canonical_cbor", hosted_remote_root["allowed_dependencies"])
+        self.assertEqual(
+            hosted_remote_root["allowed_dependencies"],
+            [
+                "backend_catalog",
+                "backend_state",
+                "canonical_cbor",
+                "environment",
+                "eval",
+                "eval_core",
+                "evidence",
+                "execution_contract",
+                "execution_fabric",
+                "execution_fabric_authority",
+                "executor",
+                "hgraph",
+                "ir",
+                "parser",
+                "placement",
+                "placement_protocol",
+                "process",
+                "project",
+                "registry",
+                "resource_identity",
+                "runtime_exec",
+                "value",
+                "wire",
+                "world",
+            ],
+        )
         self.assertEqual(
             {
                 (entry["path"], entry["kind"], tuple(entry["module_path"]))

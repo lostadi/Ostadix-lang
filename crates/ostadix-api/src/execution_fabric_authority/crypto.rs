@@ -48,6 +48,10 @@ impl FabricSigningKeyV1 {
         self.signing_key.verifying_key().to_bytes()
     }
 
+    pub(crate) fn secret_bytes(&self) -> [u8; 32] {
+        self.signing_key.to_bytes()
+    }
+
     pub fn public_key_hex(&self) -> String {
         hex::encode(self.public_key())
     }
@@ -144,10 +148,30 @@ impl TrustedFabricAuthoritiesV1 {
         self.keys.contains_key(key_id)
     }
 
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
     pub fn verify_execution_lease(
         &self,
         signed: &SignedExecutionLeaseV3,
         now: UnixMillisV1,
+    ) -> Result<(), FabricAuthorityError> {
+        self.authenticate_execution_lease(signed)?;
+        signed.lease().validate_at(now)
+    }
+
+    /// Authenticate the trusted issuer and exact canonical lease signature
+    /// without asserting that the lease is still fresh.  Providers use this
+    /// narrower fact only to retrieve an already durable, principal-bound
+    /// attempt; new execution still requires [`Self::verify_execution_lease`].
+    pub fn authenticate_execution_lease(
+        &self,
+        signed: &SignedExecutionLeaseV3,
     ) -> Result<(), FabricAuthorityError> {
         signed.validate_envelope_shape()?;
         let public_key = decode_fixed_hex::<32>(
@@ -174,8 +198,7 @@ impl TrustedFabricAuthoritiesV1 {
             signed.lease(),
             &public_key,
             signed.signature(),
-        )?;
-        signed.lease().validate_at(now)
+        )
     }
 }
 

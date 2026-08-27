@@ -59,11 +59,14 @@ authority; it does not add a field to a frozen record. The existing known-answer
 vectors remain pinned.
 
 The new Fabric ALPN is exactly `ostadix-execution-fabric/1`, following the
-existing `ostadix-<protocol>/<version>` convention. A Fabric client advertises
-only this ALPN. A shared server may advertise it alongside Hosted and Mesh, but
-the selected ALPN chooses exactly one decoder before any application byte is
-read. Missing or unknown ALPN, malformed framing, wrong schema, or decode
-failure closes that route without sniffing or fallback.
+existing `ostadix-<protocol>/<version>` convention. Fabric is opt-in on both
+ends. A Fabric client advertises only this ALPN. The ordinary Hosted V1,
+Hosted V1/V2, and Hosted V1/V2 plus Mesh server builders do not advertise it.
+Only the additive Fabric-enabled builders add it to the exact Hosted route set
+that was otherwise requested. The selected ALPN chooses exactly one decoder
+before any application byte is read. Missing or unknown ALPN, malformed
+framing, wrong schema, or decode failure closes that route without sniffing or
+fallback.
 
 ## Wire shape and canonicality
 
@@ -75,9 +78,15 @@ unchanged to their frozen M2 bounded decoders. This prevents a generic CBOR
 
 Every header is decoded with explicit depth, item, string, and allocation
 limits, re-encoded canonically, and required to equal the received bytes.
-Trailing bytes, duplicate map keys, noncanonical integers/maps, unknown fields,
-unknown tags, oversized declarations, truncation, and digest mismatches fail
-closed. OWVALUE remains nested only through `PortableValueV1`, which validates,
+Fabric V1 carries exactly one frame in each TLS write direction. After writing
+that frame, the sender emits TLS `close_notify`; the receiver requires that
+authenticated end-of-stream before using the decoded message. A trailing byte,
+a second frame, a peer that does not finish its write direction before the
+bounded timeout, and raw TCP EOF without TLS closure all fail closed, as do
+duplicate map keys, noncanonical integers/maps, unknown fields, unknown tags,
+oversized declarations, truncation, and digest mismatches. No Fabric suffix is
+treated as fallback Hosted or Mesh traffic. OWVALUE remains nested only through
+`PortableValueV1`, which validates,
 decodes, canonically re-encodes, compares exact bytes, verifies its digest, and
 applies the frozen M2 value allowlist.
 
@@ -93,13 +102,20 @@ attempt coordinate, target node and stable node generation, execution-cell
 incarnation, target descriptor, profile/capacity facts and generations, source,
 OIR, plan, input, output, the plan-referenced backend-catalog projection,
 backend implementation, realization, admission, trust/reservation bindings,
-maximum runtime, issue/expiry window, and one-use requirement. Expiry is
-absolute wall-clock authority with an explicit bounded skew allowance. Runtime
-is measured only with the provider's local monotonic clock. The M3
+maximum runtime, issue/expiry window, and one-use requirement. The provider
+checks absolute wall-clock lease validity, with the fixed two-second skew
+tolerance, before reconstruction, immediately before durable acceptance, and
+after the durable `Running` transition immediately before realization. A
+trusted exact duplicate may retrieve its principal-bound durable status or
+terminal bytes after expiry, but expiry can never authorize new work. Runtime
+is measured only with the provider's local monotonic clock,
+both around direct rendering and around the complete realizer call. The M3
 trusted-inline renderer is a bounded, infallible direct renderer, so this
 delivery rejects an over-budget result after the call returns; it does not
-claim hard preemption, cancellation, or isolation. Coordinator receipt time,
-never a provider timestamp, decides final timeliness.
+claim hard preemption, cancellation, or isolation. Provider completion wall
+time and monotonic duration are signed evidence. They are not compared as
+cross-machine monotonic time, and neither proves final timeliness. Coordinator
+receipt time decides that question.
 
 The provider can fence durable nonce and binding reuse. It cannot learn that a
 coordinator has superseded an otherwise valid attempt without a revocation
@@ -117,13 +133,25 @@ KernelWorld execution region.
 (`root_operation == 0`), a canonical existing `Policy` spelling, and the
 admitted intent, OIR, plan, and closure digests. After authentication and lease
 checks, the provider parses that exact source and independently reconstructs
-one `Exec` operation. Its body may contain only text literals and direct
-`Load(slot)` expressions whose slots map exactly to frozen `Literal` or `Input`
-renderer-part roles. The provider then re-lowers through the current
-OIR/planner path and recomputes the source, intent, OIR, plan, plan-referenced
-backend-catalog projection, backend specification, backend implementation,
-realization, input, output-contract, and capsule-admission digests. Any mismatch
-precedes execution.
+one `Exec` operation. Its body may contain only text literals and exact direct
+`$slot` lexical placeholders. The parser transiently represents such a
+placeholder as `OIr::Load(slot)`, but the realizer never executes it as a scope
+or environment load. It converts that direct child only into the frozen
+`RendererPartV1::Input` role and requires exact role, order, slot, and literal
+equality. A root `Load`, a nested `Load`, a computed lookup, and every arbitrary
+OIR subgraph remain rejected.
+
+The provider then re-lowers through the current OIR/planner path. The frozen M2
+decoder independently validates the exact capsule bytes, canonical OWVALUE
+records, input manifest, output contract, and capsule digest. The source
+realizer independently recomputes the source, intent, OIR, plan,
+plan-referenced backend-catalog projection, current backend specification,
+backend implementation, realization pipeline, and exact renderer region. The
+source closure does not carry the complete V6 evidence needed to reproduce the
+admission compiler. Therefore the provider does not claim to recompute the
+admission digest: it requires the trusted issuer's signed V3 lease to bind the
+exact admission digest already present in the frozen capsule. Any reproducible
+binding mismatch precedes execution.
 
 The trusted-inline backend implementation identity is truthful: its adapter
 artifact digest covers the exact embedded realizer source set; its executable
@@ -141,8 +169,8 @@ through:
 
 ```text
 Received -> Validated -> Accepted -> Running -> TerminalCandidate
-                                  \-> Rejected
-                         Running from an older incarnation -> Abandoned
+    \-----------> Rejected <-------------/
+incomplete state from an older incarnation -> Abandoned
 ```
 
 The critical durable transition atomically consumes the issuer/attempt/nonce
@@ -177,7 +205,7 @@ semantic errors. A selected remote failure never invokes the local renderer.
 
 - M3a: narrow M2 accessors; reusable signing helper; additive placement V3;
   `execution_fabric_authority` records, codecs, signatures, and known answers.
-- M3b: Fabric ALPN/framing; `execution_fabric_runtime` realizer, provider, and
+- M3b: Fabric ALPN/framing; `hosted_remote::fabric` realizer, provider, and
   durable ledger; explicit `o-node` configuration.
 - M3c: `RemotePureAttemptDriver`, private token mapping, ordered coordinator
   validation bridge, and no-fallback failure mapping.

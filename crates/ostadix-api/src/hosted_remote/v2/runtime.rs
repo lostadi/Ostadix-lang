@@ -663,6 +663,10 @@ impl HostedV2RuntimeHandle {
         self.runtime.node_id()
     }
 
+    pub fn node_generation(&self) -> Result<GenerationV1> {
+        self.runtime.node_generation()
+    }
+
     pub fn state_quotas(&self) -> Result<&StateQuotaLimitsV2> {
         self.runtime.state_quotas()
     }
@@ -832,6 +836,11 @@ impl HostedV2Runtime {
     pub fn node_id(&self) -> Result<&str> {
         self.inner.require_running()?;
         Ok(&self.inner.config.node_id)
+    }
+
+    pub fn node_generation(&self) -> Result<GenerationV1> {
+        self.inner.require_running()?;
+        Ok(self.inner.config.node_generation)
     }
 
     pub fn state_quotas(&self) -> Result<&StateQuotaLimitsV2> {

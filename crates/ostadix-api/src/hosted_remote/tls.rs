@@ -18,6 +18,7 @@ use sha2::{Digest, Sha256};
 pub const HOSTED_TLS_ALPN_V1: &[u8] = b"ostadix-hosted/1";
 pub const HOSTED_TLS_ALPN_V2: &[u8] = b"ostadix-hosted/2";
 pub const HOSTED_TLS_ALPN_MESH_V1: &[u8] = b"ostadix-mesh/1";
+pub const EXECUTION_FABRIC_TLS_ALPN_V1: &[u8] = b"ostadix-execution-fabric/1";
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DEFAULT_IO_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -68,6 +69,14 @@ pub enum HostedTlsProtocol {
     MeshV1,
 }
 
+/// Opt-in shared-listener route. Existing Hosted/Mesh acceptors retain their
+/// frozen `HostedTlsProtocol` result and reject Fabric instead of falling back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostedTlsRouteV1 {
+    Hosted(HostedTlsProtocol),
+    ExecutionFabricV1,
+}
+
 pub fn build_client_config(identity: &ClientTlsIdentity) -> Result<Arc<ClientConfig>> {
     build_client_config_for_alpn(identity, HOSTED_TLS_ALPN_V1)
 }
@@ -78,6 +87,14 @@ pub fn build_client_config_v2(identity: &ClientTlsIdentity) -> Result<Arc<Client
 
 pub fn build_client_config_mesh_v1(identity: &ClientTlsIdentity) -> Result<Arc<ClientConfig>> {
     build_client_config_for_alpn(identity, HOSTED_TLS_ALPN_MESH_V1)
+}
+
+/// Build a client that advertises only the independently versioned execution
+/// Fabric ALPN. Hosted and Mesh are never offered as fallback protocols.
+pub fn build_client_config_execution_fabric_v1(
+    identity: &ClientTlsIdentity,
+) -> Result<Arc<ClientConfig>> {
+    build_client_config_for_alpn(identity, EXECUTION_FABRIC_TLS_ALPN_V1)
 }
 
 fn build_client_config_for_alpn(
@@ -115,10 +132,37 @@ pub fn build_server_config(identity: &ServerTlsIdentity) -> Result<Arc<ServerCon
     build_server_config_for_alpns(identity, vec![HOSTED_TLS_ALPN_V1.to_vec()])
 }
 
+/// Opt in to Fabric beside frozen Hosted V1 without advertising V2 or Mesh.
+pub fn build_server_config_with_execution_fabric_v1(
+    identity: &ServerTlsIdentity,
+) -> Result<Arc<ServerConfig>> {
+    build_server_config_for_alpns(
+        identity,
+        vec![
+            EXECUTION_FABRIC_TLS_ALPN_V1.to_vec(),
+            HOSTED_TLS_ALPN_V1.to_vec(),
+        ],
+    )
+}
+
 pub fn build_dual_server_config(identity: &ServerTlsIdentity) -> Result<Arc<ServerConfig>> {
     build_server_config_for_alpns(
         identity,
         vec![HOSTED_TLS_ALPN_V2.to_vec(), HOSTED_TLS_ALPN_V1.to_vec()],
+    )
+}
+
+/// Opt in to Fabric beside frozen Hosted V1/V2 without advertising Mesh.
+pub fn build_dual_server_config_with_execution_fabric_v1(
+    identity: &ServerTlsIdentity,
+) -> Result<Arc<ServerConfig>> {
+    build_server_config_for_alpns(
+        identity,
+        vec![
+            EXECUTION_FABRIC_TLS_ALPN_V1.to_vec(),
+            HOSTED_TLS_ALPN_V2.to_vec(),
+            HOSTED_TLS_ALPN_V1.to_vec(),
+        ],
     )
 }
 
@@ -130,6 +174,22 @@ pub fn build_dual_server_config_with_mesh(
     build_server_config_for_alpns(
         identity,
         vec![
+            HOSTED_TLS_ALPN_MESH_V1.to_vec(),
+            HOSTED_TLS_ALPN_V2.to_vec(),
+            HOSTED_TLS_ALPN_V1.to_vec(),
+        ],
+    )
+}
+
+/// Opt in to Fabric on the shared TLS listener. Existing server builders do
+/// not advertise this ALPN, so enabling a Fabric provider remains explicit.
+pub fn build_dual_server_config_with_mesh_and_execution_fabric_v1(
+    identity: &ServerTlsIdentity,
+) -> Result<Arc<ServerConfig>> {
+    build_server_config_for_alpns(
+        identity,
+        vec![
+            EXECUTION_FABRIC_TLS_ALPN_V1.to_vec(),
             HOSTED_TLS_ALPN_MESH_V1.to_vec(),
             HOSTED_TLS_ALPN_V2.to_vec(),
             HOSTED_TLS_ALPN_V1.to_vec(),
@@ -223,6 +283,27 @@ pub fn connect_mutual_tls_mesh_v1(
     )
 }
 
+/// Connect with the execution-Fabric ALPN as the sole application protocol.
+/// A peer that selects no ALPN or any Hosted/Mesh ALPN is rejected; there is
+/// no protocol sniffing or fallback after the TLS handshake.
+pub fn connect_mutual_tls_execution_fabric_v1(
+    address: &str,
+    identity: &ClientTlsIdentity,
+    connect_timeout: Duration,
+    io_timeout: Duration,
+) -> Result<HostedClientStream> {
+    let config = build_client_config_execution_fabric_v1(identity)?;
+    connect_mutual_tls_for_alpn(
+        address,
+        identity,
+        connect_timeout,
+        io_timeout,
+        config,
+        EXECUTION_FABRIC_TLS_ALPN_V1,
+        "node did not negotiate the execution-Fabric V1 ALPN",
+    )
+}
+
 fn connect_mutual_tls_for_protocol(
     address: &str,
     identity: &ClientTlsIdentity,
@@ -230,11 +311,34 @@ fn connect_mutual_tls_for_protocol(
     io_timeout: Duration,
     protocol: HostedTlsProtocol,
 ) -> Result<HostedClientStream> {
-    let config = match protocol {
-        HostedTlsProtocol::V1 => build_client_config(identity)?,
-        HostedTlsProtocol::V2 => build_client_config_v2(identity)?,
-        HostedTlsProtocol::MeshV1 => build_client_config_mesh_v1(identity)?,
+    let (config, expected_alpn) = match protocol {
+        HostedTlsProtocol::V1 => (build_client_config(identity)?, HOSTED_TLS_ALPN_V1),
+        HostedTlsProtocol::V2 => (build_client_config_v2(identity)?, HOSTED_TLS_ALPN_V2),
+        HostedTlsProtocol::MeshV1 => (
+            build_client_config_mesh_v1(identity)?,
+            HOSTED_TLS_ALPN_MESH_V1,
+        ),
     };
+    connect_mutual_tls_for_alpn(
+        address,
+        identity,
+        connect_timeout,
+        io_timeout,
+        config,
+        expected_alpn,
+        "node did not negotiate the hosted-transport ALPN",
+    )
+}
+
+fn connect_mutual_tls_for_alpn(
+    address: &str,
+    identity: &ClientTlsIdentity,
+    connect_timeout: Duration,
+    io_timeout: Duration,
+    config: Arc<ClientConfig>,
+    expected_alpn: &'static [u8],
+    alpn_failure: &'static str,
+) -> Result<HostedClientStream> {
     let server_name = ServerName::try_from(identity.server_name.clone()).with_context(|| {
         format!(
             "invalid TLS server name `{}` (use a DNS name or IP SAN from the node certificate)",
@@ -263,7 +367,9 @@ fn connect_mutual_tls_for_protocol(
         set_timeouts(&tcp, connect_timeout)?;
         let mut connection = ClientConnection::new(config.clone(), server_name.clone())
             .context("failed to initialize hosted TLS client")?;
-        if let Err(error) = complete_client_handshake(&mut connection, &mut tcp, protocol) {
+        if let Err(error) =
+            complete_client_handshake(&mut connection, &mut tcp, expected_alpn, alpn_failure)
+        {
             failures.push(format!("{resolved}: {error:#}"));
             continue;
         }
@@ -306,14 +412,52 @@ pub fn accept_mutual_tls_versioned(
             .complete_io(&mut tcp)
             .context("mutual TLS handshake failed")?;
     }
-    let protocol = match connection.alpn_protocol() {
-        Some(protocol) if protocol == HOSTED_TLS_ALPN_V1 => HostedTlsProtocol::V1,
-        Some(protocol) if protocol == HOSTED_TLS_ALPN_V2 => HostedTlsProtocol::V2,
-        Some(protocol) if protocol == HOSTED_TLS_ALPN_MESH_V1 => HostedTlsProtocol::MeshV1,
-        _ => bail!("client did not negotiate a supported hosted-transport ALPN"),
-    };
+    let protocol = classify_hosted_tls_alpn(connection.alpn_protocol())?;
     set_timeouts(&tcp, io_timeout)?;
     Ok((StreamOwned::new(connection, tcp), protocol))
+}
+
+/// Accept a connection on a listener whose configuration explicitly opted in
+/// to the Fabric ALPN, then return an exact route selected only from the TLS
+/// negotiation result. No application bytes are consumed for protocol
+/// detection and an absent or unknown ALPN is rejected.
+pub fn accept_mutual_tls_with_execution_fabric_v1(
+    mut tcp: TcpStream,
+    config: Arc<ServerConfig>,
+    handshake_timeout: Duration,
+    io_timeout: Duration,
+) -> Result<(HostedServerStream, HostedTlsRouteV1)> {
+    tcp.set_nodelay(true)
+        .context("failed to enable TCP_NODELAY for hosted node")?;
+    set_timeouts(&tcp, handshake_timeout)?;
+    let mut connection =
+        ServerConnection::new(config).context("failed to initialize hosted TLS server")?;
+    while connection.is_handshaking() {
+        connection
+            .complete_io(&mut tcp)
+            .context("mutual TLS handshake failed")?;
+    }
+    let route = classify_hosted_or_fabric_tls_alpn_v1(connection.alpn_protocol())?;
+    set_timeouts(&tcp, io_timeout)?;
+    Ok((StreamOwned::new(connection, tcp), route))
+}
+
+fn classify_hosted_tls_alpn(protocol: Option<&[u8]>) -> Result<HostedTlsProtocol> {
+    match protocol {
+        Some(protocol) if protocol == HOSTED_TLS_ALPN_V1 => Ok(HostedTlsProtocol::V1),
+        Some(protocol) if protocol == HOSTED_TLS_ALPN_V2 => Ok(HostedTlsProtocol::V2),
+        Some(protocol) if protocol == HOSTED_TLS_ALPN_MESH_V1 => Ok(HostedTlsProtocol::MeshV1),
+        _ => bail!("client did not negotiate a supported hosted-transport ALPN"),
+    }
+}
+
+fn classify_hosted_or_fabric_tls_alpn_v1(protocol: Option<&[u8]>) -> Result<HostedTlsRouteV1> {
+    match protocol {
+        Some(protocol) if protocol == EXECUTION_FABRIC_TLS_ALPN_V1 => {
+            Ok(HostedTlsRouteV1::ExecutionFabricV1)
+        }
+        protocol => classify_hosted_tls_alpn(protocol).map(HostedTlsRouteV1::Hosted),
+    }
 }
 
 pub fn peer_principal_sha256(stream: &HostedServerStream) -> Result<String> {
@@ -338,20 +482,16 @@ pub fn certificate_leaf_sha256(path: impl AsRef<Path>) -> Result<String> {
 fn complete_client_handshake(
     connection: &mut ClientConnection,
     tcp: &mut TcpStream,
-    protocol: HostedTlsProtocol,
+    expected_alpn: &[u8],
+    alpn_failure: &'static str,
 ) -> Result<()> {
     while connection.is_handshaking() {
         connection
             .complete_io(tcp)
             .context("mutual TLS handshake failed")?;
     }
-    let expected = match protocol {
-        HostedTlsProtocol::V1 => HOSTED_TLS_ALPN_V1,
-        HostedTlsProtocol::V2 => HOSTED_TLS_ALPN_V2,
-        HostedTlsProtocol::MeshV1 => HOSTED_TLS_ALPN_MESH_V1,
-    };
-    if connection.alpn_protocol() != Some(expected) {
-        bail!("node did not negotiate the hosted-transport ALPN");
+    if connection.alpn_protocol() != Some(expected_alpn) {
+        bail!(alpn_failure);
     }
     Ok(())
 }
@@ -384,6 +524,87 @@ fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
     rustls_pemfile::private_key(&mut reader)
         .context("private-key PEM is malformed")?
         .context("private-key PEM contains no supported private key")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_client_identity(server: &ServerTlsIdentity) -> ClientTlsIdentity {
+        ClientTlsIdentity {
+            ca_path: server.client_ca_path.clone(),
+            cert_path: server.cert_path.clone(),
+            key_path: server.key_path.clone(),
+            server_name: "localhost".to_string(),
+        }
+    }
+
+    #[test]
+    fn fabric_client_advertises_only_the_exact_fabric_alpn() {
+        let (_directory, server) = test_server_tls_identity().unwrap();
+        let client = test_client_identity(&server);
+        let config = build_client_config_execution_fabric_v1(&client).unwrap();
+        assert_eq!(
+            config.alpn_protocols,
+            vec![EXECUTION_FABRIC_TLS_ALPN_V1.to_vec()]
+        );
+    }
+
+    #[test]
+    fn existing_server_builders_do_not_opt_in_to_fabric() {
+        let (_directory, identity) = test_server_tls_identity().unwrap();
+        for config in [
+            build_server_config(&identity).unwrap(),
+            build_dual_server_config(&identity).unwrap(),
+            build_dual_server_config_with_mesh(&identity).unwrap(),
+        ] {
+            assert!(!config
+                .alpn_protocols
+                .iter()
+                .any(|alpn| alpn == EXECUTION_FABRIC_TLS_ALPN_V1));
+        }
+    }
+
+    #[test]
+    fn shared_server_builder_explicitly_offers_exact_fabric_alpn() {
+        let (_directory, identity) = test_server_tls_identity().unwrap();
+        let config = build_dual_server_config_with_mesh_and_execution_fabric_v1(&identity).unwrap();
+        assert_eq!(
+            config.alpn_protocols,
+            vec![
+                EXECUTION_FABRIC_TLS_ALPN_V1.to_vec(),
+                HOSTED_TLS_ALPN_MESH_V1.to_vec(),
+                HOSTED_TLS_ALPN_V2.to_vec(),
+                HOSTED_TLS_ALPN_V1.to_vec(),
+            ]
+        );
+    }
+
+    #[test]
+    fn shared_route_is_exact_and_existing_classifier_has_no_fabric_fallback() {
+        assert!(classify_hosted_tls_alpn(Some(EXECUTION_FABRIC_TLS_ALPN_V1)).is_err());
+        assert!(classify_hosted_tls_alpn(None).is_err());
+        assert!(classify_hosted_tls_alpn(Some(b"ostadix-execution-fabric/2")).is_err());
+
+        assert_eq!(
+            classify_hosted_or_fabric_tls_alpn_v1(Some(EXECUTION_FABRIC_TLS_ALPN_V1)).unwrap(),
+            HostedTlsRouteV1::ExecutionFabricV1
+        );
+        assert_eq!(
+            classify_hosted_or_fabric_tls_alpn_v1(Some(HOSTED_TLS_ALPN_V1)).unwrap(),
+            HostedTlsRouteV1::Hosted(HostedTlsProtocol::V1)
+        );
+        assert_eq!(
+            classify_hosted_or_fabric_tls_alpn_v1(Some(HOSTED_TLS_ALPN_V2)).unwrap(),
+            HostedTlsRouteV1::Hosted(HostedTlsProtocol::V2)
+        );
+        assert_eq!(
+            classify_hosted_or_fabric_tls_alpn_v1(Some(HOSTED_TLS_ALPN_MESH_V1)).unwrap(),
+            HostedTlsRouteV1::Hosted(HostedTlsProtocol::MeshV1)
+        );
+        assert!(classify_hosted_or_fabric_tls_alpn_v1(None).is_err());
+        assert!(classify_hosted_or_fabric_tls_alpn_v1(Some(b"ostadix-hosted/3")).is_err());
+    }
 }
 
 fn load_roots(path: &Path) -> Result<RootCertStore> {

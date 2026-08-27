@@ -12,6 +12,7 @@
 //! and World mutation remain outside this module.
 
 mod client;
+pub mod fabric;
 mod lan;
 pub mod mesh;
 mod node;
@@ -23,6 +24,7 @@ mod tls;
 pub mod v2;
 
 pub use client::*;
+pub use fabric::*;
 pub use lan::*;
 pub use mesh::*;
 pub use node::*;

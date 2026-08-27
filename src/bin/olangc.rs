@@ -1035,6 +1035,15 @@ fn write_runtime_sources(src_dir: &Path) -> Result<()> {
     for &(relative_path, source) in RUNTIME_EXECUTION_FABRIC_AUTHORITY_SOURCES {
         fs::write(execution_fabric_authority_dir.join(relative_path), source)?;
     }
+    // Provider sources are copied as exact source-closure assets, including
+    // the realizer source that participates in implementation identity. The
+    // generated runtime deliberately does not declare or compile
+    // `hosted_remote`, so this does not add a network listener to AOT output.
+    let hosted_remote_fabric_dir = src_dir.join("hosted_remote/fabric");
+    fs::create_dir_all(&hosted_remote_fabric_dir)?;
+    for &(relative_path, source) in RUNTIME_HOSTED_REMOTE_FABRIC_SOURCES {
+        fs::write(hosted_remote_fabric_dir.join(relative_path), source)?;
+    }
     fs::write(src_dir.join("eval_core.rs"), RUNTIME_EVAL_CORE_RS)?;
     fs::write(src_dir.join("eval.rs"), RUNTIME_EVAL_RS)?;
     fs::write(src_dir.join("process.rs"), RUNTIME_PROCESS_RS)?;
@@ -2804,6 +2813,12 @@ mod tests {
             "execution_fabric_authority/crypto.rs",
             "execution_fabric_authority/protocol.rs",
             "execution_fabric_authority/tests.rs",
+            "hosted_remote/fabric/mod.rs",
+            "hosted_remote/fabric/keys.rs",
+            "hosted_remote/fabric/ledger.rs",
+            "hosted_remote/fabric/provider.rs",
+            "hosted_remote/fabric/realizer.rs",
+            "hosted_remote/fabric/wire.rs",
             "eval_core.rs",
             "runtime_exec.rs",
             "placement/mod.rs",
@@ -2928,6 +2943,14 @@ mod tests {
                 .unwrap(),
                 source,
                 "generated runtimes must receive execution-fabric authority source {relative_path} verbatim"
+            );
+        }
+        for &(relative_path, source) in RUNTIME_HOSTED_REMOTE_FABRIC_SOURCES {
+            assert_eq!(
+                fs::read_to_string(src_dir.join("hosted_remote/fabric").join(relative_path))
+                    .unwrap(),
+                source,
+                "generated runtimes must receive hosted Fabric source {relative_path} verbatim"
             );
         }
         assert_eq!(

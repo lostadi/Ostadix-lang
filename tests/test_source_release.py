@@ -168,6 +168,14 @@ pub const RUNTIME_EXECUTION_FABRIC_AUTHORITY_SOURCES: &[(&str, &str)] = &[
     ("protocol.rs", include_str!("../execution_fabric_authority/protocol.rs")),
     ("tests.rs", include_str!("../execution_fabric_authority/tests.rs")),
 ];
+pub const RUNTIME_HOSTED_REMOTE_FABRIC_SOURCES: &[(&str, &str)] = &[
+    ("mod.rs", include_str!("../hosted_remote/fabric/mod.rs")),
+    ("keys.rs", include_str!("../hosted_remote/fabric/keys.rs")),
+    ("ledger.rs", include_str!("../hosted_remote/fabric/ledger.rs")),
+    ("provider.rs", include_str!("../hosted_remote/fabric/provider.rs")),
+    ("realizer.rs", include_str!("../hosted_remote/fabric/realizer.rs")),
+    ("wire.rs", include_str!("../hosted_remote/fabric/wire.rs")),
+];
 """
 FIXTURE_API_TEST = """\
 #[test]
@@ -778,6 +786,7 @@ class SourceReleaseTests(unittest.TestCase):
             "docs/PROJECT_MESH_V1.md": "fixture project mesh contract\n",
             "docs/UNIFIED_INTENT_FRONT_DOOR_V1.md": "fixture unified intent front door contract\n",
             "docs/OIR_EXECUTION_FABRIC_V1.md": "fixture OIR execution-fabric contract\n",
+            "docs/M3_AUTHENTICATED_PURE_REMOTE_EXECUTION_DESIGN.md": "fixture M3 authenticated Fabric design\n",
             "docs/KERNEL_WORLD_CONTRACT.md": "fixture kernel World contract\n",
             "docs/HOSTED_WORLD_REFERENCE_PROFILE.md": WORLD_NORMATIVE_BYTES[
                 "docs/HOSTED_WORLD_REFERENCE_PROFILE.md"
@@ -1000,13 +1009,21 @@ class SourceReleaseTests(unittest.TestCase):
             "crates/ostadix-api/src/hgraph/from_oir.rs": "// fixture HGraph effect lowering\n",
             "crates/ostadix-api/src/hgraph/solve.rs": "// fixture HGraph fidelity transfer\n",
             "crates/ostadix-api/src/hosted_remote/client.rs": "// fixture hosted client\n",
-            "crates/ostadix-api/src/hosted_remote/mod.rs": "pub mod protocol;\n",
+            "crates/ostadix-api/src/hosted_remote/mod.rs": "pub mod fabric;\npub mod protocol;\n",
             "crates/ostadix-api/src/hosted_remote/mesh.rs": "// fixture hosted mesh data plane\n",
             "crates/ostadix-api/src/hosted_remote/node.rs": "// fixture hosted node runtime\n",
             "crates/ostadix-api/src/hosted_remote/paths.rs": "// fixture hosted paths\n",
             "crates/ostadix-api/src/hosted_remote/project_mesh.rs": "// fixture project mesh scheduler\n",
             "crates/ostadix-api/src/hosted_remote/protocol.rs": "// fixture hosted V1 protocol\n",
             "crates/ostadix-api/src/hosted_remote/tls.rs": "// fixture hosted TLS\n",
+            "crates/ostadix-api/src/hosted_remote/fabric/mod.rs": (
+                "mod keys;\nmod ledger;\nmod provider;\nmod realizer;\nmod wire;\n"
+            ),
+            "crates/ostadix-api/src/hosted_remote/fabric/keys.rs": "// fixture Fabric provider keys\n",
+            "crates/ostadix-api/src/hosted_remote/fabric/ledger.rs": "// fixture Fabric durable ledger\n",
+            "crates/ostadix-api/src/hosted_remote/fabric/provider.rs": "// fixture Fabric provider runtime\n",
+            "crates/ostadix-api/src/hosted_remote/fabric/realizer.rs": "// fixture Fabric trusted-inline realizer\n",
+            "crates/ostadix-api/src/hosted_remote/fabric/wire.rs": "// fixture Fabric bounded wire adapter\n",
             "crates/ostadix-api/src/hosted_remote/v2/auth.rs": "// fixture hosted V2 authority adapter\n",
             "crates/ostadix-api/src/hosted_remote/v2/client.rs": "// fixture hosted V2 client\n",
             "crates/ostadix-api/src/hosted_remote/v2/crypto.rs": "// fixture hosted V2 signatures\n",
@@ -1333,6 +1350,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "docs/PROJECT_MESH_V1.md",
                 "docs/UNIFIED_INTENT_FRONT_DOOR_V1.md",
                 "docs/OIR_EXECUTION_FABRIC_V1.md",
+                "docs/M3_AUTHENTICATED_PURE_REMOTE_EXECUTION_DESIGN.md",
                 "docs/HOSTED_WORLD_REFERENCE_PROFILE.md",
                 "docs/KERNEL_WORLD_CONTRACT.md",
                 "docs/O_MACHINE_CONTRACT.md",
@@ -1506,6 +1524,12 @@ class SourceReleaseTests(unittest.TestCase):
                 "crates/ostadix-api/src/hosted_remote/project_mesh.rs",
                 "crates/ostadix-api/src/hosted_remote/protocol.rs",
                 "crates/ostadix-api/src/hosted_remote/tls.rs",
+                "crates/ostadix-api/src/hosted_remote/fabric/mod.rs",
+                "crates/ostadix-api/src/hosted_remote/fabric/keys.rs",
+                "crates/ostadix-api/src/hosted_remote/fabric/ledger.rs",
+                "crates/ostadix-api/src/hosted_remote/fabric/provider.rs",
+                "crates/ostadix-api/src/hosted_remote/fabric/realizer.rs",
+                "crates/ostadix-api/src/hosted_remote/fabric/wire.rs",
                 "crates/ostadix-api/src/hosted_remote/v2/auth.rs",
                 "crates/ostadix-api/src/hosted_remote/v2/client.rs",
                 "crates/ostadix-api/src/hosted_remote/v2/crypto.rs",
@@ -2597,6 +2621,7 @@ class SourceReleaseTests(unittest.TestCase):
     def test_execution_fabric_profile_codec_and_authority_surface_are_required(self) -> None:
         required = (
             "docs/OIR_EXECUTION_FABRIC_V1.md",
+            "docs/M3_AUTHENTICATED_PURE_REMOTE_EXECUTION_DESIGN.md",
             "crates/ostadix-api/src/execution_fabric/codec.rs",
             "crates/ostadix-api/src/execution_fabric/protocol.rs",
             "crates/ostadix-api/src/execution_fabric_authority/mod.rs",
@@ -2604,6 +2629,12 @@ class SourceReleaseTests(unittest.TestCase):
             "crates/ostadix-api/src/execution_fabric_authority/crypto.rs",
             "crates/ostadix-api/src/execution_fabric_authority/protocol.rs",
             "crates/ostadix-api/src/execution_fabric_authority/tests.rs",
+            "crates/ostadix-api/src/hosted_remote/fabric/mod.rs",
+            "crates/ostadix-api/src/hosted_remote/fabric/keys.rs",
+            "crates/ostadix-api/src/hosted_remote/fabric/ledger.rs",
+            "crates/ostadix-api/src/hosted_remote/fabric/provider.rs",
+            "crates/ostadix-api/src/hosted_remote/fabric/realizer.rs",
+            "crates/ostadix-api/src/hosted_remote/fabric/wire.rs",
         )
         self._commit()
         self._git("rm", *required)

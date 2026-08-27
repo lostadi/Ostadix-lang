@@ -50,6 +50,28 @@ pub const RUNTIME_EXECUTION_FABRIC_AUTHORITY_SOURCES: &[(&str, &str)] = &[
         include_str!("../execution_fabric_authority/tests.rs"),
     ),
 ];
+// The generated runtime does not compile the hosted listener/provider, but it
+// still carries the exact Fabric provider source inventory. Keeping these
+// files at their canonical relative paths makes realizer.rs, whose embedded
+// source set contributes to the trusted-inline adapter artifact identity,
+// reproducible in an isolated generated source tree.
+pub const RUNTIME_HOSTED_REMOTE_FABRIC_SOURCES: &[(&str, &str)] = &[
+    ("mod.rs", include_str!("../hosted_remote/fabric/mod.rs")),
+    ("keys.rs", include_str!("../hosted_remote/fabric/keys.rs")),
+    (
+        "ledger.rs",
+        include_str!("../hosted_remote/fabric/ledger.rs"),
+    ),
+    (
+        "provider.rs",
+        include_str!("../hosted_remote/fabric/provider.rs"),
+    ),
+    (
+        "realizer.rs",
+        include_str!("../hosted_remote/fabric/realizer.rs"),
+    ),
+    ("wire.rs", include_str!("../hosted_remote/fabric/wire.rs")),
+];
 pub const RUNTIME_EVAL_CORE_RS: &str = include_str!("../eval_core.rs");
 pub const RUNTIME_EVAL_RS: &str = include_str!("../eval.rs");
 pub const RUNTIME_PROCESS_RS: &str = include_str!("../process.rs");

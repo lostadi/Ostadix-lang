@@ -960,6 +960,30 @@ impl FabricAttemptStatusV1 {
         }
     }
 
+    /// Build provider-scoped status coordinates for a query that has no
+    /// retained ledger record. This does not authorize or advance an attempt;
+    /// it only permits a bounded rejection to echo the queried binding on the
+    /// authenticated Fabric route.
+    pub fn from_query(
+        query: &FabricAttemptQueryV1,
+        node_id: impl Into<String>,
+        node_generation: GenerationV1,
+        execution_cell_incarnation: ExecutionCellIncarnationV1,
+    ) -> Result<Self, FabricAuthorityError> {
+        query.validate()?;
+        let value = Self {
+            issuer_key_id: query.issuer_key_id.clone(),
+            attempt: query.attempt.clone(),
+            lease_nonce: query.lease_nonce.clone(),
+            submission_binding_sha256: query.submission_binding_sha256,
+            node_id: node_id.into(),
+            node_generation,
+            execution_cell_incarnation,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
     pub fn issuer_key_id(&self) -> &SemanticDigestV1 {
         &self.issuer_key_id
     }

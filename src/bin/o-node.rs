@@ -29,16 +29,19 @@ use clap::{Args, Parser, Subcommand};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
+use o_lang::execution_fabric_authority::TrustedFabricAuthoritiesV1;
 #[cfg(unix)]
 use o_lang::hosted_remote::lan_node_process_dir;
 use o_lang::hosted_remote::mesh::{MeshNodeRuntime, MeshNodeRuntimeConfig};
 use o_lang::hosted_remote::v2::{
     default_hosted_v2_state_dir, read_node_signing_key_v2, read_placement_public_key_v2,
-    serve_owned_node_dual_until_shutdown_with_listener_ready, write_new_node_public_key_v2,
-    write_new_node_signing_key_v2, DurableSessionStoreV2, HostedDualNodeShutdown,
-    HostedNodeSignerV2, HostedOwnedDualNodeServerConfig, HostedV2RuntimeConfig,
-    HostedV2RuntimeOwner, LanOpenPlacementAuthorizerV2, PinnedEd25519PlacementAuthorizerV2,
-    PlacementProofAuthorizerV2, DEFAULT_MAX_ACTORS_PER_SESSION_V2, DEFAULT_MAX_OPEN_SESSIONS_V2,
+    serve_owned_node_dual_until_shutdown_with_listener_ready,
+    serve_owned_node_dual_with_execution_fabric_v1_until_shutdown_with_listener_ready,
+    write_new_node_public_key_v2, write_new_node_signing_key_v2, DurableSessionStoreV2,
+    HostedDualNodeShutdown, HostedNodeSignerV2, HostedOwnedDualNodeServerConfig,
+    HostedOwnedDualNodeWithFabricServerConfigV1, HostedV2RuntimeConfig, HostedV2RuntimeOwner,
+    LanOpenPlacementAuthorizerV2, PinnedEd25519PlacementAuthorizerV2, PlacementProofAuthorizerV2,
+    DEFAULT_MAX_ACTORS_PER_SESSION_V2, DEFAULT_MAX_OPEN_SESSIONS_V2,
     DEFAULT_MAX_SNAPSHOT_BYTES_PER_ACTOR_V2, DEFAULT_MAX_STATE_BYTES_PER_SESSION_V2,
     DEFAULT_MAX_STATE_BYTES_TOTAL_V2,
 };
@@ -47,19 +50,23 @@ use o_lang::hosted_remote::{
     connect_mutual_tls, default_ca_path, default_node_cert_path, default_node_key_path,
     discover_lan_nodes, generate_pairing_passcode, hosted_config_dir, join_pairing_once,
     lan_open_config_dir, lan_open_v2_state_dir, lan_peers_config_dir, load_stored_lan_peer,
-    replace_paired_lan_peer, serve_node_with_listener_ready, spawn_lan_bootstrap_server,
-    spawn_lan_discovery_responder, store_paired_lan_peer, ClientTlsIdentity, HostedNodeRuntime,
-    HostedNodeServerConfig, LanBootstrapBundleV1, LanNodeAdvertisementV1, NodeDoctorCheckV1,
-    PairingLocalIdentityV1, PairingPublicIdentityV1, PairingResultV1, ServerTlsIdentity,
-    StoredLanPeerPathsV1, DEFAULT_LAN_BOOTSTRAP_PORT, DEFAULT_LAN_DISCOVERY_PORT,
-    DEFAULT_LAN_NODE_PORT, DEFAULT_LAN_PAIRING_PORT, DEFAULT_MAX_CONNECTIONS, DEFAULT_NODE_BIND,
-    DEFAULT_NODE_ID, LAN_BOOTSTRAP_SCHEMA_V1, LAN_SECURITY_MODE,
+    read_fabric_node_signing_key_v1, read_fabric_public_key_v1, replace_paired_lan_peer,
+    serve_node_with_execution_fabric_v1_and_listener_ready, serve_node_with_listener_ready,
+    spawn_lan_bootstrap_server, spawn_lan_discovery_responder, store_paired_lan_peer,
+    ClientTlsIdentity, FabricAttemptProviderConfigV1, FabricAttemptProviderV1, HostedNodeRuntime,
+    HostedNodeServerConfig, HostedNodeWithFabricServerConfigV1, LanBootstrapBundleV1,
+    LanNodeAdvertisementV1, NodeDoctorCheckV1, PairingLocalIdentityV1, PairingPublicIdentityV1,
+    PairingResultV1, ServerTlsIdentity, StoredLanPeerPathsV1, DEFAULT_LAN_BOOTSTRAP_PORT,
+    DEFAULT_LAN_DISCOVERY_PORT, DEFAULT_LAN_NODE_PORT, DEFAULT_LAN_PAIRING_PORT,
+    DEFAULT_MAX_CONNECTIONS, DEFAULT_NODE_BIND, DEFAULT_NODE_ID, LAN_BOOTSTRAP_SCHEMA_V1,
+    LAN_SECURITY_MODE,
 };
 use o_lang::placement::{GenerationV1, StateQuotaLimitsV2};
 use o_lang::runtime_exec::validate_native_runtime_binary;
 use o_lang::shims::ExtractedShims;
 
 const V2_NODE_EPOCH_HELP: &str = "Stable node-state/deployment epoch bound into durable V2 session identity. Reuse it across normal process restarts. To bump it, use a new state root or archive the old root first; changing this value never evicts or migrates existing sessions.";
+const FABRIC_NODE_EPOCH_HELP: &str = "Stable Fabric target node/deployment generation bound into execution leases. Reuse it across normal process restarts. The durable execution-cell incarnation advances separately when the Fabric provider reopens; change this generation only for an intentional deployment epoch.";
 const DEFAULT_DETACHED_STARTUP_TIMEOUT_SECONDS: u64 = 120;
 #[cfg(unix)]
 const DETACHED_STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -105,7 +112,7 @@ enum Command {
     Profile(ProfileArgs),
     /// Validate the local shim and TLS configuration without listening.
     Doctor(DoctorArgs),
-    /// Serve frozen V1, optional durable Hosted V2, and scheduler/actor mesh requests over mTLS.
+    /// Serve frozen V1, optional durable Hosted V2/Mesh, and explicitly authorized Fabric V1 over mTLS.
     Serve(ServeArgs),
 }
 
@@ -300,6 +307,17 @@ struct ServeArgs {
     /// Internal identity binding for a detached child launched by `start`.
     #[arg(long, hide = true, value_name = "TOKEN")]
     managed_start_token: Option<String>,
+    /// Explicitly enable execution Fabric V1 using this durable provider state base.
+    #[arg(long, value_name = "PATH")]
+    fabric_state_dir: Option<PathBuf>,
+    /// Fabric V1 node receipt-signing key. Required with --fabric-state-dir.
+    #[arg(long, value_name = "PATH")]
+    fabric_node_signing_key: Option<PathBuf>,
+    /// Trusted Fabric execution-authority public key. Repeat to enroll multiple issuers.
+    #[arg(long = "fabric-authority-public-key", value_name = "PATH")]
+    fabric_authority_public_keys: Vec<PathBuf>,
+    #[arg(long, default_value_t = 1, help = FABRIC_NODE_EPOCH_HELP)]
+    fabric_node_generation: u64,
     /// Enable durable session protocol V2 using this capability-first state root.
     #[arg(long)]
     v2_state_dir: Option<PathBuf>,
@@ -2326,11 +2344,118 @@ fn doctor(mut args: DoctorArgs) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct FabricServePathsV1 {
+    state_base: PathBuf,
+    node_signing_key: PathBuf,
+    authority_public_keys: Vec<PathBuf>,
+    node_generation: GenerationV1,
+}
+
+fn resolve_fabric_serve_paths(
+    state_base: Option<PathBuf>,
+    node_signing_key: Option<PathBuf>,
+    authority_public_keys: Vec<PathBuf>,
+    node_generation: u64,
+) -> Result<Option<FabricServePathsV1>> {
+    let Some(state_base) = state_base else {
+        if node_signing_key.is_some() || !authority_public_keys.is_empty() {
+            bail!("--fabric-state-dir is required when any Fabric key option is supplied");
+        }
+        return Ok(None);
+    };
+    let node_signing_key = node_signing_key.context(
+        "--fabric-node-signing-key is required when --fabric-state-dir enables Fabric V1",
+    )?;
+    if authority_public_keys.is_empty() {
+        bail!(
+            "at least one --fabric-authority-public-key is required when --fabric-state-dir enables Fabric V1"
+        );
+    }
+    Ok(Some(FabricServePathsV1 {
+        state_base,
+        node_signing_key,
+        authority_public_keys,
+        node_generation: GenerationV1::new(node_generation)?,
+    }))
+}
+
+fn validate_shared_node_generation(
+    fabric: Option<&FabricServePathsV1>,
+    v2_enabled: bool,
+    v2_node_generation: u64,
+) -> Result<()> {
+    if let Some(fabric) = fabric {
+        if v2_enabled && fabric.node_generation.get() != v2_node_generation {
+            bail!(
+                "--fabric-node-generation ({}) must equal --v2-node-generation ({v2_node_generation}) when both protocols identify the same o-node deployment",
+                fabric.node_generation.get()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn open_fabric_provider(
+    node_id: &str,
+    paths: FabricServePathsV1,
+) -> Result<Arc<FabricAttemptProviderV1>> {
+    let node_signer =
+        read_fabric_node_signing_key_v1(&paths.node_signing_key).with_context(|| {
+            format!(
+                "failed to read Fabric node signing key `{}`",
+                paths.node_signing_key.display()
+            )
+        })?;
+    let mut trusted_authorities = TrustedFabricAuthoritiesV1::new();
+    for path in &paths.authority_public_keys {
+        let public_key = read_fabric_public_key_v1(path).with_context(|| {
+            format!(
+                "failed to read Fabric authority public key `{}`",
+                path.display()
+            )
+        })?;
+        trusted_authorities.enroll(public_key);
+    }
+    let state_base = paths.state_base;
+    let provider = FabricAttemptProviderV1::open(FabricAttemptProviderConfigV1 {
+        state_base: state_base.clone(),
+        node_id: node_id.to_owned(),
+        node_generation: paths.node_generation,
+        node_signer,
+        trusted_authorities,
+    })
+    .with_context(|| {
+        format!(
+            "failed to open execution Fabric V1 provider beneath `{}`",
+            state_base.display()
+        )
+    })?;
+    Ok(Arc::new(provider))
+}
+
+fn service_summary_with_fabric(base: &str, provider: Option<&FabricAttemptProviderV1>) -> String {
+    match provider {
+        Some(provider) => format!(
+            "{base}; execution Fabric V1 enabled; Fabric node key id {}; execution-cell incarnation {}",
+            provider.node_key_id(),
+            provider.execution_cell_incarnation().get()
+        ),
+        None => base.to_owned(),
+    }
+}
+
 fn serve(mut args: ServeArgs) -> Result<()> {
     if let Some(token) = args.managed_start_token.as_deref() {
         validate_detached_launch_token(token)?;
     }
     let managed_start_token = args.managed_start_token.take();
+    let fabric_paths = resolve_fabric_serve_paths(
+        args.fabric_state_dir.take(),
+        args.fabric_node_signing_key.take(),
+        std::mem::take(&mut args.fabric_authority_public_keys),
+        args.fabric_node_generation,
+    )?;
     let automatic_mode = !args.manual;
     let legacy_lan_open = automatic_mode && args.lan_open;
     let automatic = if automatic_mode {
@@ -2379,6 +2504,14 @@ fn serve(mut args: ServeArgs) -> Result<()> {
     let service_port = parse_bind_port(&bind_address)?;
     let (shim_dir, _shim_guard) = resolve_shim_dir(args.runtime.shim_dir.clone())?;
     let v1_runtime = runtime_from_args(args.runtime, shim_dir)?;
+    validate_shared_node_generation(
+        fabric_paths.as_ref(),
+        args.v2_state_dir.is_some(),
+        args.v2_node_generation,
+    )?;
+    let fabric_provider = fabric_paths
+        .map(|paths| open_fabric_provider(&v1_runtime.node_id, paths))
+        .transpose()?;
 
     if automatic.is_some() {
         if legacy_lan_open {
@@ -2499,27 +2632,50 @@ fn serve(mut args: ServeArgs) -> Result<()> {
         }
         let ready_node_id = v1_runtime.node_id.clone();
         let ready_maximum_connections = v1_runtime.max_concurrent_connections;
-        let ready_service_summary = if mesh_runtime.is_some() {
+        let base_service_summary = if mesh_runtime.is_some() {
             "TLS 1.3 mTLS; frozen V1 + durable V2; scheduler/actor mesh enabled"
         } else {
             "TLS 1.3 mTLS; frozen V1 + durable V2; scheduler/actor mesh disabled"
         };
+        let ready_service_summary =
+            service_summary_with_fabric(base_service_summary, fabric_provider.as_deref());
         let listener_ready_shutdown = shutdown.clone();
+        let hosted = HostedOwnedDualNodeServerConfig {
+            bind_address,
+            v1_runtime,
+            v2_runtime,
+            mesh_runtime,
+            tls_identity: tls_identity(args.tls),
+        };
+        if let Some(fabric_provider) = fabric_provider {
+            return serve_owned_node_dual_with_execution_fabric_v1_until_shutdown_with_listener_ready(
+                HostedOwnedDualNodeWithFabricServerConfigV1 {
+                    hosted,
+                    fabric_provider,
+                },
+                shutdown,
+                move |listening_address| {
+                    report_listener_ready(
+                        listening_address,
+                        &ready_node_id,
+                        ready_maximum_connections,
+                        &ready_service_summary,
+                        lan_services,
+                        Some(&listener_ready_shutdown),
+                        managed_start_token.as_deref(),
+                    )
+                },
+            );
+        }
         return serve_owned_node_dual_until_shutdown_with_listener_ready(
-            HostedOwnedDualNodeServerConfig {
-                bind_address,
-                v1_runtime,
-                v2_runtime,
-                mesh_runtime,
-                tls_identity: tls_identity(args.tls),
-            },
+            hosted,
             shutdown,
             move |listening_address| {
                 report_listener_ready(
                     listening_address,
                     &ready_node_id,
                     ready_maximum_connections,
-                    ready_service_summary,
+                    &ready_service_summary,
                     lan_services,
                     Some(&listener_ready_shutdown),
                     managed_start_token.as_deref(),
@@ -2537,12 +2693,35 @@ fn serve(mut args: ServeArgs) -> Result<()> {
     };
     let ready_node_id = config.runtime.node_id.clone();
     let ready_maximum_connections = config.runtime.max_concurrent_connections;
+    let ready_service_summary = service_summary_with_fabric(
+        "TLS 1.3 mTLS; frozen V1; scheduler/actor mesh disabled",
+        fabric_provider.as_deref(),
+    );
+    if let Some(fabric_provider) = fabric_provider {
+        return serve_node_with_execution_fabric_v1_and_listener_ready(
+            HostedNodeWithFabricServerConfigV1 {
+                hosted: config,
+                fabric_provider,
+            },
+            move |listening_address| {
+                report_listener_ready(
+                    listening_address,
+                    &ready_node_id,
+                    ready_maximum_connections,
+                    &ready_service_summary,
+                    lan_services,
+                    None,
+                    managed_start_token.as_deref(),
+                )
+            },
+        );
+    }
     serve_node_with_listener_ready(config, move |listening_address| {
         report_listener_ready(
             listening_address,
             &ready_node_id,
             ready_maximum_connections,
-            "TLS 1.3 mTLS; frozen V1; scheduler/actor mesh disabled",
+            &ready_service_summary,
             lan_services,
             None,
             managed_start_token.as_deref(),
@@ -3024,6 +3203,133 @@ mod tests {
         assert!(help.contains("Reuse it across normal process restarts"));
         assert!(help.contains("new state root or archive the old root"));
         assert!(help.contains("never evicts or migrates existing sessions"));
+    }
+
+    #[test]
+    fn fabric_cli_parses_explicit_state_key_authorities_and_generation() {
+        let cli = Cli::try_parse_from([
+            "o-node",
+            "serve",
+            "--manual",
+            "--fabric-state-dir",
+            "fabric-state",
+            "--fabric-node-signing-key",
+            "fabric-node.key",
+            "--fabric-authority-public-key",
+            "authority-a.pub",
+            "--fabric-authority-public-key",
+            "authority-b.pub",
+            "--fabric-node-generation",
+            "7",
+        ])
+        .unwrap();
+        let Command::Serve(args) = cli.command else {
+            panic!("serve subcommand was not parsed");
+        };
+        assert_eq!(args.fabric_state_dir, Some(PathBuf::from("fabric-state")));
+        assert_eq!(
+            args.fabric_node_signing_key,
+            Some(PathBuf::from("fabric-node.key"))
+        );
+        assert_eq!(
+            args.fabric_authority_public_keys,
+            [
+                PathBuf::from("authority-a.pub"),
+                PathBuf::from("authority-b.pub")
+            ]
+        );
+        assert_eq!(args.fabric_node_generation, 7);
+    }
+
+    #[test]
+    fn fabric_cli_requires_a_complete_explicit_authority_configuration() {
+        assert!(resolve_fabric_serve_paths(None, None, Vec::new(), 1)
+            .unwrap()
+            .is_none());
+
+        let missing_state = resolve_fabric_serve_paths(
+            None,
+            Some(PathBuf::from("fabric-node.key")),
+            vec![PathBuf::from("authority.pub")],
+            1,
+        )
+        .unwrap_err();
+        assert!(missing_state.to_string().contains("--fabric-state-dir"));
+
+        let missing_node_key = resolve_fabric_serve_paths(
+            Some(PathBuf::from("fabric-state")),
+            None,
+            vec![PathBuf::from("authority.pub")],
+            1,
+        )
+        .unwrap_err();
+        assert!(missing_node_key
+            .to_string()
+            .contains("--fabric-node-signing-key"));
+
+        let missing_authority = resolve_fabric_serve_paths(
+            Some(PathBuf::from("fabric-state")),
+            Some(PathBuf::from("fabric-node.key")),
+            Vec::new(),
+            1,
+        )
+        .unwrap_err();
+        assert!(missing_authority
+            .to_string()
+            .contains("--fabric-authority-public-key"));
+
+        let resolved = resolve_fabric_serve_paths(
+            Some(PathBuf::from("fabric-state")),
+            Some(PathBuf::from("fabric-node.key")),
+            vec![PathBuf::from("authority.pub")],
+            7,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(resolved.state_base, PathBuf::from("fabric-state"));
+        assert_eq!(resolved.node_signing_key, PathBuf::from("fabric-node.key"));
+        assert_eq!(
+            resolved.authority_public_keys,
+            [PathBuf::from("authority.pub")]
+        );
+        assert_eq!(resolved.node_generation.get(), 7);
+    }
+
+    #[test]
+    fn fabric_and_v2_share_one_node_deployment_generation() {
+        let fabric = resolve_fabric_serve_paths(
+            Some(PathBuf::from("fabric-state")),
+            Some(PathBuf::from("fabric-node.key")),
+            vec![PathBuf::from("authority.pub")],
+            7,
+        )
+        .unwrap()
+        .unwrap();
+        validate_shared_node_generation(Some(&fabric), false, 8).unwrap();
+        validate_shared_node_generation(Some(&fabric), true, 7).unwrap();
+        let error = validate_shared_node_generation(Some(&fabric), true, 8).unwrap_err();
+        assert!(error.to_string().contains("same o-node deployment"));
+    }
+
+    #[test]
+    fn fabric_node_generation_help_distinguishes_restart_incarnation() {
+        let mut command = Cli::command();
+        let serve = command.find_subcommand_mut("serve").unwrap();
+        let generation = serve
+            .get_arguments()
+            .find(|argument| argument.get_id() == "fabric_node_generation")
+            .unwrap();
+        let help = generation.get_help().unwrap().to_string();
+        assert_eq!(help, FABRIC_NODE_EPOCH_HELP);
+        assert!(help.contains("Reuse it across normal process restarts"));
+        assert!(help.contains("execution-cell incarnation advances separately"));
+        assert!(help.contains("intentional deployment epoch"));
+    }
+
+    #[test]
+    fn disabled_fabric_preserves_the_existing_readiness_summary() {
+        let existing = "TLS 1.3 mTLS; frozen V1; scheduler/actor mesh disabled";
+        assert_eq!(service_summary_with_fabric(existing, None), existing);
     }
 
     #[test]
