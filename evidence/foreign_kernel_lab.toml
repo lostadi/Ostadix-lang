@@ -22,6 +22,14 @@ candidates = [
   "/usr/local/share/qemu/edk2-aarch64-code.fd",
 ]
 
+[firmware.x86_64_uefi]
+candidates = [
+  "/usr/share/ovmf/OVMF.fd",
+  "/usr/share/edk2/x64/OVMF.fd",
+  "/opt/homebrew/share/qemu/edk2-x86_64-code.fd",
+  "/usr/local/share/qemu/edk2-x86_64-code.fd",
+]
+
 [[guests]]
 id = "linux-alpine-3.24.1-aarch64"
 family = "linux"
@@ -89,6 +97,75 @@ filename = "initramfs-virt"
 url = "https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/aarch64/netboot-3.24.1/initramfs-virt"
 size_bytes = 9385851
 sha256 = "e47d38bc88509a3db11affc09f9762f9643b026bd29441724a4729ad8e97add6"
+integrity = "repository-pinned digest observed from Alpine's versioned HTTPS release member"
+
+[[guests]]
+id = "linux-alpine-3.24.1-x86_64"
+family = "linux"
+version = "Alpine Linux 3.24.1, Linux 6.18.35-0-virt"
+architecture = "x86_64"
+qemu_profile = "x86_64-q35"
+cache_dir = "alpine-3.24.1-x86_64"
+qemu_executable = "qemu-system-x86_64"
+timeout_seconds = 30
+post_completion_seconds = 0.25
+max_capture_bytes = 2097152
+claim = "An unmodified Alpine Linux x86_64 virt kernel reached its upstream initramfs shell and answered a bounded uname probe under QEMU TCG."
+nonclaims = [
+  "The rdinit shell is not an installed or persistent Alpine system.",
+  "This boot does not prove O-core or KernelWorld governance of Linux.",
+  "This QEMU TCG observation is not physical x86_64 or hardware-acceleration evidence.",
+]
+required_markers = [
+  "Linux version 6.18.35-0-virt",
+  "/bin/sh: can't access tty; job control turned off",
+  "OSTADIX_LINUX_X86_64_USERSPACE_READY",
+  "Linux 6.18.35-0-virt x86_64",
+  "reboot: Power down",
+]
+unique_markers = [
+  "Linux version 6.18.35-0-virt",
+  "/bin/sh: can't access tty; job control turned off",
+  "Linux 6.18.35-0-virt x86_64",
+  "reboot: Power down",
+]
+forbidden_markers = [
+  "Kernel panic - not syncing",
+  "Failed to execute /bin/sh",
+  "No working init found",
+]
+console_actions = [
+  { trigger = "/bin/sh: can't access tty; job control turned off", commands = ["echo OSTADIX_LINUX_X86_64_USERSPACE_READY", "/bin/busybox uname -srm", "/bin/busybox poweroff -f"] },
+]
+qemu_args = [
+  "-machine", "q35,accel=tcg",
+  "-cpu", "qemu64",
+  "-smp", "1",
+  "-m", "512M",
+  "-nic", "none",
+  "-display", "none",
+  "-serial", "stdio",
+  "-monitor", "none",
+  "-no-reboot",
+  "-kernel", "{artifact:kernel}",
+  "-initrd", "{artifact:initramfs}",
+  "-append", "console=ttyS0,115200n8 earlycon=uart8250,io,0x3f8,115200n8 rdinit=/bin/sh panic=-1 loglevel=4",
+]
+
+[[guests.artifacts]]
+id = "kernel"
+filename = "vmlinuz-virt"
+url = "https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/x86_64/netboot-3.24.1/vmlinuz-virt"
+size_bytes = 12575744
+sha256 = "1e6bf9027720c75c3ed0d79171f21b5791ee40ca9795d07c7c6e04dc5ea2ae90"
+integrity = "repository-pinned digest observed from Alpine's versioned HTTPS release member"
+
+[[guests.artifacts]]
+id = "initramfs"
+filename = "initramfs-virt"
+url = "https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/x86_64/netboot-3.24.1/initramfs-virt"
+size_bytes = 9637032
+sha256 = "6d80a739fedeeb6cd63e24dd208845e22199c41a5fb2054941ef61ec30264fa9"
 integrity = "repository-pinned digest observed from Alpine's versioned HTTPS release member"
 
 [[guests]]
@@ -161,6 +238,78 @@ expanded_id = "media"
 expanded_filename = "FreeBSD-15.1-RELEASE-arm64-aarch64-bootonly.iso"
 expanded_size_bytes = 460095488
 expanded_sha256 = "359136c2af73e03da6f15ad59f0c67bc561ca8b69631d78bfb8f2225e2c9a5ef"
+
+[[guests]]
+id = "openbsd-7.9-amd64"
+family = "openbsd"
+version = "OpenBSD 7.9 RAMDISK_CD #396"
+architecture = "x86_64"
+qemu_profile = "x86_64-q35"
+cache_dir = "openbsd-7.9-amd64"
+qemu_executable = "qemu-system-x86_64"
+timeout_seconds = 60
+post_completion_seconds = 0.5
+max_capture_bytes = 4194304
+claim = "The unmodified OpenBSD 7.9 amd64 install ISO booted through its upstream BOOTX64 loader, RAMDISK_CD kernel, and rd0 userland to the installation prompt under QEMU TCG."
+nonclaims = [
+  "The installation prompt is not an installed or persistent OpenBSD system.",
+  "The host OVMF firmware is a recorded local trust anchor, not an OpenBSD artifact or a repository-authenticated dependency.",
+  "This boot does not prove O-core or KernelWorld governance of OpenBSD.",
+  "This QEMU TCG observation is not physical x86_64, Secure Boot, hardware-acceleration, or device-isolation evidence.",
+]
+required_markers = [
+  ">> OpenBSD/amd64 BOOTX64 3.71",
+  "boot>",
+  "switching console to com0",
+  "entry point at 0x1001000",
+  "OpenBSD 7.9 (RAMDISK_CD) #396",
+  "root on rd0a swap on rd0b dump on rd0b",
+  "Welcome to the OpenBSD/amd64 7.9 installation program.",
+  "(I)nstall, (U)pgrade, (A)utoinstall or (S)hell?",
+]
+unique_markers = [
+  "switching console to com0",
+  "entry point at 0x1001000",
+  "OpenBSD 7.9 (RAMDISK_CD) #396",
+  "root on rd0a swap on rd0b dump on rd0b",
+  "Welcome to the OpenBSD/amd64 7.9 installation program.",
+  "(I)nstall, (U)pgrade, (A)utoinstall or (S)hell?",
+]
+forbidden_markers = [
+  "panic:",
+  "ddb>",
+  "howto: bad option",
+  "No bootable option or device was found",
+  "UEFI Interactive Shell",
+]
+console_actions = [
+  { trigger = "boot>", occurrence = 1, commands = ["set tty com0"] },
+  { trigger = "boot>", occurrence = 2, commands = ["boot"] },
+]
+qemu_args = [
+  "-machine", "q35,accel=tcg",
+  "-cpu", "qemu64",
+  "-smp", "1",
+  "-m", "1024M",
+  "-bios", "{firmware:x86_64_uefi}",
+  "-boot", "order=d,strict=on",
+  "-drive", "if=none,id=cd0,media=cdrom,format=raw,readonly=on,file={artifact:media}",
+  "-device", "ide-cd,drive=cd0,bus=ide.0",
+  "-nic", "none",
+  "-display", "none",
+  "-serial", "stdio",
+  "-monitor", "none",
+  "-no-reboot",
+]
+
+[[guests.artifacts]]
+id = "media"
+filename = "install79.iso"
+url = "https://cdn.openbsd.org/pub/OpenBSD/7.9/amd64/install79.iso"
+size_bytes = 798625792
+sha256 = "7a4a92e953618035097c796a90b54424a0f3ae775552e1e7d102cf8a5130449f"
+integrity = "OpenBSD 7.9 signed SHA256 record"
+checksum_url = "https://cdn.openbsd.org/pub/OpenBSD/7.9/amd64/SHA256.sig"
 
 [[guests]]
 id = "plan9-9front-11983-amd64"

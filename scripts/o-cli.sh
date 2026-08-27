@@ -8,6 +8,7 @@ OCLI_BIN=${O_LANG_OCLI_BIN:-"$ROOT/target/release/o-cli"}
 OLANGC_BIN=${O_LANG_OLANGC_BIN:-"$ROOT/target/release/olangc"}
 O_BIN=${O_LANG_EVALUATOR_BIN:-"$ROOT/target/release/O"}
 KERNEL_CLI_BIN=${O_LANG_KERNEL_CLI_BIN:-"$ROOT/scripts/o-kernel.sh"}
+CAPACITY_BIN=${O_LANG_CAPACITY_BIN:-"$ROOT/scripts/ostadix_capacity.py"}
 LIVE_BIN=${O_LANG_LIVE_BIN:-"$ROOT/target/release/o-live-host"}
 OGIT_BIN=${O_LANG_OGIT_BIN:-"$ROOT/target/release/ogit"}
 NODE_BIN=${O_LANG_NODE_BIN:-"$ROOT/target/release/o-node"}
@@ -39,6 +40,14 @@ case "${1:-}" in
             exit 1
         fi
         exec "$KERNEL_CLI_BIN" "$@"
+        ;;
+    capacity)
+        shift
+        if [[ ! -x "$CAPACITY_BIN" ]]; then
+            printf 'error: absorbed-capacity package manager is missing or not executable: %s\n' "$CAPACITY_BIN" >&2
+            exit 1
+        fi
+        exec "$CAPACITY_BIN" "$@"
         ;;
     node)
         shift

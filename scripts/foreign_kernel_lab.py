@@ -127,6 +127,7 @@ class Firmware:
 class ConsoleAction:
     trigger: str
     commands: tuple[str, ...]
+    occurrence: int = 1
 
 
 @dataclass(frozen=True)
@@ -568,8 +569,11 @@ def _validate_qemu_args(
             raise LabError(
                 f"guest {guest_id} x86_64 memory must be 512M, 1024M, or 2048M"
             )
-        if values["-bios"]:
-            raise LabError(f"guest {guest_id} x86_64 profile does not admit -bios")
+        if values["-bios"] not in ([], ["{firmware:x86_64_uefi}"]):
+            raise LabError(
+                f"guest {guest_id} x86_64 profile admits only the declared "
+                "x86_64_uefi firmware"
+            )
         if values["-boot"] not in (
             [],
             ["order=c,strict=on"],
@@ -761,20 +765,29 @@ def _parse_guest(raw: Any, firmware_ids: set[str], context: str) -> Guest:
     if not isinstance(actions_raw, list) or len(actions_raw) > 8:
         raise LabError(f"{context}.console_actions must contain at most 8 tables")
     console_actions: list[ConsoleAction] = []
-    action_triggers: set[str] = set()
+    last_action_occurrence: dict[str, int] = {}
     for index, action_raw in enumerate(actions_raw):
         action_context = f"{context}.console_actions[{index}]"
         if not isinstance(action_raw, dict):
             raise LabError(f"{action_context} must be a table")
-        _require_keys(action_raw, {"trigger", "commands"}, action_context)
+        _require_keys(action_raw, {"trigger", "commands", "occurrence"}, action_context)
         trigger = _string(
             action_raw.get("trigger"), f"{action_context}.trigger", maximum=512
         )
         if trigger not in required_markers:
             raise LabError(f"{action_context}.trigger must also be a required marker")
-        if trigger in action_triggers:
-            raise LabError(f"{context}.console_actions repeats trigger {trigger!r}")
-        action_triggers.add(trigger)
+        occurrence = _positive_int(
+            action_raw.get("occurrence", 1),
+            f"{action_context}.occurrence",
+            maximum=8,
+        )
+        previous_occurrence = last_action_occurrence.get(trigger, 0)
+        if occurrence <= previous_occurrence:
+            raise LabError(
+                f"{context}.console_actions occurrences for trigger {trigger!r} "
+                "must be strictly increasing"
+            )
+        last_action_occurrence[trigger] = occurrence
         commands = _string_list(
             action_raw.get("commands"),
             f"{action_context}.commands",
@@ -787,7 +800,13 @@ def _parse_guest(raw: Any, firmware_ids: set[str], context: str) -> Guest:
                 raise LabError(
                     f"{action_context}.commands must contain printable ASCII only"
                 )
-        console_actions.append(ConsoleAction(trigger=trigger, commands=commands))
+        console_actions.append(
+            ConsoleAction(
+                trigger=trigger,
+                commands=commands,
+                occurrence=occurrence,
+            )
+        )
     action_positions = [required_markers.index(action.trigger) for action in console_actions]
     if action_positions != sorted(action_positions):
         raise LabError(
@@ -2379,7 +2398,10 @@ def run_guest(
                 normalized = normalize_terminal(stdout)
                 if (
                     len(actions_sent_at) < len(guest.console_actions)
-                    and guest.console_actions[len(actions_sent_at)].trigger in normalized
+                    and normalized.count(
+                        guest.console_actions[len(actions_sent_at)].trigger
+                    )
+                    >= guest.console_actions[len(actions_sent_at)].occurrence
                 ):
                     action = guest.console_actions[len(actions_sent_at)]
                     assert process.stdin is not None

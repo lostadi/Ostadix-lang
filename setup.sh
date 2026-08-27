@@ -475,7 +475,7 @@ install_system_deps() {
             append_unique debian_packages nodejs ruby racket ghc ocaml sbcl mono-devel octave wabt
           fi
           if $WITH_GUEST_TOOLS; then
-            append_unique debian_packages qemu-system-x86 qemu-system-arm qemu-efi-aarch64 qemu-utils gzip xz-utils zstd xorriso
+            append_unique debian_packages qemu-system-x86 qemu-system-arm qemu-efi-aarch64 qemu-utils gzip xz-utils zstd xorriso cpio squashfs-tools
           fi
           if $WITH_LINUX_KERNEL_TOOLS; then
             append_unique debian_packages openssl bc bison flex libelf-dev dwarves cpio rsync kmod libncurses-dev xz-utils zstd
@@ -1261,6 +1261,9 @@ check_capabilities() {
     check_any_tool "xz" xz
     check_any_tool "zstd" zstd
     check_any_tool "ISO member extractor" xorriso
+    if [[ "$PLATFORM" == "linux" ]]; then
+      check_any_tool "SquashFS module extractor" unsquashfs
+    fi
     local guest_firmware_candidate=""
     for guest_firmware_candidate in \
       "${OSTADIX_AARCH64_UEFI:-}" \

@@ -74,8 +74,9 @@ class ForeignKernelLabTests(unittest.TestCase):
         self.assertEqual(manifest.claim_class, LAB.CLAIM_CLASS)
         self.assertEqual(
             {guest.family for guest in manifest.guests},
-            {"linux", "freebsd", "plan9", "guix", "redox"},
+            {"linux", "freebsd", "openbsd", "plan9", "guix", "redox"},
         )
+        self.assertEqual(len(manifest.guests), 7)
         self.assertEqual(
             {guest.qemu_profile for guest in manifest.guests},
             {"aarch64-virt", "x86_64-q35"},
@@ -90,6 +91,43 @@ class ForeignKernelLabTests(unittest.TestCase):
             "bootargs is (tcp, tls, il, local!device)[local!/dev/sdF0/fs]",
             "user[glenda]:",
         ])
+        alpine_x86 = next(
+            guest
+            for guest in manifest.guests
+            if guest.id == "linux-alpine-3.24.1-x86_64"
+        )
+        self.assertEqual(alpine_x86.architecture, "x86_64")
+        self.assertEqual(
+            {
+                artifact.id: (artifact.size_bytes, artifact.sha256)
+                for artifact in alpine_x86.artifacts
+            },
+            {
+                "kernel": (
+                    12575744,
+                    "1e6bf9027720c75c3ed0d79171f21b5791ee40ca9795d07c7c6e04dc5ea2ae90",
+                ),
+                "initramfs": (
+                    9637032,
+                    "6d80a739fedeeb6cd63e24dd208845e22199c41a5fb2054941ef61ec30264fa9",
+                ),
+            },
+        )
+        openbsd = next(guest for guest in manifest.guests if guest.family == "openbsd")
+        self.assertEqual(openbsd.id, "openbsd-7.9-amd64")
+        self.assertEqual(openbsd.architecture, "x86_64")
+        self.assertIn("{firmware:x86_64_uefi}", openbsd.qemu_args)
+        self.assertEqual(
+            [(action.trigger, action.occurrence) for action in openbsd.console_actions],
+            [("boot>", 1), ("boot>", 2)],
+        )
+        self.assertEqual(
+            (openbsd.artifacts[0].size_bytes, openbsd.artifacts[0].sha256),
+            (
+                798625792,
+                "7a4a92e953618035097c796a90b54424a0f3ae775552e1e7d102cf8a5130449f",
+            ),
+        )
 
     def test_manifest_rejects_unknown_fields_and_networked_qemu(self) -> None:
         raw = self.load_raw_manifest()
@@ -139,16 +177,46 @@ class ForeignKernelLabTests(unittest.TestCase):
                     LAB.parse_manifest_data(unsafe, MANIFEST_PATH, identity)
 
         unsafe_drive = copy.deepcopy(raw)
-        freebsd_arguments = unsafe_drive["guests"][1]["qemu_args"]
+        freebsd_raw = next(
+            guest
+            for guest in unsafe_drive["guests"]
+            if guest["id"] == "freebsd-15.1-release-aarch64"
+        )
+        freebsd_arguments = freebsd_raw["qemu_args"]
         drive_index = freebsd_arguments.index("-drive")
         freebsd_arguments[drive_index + 1] += ",cache=unsafe"
         with self.assertRaises(LAB.LabError):
             LAB.parse_manifest_data(unsafe_drive, MANIFEST_PATH, identity)
 
         reversed_actions = copy.deepcopy(raw)
-        reversed_actions["guests"][2]["console_actions"].reverse()
+        plan9_raw = next(
+            guest
+            for guest in reversed_actions["guests"]
+            if guest["id"] == "plan9-9front-11983-amd64"
+        )
+        plan9_raw["console_actions"].reverse()
         with self.assertRaisesRegex(LAB.LabError, "required_markers order"):
             LAB.parse_manifest_data(reversed_actions, MANIFEST_PATH, identity)
+
+        invalid_occurrence = copy.deepcopy(raw)
+        openbsd_raw = next(
+            guest
+            for guest in invalid_occurrence["guests"]
+            if guest["id"] == "openbsd-7.9-amd64"
+        )
+        openbsd_raw["console_actions"][0]["occurrence"] = 0
+        with self.assertRaisesRegex(LAB.LabError, "occurrence"):
+            LAB.parse_manifest_data(invalid_occurrence, MANIFEST_PATH, identity)
+
+        reversed_occurrences = copy.deepcopy(raw)
+        openbsd_raw = next(
+            guest
+            for guest in reversed_occurrences["guests"]
+            if guest["id"] == "openbsd-7.9-amd64"
+        )
+        openbsd_raw["console_actions"].reverse()
+        with self.assertRaisesRegex(LAB.LabError, "strictly increasing"):
+            LAB.parse_manifest_data(reversed_occurrences, MANIFEST_PATH, identity)
 
         control_action = copy.deepcopy(raw)
         control_action["guests"][0]["console_actions"][0]["commands"][0] = (
@@ -328,6 +396,23 @@ class ForeignKernelLabTests(unittest.TestCase):
             "-no-reboot",
         )
         LAB._validate_qemu_args("test-x86", "x86_64", "x86_64-q35", safe)
+        safe_uefi = safe + ("-bios", "{firmware:x86_64_uefi}")
+        LAB._validate_qemu_args(
+            "test-x86-uefi", "x86_64", "x86_64-q35", safe_uefi
+        )
+
+        for firmware in (
+            "{firmware:aarch64_uefi}",
+            "/usr/share/ovmf/OVMF.fd",
+        ):
+            with self.subTest(firmware=firmware):
+                with self.assertRaises(LAB.LabError):
+                    LAB._validate_qemu_args(
+                        "test-x86-uefi",
+                        "x86_64",
+                        "x86_64-q35",
+                        safe + ("-bios", firmware),
+                    )
 
         for old, new in (
             ("q35,accel=tcg", "q35,accel=kvm"),
@@ -779,6 +864,56 @@ class ForeignKernelLabTests(unittest.TestCase):
             guest,
             guest_root,
             self.root / "phased-output",
+            qemu_override=qemu,
+        )
+
+        self.assertEqual(observation["status"], "synthetic-passed", observation)
+        self.assertEqual(observation["runtime"]["console_actions_total"], 2)
+        self.assertEqual(observation["runtime"]["console_actions_sent"], 2)
+
+    def test_console_actions_wait_for_counted_trigger_occurrence(self) -> None:
+        guest = replace(
+            self.make_guest(timeout=2.0),
+            required_markers=("BOOT", "SHELL", "READY", "ARCH", "POWER"),
+            unique_markers=("BOOT", "READY", "ARCH", "POWER"),
+            console_actions=(
+                LAB.ConsoleAction("SHELL", ("set-console",), occurrence=1),
+                LAB.ConsoleAction("SHELL", ("boot",), occurrence=2),
+            ),
+        )
+        manifest = self.make_manifest(guest)
+        guest_root = self.prepare_kernel(guest)
+        qemu = self.write_executable(
+            "fake-qemu-counted-prompt",
+            """\
+            #!/usr/bin/env python3
+            import select
+            import sys
+            import time
+            if "--version" in sys.argv:
+                print("QEMU emulator version test")
+                raise SystemExit(0)
+            print("BOOT", flush=True)
+            print("SHELL", flush=True)
+            if sys.stdin.readline().strip() != "set-console":
+                raise SystemExit(3)
+            time.sleep(0.2)
+            if select.select([sys.stdin], [], [], 0)[0]:
+                raise SystemExit(4)
+            print("SHELL", flush=True)
+            if sys.stdin.readline().strip() != "boot":
+                raise SystemExit(5)
+            print("READY", flush=True)
+            print("ARCH", flush=True)
+            print("POWER", flush=True)
+            """,
+        )
+
+        observation = LAB.run_guest(
+            manifest,
+            guest,
+            guest_root,
+            self.root / "counted-prompt-output",
             qemu_override=qemu,
         )
 

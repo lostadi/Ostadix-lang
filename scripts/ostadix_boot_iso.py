@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import mmap
 import os
 from pathlib import Path
 import re
@@ -24,7 +25,11 @@ import tempfile
 SCHEMA = "ostadix.boot-iso/v1"
 LOGICAL_BLOCK_SIZE = 2048
 MIN_ISO_BYTES = 24 * LOGICAL_BLOCK_SIZE
-MAX_ISO_BYTES = 1024 * 1024 * 1024
+# ISO9660's volume-space field is substantially larger than this bound, but the
+# repository deliberately admits optical images only through 16 GiB.  Inspection
+# maps the descriptor instead of materializing these bytes in the Python heap.
+MAX_ISO_BYTES = 16 * 1024 * 1024 * 1024
+COPY_CHUNK_BYTES = 4 * 1024 * 1024
 MAX_VOLUME_DESCRIPTORS = 64
 EL_TORITO_SYSTEM_ID = b"EL TORITO SPECIFICATION"
 EFI_PLATFORM_ID = 0xEF
@@ -111,7 +116,7 @@ def _open_pinned_regular(
     return descriptor
 
 
-def _sha256(data: bytes) -> str:
+def _sha256(data: bytes | mmap.mmap) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
@@ -125,59 +130,64 @@ def _file_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
     )
 
 
-def _read_bounded(path: Path, maximum: int = MAX_ISO_BYTES) -> bytes:
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+def _require_descriptor_identity(
+    descriptor: int, expected: os.stat_result, label: str
+) -> os.stat_result:
     try:
-        descriptor = os.open(path, flags)
+        current = os.fstat(descriptor)
     except OSError as error:
-        raise IsoError(
-            f"cannot open ISO input without following links: {path}: {error}"
-        ) from error
-    try:
-        stream = os.fdopen(descriptor, "rb")
-    except OSError as error:
-        try:
-            os.close(descriptor)
-        except OSError:
-            pass
-        raise IsoError(f"cannot attach ISO input descriptor: {path}: {error}") from error
+        raise IsoError(f"cannot recheck {label} descriptor: {error}") from error
+    if _file_identity(current) != _file_identity(expected):
+        raise IsoError(f"{label} changed while its descriptor was held")
+    return current
 
-    try:
-        with stream:
-            before = os.fstat(stream.fileno())
-            if not stat.S_ISREG(before.st_mode):
-                raise IsoError(f"ISO input is not a regular file: {path}")
-            if before.st_size < MIN_ISO_BYTES or before.st_size > maximum:
-                raise IsoError(
-                    f"ISO size outside {MIN_ISO_BYTES}..{maximum} bytes: {path}"
-                )
-            chunks: list[bytes] = []
-            remaining = before.st_size
-            while remaining:
-                chunk = stream.read(min(4 * 1024 * 1024, remaining))
-                if not chunk:
-                    raise IsoError(f"ISO ended before its admitted size: {path}")
-                chunks.append(chunk)
-                remaining -= len(chunk)
-            if stream.read(1):
-                raise IsoError(f"ISO grew beyond its admitted size: {path}")
-            after = os.fstat(stream.fileno())
-    except IsoError:
-        raise
-    except OSError as error:
-        raise IsoError(f"cannot read ISO input {path}: {error}") from error
 
-    if _file_identity(after) != _file_identity(before):
-        raise IsoError(f"ISO changed while it was read: {path}")
+def _require_path_identity(path: Path, expected: os.stat_result, label: str) -> None:
     try:
         current = os.stat(path, follow_symlinks=False)
     except OSError as error:
-        raise IsoError(f"ISO path changed after it was read: {path}: {error}") from error
+        raise IsoError(f"{label} path changed while it was held: {path}: {error}") from error
     if not stat.S_ISREG(current.st_mode) or _file_identity(current) != _file_identity(
-        before
+        expected
     ):
-        raise IsoError(f"ISO path was replaced while it was read: {path}")
-    return b"".join(chunks)
+        raise IsoError(f"{label} path was replaced while it was held: {path}")
+
+
+def _write_all(descriptor: int, data: bytes) -> None:
+    offset = 0
+    while offset < len(data):
+        try:
+            written = os.write(descriptor, data[offset:])
+        except OSError as error:
+            raise IsoError(f"cannot write private ISO output: {error}") from error
+        if written <= 0:
+            raise IsoError("private ISO output stopped accepting bytes")
+        offset += written
+
+
+def _stream_copy_descriptor(
+    source_descriptor: int, output_descriptor: int, size: int
+) -> str:
+    digest = hashlib.sha256()
+    offset = 0
+    try:
+        while offset < size:
+            requested = min(COPY_CHUNK_BYTES, size - offset)
+            chunk = os.pread(source_descriptor, requested, offset)
+            if not chunk:
+                raise IsoError("ISO source ended before its admitted size during publication")
+            if len(chunk) > requested:
+                raise IsoError("ISO source read exceeded its bounded publication chunk")
+            _write_all(output_descriptor, chunk)
+            digest.update(chunk)
+            offset += len(chunk)
+        if os.pread(source_descriptor, 1, size):
+            raise IsoError("ISO source grew beyond its admitted size during publication")
+    except IsoError:
+        raise
+    except OSError as error:
+        raise IsoError(f"cannot stream ISO source during publication: {error}") from error
+    return digest.hexdigest()
 
 
 def _u16_both(data: bytes, offset: int, label: str) -> int:
@@ -196,7 +206,13 @@ def _u32_both(data: bytes, offset: int, label: str) -> int:
     return little
 
 
-def _extent(data: bytes, lba: int, size: int, volume_bytes: int, label: str) -> bytes:
+def _extent(
+    data: bytes | mmap.mmap,
+    lba: int,
+    size: int,
+    volume_bytes: int,
+    label: str,
+) -> bytes:
     if lba <= 0 or size < 0:
         raise IsoError(f"{label} has an invalid extent")
     start = lba * LOGICAL_BLOCK_SIZE
@@ -241,7 +257,10 @@ def _normalized_iso_name(raw: bytes) -> str | None:
 
 
 def _directory_entries(
-    data: bytes, directory: dict[str, object], volume_bytes: int, label: str
+    data: bytes | mmap.mmap,
+    directory: dict[str, object],
+    volume_bytes: int,
+    label: str,
 ) -> list[dict[str, object]]:
     content = _extent(
         data,
@@ -272,7 +291,7 @@ def _directory_entries(
 
 
 def _find_iso_path(
-    data: bytes,
+    data: bytes | mmap.mmap,
     root: dict[str, object],
     components: tuple[str, ...],
     volume_bytes: int,
@@ -305,7 +324,9 @@ def _find_iso_path(
     return content, current
 
 
-def _fat_geometry(image: bytes) -> dict[str, int]:
+def _fat_geometry(
+    image: bytes, *, available_bytes: int | None = None
+) -> dict[str, int]:
     if len(image) < 512 or image[510:512] != b"\x55\xaa":
         raise IsoError("El Torito EFI boot image lacks a FAT boot-sector signature")
     bytes_per_sector = int.from_bytes(image[11:13], "little")
@@ -332,7 +353,8 @@ def _fat_geometry(image: bytes) -> dict[str, int]:
     ):
         raise IsoError("El Torito EFI boot image has invalid FAT geometry")
     image_bytes = total_sectors * bytes_per_sector
-    if image_bytes > len(image):
+    admitted_bytes = len(image) if available_bytes is None else available_bytes
+    if image_bytes > admitted_bytes:
         raise IsoError("El Torito EFI boot image is truncated")
     root_dir_sectors = (root_entries * 32 + bytes_per_sector - 1) // bytes_per_sector
     first_data_sector = reserved_sectors + fat_count * fat_sectors + root_dir_sectors
@@ -733,7 +755,7 @@ def _el_torito_entries(catalog: bytes) -> list[tuple[int, bytes]]:
     return entries
 
 
-def inspect_image(data: bytes) -> dict[str, object]:
+def inspect_image(data: bytes | mmap.mmap) -> dict[str, object]:
     if len(data) < MIN_ISO_BYTES or len(data) > MAX_ISO_BYTES:
         raise IsoError(f"ISO size outside {MIN_ISO_BYTES}..{MAX_ISO_BYTES} bytes")
     if len(data) % LOGICAL_BLOCK_SIZE:
@@ -812,18 +834,26 @@ def inspect_image(data: bytes) -> dict[str, object]:
     boot_image_lba = int.from_bytes(uefi[8:12], "little")
     if boot_load_sectors <= 0:
         raise IsoError("El Torito UEFI entry has a zero load-sector count")
-    initial_boot_image = _extent(
+    boot_image_start = boot_image_lba * LOGICAL_BLOCK_SIZE
+    boot_image_available = volume_bytes - boot_image_start
+    boot_sector = _extent(
         data,
         boot_image_lba,
-        min(volume_bytes - boot_image_lba * LOGICAL_BLOCK_SIZE, MAX_ISO_BYTES),
+        512,
         volume_bytes,
-        "El Torito EFI boot image",
+        "El Torito EFI boot sector",
     )
-    geometry = _fat_geometry(initial_boot_image)
+    geometry = _fat_geometry(boot_sector, available_bytes=boot_image_available)
     boot_image_bytes = geometry["image_bytes"]
     if boot_load_sectors * 512 > boot_image_bytes:
         raise IsoError("El Torito load-sector count exceeds the EFI boot image")
-    boot_image = initial_boot_image[:boot_image_bytes]
+    boot_image = _extent(
+        data,
+        boot_image_lba,
+        boot_image_bytes,
+        volume_bytes,
+        "El Torito EFI boot image",
+    )
     bootloader = _find_fat_bootloader(boot_image, geometry)
     _validate_x86_64_efi_application(bootloader)
 
@@ -881,7 +911,15 @@ def inspect_image(data: bytes) -> dict[str, object]:
 
 
 def inspect_path(path: Path) -> dict[str, object]:
-    return inspect_image(_read_bounded(path))
+    descriptor = _open_pinned_regular(path, nofollow=True)
+    try:
+        before = os.fstat(descriptor)
+        result = inspect_descriptor(descriptor, str(path))
+        _require_path_identity(path, before, "ISO input")
+        _require_descriptor_identity(descriptor, before, "ISO input")
+        return result
+    finally:
+        os.close(descriptor)
 
 
 def inspect_descriptor(
@@ -889,34 +927,29 @@ def inspect_descriptor(
 ) -> dict[str, object]:
     """Inspect one already-open regular ISO without resolving its pathname again."""
 
+    mapping: mmap.mmap | None = None
     try:
         before = os.fstat(descriptor)
         if not stat.S_ISREG(before.st_mode):
             raise IsoError(f"{label} descriptor is not a regular file")
-        if before.st_size < MIN_ISO_BYTES or before.st_size > maximum:
+        admitted_maximum = min(maximum, MAX_ISO_BYTES)
+        if before.st_size < MIN_ISO_BYTES or before.st_size > admitted_maximum:
             raise IsoError(
-                f"{label} size outside {MIN_ISO_BYTES}..{maximum} bytes"
+                f"{label} size outside {MIN_ISO_BYTES}..{admitted_maximum} bytes"
             )
-        chunks: list[bytes] = []
-        offset = 0
-        while offset < before.st_size:
-            chunk = os.pread(
-                descriptor, min(4 * 1024 * 1024, before.st_size - offset), offset
-            )
-            if not chunk:
-                raise IsoError(f"{label} ended before its admitted size")
-            chunks.append(chunk)
-            offset += len(chunk)
-        if os.pread(descriptor, 1, before.st_size):
-            raise IsoError(f"{label} grew beyond its admitted size")
-        after = os.fstat(descriptor)
+        mapping = mmap.mmap(descriptor, before.st_size, access=mmap.ACCESS_READ)
+        result = inspect_image(mapping)
+        after = _require_descriptor_identity(descriptor, before, label)
     except IsoError:
         raise
-    except OSError as error:
-        raise IsoError(f"cannot read {label} descriptor: {error}") from error
+    except (OSError, ValueError) as error:
+        raise IsoError(f"cannot map or read {label} descriptor: {error}") from error
+    finally:
+        if mapping is not None:
+            mapping.close()
     if _file_identity(before) != _file_identity(after):
         raise IsoError(f"{label} changed while its descriptor was read")
-    return inspect_image(b"".join(chunks))
+    return result
 
 
 def _reject_output_link_or_special(path: Path) -> None:
@@ -933,12 +966,35 @@ def _reject_output_link_or_special(path: Path) -> None:
 
 
 def publish_path(source: Path, output: Path) -> dict[str, object]:
-    source_data = _read_bounded(source)
-    metadata = inspect_image(source_data)
     output = Path(os.path.abspath(output))
     source_absolute = Path(os.path.abspath(source))
     if source_absolute == output:
         raise IsoError("ISO publish source and output must be distinct paths")
+    source_descriptor = _open_pinned_regular(source_absolute, nofollow=True)
+    try:
+        source_state = os.fstat(source_descriptor)
+        metadata = inspect_descriptor(source_descriptor, str(source_absolute))
+        _require_path_identity(source_absolute, source_state, "ISO source")
+        _require_descriptor_identity(source_descriptor, source_state, "ISO source")
+
+        return _publish_descriptor(
+            source_absolute,
+            source_descriptor,
+            source_state,
+            output,
+            metadata,
+        )
+    finally:
+        os.close(source_descriptor)
+
+
+def _publish_descriptor(
+    source: Path,
+    source_descriptor: int,
+    source_state: os.stat_result,
+    output: Path,
+    metadata: dict[str, object],
+) -> dict[str, object]:
     parent = output.parent
     try:
         parent_state = os.stat(parent, follow_symlinks=False)
@@ -954,12 +1010,22 @@ def publish_path(source: Path, output: Path) -> dict[str, object]:
         descriptor, temporary_name = tempfile.mkstemp(
             prefix=".ostadix-iso-publish.", suffix=".tmp", dir=parent
         )
-        with os.fdopen(descriptor, "wb") as stream:
-            descriptor = -1
-            stream.write(source_data)
-            stream.flush()
-            os.fchmod(stream.fileno(), 0o444)
-            os.fsync(stream.fileno())
+        copied_sha256 = _stream_copy_descriptor(
+            source_descriptor, descriptor, source_state.st_size
+        )
+        if copied_sha256 != metadata["sha256"]:
+            raise IsoError("published ISO copy digest differs from the inspected source")
+        _require_path_identity(source, source_state, "ISO source")
+        _require_descriptor_identity(source_descriptor, source_state, "ISO source")
+        os.fchmod(descriptor, 0o444)
+        os.fsync(descriptor)
+        private_metadata = inspect_descriptor(descriptor, "private ISO output")
+        if private_metadata != metadata:
+            raise IsoError("private ISO output identity differs from the inspected source")
+        os.close(descriptor)
+        descriptor = -1
+        _require_path_identity(source, source_state, "ISO source")
+        _require_descriptor_identity(source_descriptor, source_state, "ISO source")
         _reject_output_link_or_special(output)
         os.replace(temporary_name, output)
         temporary_name = ""
