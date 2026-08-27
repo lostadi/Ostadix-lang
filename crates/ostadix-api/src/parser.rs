@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crate::environment::{EnvironmentRefV2, EPHEMERAL_ENV_ID};
 use crate::syntax_dialect::SyntaxDialect;
 use anyhow::{bail, Result};
@@ -105,6 +107,124 @@ pub struct ParsedDocumentV1 {
     plan_origins: Vec<SourceSpanV1>,
     source_sha256: [u8; 32],
     source_len: usize,
+}
+
+/// Escape literal body text so reparsing it inside one exact typed-expression
+/// wrapper preserves every byte as `RawText` rather than recognizing nested O
+/// syntax.
+///
+/// The caller supplies the wrapper closer (for example `)_html`) and the exact
+/// registered parser tags. The parser consumes each inserted backslash. This
+/// is the shared lossless boundary used by both source linking and Fabric V1's
+/// source-closed renderer projection.
+pub fn escape_typed_body_literal(
+    body: &str,
+    closer: &str,
+    registered_backends: &HashSet<String>,
+) -> String {
+    let bytes = body.as_bytes();
+    let mut output = String::with_capacity(body.len());
+    let mut position = 0;
+
+    while position < bytes.len() {
+        if exact_escaped_closer_len_at(body, position, closer).is_some() {
+            output.push('\\');
+            output.push_str(closer);
+            position += closer.len();
+            continue;
+        }
+        if let Some(length) = registered_opener_len(&body[position..], registered_backends) {
+            output.push('\\');
+            output.push_str(&body[position..position + length]);
+            position += length;
+            continue;
+        }
+        if bytes[position] == b'$'
+            && position + 1 < bytes.len()
+            && (bytes[position + 1].is_ascii_alphabetic() || bytes[position + 1] == b'_')
+        {
+            output.push('\\');
+            output.push('$');
+            position += 1;
+            continue;
+        }
+        let character = body[position..]
+            .chars()
+            .next()
+            .expect("position is inside the UTF-8 body");
+        output.push(character);
+        position += character.len_utf8();
+    }
+
+    output
+}
+
+fn exact_escaped_closer_len_at(source: &str, position: usize, closer: &str) -> Option<usize> {
+    let raw_tag = closer.strip_prefix(")_")?;
+    let remaining = source.get(position..)?;
+    if !remaining.starts_with(closer) {
+        return None;
+    }
+
+    let next = remaining.as_bytes().get(closer.len()).copied();
+    let has_attributes = raw_tag.as_bytes().contains(&b'{');
+    let tag_before_attributes = raw_tag.split('{').next().unwrap_or(raw_tag);
+    let has_environment = tag_before_attributes.as_bytes().contains(&b'[');
+    let extends_tag = if has_attributes {
+        false
+    } else if has_environment {
+        next == Some(b'{')
+    } else {
+        next.is_some_and(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            || matches!(next, Some(b'[' | b'{'))
+    };
+    (!extends_tag).then_some(closer.len())
+}
+
+fn registered_opener_len(source: &str, registered_backends: &HashSet<String>) -> Option<usize> {
+    let bytes = source.as_bytes();
+    if bytes.is_empty() || !(bytes[0].is_ascii_alphabetic() || bytes[0] == b'_') {
+        return None;
+    }
+    let mut position = 1;
+    while position < bytes.len()
+        && (bytes[position].is_ascii_alphanumeric() || bytes[position] == b'_')
+    {
+        position += 1;
+    }
+    if !registered_backends.contains(&source[..position]) {
+        return None;
+    }
+
+    if position < bytes.len() && bytes[position] == b'[' {
+        let mut end = position + 1;
+        if end < bytes.len() && bytes[end] == b'*' {
+            end += 1;
+        } else {
+            let digits_start = end;
+            while end < bytes.len() && bytes[end].is_ascii_digit() {
+                end += 1;
+            }
+            if end == digits_start {
+                return None;
+            }
+        }
+        if end < bytes.len() && bytes[end] == b']' {
+            position = end + 1;
+        }
+    }
+
+    if position < bytes.len() && bytes[position] == b'{' {
+        let mut end = position + 1;
+        while end < bytes.len() && bytes[end] != b'}' {
+            end += 1;
+        }
+        if end > position + 1 && end < bytes.len() && bytes[end] == b'}' {
+            position = end + 1;
+        }
+    }
+
+    source[position..].starts_with("^(").then_some(position + 2)
 }
 
 impl ParsedDocumentV1 {

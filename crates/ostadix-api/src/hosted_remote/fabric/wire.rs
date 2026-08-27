@@ -20,7 +20,7 @@ use std::io::{self, ErrorKind, Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 
 use crate::execution_fabric::{MAX_EXECUTION_CANDIDATE_BYTES, MAX_EXECUTION_CAPSULE_BYTES};
 use crate::execution_fabric_authority::{
@@ -35,7 +35,39 @@ pub const FABRIC_LENGTH_PREFIX_BYTES_V1: usize = std::mem::size_of::<u32>();
 pub const MAX_FABRIC_REQUEST_PAYLOAD_BYTES_V1: usize = MAX_EXECUTION_CAPSULE_BYTES;
 pub const MAX_FABRIC_RESPONSE_PAYLOAD_BYTES_V1: usize = MAX_EXECUTION_CANDIDATE_BYTES;
 
+#[derive(Debug, thiserror::Error)]
+#[error("{message}: {source}")]
+struct FabricWireIoErrorV1 {
+    message: String,
+    disposition: FabricWireIoDispositionV1,
+    #[source]
+    source: io::Error,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FabricWireIoDispositionV1 {
+    Timeout,
+    TruncatedRepresentation,
+    Transport,
+    NoResponse,
+}
+
+pub(crate) fn fabric_wire_io_disposition_v1(
+    error: &anyhow::Error,
+) -> Option<FabricWireIoDispositionV1> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<FabricWireIoErrorV1>())
+        .map(|error| error.disposition)
+}
+
+/// Complete canonical frame prepared before a Fabric socket is opened.
+pub(crate) struct PreparedFabricClientRequestV1 {
+    frame: Vec<u8>,
+}
+
 /// Encode and write one complete Fabric request frame.
+#[cfg(test)]
 pub(crate) fn write_fabric_request_v1<W: Write>(
     writer: &mut W,
     request: &FabricRequestV1,
@@ -129,8 +161,33 @@ pub fn write_fabric_client_request_v1(
     request: &FabricRequestV1,
     timeout: Duration,
 ) -> Result<()> {
+    let prepared = prepare_fabric_client_request_v1(request)?;
+    write_prepared_fabric_client_request_v1(stream, &prepared, timeout)
+}
+
+pub(crate) fn prepare_fabric_client_request_v1(
+    request: &FabricRequestV1,
+) -> Result<PreparedFabricClientRequestV1> {
+    let encoded = encode_fabric_request_v1(request)
+        .map_err(anyhow::Error::new)
+        .context("failed to encode Fabric request")?;
+    let frame = encode_message_parts(
+        encoded.header_bytes(),
+        encoded.payload_bytes(),
+        MAX_FABRIC_REQUEST_PAYLOAD_BYTES_V1,
+        "request",
+    )?;
+    Ok(PreparedFabricClientRequestV1 { frame })
+}
+
+pub(crate) fn write_prepared_fabric_client_request_v1(
+    stream: &mut HostedClientStream,
+    prepared: &PreparedFabricClientRequestV1,
+    timeout: Duration,
+) -> Result<()> {
     set_write_timeout(&stream.sock, timeout)?;
-    write_fabric_request_v1(stream, request)?;
+    write_all_phase(stream, &prepared.frame, "Fabric frame")?;
+    flush_phase(stream, "Fabric frame")?;
     stream.conn.send_close_notify();
     flush_phase(stream, "Fabric request TLS close-notify")
 }
@@ -143,7 +200,8 @@ pub fn read_fabric_client_response_v1(
     timeout: Duration,
 ) -> Result<FabricResponseV1> {
     set_read_timeout(&stream.sock, timeout)?;
-    read_fabric_response_v1(stream)?.context("Fabric peer closed before returning a response")
+    read_fabric_response_v1(stream)?
+        .ok_or_else(|| no_response_error("Fabric peer closed before returning a response"))
 }
 
 /// Set the read deadline on a mutually authenticated Fabric server stream,
@@ -208,6 +266,17 @@ fn write_message_parts<W: Write>(
     maximum_payload: usize,
     kind: &'static str,
 ) -> Result<()> {
+    let frame = encode_message_parts(header, payload, maximum_payload, kind)?;
+    write_all_phase(writer, &frame, "Fabric frame")?;
+    flush_phase(writer, "Fabric frame")
+}
+
+fn encode_message_parts(
+    header: &[u8],
+    payload: Option<&[u8]>,
+    maximum_payload: usize,
+    kind: &'static str,
+) -> Result<Vec<u8>> {
     if header.is_empty() || header.len() > MAX_FABRIC_HEADER_BYTES {
         bail!(
             "Fabric {kind} header length {} is outside 1..={MAX_FABRIC_HEADER_BYTES}",
@@ -237,8 +306,7 @@ fn write_message_parts<W: Write>(
     if let Some(payload) = payload {
         frame.extend_from_slice(payload);
     }
-    write_all_phase(writer, &frame, "Fabric frame")?;
-    flush_phase(writer, "Fabric frame")
+    Ok(frame)
 }
 
 fn read_encoded_message<R: Read>(
@@ -298,7 +366,12 @@ fn read_optional_u32<R: Read>(reader: &mut R, phase: &'static str) -> Result<Opt
     while filled < bytes.len() {
         match reader.read(&mut bytes[filled..]) {
             Ok(0) if filled == 0 => return Ok(None),
-            Ok(0) => bail!("connection closed in the middle of {phase}"),
+            Ok(0) => {
+                return Err(unexpected_eof(
+                    phase,
+                    format!("connection closed in the middle of {phase}"),
+                ))
+            }
             Ok(count) => filled += count,
             Err(error) if error.kind() == ErrorKind::Interrupted => {}
             Err(error) => return Err(io_error(phase, "reading", error)),
@@ -320,7 +393,12 @@ fn read_exact_phase<R: Read>(
 ) -> Result<()> {
     while !destination.is_empty() {
         match reader.read(destination) {
-            Ok(0) => bail!("connection closed before a complete {phase}"),
+            Ok(0) => {
+                return Err(unexpected_eof(
+                    phase,
+                    format!("connection closed before a complete {phase}"),
+                ))
+            }
             Ok(count) => destination = &mut destination[count..],
             Err(error) if error.kind() == ErrorKind::Interrupted => {}
             Err(error) => return Err(io_error(phase, "reading", error)),
@@ -333,10 +411,14 @@ fn write_all_phase<W: Write>(writer: &mut W, mut source: &[u8], phase: &'static 
     while !source.is_empty() {
         match writer.write(source) {
             Ok(0) => {
-                return Err(anyhow!(io::Error::new(
-                    ErrorKind::WriteZero,
-                    format!("failed to write a complete {phase}"),
-                )))
+                return Err(io_error(
+                    phase,
+                    "writing",
+                    io::Error::new(
+                        ErrorKind::WriteZero,
+                        format!("failed to write a complete {phase}"),
+                    ),
+                ))
             }
             Ok(count) => source = &source[count..],
             Err(error) if error.kind() == ErrorKind::Interrupted => {}
@@ -353,25 +435,50 @@ fn flush_phase<W: Write>(writer: &mut W, phase: &'static str) -> Result<()> {
 }
 
 fn io_error(phase: &'static str, action: &'static str, error: io::Error) -> anyhow::Error {
-    if matches!(error.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) {
-        anyhow!("timed out while {action} {phase}: {error}")
+    let disposition = match error.kind() {
+        ErrorKind::TimedOut | ErrorKind::WouldBlock => FabricWireIoDispositionV1::Timeout,
+        _ => FabricWireIoDispositionV1::Transport,
+    };
+    let message = if disposition == FabricWireIoDispositionV1::Timeout {
+        format!("timed out while {action} {phase}")
     } else {
-        anyhow!("failed while {action} {phase}: {error}")
-    }
+        format!("failed while {action} {phase}")
+    };
+    anyhow::Error::new(FabricWireIoErrorV1 {
+        message,
+        disposition,
+        source: error,
+    })
+}
+
+fn unexpected_eof(phase: &'static str, detail: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(FabricWireIoErrorV1 {
+        message: format!("failed while reading {phase}"),
+        disposition: FabricWireIoDispositionV1::TruncatedRepresentation,
+        source: io::Error::new(ErrorKind::UnexpectedEof, detail.into()),
+    })
+}
+
+fn no_response_error(detail: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(FabricWireIoErrorV1 {
+        message: "failed while reading Fabric response".to_string(),
+        disposition: FabricWireIoDispositionV1::NoResponse,
+        source: io::Error::new(ErrorKind::UnexpectedEof, detail.into()),
+    })
 }
 
 fn set_read_timeout(stream: &TcpStream, timeout: Duration) -> Result<()> {
     validate_timeout(timeout)?;
     stream
         .set_read_timeout(Some(timeout))
-        .context("failed to set Fabric read timeout")
+        .map_err(|error| io_error("Fabric read timeout", "configuring", error))
 }
 
 fn set_write_timeout(stream: &TcpStream, timeout: Duration) -> Result<()> {
     validate_timeout(timeout)?;
     stream
         .set_write_timeout(Some(timeout))
-        .context("failed to set Fabric write timeout")
+        .map_err(|error| io_error("Fabric write timeout", "configuring", error))
 }
 
 fn validate_timeout(timeout: Duration) -> Result<()> {
@@ -382,7 +489,7 @@ fn validate_timeout(timeout: Duration) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::hosted_remote::fabric) mod tests {
     use std::io::{self, Cursor, ErrorKind, Read, Write};
 
     use crate::execution_fabric::{
@@ -535,6 +642,10 @@ mod tests {
             submission,
             terminal,
         }
+    }
+
+    pub(in crate::hosted_remote::fabric) fn request_fixture() -> FabricRequestV1 {
+        FabricRequestV1::SubmitPureAttempt(fixture().submission)
     }
 
     fn payload_prefix_offset(frame: &[u8]) -> usize {
@@ -772,17 +883,55 @@ mod tests {
 
     #[test]
     fn timeout_errors_remain_distinguishable_from_malformed_frames() {
-        assert!(read_fabric_request_v1(&mut TimeoutReader)
-            .unwrap_err()
-            .to_string()
-            .contains("timed out while reading Fabric header length"));
+        let read_error = read_fabric_request_v1(&mut TimeoutReader).unwrap_err();
+        assert_eq!(
+            fabric_wire_io_disposition_v1(&read_error),
+            Some(FabricWireIoDispositionV1::Timeout)
+        );
 
         let fixture = fixture();
         let request = FabricRequestV1::SubmitPureAttempt(fixture.submission);
-        assert!(write_fabric_request_v1(&mut TimeoutWriter, &request)
-            .unwrap_err()
-            .to_string()
-            .contains("timed out while writing Fabric frame"));
+        let write_error = write_fabric_request_v1(&mut TimeoutWriter, &request).unwrap_err();
+        assert_eq!(
+            fabric_wire_io_disposition_v1(&write_error),
+            Some(FabricWireIoDispositionV1::Timeout)
+        );
+    }
+
+    struct RawUnexpectedEofReader;
+
+    impl Read for RawUnexpectedEofReader {
+        fn read(&mut self, _destination: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::new(
+                ErrorKind::UnexpectedEof,
+                "fixture raw transport EOF",
+            ))
+        }
+    }
+
+    #[test]
+    fn only_observed_partial_bytes_are_truncated_representation() {
+        let raw_transport_eof = read_fabric_request_v1(&mut RawUnexpectedEofReader).unwrap_err();
+        assert_eq!(
+            fabric_wire_io_disposition_v1(&raw_transport_eof),
+            Some(FabricWireIoDispositionV1::Transport)
+        );
+
+        let partial_prefix = read_fabric_request_v1(&mut Cursor::new(vec![0_u8])).unwrap_err();
+        assert_eq!(
+            fabric_wire_io_disposition_v1(&partial_prefix),
+            Some(FabricWireIoDispositionV1::TruncatedRepresentation)
+        );
+    }
+
+    #[test]
+    fn prepared_client_request_is_the_exact_canonical_frame() {
+        let fixture = fixture();
+        let request = FabricRequestV1::SubmitPureAttempt(fixture.submission);
+        let prepared = prepare_fabric_client_request_v1(&request).unwrap();
+        let mut ordinary = Vec::new();
+        write_fabric_request_v1(&mut ordinary, &request).unwrap();
+        assert_eq!(prepared.frame, ordinary);
     }
 
     #[test]

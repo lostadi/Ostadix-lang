@@ -12,13 +12,58 @@ use std::collections::HashMap;
 use std::sync::mpsc::{self, Sender, SyncSender};
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Result};
-
 use crate::value::OValue;
+use anyhow::{anyhow, bail, Result};
 
 /// Coordinator-issued identity for one submitted operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct TaskToken(pub(crate) usize);
+
+/// Driver-private identity for one physical attempt.
+///
+/// The graph executor deliberately knows only the stable execution/task
+/// digests and monotonically increasing generation needed to fence stale
+/// completions. Protocol adapters map their own authenticated coordinates to
+/// this value; no wire type, node identity, graph coordinate, or `TaskToken`
+/// crosses this lower-layer boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct PhysicalAttemptCoordinateV1 {
+    execution_sha256: [u8; 32],
+    logical_task_sha256: [u8; 32],
+    generation: u64,
+}
+
+impl PhysicalAttemptCoordinateV1 {
+    pub(crate) fn new(
+        execution_sha256: [u8; 32],
+        logical_task_sha256: [u8; 32],
+        generation: u64,
+    ) -> Result<Self> {
+        if execution_sha256 == [0; 32] {
+            bail!("physical attempt execution digest must be nonzero");
+        }
+        if logical_task_sha256 == [0; 32] {
+            bail!("physical attempt logical-task digest must be nonzero");
+        }
+        if generation == 0 {
+            bail!("physical attempt generation must be nonzero");
+        }
+        Ok(Self {
+            execution_sha256,
+            logical_task_sha256,
+            generation,
+        })
+    }
+
+    pub(crate) fn generation(self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) fn same_logical_task(self, other: Self) -> bool {
+        self.execution_sha256 == other.execution_sha256
+            && self.logical_task_sha256 == other.logical_task_sha256
+    }
+}
 
 /// An owned, `Send`-only computation prepared from already-materialized inputs.
 ///
@@ -111,15 +156,49 @@ impl TaskContext {
 pub(crate) struct TaskSubmission {
     token: TaskToken,
     task: Box<dyn PreparedTask>,
+    /// Present only for an externally coordinated physical attempt. The
+    /// worker never interprets this neutral coordinate; its driver retains the
+    /// coordinate-to-`TaskToken` map privately.
+    physical_attempt: Option<PhysicalAttemptCoordinateV1>,
 }
 
 impl TaskSubmission {
     pub(crate) fn new(token: TaskToken, task: Box<dyn PreparedTask>) -> Self {
-        Self { token, task }
+        Self {
+            token,
+            task,
+            physical_attempt: None,
+        }
     }
 
-    pub(crate) fn into_parts(self) -> (TaskToken, Box<dyn PreparedTask>) {
-        (self.token, self.task)
+    pub(crate) fn physical(
+        token: TaskToken,
+        attempt: PhysicalAttemptCoordinateV1,
+        task: Box<dyn PreparedTask>,
+    ) -> Self {
+        Self {
+            token,
+            task,
+            physical_attempt: Some(attempt),
+        }
+    }
+
+    pub(crate) fn token(&self) -> TaskToken {
+        self.token
+    }
+
+    pub(crate) fn physical_attempt(&self) -> Option<PhysicalAttemptCoordinateV1> {
+        self.physical_attempt
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        TaskToken,
+        Option<PhysicalAttemptCoordinateV1>,
+        Box<dyn PreparedTask>,
+    ) {
+        (self.token, self.physical_attempt, self.task)
     }
 }
 
@@ -128,22 +207,33 @@ impl TaskSubmission {
 /// value may provisionally unlock equally safe worker dependents.
 pub(crate) struct TaskCompletion {
     pub(crate) token: TaskToken,
+    /// Coordinator-private physical identity. It is retained only long enough
+    /// for a remote driver to enforce gate 19 and is never serialized.
+    pub(crate) physical_attempt: Option<PhysicalAttemptCoordinateV1>,
     pub(crate) outcome: TaskOutcome,
 }
 
 impl TaskCompletion {
+    #[cfg(test)]
     pub(crate) fn completed(token: TaskToken, outcome: Result<OValue>) -> Self {
         Self {
             token,
+            physical_attempt: None,
             outcome: TaskOutcome::Completed(outcome.map(Box::new)),
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn infrastructure_abort(token: TaskToken, error: anyhow::Error) -> Self {
         Self {
             token,
+            physical_attempt: None,
             outcome: TaskOutcome::InfrastructureAbort(error),
         }
+    }
+
+    pub(crate) fn physical_attempt(&self) -> Option<PhysicalAttemptCoordinateV1> {
+        self.physical_attempt
     }
 }
 

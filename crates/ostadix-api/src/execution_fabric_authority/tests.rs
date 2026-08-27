@@ -335,6 +335,91 @@ mod authority_tests {
     }
 
     #[test]
+    fn pinned_node_signature_authentication_leaves_semantic_bindings_for_later_gates() {
+        let fixture = fixture();
+        let mut receipt_value =
+            serde_json::to_value(fixture.terminal.signed_receipt().receipt()).unwrap();
+        *value_field_mut(&mut receipt_value, &["node_generation"]) =
+            Value::from(NODE_GENERATION + 1);
+        let receipt: TerminalCandidateReceiptV1 = serde_json::from_value(receipt_value).unwrap();
+        let receipt_bytes = crate::canonical_cbor::encode(&receipt).unwrap();
+        let preimage = crate::canonical_cbor::signing_preimage(
+            FABRIC_TERMINAL_RECEIPT_SIGNING_DOMAIN_V1,
+            &receipt_bytes,
+        )
+        .unwrap();
+        let signing_key = SigningKey::from_bytes(&[0x22; 32]);
+        let signed = SignedTerminalCandidateReceiptV1 {
+            schema: FABRIC_SIGNED_TERMINAL_RECEIPT_SCHEMA_V1.to_string(),
+            receipt,
+            signer_public_key: hex::encode(signing_key.verifying_key().to_bytes()),
+            signer_key_id: fixture.node_key.key_id_hex(),
+            signature: hex::encode(signing_key.sign(&preimage).to_bytes()),
+        };
+        let target = fixture.submission.header().lease().lease().target();
+        let pinned = PinnedFabricNodeKeyV1::new(
+            target.node_id(),
+            target.node_generation(),
+            target.execution_cell_incarnation(),
+            fixture.node_key.public_key(),
+        )
+        .unwrap();
+
+        assert_eq!(pinned.node_id(), target.node_id());
+        assert_eq!(pinned.node_generation(), target.node_generation());
+        assert_eq!(
+            pinned.execution_cell_incarnation(),
+            target.execution_cell_incarnation()
+        );
+        assert_eq!(pinned.public_key(), fixture.node_key.public_key());
+        assert_eq!(pinned.key_id(), fixture.node_key.key_id_hex());
+        pinned
+            .authenticate_terminal_receipt(&signed)
+            .expect("a valid pinned-node signature is independent of later generation gates");
+
+        let terminal =
+            FabricTerminalCandidateV1::from_wire(signed, fixture.candidate_bytes).unwrap();
+        assert!(pinned
+            .verify_terminal_candidate(&terminal, &fixture.submission)
+            .unwrap_err()
+            .to_string()
+            .contains("node/generation"));
+    }
+
+    #[test]
+    fn pinned_node_signature_authentication_rejects_wrong_key_and_signature() {
+        let fixture = fixture();
+        let target = fixture.submission.header().lease().lease().target();
+        let wrong_key = FabricSigningKeyV1::from_secret_bytes([0x33; 32]);
+        let wrong_pin = PinnedFabricNodeKeyV1::new(
+            target.node_id(),
+            target.node_generation(),
+            target.execution_cell_incarnation(),
+            wrong_key.public_key(),
+        )
+        .unwrap();
+        assert!(wrong_pin
+            .authenticate_terminal_receipt(fixture.terminal.signed_receipt())
+            .unwrap_err()
+            .to_string()
+            .contains("pinned node key"));
+
+        let pinned = PinnedFabricNodeKeyV1::new(
+            target.node_id(),
+            target.node_generation(),
+            target.execution_cell_incarnation(),
+            fixture.node_key.public_key(),
+        )
+        .unwrap();
+        let mut invalid_signature = fixture.terminal.signed_receipt().clone();
+        invalid_signature.signature = corrupt_lower_hex(invalid_signature.signature());
+        assert!(matches!(
+            pinned.authenticate_terminal_receipt(&invalid_signature),
+            Err(FabricAuthorityError::Signature(_))
+        ));
+    }
+
+    #[test]
     fn canonical_decoder_rejects_trailing_nonminimal_duplicate_deep_and_oversized_headers() {
         let fixture = fixture();
         let encoded =

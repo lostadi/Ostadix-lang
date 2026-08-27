@@ -29,7 +29,7 @@ use crate::hgraph::{schedule::ReadySchedule, NodeId, ValueState};
 use crate::ir::{ExecutionPlan, OIr, OIrProgram, PlanNodeId, PlanNodeKind};
 use crate::value::OValue;
 
-use super::driver::{AttemptDriver, LocalWorkerDriver};
+use super::driver::{AttemptDriver, LocalWorkerDriver, PhysicalAttemptAdapterV1};
 use super::parallel;
 use super::task::{
     TaskCallbackFailure, TaskCompletion, TaskEvalRequest, TaskOutcome, TaskSubmission, TaskToken,
@@ -204,6 +204,7 @@ impl<'a> Coordinator<'a> {
         mut self,
         evaluator: &mut dyn GraphEvaluationHost,
         scope: &mut std::collections::HashMap<String, OValue>,
+        physical_attempt_adapter: Option<&dyn PhysicalAttemptAdapterV1>,
     ) -> Result<OValue> {
         evaluator.verify_admitted_runtime_context(&self.admitted)?;
         validate_execution_metadata(&self.flat)?;
@@ -211,7 +212,7 @@ impl<'a> Coordinator<'a> {
 
         self.materialize_literals()?;
 
-        if let Err(err) = self.drive(evaluator) {
+        if let Err(err) = self.drive(evaluator, physical_attempt_adapter) {
             evaluator.install_execution_trace(std::mem::take(&mut self.trace).into_trace());
             return Err(err);
         }
@@ -253,7 +254,11 @@ impl<'a> Coordinator<'a> {
     }
 
     /// The readiness-driven event loop.
-    fn drive(&mut self, evaluator: &mut dyn GraphEvaluationHost) -> Result<()> {
+    fn drive(
+        &mut self,
+        evaluator: &mut dyn GraphEvaluationHost,
+        physical_attempt_adapter: Option<&dyn PhysicalAttemptAdapterV1>,
+    ) -> Result<()> {
         let worker_operations = self
             .ops
             .iter()
@@ -267,9 +272,16 @@ impl<'a> Coordinator<'a> {
         let worker_capacity = parallel::worker_count_hint()
             .unwrap_or(worker_capacity)
             .max(1);
-        let mut driver = (worker_operations > 0)
-            .then(|| LocalWorkerDriver::new(worker_capacity))
-            .transpose()?;
+        if physical_attempt_adapter.is_some() {
+            self.validate_remote_selection()?;
+        }
+        let mut driver: Option<Box<dyn AttemptDriver>> = if worker_operations == 0 {
+            None
+        } else if let Some(adapter) = physical_attempt_adapter {
+            Some(adapter.create_driver()?)
+        } else {
+            Some(Box::new(LocalWorkerDriver::new(worker_capacity)?))
+        };
 
         loop {
             if let Some(driver) = driver.as_mut() {
@@ -279,13 +291,13 @@ impl<'a> Coordinator<'a> {
                         Ok(None) => break,
                         Err(error) => {
                             return Err(self.abort_after_worker_error(
-                                Some(driver),
+                                Some(driver.as_mut()),
                                 "local worker completion channel failed",
                                 error,
                             ));
                         }
                     };
-                    self.accept_worker_event_or_abort(evaluator, driver, event)?;
+                    self.accept_worker_event_or_abort(evaluator, driver.as_mut(), event)?;
                 }
             }
 
@@ -304,7 +316,7 @@ impl<'a> Coordinator<'a> {
                 self.discard_started_workers(
                     driver
                         .as_mut()
-                        .map(|driver| driver as &mut dyn AttemptDriver),
+                        .map(|driver| &mut **driver as &mut (dyn AttemptDriver + '_)),
                     &reason,
                 );
                 return Err(failure.error);
@@ -328,7 +340,7 @@ impl<'a> Coordinator<'a> {
                 return Err(self.abort_after_worker_error(
                     driver
                         .as_mut()
-                        .map(|driver| driver as &mut dyn AttemptDriver),
+                        .map(|driver| &mut **driver as &mut (dyn AttemptDriver + '_)),
                     "scheduler aborted after a local-worker preparation contract mismatch",
                     error,
                 ));
@@ -339,11 +351,14 @@ impl<'a> Coordinator<'a> {
                 let candidates =
                     self.worker_dispatch_candidates(&ready, attempt_driver.available_slots());
                 if !candidates.is_empty() {
-                    if let Err(error) =
-                        self.dispatch_workers(evaluator, attempt_driver, &candidates)
-                    {
+                    if let Err(error) = self.dispatch_workers(
+                        evaluator,
+                        attempt_driver.as_mut(),
+                        physical_attempt_adapter,
+                        &candidates,
+                    ) {
                         return Err(self.abort_after_worker_error(
-                            Some(attempt_driver),
+                            Some(attempt_driver.as_mut()),
                             "scheduler aborted while submitting prepared local-worker tasks",
                             error,
                         ));
@@ -355,14 +370,14 @@ impl<'a> Coordinator<'a> {
                 continue;
             }
 
-            let workers_outstanding = driver.as_ref().map_or(0, AttemptDriver::outstanding);
+            let workers_outstanding = driver.as_ref().map_or(0, |driver| driver.outstanding());
             if workers_outstanding == 0 {
                 if let Some(coordinator) = self.coordinator_at_settlement_frontier(&ready) {
                     if let Err(error) = self.run_coordinator_op(evaluator, coordinator) {
                         self.discard_started_workers(
                             driver
                                 .as_mut()
-                                .map(|driver| driver as &mut dyn AttemptDriver),
+                                .map(|driver| &mut **driver as &mut (dyn AttemptDriver + '_)),
                             &format!(
                                 "strict fail-stop withheld result after operation {} failed",
                                 self.ops[coordinator].plan_node.0
@@ -380,13 +395,13 @@ impl<'a> Coordinator<'a> {
                     Ok(event) => event,
                     Err(error) => {
                         return Err(self.abort_after_worker_error(
-                            Some(attempt_driver),
+                            Some(attempt_driver.as_mut()),
                             "local worker completion channel failed",
                             error,
                         ));
                     }
                 };
-                self.accept_worker_event_or_abort(evaluator, attempt_driver, event)?;
+                self.accept_worker_event_or_abort(evaluator, attempt_driver.as_mut(), event)?;
                 continue;
             }
 
@@ -395,12 +410,13 @@ impl<'a> Coordinator<'a> {
                 .iter()
                 .filter(|op| op.state != OpRunState::Settled)
                 .count();
-            self.discard_started_workers(
-                driver
-                    .as_mut()
-                    .map(|driver| driver as &mut dyn AttemptDriver),
-                "scheduler stalled before a started local-worker result could settle",
-            );
+            let stall_reason =
+                "scheduler stalled before a started local-worker result could settle";
+            if let Some(mut stalled_driver) = driver.take() {
+                self.discard_started_workers(Some(stalled_driver.as_mut()), stall_reason);
+            } else {
+                self.discard_started_workers(None, stall_reason);
+            }
             bail!(
                 "graph executor stalled: {remaining} of {} operations never became ready \
                  (dependency cycle, failed input, or unsatisfiable constraint; \
@@ -409,6 +425,52 @@ impl<'a> Coordinator<'a> {
                 self.failed_outputs.len()
             );
         }
+    }
+
+    /// Fail closed before dispatch when explicit Fabric policy would otherwise
+    /// leave a selected renderer on a local path or broaden M3 into autonomous
+    /// hosted execution. Coordinator-owned bookkeeping and local scope reads
+    /// remain permitted; they are not renderer fallback.
+    fn validate_remote_selection(&self) -> Result<()> {
+        let mut selected_renderers = 0usize;
+        for (index, op) in self.ops.iter().enumerate() {
+            if op.dispatch_lane != DispatchLaneV1::LocalWorker {
+                continue;
+            }
+            match op.dispatch_adapter {
+                DispatchAdapterV1::TrustedInlineRendererV1 => {
+                    if op.failure_class != FailureClassV1::Infallible
+                        || !op.effect.is_verified_pure_infallible()
+                        || !parallel::adapter_matches(
+                            op.dispatch_adapter,
+                            self.plan,
+                            op.plan_node,
+                            self.flat[op.plan_node.0],
+                        )
+                    {
+                        bail!(
+                            "operation {} does not satisfy the admitted pure-infallible remote renderer contract",
+                            op.plan_node.0
+                        );
+                    }
+                    selected_renderers += 1;
+                }
+                DispatchAdapterV1::OScopeLoadV1 => {}
+                DispatchAdapterV1::AutonomousEphemeralShimV1 | DispatchAdapterV1::CoordinatorV1 => {
+                    bail!(
+                        "operation {} uses adapter {} outside the explicit Fabric V1 profile",
+                        self.ops[index].plan_node.0,
+                        self.ops[index].dispatch_adapter.name()
+                    )
+                }
+            }
+        }
+        if selected_renderers == 0 {
+            bail!(
+                "explicit remote pure execution selected no admitted trusted-inline renderer operation"
+            );
+        }
+        Ok(())
     }
 
     /// Indices of operations for which every ordinary/state/control input has
@@ -575,6 +637,7 @@ impl<'a> Coordinator<'a> {
         &mut self,
         evaluator: &dyn GraphEvaluationHost,
         driver: &mut dyn AttemptDriver,
+        physical_attempt_adapter: Option<&dyn PhysicalAttemptAdapterV1>,
         selected: &[usize],
     ) -> Result<()> {
         if selected.iter().any(|&index| {
@@ -600,38 +663,68 @@ impl<'a> Coordinator<'a> {
         let mut prepared = Vec::with_capacity(selected.len());
         for &index in selected {
             let id = self.ops[index].plan_node;
-            let task = parallel::prepare(
-                self.ops[index].dispatch_adapter,
-                &self.frame,
-                self.plan,
-                id,
-                self.flat[id.0],
-                match self.ops[index].dispatch_adapter {
-                    DispatchAdapterV1::AutonomousEphemeralShimV1 => {
-                        let OIr::Exec { backend, .. } = self.flat[id.0] else {
-                            unreachable!("ephemeral shim adapter requires an Exec node")
-                        };
-                        let authority_scope = self.frame.scope_from_data_edges(id, self.plan)?;
-                        let sandbox = evaluator
-                            .authorize_autonomous_ephemeral_shim(backend, &authority_scope)?;
-                        Some(parallel::EphemeralShimRuntime::new(
-                            evaluator.shim_path(&backend.canonical),
-                            sandbox,
-                            self.admitted.executable_leases()?,
-                        ))
-                    }
-                    _ => None,
-                },
-            )?;
+            let submission = if self.ops[index].dispatch_adapter
+                == DispatchAdapterV1::TrustedInlineRendererV1
+            {
+                if let Some(adapter) = physical_attempt_adapter {
+                    let prepared = adapter.prepare_attempt(
+                        &self.admitted,
+                        &self.frame,
+                        &self.flat,
+                        self.plan,
+                        id,
+                    )?;
+                    let (coordinate, task) = prepared.into_parts();
+                    TaskSubmission::physical(TaskToken(index), coordinate, task)
+                } else {
+                    TaskSubmission::new(
+                        TaskToken(index),
+                        parallel::prepare(
+                            self.ops[index].dispatch_adapter,
+                            &self.frame,
+                            self.plan,
+                            id,
+                            self.flat[id.0],
+                            None,
+                        )?,
+                    )
+                }
+            } else {
+                let task = parallel::prepare(
+                    self.ops[index].dispatch_adapter,
+                    &self.frame,
+                    self.plan,
+                    id,
+                    self.flat[id.0],
+                    match self.ops[index].dispatch_adapter {
+                        DispatchAdapterV1::AutonomousEphemeralShimV1 => {
+                            let OIr::Exec { backend, .. } = self.flat[id.0] else {
+                                unreachable!("ephemeral shim adapter requires an Exec node")
+                            };
+                            let authority_scope =
+                                self.frame.scope_from_data_edges(id, self.plan)?;
+                            let sandbox = evaluator
+                                .authorize_autonomous_ephemeral_shim(backend, &authority_scope)?;
+                            Some(parallel::EphemeralShimRuntime::new(
+                                evaluator.shim_path(&backend.canonical),
+                                sandbox,
+                                self.admitted.executable_leases()?,
+                            ))
+                        }
+                        _ => None,
+                    },
+                )?;
+                TaskSubmission::new(TaskToken(index), task)
+            };
             crate::process::lifecycle_trace(
                 "coordinator.task_prepared",
                 format!("token={index} plan_node={}", id.0),
             );
-            prepared.push((index, id, task));
+            prepared.push((index, id, submission));
         }
 
-        for (index, id, task) in prepared {
-            driver.submit(TaskSubmission::new(TaskToken(index), task))?;
+        for (index, id, submission) in prepared {
+            driver.submit(submission)?;
             crate::process::lifecycle_trace(
                 "coordinator.task_submitted",
                 format!("token={index} plan_node={}", id.0),
@@ -1118,10 +1211,19 @@ mod tests {
     use crate::backend_catalog::BackendRegistry;
     use crate::eval::Evaluator;
     use crate::evidence::{admit_execution, analyze_execution};
-    use crate::executor::task::PreparedTask;
+    use crate::executor::task::{PhysicalAttemptCoordinateV1, PreparedTask};
     use crate::hgraph::from_oir::build_program;
     use crate::hgraph::solve::solve_types;
     use crate::hgraph::HNodeKind;
+    use crate::hosted_remote::fabric::trusted_inline_fabric_profile_v1;
+    use crate::hosted_remote::ClientTlsIdentity;
+    use crate::placement_protocol::{GenerationV1, SemanticDigestV1};
+
+    use crate::execution_fabric::{ExecutionIdV1, ExecutionLimitsV1};
+    use crate::execution_fabric_authority::{
+        ExecutionCellIncarnationV1, FabricSigningKeyV1, FabricTargetBindingV1,
+    };
+    use crate::world::MAX_OVALUE_RECORD_BYTES;
 
     struct PanicPreparedTask;
 
@@ -1163,6 +1265,93 @@ mod tests {
         capacity: usize,
         outstanding: usize,
         events: VecDeque<WorkerEvent>,
+    }
+
+    #[derive(Default)]
+    struct RecordingRemoteSubmissionDriver {
+        submissions: Vec<(TaskToken, PhysicalAttemptCoordinateV1)>,
+    }
+
+    impl AttemptDriver for RecordingRemoteSubmissionDriver {
+        fn available_slots(&self) -> usize {
+            1usize.saturating_sub(self.submissions.len())
+        }
+
+        fn outstanding(&self) -> usize {
+            self.submissions.len()
+        }
+
+        fn submit(&mut self, submission: TaskSubmission) -> Result<()> {
+            let attempt = submission
+                .physical_attempt()
+                .ok_or_else(|| anyhow::anyhow!("remote policy constructed a local submission"))?;
+            self.submissions.push((submission.token(), attempt));
+            Ok(())
+        }
+
+        fn try_recv_event(&mut self) -> Result<Option<WorkerEvent>> {
+            Ok(None)
+        }
+
+        fn recv_event(&mut self) -> Result<WorkerEvent> {
+            bail!("recording driver never executes its captured submission")
+        }
+    }
+
+    fn semantic_digest(seed: u8) -> SemanticDigestV1 {
+        SemanticDigestV1::from_sha256(hex::encode([seed; 32])).unwrap()
+    }
+
+    fn remote_config_for(
+        backend: &crate::backend_catalog::BackendInterface,
+        address: impl Into<String>,
+    ) -> crate::hosted_remote::fabric::RemotePureExecutionConfigV1 {
+        let profile = trusted_inline_fabric_profile_v1(backend).unwrap();
+        let target = FabricTargetBindingV1::new(
+            semantic_digest(1),
+            "fabric-node-no-fallback",
+            GenerationV1::new(2).unwrap(),
+            ExecutionCellIncarnationV1::new(3).unwrap(),
+            semantic_digest(4),
+            GenerationV1::new(5).unwrap(),
+            GenerationV1::new(6).unwrap(),
+            semantic_digest(7),
+            semantic_digest(8),
+            semantic_digest(9),
+            semantic_digest(10),
+            semantic_digest(11),
+            semantic_digest(12),
+            profile.realization_pipeline_sha256().clone(),
+        )
+        .unwrap();
+        let authority = FabricSigningKeyV1::from_secret_bytes([0x41; 32]);
+        let node = FabricSigningKeyV1::from_secret_bytes([0x42; 32]);
+        let (_tls_directory, tls_server) =
+            crate::hosted_remote::test_server_tls_identity().unwrap();
+        crate::hosted_remote::fabric::RemotePureExecutionConfigV1::new(
+            address,
+            ClientTlsIdentity {
+                ca_path: tls_server.client_ca_path,
+                cert_path: tls_server.cert_path,
+                key_path: tls_server.key_path,
+                server_name: "localhost".to_string(),
+            },
+            semantic_digest(13),
+            authority,
+            target,
+            node.public_key(),
+            ExecutionIdV1::new([0x43; 32]).unwrap(),
+        )
+        .unwrap()
+        .with_limits(ExecutionLimitsV1::new(100, 16 * 1024, MAX_OVALUE_RECORD_BYTES).unwrap())
+        .unwrap()
+        .with_timeouts(
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+            Duration::from_millis(5),
+            Duration::from_millis(250),
+        )
+        .unwrap()
     }
 
     impl ReorderingAttemptDriver {
@@ -1229,6 +1418,92 @@ mod tests {
                 panic!("unexpected callback in completion-only test")
             }
         }
+    }
+
+    #[test]
+    fn explicit_remote_policy_constructs_no_local_renderer_submission() {
+        let backend = BackendRegistry::global().interface_for("text");
+        let program = OIrProgram {
+            nodes: vec![OIr::Exec {
+                lang: "text".into(),
+                env_id: u32::MAX,
+                attr: None,
+                backend: backend.clone(),
+                body: vec![OIr::Text("remote-only".into())],
+            }],
+        };
+        let plan = program.plan();
+        let mut graph = build_program(&program);
+        solve_types(&mut graph).unwrap();
+        let evaluator = Evaluator::new("/tmp".into())
+            .with_remote_pure_execution(remote_config_for(&backend, "127.0.0.1:9"));
+        let adapter = evaluator.physical_attempt_adapter().unwrap();
+        let runtime = evaluator.admission_runtime_binding(&plan);
+        let evidence = analyze_execution(&program, &plan, &graph, runtime.clone()).unwrap();
+        let admitted =
+            admit_execution(&program, &plan, graph, Policy::Eager, runtime, evidence).unwrap();
+        let mut coordinator = Coordinator::new(admitted).unwrap();
+        coordinator.materialize_literals().unwrap();
+        coordinator.validate_remote_selection().unwrap();
+        let renderer = coordinator
+            .ops
+            .iter()
+            .position(|op| op.dispatch_adapter == DispatchAdapterV1::TrustedInlineRendererV1)
+            .unwrap();
+        let mut driver = RecordingRemoteSubmissionDriver::default();
+
+        coordinator
+            .dispatch_workers(&evaluator, &mut driver, Some(adapter.as_ref()), &[renderer])
+            .unwrap();
+
+        assert_eq!(driver.submissions.len(), 1);
+        assert_eq!(driver.submissions[0].0, TaskToken(renderer));
+        assert_eq!(driver.submissions[0].1.generation(), 1);
+    }
+
+    #[test]
+    fn failed_remote_target_never_invokes_local_trusted_renderer() {
+        let backend = BackendRegistry::global().interface_for("text");
+        let program = OIrProgram {
+            nodes: vec![OIr::Exec {
+                lang: "text".into(),
+                env_id: u32::MAX,
+                attr: None,
+                backend: backend.clone(),
+                body: vec![OIr::Text("forbidden-local-fallback".into())],
+            }],
+        };
+        let plan = program.plan();
+        let mut graph = build_program(&program);
+        solve_types(&mut graph).unwrap();
+        let closed_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let closed_address = closed_listener.local_addr().unwrap();
+        drop(closed_listener);
+        let mut evaluator = Evaluator::new("/tmp".into())
+            .with_remote_pure_execution(remote_config_for(&backend, closed_address.to_string()));
+        let adapter = evaluator.physical_attempt_adapter().unwrap();
+        let runtime = evaluator.admission_runtime_binding(&plan);
+        let evidence = analyze_execution(&program, &plan, &graph, runtime.clone()).unwrap();
+        let admitted =
+            admit_execution(&program, &plan, graph, Policy::Eager, runtime, evidence).unwrap();
+        let coordinator = Coordinator::new(admitted).unwrap();
+        let local_renderer = parallel::TestLocalRendererSession::begin();
+        let mut scope = HashMap::new();
+
+        let error = coordinator
+            .run_host(&mut evaluator, &mut scope, Some(adapter.as_ref()))
+            .expect_err("unreachable explicitly selected node must fail");
+
+        assert!(
+            crate::process::is_infrastructure_error(&error),
+            "remote transport failure escaped the infrastructure taxonomy: {error:#}"
+        );
+        assert_eq!(
+            local_renderer.invocations(),
+            0,
+            "failed remote attempt invoked the local trusted renderer"
+        );
+        assert!(scope.is_empty(), "failed remote work mutated O scope");
     }
 
     #[test]

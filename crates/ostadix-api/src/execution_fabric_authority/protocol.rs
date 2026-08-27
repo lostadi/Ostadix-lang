@@ -1283,9 +1283,7 @@ impl TerminalCandidateReceiptV1 {
     }
 
     pub(crate) fn validate(&self) -> Result<(), FabricAuthorityError> {
-        if self.schema != FABRIC_TERMINAL_RECEIPT_SCHEMA_V1 {
-            return Err(invalid("unsupported terminal-candidate receipt schema"));
-        }
+        self.validate_representation_shape()?;
         AttemptIdV1::new(self.attempt.task().clone(), self.attempt.generation())
             .map_err(|error| invalid(format!("terminal receipt attempt: {error}")))?;
         validate_node_id(&self.node_id)?;
@@ -1313,6 +1311,17 @@ impl TerminalCandidateReceiptV1 {
             require_nonzero_digest(field, digest)?;
         }
         Ok(())
+    }
+
+    /// Validate only fields that define the canonical receipt representation.
+    /// Semantic bindings are deliberately left to the coordinator's ordered
+    /// gates after the node signature has been authenticated.
+    pub(crate) fn validate_representation_shape(&self) -> Result<(), FabricAuthorityError> {
+        if self.schema != FABRIC_TERMINAL_RECEIPT_SCHEMA_V1 {
+            return Err(invalid("unsupported terminal-candidate receipt schema"));
+        }
+        self.candidate_payload
+            .validate(MAX_EXECUTION_CANDIDATE_BYTES)
     }
 
     pub fn validate_candidate_bytes(
@@ -1378,6 +1387,11 @@ impl SignedTerminalCandidateReceiptV1 {
         self.receipt.validate()
     }
 
+    pub(crate) fn validate_representation_shape(&self) -> Result<(), FabricAuthorityError> {
+        self.validate_envelope_shape()?;
+        self.receipt.validate_representation_shape()
+    }
+
     pub(crate) fn validate_envelope_shape(&self) -> Result<(), FabricAuthorityError> {
         if self.schema != FABRIC_SIGNED_TERMINAL_RECEIPT_SCHEMA_V1 {
             return Err(invalid("unsupported signed terminal receipt schema"));
@@ -1421,6 +1435,13 @@ impl FabricTerminalCandidateV1 {
             .validate_candidate_bytes(&self.candidate_bytes)
     }
 
+    pub(crate) fn decoded_candidate_representation(
+        &self,
+    ) -> Result<ExecutionCandidateV1, FabricAuthorityError> {
+        crate::execution_fabric::decode_execution_candidate_representation_v1(&self.candidate_bytes)
+            .map_err(|error| invalid(format!("terminal candidate: {error}")))
+    }
+
     pub fn validate(&self) -> Result<(), FabricAuthorityError> {
         self.validate_transport_shape()?;
         self.signed_receipt.validate_shape()?;
@@ -1428,15 +1449,8 @@ impl FabricTerminalCandidateV1 {
     }
 
     pub(crate) fn validate_transport_shape(&self) -> Result<(), FabricAuthorityError> {
-        self.signed_receipt.validate_envelope_shape()?;
-        self.signed_receipt
-            .receipt
-            .candidate_payload
-            .validate_bytes(
-                &self.candidate_bytes,
-                MAX_EXECUTION_CANDIDATE_BYTES,
-                "candidate",
-            )
+        self.signed_receipt.validate_representation_shape()?;
+        self.decoded_candidate_representation().map(|_| ())
     }
 }
 

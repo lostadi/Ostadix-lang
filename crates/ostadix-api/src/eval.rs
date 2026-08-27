@@ -380,6 +380,12 @@ pub struct Evaluator {
     /// the legacy buffered Request scheduler as a side effect.
     local_worker_parallelism_override: Option<usize>,
 
+    /// Explicit Fabric V1 physical-attempt selection for trusted-inline
+    /// renderers. Admission remains V6 and local-worker classified; this
+    /// additive policy supplies the exact remote authority and target and has
+    /// no local-renderer fallback.
+    physical_attempt_adapter: Option<Arc<dyn crate::executor::PhysicalAttemptAdapterV1>>,
+
     /// Optional native `O --o-backend` entrypoint for embedding processes that
     /// are not themselves the O evaluator (for example `o-node`). Ordinary O
     /// execution leaves this unset and binds `current_exe()` as before.
@@ -784,6 +790,7 @@ impl Evaluator {
             eval_cache: HashMap::new(),
             scheduler: AutonomousScheduler::new(),
             local_worker_parallelism_override: None,
+            physical_attempt_adapter: None,
             runtime_executable_override: None,
             autonomous_buffer: Vec::new(),
             last_execution_plan: None,
@@ -935,6 +942,23 @@ impl Evaluator {
     /// current machine parallelism only after evidence-bound admission.
     pub(crate) fn local_worker_parallelism_override(&self) -> Option<usize> {
         self.local_worker_parallelism_override
+    }
+
+    /// Install one explicit high-layer physical-attempt realization without
+    /// teaching evaluator core about its protocol. Concrete public builders
+    /// live with the owning adapter module.
+    pub(crate) fn with_physical_attempt_adapter(
+        mut self,
+        adapter: Arc<dyn crate::executor::PhysicalAttemptAdapterV1>,
+    ) -> Self {
+        self.physical_attempt_adapter = Some(adapter);
+        self
+    }
+
+    pub(crate) fn physical_attempt_adapter(
+        &self,
+    ) -> Option<Arc<dyn crate::executor::PhysicalAttemptAdapterV1>> {
+        self.physical_attempt_adapter.clone()
     }
 
     pub(crate) fn shim_path(&self, language: &str) -> PathBuf {
@@ -2545,6 +2569,11 @@ impl Evaluator {
             }
         };
         let use_serial = select_serial_executor(forced, configured.as_deref())?;
+        if use_serial && self.physical_attempt_adapter.is_some() {
+            bail!(
+                "explicit remote pure execution requires the graph coordinator; serial execution would be an unauthorized local fallback"
+            );
+        }
         let executable_leases = admitted.executable_leases()?;
         let shim_backends = plan
             .nodes
@@ -3674,7 +3703,8 @@ impl<'a> crate::executor::Coordinator<'a> {
         evaluator: &mut Evaluator,
         scope: &mut HashMap<String, OValue>,
     ) -> Result<OValue> {
-        self.run_host(evaluator, scope)
+        let physical_attempt_adapter = evaluator.physical_attempt_adapter();
+        self.run_host(evaluator, scope, physical_attempt_adapter.as_deref())
     }
 }
 

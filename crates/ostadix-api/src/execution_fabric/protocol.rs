@@ -1114,9 +1114,7 @@ impl ExecutionCandidateV1 {
     }
 
     pub(crate) fn validate(&self) -> Result<(), ExecutionFabricError> {
-        if self.schema != EXECUTION_CANDIDATE_SCHEMA_V1 || self.version != WIRE_VERSION_V1 {
-            return Err(invalid("unsupported execution candidate schema/version"));
-        }
+        self.validate_representation()?;
         self.attempt.validate()?;
         for (label, digest) in [
             ("candidate capsule", &self.capsule_sha256),
@@ -1130,6 +1128,13 @@ impl ExecutionCandidateV1 {
             return Err(invalid("candidate completion time must be nonzero"));
         }
         self.outcome.validate()
+    }
+
+    pub(crate) fn validate_representation(&self) -> Result<(), ExecutionFabricError> {
+        if self.schema != EXECUTION_CANDIDATE_SCHEMA_V1 || self.version != WIRE_VERSION_V1 {
+            return Err(invalid("unsupported execution candidate schema/version"));
+        }
+        Ok(())
     }
 }
 
