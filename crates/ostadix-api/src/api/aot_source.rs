@@ -28,6 +28,28 @@ pub const RUNTIME_EXECUTION_FABRIC_SOURCES: &[(&str, &str)] = &[
         include_str!("../execution_fabric/protocol.rs"),
     ),
 ];
+pub const RUNTIME_EXECUTION_FABRIC_AUTHORITY_SOURCES: &[(&str, &str)] = &[
+    (
+        "mod.rs",
+        include_str!("../execution_fabric_authority/mod.rs"),
+    ),
+    (
+        "codec.rs",
+        include_str!("../execution_fabric_authority/codec.rs"),
+    ),
+    (
+        "crypto.rs",
+        include_str!("../execution_fabric_authority/crypto.rs"),
+    ),
+    (
+        "protocol.rs",
+        include_str!("../execution_fabric_authority/protocol.rs"),
+    ),
+    (
+        "tests.rs",
+        include_str!("../execution_fabric_authority/tests.rs"),
+    ),
+];
 pub const RUNTIME_EVAL_CORE_RS: &str = include_str!("../eval_core.rs");
 pub const RUNTIME_EVAL_RS: &str = include_str!("../eval.rs");
 pub const RUNTIME_PROCESS_RS: &str = include_str!("../process.rs");

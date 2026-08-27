@@ -6,8 +6,9 @@
 
 pub use ostadix_api::{
     api, backend, backend_morphism, backend_state, effects, environment, eval, evidence,
-    execution_contract, execution_fabric, executor, hgraph, hosted_remote, information,
-    information_bridge, information_provenance, intent, ir, kernel_world, live_system, nix_ops,
-    nixos_ops, ocore, parser, placement, process, project, registry, resource_identity,
-    runtime_exec, scheduler, shims, syntax_dialect, value, version, wire, world,
+    execution_contract, execution_fabric, execution_fabric_authority, executor, hgraph,
+    hosted_remote, information, information_bridge, information_provenance, intent, ir,
+    kernel_world, live_system, nix_ops, nixos_ops, ocore, parser, placement, process, project,
+    registry, resource_identity, runtime_exec, scheduler, shims, syntax_dialect, value, version,
+    wire, world,
 };

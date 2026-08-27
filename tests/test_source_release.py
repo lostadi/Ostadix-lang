@@ -161,6 +161,13 @@ impl Runtime {
 """
 FIXTURE_AOT_SOURCE = """\
 pub const RUNTIME_VALUE_RS: &str = include_str!("../value.rs");
+pub const RUNTIME_EXECUTION_FABRIC_AUTHORITY_SOURCES: &[(&str, &str)] = &[
+    ("mod.rs", include_str!("../execution_fabric_authority/mod.rs")),
+    ("codec.rs", include_str!("../execution_fabric_authority/codec.rs")),
+    ("crypto.rs", include_str!("../execution_fabric_authority/crypto.rs")),
+    ("protocol.rs", include_str!("../execution_fabric_authority/protocol.rs")),
+    ("tests.rs", include_str!("../execution_fabric_authority/tests.rs")),
+];
 """
 FIXTURE_API_TEST = """\
 #[test]
@@ -983,6 +990,11 @@ class SourceReleaseTests(unittest.TestCase):
             "crates/ostadix-api/src/executor/task.rs": "// fixture prepared-task contract\n",
             "crates/ostadix-api/src/execution_fabric/codec.rs": "// fixture execution-fabric codec\n",
             "crates/ostadix-api/src/execution_fabric/protocol.rs": "// fixture execution-fabric protocol\n",
+            "crates/ostadix-api/src/execution_fabric_authority/mod.rs": "// fixture execution-fabric authority module\n",
+            "crates/ostadix-api/src/execution_fabric_authority/codec.rs": "// fixture execution-fabric authority codec\n",
+            "crates/ostadix-api/src/execution_fabric_authority/crypto.rs": "// fixture execution-fabric authority signatures\n",
+            "crates/ostadix-api/src/execution_fabric_authority/protocol.rs": "// fixture execution-fabric authority protocol\n",
+            "crates/ostadix-api/src/execution_fabric_authority/tests.rs": "// fixture execution-fabric authority tests\n",
             "crates/ostadix-api/src/hgraph/graph.rs": "// fixture HGraph validation\n",
             "crates/ostadix-api/src/hgraph/kinds.rs": "// fixture HGraph operation vocabulary\n",
             "crates/ostadix-api/src/hgraph/from_oir.rs": "// fixture HGraph effect lowering\n",
@@ -1477,6 +1489,11 @@ class SourceReleaseTests(unittest.TestCase):
                 "crates/ostadix-api/src/executor/task.rs",
                 "crates/ostadix-api/src/execution_fabric/codec.rs",
                 "crates/ostadix-api/src/execution_fabric/protocol.rs",
+                "crates/ostadix-api/src/execution_fabric_authority/mod.rs",
+                "crates/ostadix-api/src/execution_fabric_authority/codec.rs",
+                "crates/ostadix-api/src/execution_fabric_authority/crypto.rs",
+                "crates/ostadix-api/src/execution_fabric_authority/protocol.rs",
+                "crates/ostadix-api/src/execution_fabric_authority/tests.rs",
                 "crates/ostadix-api/src/hgraph/graph.rs",
                 "crates/ostadix-api/src/hgraph/kinds.rs",
                 "crates/ostadix-api/src/hgraph/from_oir.rs",
@@ -2577,11 +2594,16 @@ class SourceReleaseTests(unittest.TestCase):
         ):
             self._build("missing-prepared-task-pool.zip")
 
-    def test_execution_fabric_profile_and_codec_surface_are_required(self) -> None:
+    def test_execution_fabric_profile_codec_and_authority_surface_are_required(self) -> None:
         required = (
             "docs/OIR_EXECUTION_FABRIC_V1.md",
             "crates/ostadix-api/src/execution_fabric/codec.rs",
             "crates/ostadix-api/src/execution_fabric/protocol.rs",
+            "crates/ostadix-api/src/execution_fabric_authority/mod.rs",
+            "crates/ostadix-api/src/execution_fabric_authority/codec.rs",
+            "crates/ostadix-api/src/execution_fabric_authority/crypto.rs",
+            "crates/ostadix-api/src/execution_fabric_authority/protocol.rs",
+            "crates/ostadix-api/src/execution_fabric_authority/tests.rs",
         )
         self._commit()
         self._git("rm", *required)

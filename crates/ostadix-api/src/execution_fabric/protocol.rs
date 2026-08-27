@@ -283,6 +283,26 @@ impl SourceClosedRendererV1 {
         &self.parts
     }
 
+    pub fn source_sha256(&self) -> &Sha256DigestV1 {
+        &self.source_sha256
+    }
+
+    pub fn expected_oir_sha256(&self) -> &Sha256DigestV1 {
+        &self.expected_oir_sha256
+    }
+
+    pub fn expected_plan_sha256(&self) -> &Sha256DigestV1 {
+        &self.expected_plan_sha256
+    }
+
+    pub fn backend_catalog_sha256(&self) -> &Sha256DigestV1 {
+        &self.backend_catalog_sha256
+    }
+
+    pub fn backend_implementation_sha256(&self) -> &Sha256DigestV1 {
+        &self.backend_implementation_sha256
+    }
+
     pub fn region_sha256(&self) -> &Sha256DigestV1 {
         &self.region_sha256
     }
@@ -802,6 +822,10 @@ impl ExecutionCapsuleV1 {
         &self.region
     }
 
+    pub fn admission_sha256(&self) -> &Sha256DigestV1 {
+        &self.admission_sha256
+    }
+
     pub fn inputs(&self) -> &InputManifestV1 {
         &self.inputs
     }
@@ -818,7 +842,7 @@ impl ExecutionCapsuleV1 {
         &self.limits
     }
 
-    pub(crate) fn canonical_sha256(&self) -> Result<Sha256DigestV1, ExecutionFabricError> {
+    pub fn canonical_sha256(&self) -> Result<Sha256DigestV1, ExecutionFabricError> {
         self.validate()?;
         canonical_digest(b"ostadix/execution-fabric/capsule/v1", self)
     }
@@ -996,8 +1020,32 @@ impl ExecutionCandidateV1 {
         Ok(value)
     }
 
+    pub fn attempt(&self) -> &AttemptIdV1 {
+        &self.attempt
+    }
+
+    pub fn capsule_sha256(&self) -> &Sha256DigestV1 {
+        &self.capsule_sha256
+    }
+
+    pub fn region_sha256(&self) -> &Sha256DigestV1 {
+        &self.region_sha256
+    }
+
+    pub fn input_manifest_sha256(&self) -> &Sha256DigestV1 {
+        &self.input_manifest_sha256
+    }
+
+    pub fn output_contract_sha256(&self) -> &Sha256DigestV1 {
+        &self.output_contract_sha256
+    }
+
     pub fn outcome(&self) -> &CandidateOutcomeV1 {
         &self.outcome
+    }
+
+    pub fn completed_unix_ms(&self) -> u64 {
+        self.completed_unix_ms
     }
 
     pub fn validate_against(
