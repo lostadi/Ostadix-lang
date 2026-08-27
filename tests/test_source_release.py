@@ -783,6 +783,7 @@ class SourceReleaseTests(unittest.TestCase):
             "docs/CLAIMS.md": "fixture claims\n",
             "docs/CI_POSTURE.md": "fixture local CI posture contract\n",
             "docs/FOREIGN_KERNEL_LAB.md": "# Fixture foreign-kernel lab\n",
+            "docs/ABSORBED_CAPACITY.md": "# Fixture absorbed capacity\n",
             "docs/IMAGE_ADMISSION.md": "fixture image-admission contract\n",
             "docs/INFORMATION_KERNEL_V1.md": "fixture information kernel contract\n",
             "docs/releases/v0.3.0.md": "# Ostadix-lang v0.3.0 fixture\n",
@@ -807,6 +808,12 @@ class SourceReleaseTests(unittest.TestCase):
             "docs/VERSIONING.md": "fixture version axes\n",
             "evidence/foreign_kernel_lab.toml": (
                 'schema = "ostadix.foreign-kernel-lab/v1"\n'
+            ),
+            "evidence/absorbed_capacity_catalog.toml": (
+                'schema = "ostadix.absorbed-capacity-catalog/v1"\n'
+            ),
+            "evidence/absorbed_capacity_iso.toml": (
+                'schema = "ostadix.capacity-iso-profile/v1"\n'
             ),
             "evidence/gates.toml": fixture_evidence_manifest(),
             "evidence/world_alpha_gates.toml": WORLD_NORMATIVE_BYTES[
@@ -874,6 +881,7 @@ class SourceReleaseTests(unittest.TestCase):
             "ocore/kernel/aarch64/linker.ld": "ENTRY(_start)\n",
             "ocore/kernel/aarch64/vectors.S": ".section .text\n",
             "ocore/kernel/build-aarch64-g2.sh": "#!/bin/sh\nexit 0\n",
+            "ocore/kernel/build-x86_64-capacity-iso.sh": "#!/bin/sh\nexit 0\n",
             "ocore/kernel/build-x86_64-uefi-iso.sh": "#!/bin/sh\nexit 0\n",
             "ocore/kernel/build-x86_64-uefi-media.sh": "#!/bin/sh\nexit 0\n",
             "ocore/kernel/build.sh": "#!/bin/sh\nexit 0\n",
@@ -887,6 +895,7 @@ class SourceReleaseTests(unittest.TestCase):
             "ocore/kernel/resolve-x86_64-ovmf-code.sh": "# resolver fixture\n",
             "ocore/kernel/smp_probe.oc": "module kernel::smp_probe;\n",
             "ocore/kernel/smp_probe_stub.oc": "module kernel::smp_probe;\n",
+            "ocore/kernel/run-x86_64-capacity-iso-qemu.sh": "#!/bin/sh\nexit 0\n",
             "ocore/kernel/run-x86_64-uefi-iso-qemu.sh": "#!/bin/sh\nexit 0\n",
             "ocore/kernel/run-x86_64-uefi-media-qemu.sh": "#!/bin/sh\nexit 0\n",
             "ocore/kernel/smoke-x86_64-boot-info-qemu.sh": "#!/bin/sh\nexit 0\n",
@@ -962,6 +971,9 @@ class SourceReleaseTests(unittest.TestCase):
             "scripts/install-o-cli-wrapper.sh": "#!/usr/bin/env bash\n",
             "scripts/o-cli.sh": "#!/usr/bin/env bash\nexec true\n",
             "scripts/o-kernel.sh": "#!/usr/bin/env bash\nexec true\n",
+            "scripts/ostadix_capacity.py": "#!/usr/bin/env python3\n",
+            "scripts/ostadix_capacity_iso.py": "#!/usr/bin/env python3\n",
+            "scripts/prepare-x86_64-capacity-host.sh": "#!/usr/bin/env bash\n",
             "scripts/ostadix_boot_iso.py": "#!/usr/bin/env python3\n",
             "scripts/ostadix_boot_media.py": "#!/usr/bin/env python3\n",
             "scripts/ostadix_boot_info_qemu.py": "#!/usr/bin/env python3\n",
@@ -1130,6 +1142,8 @@ class SourceReleaseTests(unittest.TestCase):
             "tests/test_local_ci_posture.py": "# fixture local CI posture tests\n",
             "tests/test_backend_state_protocol.py": "# fixture backend state protocol tests\n",
             "tests/test_mcp_smoke.py": "# fixture MCP smoke tests\n",
+            "tests/test_ostadix_capacity.py": "# fixture absorbed-capacity tests\n",
+            "tests/test_ostadix_capacity_iso.py": "# fixture capacity-ISO tests\n",
             "tests/test_ostadix_boot_media.py": "# fixture boot-media tests\n",
             "tests/test_ostadix_boot_iso.py": "# fixture boot-iso tests\n",
             "tests/test_ostadix_boot_info_qemu.py": "# fixture boot-info QEMU tests\n",
@@ -1197,8 +1211,10 @@ class SourceReleaseTests(unittest.TestCase):
                     "okernel-multikernel/boot-and-test.sh",
                     "ocore/kernel/build.sh",
                     "ocore/kernel/build-aarch64-g2.sh",
+                    "ocore/kernel/build-x86_64-capacity-iso.sh",
                     "ocore/kernel/build-x86_64-uefi-iso.sh",
                     "ocore/kernel/build-x86_64-uefi-media.sh",
+                    "ocore/kernel/run-x86_64-capacity-iso-qemu.sh",
                     "ocore/kernel/run-x86_64-uefi-iso-qemu.sh",
                     "ocore/kernel/run-x86_64-uefi-media-qemu.sh",
                     "ocore/kernel/smoke-x86_64-boot-info-qemu.sh",
@@ -1216,6 +1232,9 @@ class SourceReleaseTests(unittest.TestCase):
                     "scripts/o-cli.sh",
                     "scripts/o-kernel.sh",
                     "scripts/foreign_kernel_lab.py",
+                    "scripts/ostadix_capacity.py",
+                    "scripts/ostadix_capacity_iso.py",
+                    "scripts/prepare-x86_64-capacity-host.sh",
                     "scripts/ostadix_boot_iso.py",
                     "scripts/ostadix_boot_media.py",
                     "scripts/ostadix_boot_info_qemu.py",
@@ -1374,6 +1393,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "rust-toolchain.toml",
                 "setup.sh",
                 "docs/CLAIMS.md",
+                "docs/ABSORBED_CAPACITY.md",
                 "docs/CI_POSTURE.md",
                 "docs/FOREIGN_KERNEL_LAB.md",
                 "docs/IMAGE_ADMISSION.md",
@@ -1392,6 +1412,8 @@ class SourceReleaseTests(unittest.TestCase):
                 "docs/OSTADIX_WORLD.md",
                 "docs/SEMANTIC_CUSTODY.md",
                 "docs/VERSIONING.md",
+                "evidence/absorbed_capacity_catalog.toml",
+                "evidence/absorbed_capacity_iso.toml",
                 "evidence/foreign_kernel_lab.toml",
                 "evidence/gates.toml",
                 "evidence/o_machine_contract_v1.toml",
@@ -1434,6 +1456,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "ocore/kernel/aarch64/linker.ld",
                 "ocore/kernel/aarch64/vectors.S",
                 "ocore/kernel/build-aarch64-g2.sh",
+                "ocore/kernel/build-x86_64-capacity-iso.sh",
                 "ocore/kernel/build-x86_64-uefi-iso.sh",
                 "ocore/kernel/build-x86_64-uefi-media.sh",
                 "ocore/kernel/build.sh",
@@ -1443,6 +1466,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "ocore/kernel/resolve-x86_64-ovmf-code.sh",
                 "ocore/kernel/smp_probe.oc",
                 "ocore/kernel/smp_probe_stub.oc",
+                "ocore/kernel/run-x86_64-capacity-iso-qemu.sh",
                 "ocore/kernel/run-x86_64-uefi-iso-qemu.sh",
                 "ocore/kernel/run-x86_64-uefi-media-qemu.sh",
                 "ocore/kernel/smoke-x86_64-boot-info-qemu.sh",
@@ -1496,6 +1520,9 @@ class SourceReleaseTests(unittest.TestCase):
                 "scripts/install-o-cli-wrapper.sh",
                 "scripts/o-cli.sh",
                 "scripts/o-kernel.sh",
+                "scripts/ostadix_capacity.py",
+                "scripts/ostadix_capacity_iso.py",
+                "scripts/prepare-x86_64-capacity-host.sh",
                 "scripts/ostadix_boot_iso.py",
                 "scripts/ostadix_boot_media.py",
                 "scripts/ostadix_boot_info_qemu.py",
@@ -1660,6 +1687,8 @@ class SourceReleaseTests(unittest.TestCase):
                 "tests/test_local_ci_posture.py",
                 "tests/test_backend_state_protocol.py",
                 "tests/test_mcp_smoke.py",
+                "tests/test_ostadix_capacity.py",
+                "tests/test_ostadix_capacity_iso.py",
                 "tests/test_ostadix_boot_iso.py",
                 "tests/test_ostadix_boot_media.py",
                 "tests/test_ostadix_boot_info_qemu.py",
@@ -1751,8 +1780,10 @@ class SourceReleaseTests(unittest.TestCase):
                 "100755",
             )
             for executable_path in (
+                "ocore/kernel/build-x86_64-capacity-iso.sh",
                 "ocore/kernel/build-x86_64-uefi-iso.sh",
                 "ocore/kernel/build-x86_64-uefi-media.sh",
+                "ocore/kernel/run-x86_64-capacity-iso-qemu.sh",
                 "ocore/kernel/run-x86_64-uefi-iso-qemu.sh",
                 "ocore/kernel/run-x86_64-uefi-media-qemu.sh",
                 "ocore/kernel/smoke-x86_64-boot-info-qemu.sh",
@@ -1760,6 +1791,9 @@ class SourceReleaseTests(unittest.TestCase):
                 "ocore/kernel/smoke-x86_64-uefi-iso-qemu.sh",
                 "ocore/kernel/smoke-x86_64-uefi-media-qemu.sh",
                 "ocore/kernel/stress-live-linux-personality-qemu.sh",
+                "scripts/ostadix_capacity.py",
+                "scripts/ostadix_capacity_iso.py",
+                "scripts/prepare-x86_64-capacity-host.sh",
                 "scripts/ostadix_boot_iso.py",
                 "scripts/ostadix_boot_media.py",
                 "scripts/ostadix_boot_info_qemu.py",
@@ -1986,6 +2020,25 @@ class SourceReleaseTests(unittest.TestCase):
             r"missing required path\(s\): boot-and-test\.sh",
         ):
             self._build("missing-launcher.zip")
+
+    def test_absorbed_capacity_is_a_required_release_closure(self) -> None:
+        required = (
+            "docs/ABSORBED_CAPACITY.md",
+            "evidence/absorbed_capacity_catalog.toml",
+            "evidence/absorbed_capacity_iso.toml",
+            "ocore/kernel/build-x86_64-capacity-iso.sh",
+            "ocore/kernel/run-x86_64-capacity-iso-qemu.sh",
+            "scripts/ostadix_capacity.py",
+            "scripts/ostadix_capacity_iso.py",
+            "scripts/prepare-x86_64-capacity-host.sh",
+            "tests/test_ostadix_capacity.py",
+            "tests/test_ostadix_capacity_iso.py",
+        )
+        self._commit()
+        self._git("rm", *required)
+        self._git("commit", "-q", "-m", "remove absorbed-capacity closure")
+
+        self._assert_missing_required_paths("missing-absorbed-capacity.zip", required)
 
     def test_hosted_hgraph_benchmark_is_a_required_release_closure(self) -> None:
         self._commit()

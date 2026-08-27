@@ -8,6 +8,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import tracemalloc
 import unittest
 from unittest import mock
 
@@ -276,6 +277,18 @@ def _fixture(config: bytes | None = None) -> bytes:
     return bytes(image)
 
 
+def _write_sparse_extended_fixture(path: Path, total_bytes: int) -> None:
+    if total_bytes % ISO.LOGICAL_BLOCK_SIZE or total_bytes < len(_fixture()):
+        raise AssertionError("invalid sparse ISO fixture size")
+    image = bytearray(_fixture())
+    volume_blocks = total_bytes // ISO.LOGICAL_BLOCK_SIZE
+    primary_volume_size = 16 * ISO.LOGICAL_BLOCK_SIZE + 80
+    image[primary_volume_size : primary_volume_size + 8] = _both32(volume_blocks)
+    with path.open("wb") as stream:
+        stream.write(image)
+        stream.truncate(total_bytes)
+
+
 def _grub_rescue_tree(
     root: Path, token: str, *, auxiliary_boot: str = "boot.efi"
 ) -> Path:
@@ -441,6 +454,111 @@ class OstadixBootIsoTests(unittest.TestCase):
             with self.assertRaisesRegex(ISO.IsoError, "without following links"):
                 ISO.inspect_path(link)
 
+    def test_descriptor_inspection_preserves_the_legacy_v1_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "legacy.iso"
+            payload = _fixture()
+            image.write_bytes(payload)
+            expected = ISO.inspect_image(payload)
+            descriptor = os.open(image, os.O_RDONLY)
+            try:
+                self.assertEqual(
+                    ISO.inspect_descriptor(descriptor, "legacy fixture"), expected
+                )
+            finally:
+                os.close(descriptor)
+
+    def test_inspect_path_accepts_sparse_image_over_legacy_one_gib_boundedly(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "large-sparse.iso"
+            total_bytes = 1024 * 1024 * 1024 + ISO.LOGICAL_BLOCK_SIZE
+            _write_sparse_extended_fixture(image, total_bytes)
+
+            tracemalloc.start()
+            try:
+                metadata = ISO.inspect_path(image)
+                _current, peak = tracemalloc.get_traced_memory()
+            finally:
+                tracemalloc.stop()
+
+            self.assertEqual(metadata["schema"], "ostadix.boot-iso/v1")
+            self.assertEqual(metadata["bytes"], total_bytes)
+            self.assertEqual(
+                metadata["volume_blocks"], total_bytes // ISO.LOGICAL_BLOCK_SIZE
+            )
+            self.assertLess(peak, 32 * 1024 * 1024)
+
+    def test_inspect_path_rejects_sparse_image_over_sixteen_gib_before_mapping(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "too-large-sparse.iso"
+            with image.open("wb") as stream:
+                stream.truncate(ISO.MAX_ISO_BYTES + ISO.LOGICAL_BLOCK_SIZE)
+            with mock.patch.object(
+                ISO.mmap, "mmap", side_effect=AssertionError("oversized ISO was mapped")
+            ):
+                with self.assertRaisesRegex(ISO.IsoError, "size outside"):
+                    ISO.inspect_path(image)
+            descriptor = os.open(image, os.O_RDONLY)
+            try:
+                with mock.patch.object(
+                    ISO.mmap,
+                    "mmap",
+                    side_effect=AssertionError("caller raised the hard ISO ceiling"),
+                ):
+                    with self.assertRaisesRegex(ISO.IsoError, "size outside"):
+                        ISO.inspect_descriptor(
+                            descriptor,
+                            "oversized fixture",
+                            maximum=2 * ISO.MAX_ISO_BYTES,
+                        )
+            finally:
+                os.close(descriptor)
+
+    def test_descriptor_inspection_detects_mutation_during_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "mutable.iso"
+            image.write_bytes(_fixture())
+            descriptor = os.open(image, os.O_RDONLY)
+            real_inspect = ISO.inspect_image
+
+            def inspect_then_grow(mapping: object) -> dict[str, object]:
+                metadata = real_inspect(mapping)
+                writer = os.open(image, os.O_WRONLY)
+                try:
+                    os.ftruncate(writer, image.stat().st_size + ISO.LOGICAL_BLOCK_SIZE)
+                finally:
+                    os.close(writer)
+                return metadata
+
+            try:
+                with mock.patch.object(
+                    ISO, "inspect_image", side_effect=inspect_then_grow
+                ):
+                    with self.assertRaisesRegex(ISO.IsoError, "changed while"):
+                        ISO.inspect_descriptor(descriptor, "mutable fixture")
+            finally:
+                os.close(descriptor)
+
+    def test_inspect_path_detects_replacement_after_descriptor_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            image = root / "replaceable.iso"
+            replacement = root / "replacement.iso"
+            image.write_bytes(_fixture())
+            replacement.write_bytes(_fixture())
+            real_inspect_descriptor = ISO.inspect_descriptor
+
+            def inspect_then_replace(*arguments: object, **keywords: object) -> object:
+                metadata = real_inspect_descriptor(*arguments, **keywords)
+                os.replace(replacement, image)
+                return metadata
+
+            with mock.patch.object(
+                ISO, "inspect_descriptor", side_effect=inspect_then_replace
+            ):
+                with self.assertRaisesRegex(ISO.IsoError, "path was replaced"):
+                    ISO.inspect_path(image)
+
     def test_publish_rejects_output_symlink_without_touching_target(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -466,6 +584,54 @@ class OstadixBootIsoTests(unittest.TestCase):
             self.assertEqual(metadata, ISO.inspect_path(output))
             self.assertTrue(stat.S_ISREG(os.stat(output, follow_symlinks=False).st_mode))
             self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o444)
+
+    def test_publish_streams_bounded_chunks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "candidate.iso"
+            output = root / "ostadix.iso"
+            total_bytes = 2 * ISO.COPY_CHUNK_BYTES + ISO.LOGICAL_BLOCK_SIZE
+            _write_sparse_extended_fixture(source, total_bytes)
+            real_pread = ISO.os.pread
+            requested_sizes: list[int] = []
+
+            def bounded_pread(descriptor: int, size: int, offset: int) -> bytes:
+                requested_sizes.append(size)
+                return real_pread(descriptor, size, offset)
+
+            with mock.patch.object(ISO.os, "pread", side_effect=bounded_pread):
+                metadata = ISO.publish_path(source, output)
+
+            self.assertEqual(metadata["bytes"], total_bytes)
+            self.assertTrue(requested_sizes)
+            self.assertLessEqual(max(requested_sizes), ISO.COPY_CHUNK_BYTES)
+            self.assertIn(ISO.COPY_CHUNK_BYTES, requested_sizes)
+            self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o444)
+
+    def test_publish_rejects_source_replacement_without_clobbering_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "candidate.iso"
+            replacement = root / "replacement.iso"
+            output = root / "ostadix.iso"
+            source.write_bytes(_fixture())
+            replacement.write_bytes(_fixture())
+            output.write_bytes(b"preserve existing output")
+            real_stream_copy = ISO._stream_copy_descriptor
+
+            def copy_then_replace(*arguments: object, **keywords: object) -> str:
+                digest = real_stream_copy(*arguments, **keywords)
+                os.replace(replacement, source)
+                return digest
+
+            with mock.patch.object(
+                ISO, "_stream_copy_descriptor", side_effect=copy_then_replace
+            ):
+                with self.assertRaisesRegex(ISO.IsoError, "path was replaced"):
+                    ISO.publish_path(source, output)
+
+            self.assertEqual(output.read_bytes(), b"preserve existing output")
+            self.assertEqual(list(root.glob(".ostadix-iso-publish.*.tmp")), [])
 
     def test_publish_never_uses_pathname_chmod(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

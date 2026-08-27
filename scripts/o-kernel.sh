@@ -21,6 +21,9 @@ ISO_BUILD_SCRIPT=${O_KERNEL_ISO_BUILD_SCRIPT:-"$ROOT/ocore/kernel/build-x86_64-u
 ISO_BOOT_SCRIPT=${O_KERNEL_ISO_BOOT_SCRIPT:-"$ROOT/ocore/kernel/run-x86_64-uefi-iso-qemu.sh"}
 ISO_SMOKE_SCRIPT=${O_KERNEL_ISO_SMOKE_SCRIPT:-"$ROOT/ocore/kernel/smoke-x86_64-uefi-iso-qemu.sh"}
 ISO_INSPECT_SCRIPT=${O_KERNEL_ISO_INSPECT_SCRIPT:-"$ROOT/scripts/ostadix_boot_iso.py"}
+CAPACITY_ISO_BUILD_SCRIPT=${O_KERNEL_CAPACITY_ISO_BUILD_SCRIPT:-"$ROOT/ocore/kernel/build-x86_64-capacity-iso.sh"}
+CAPACITY_ISO_BOOT_SCRIPT=${O_KERNEL_CAPACITY_ISO_BOOT_SCRIPT:-"$ROOT/ocore/kernel/run-x86_64-capacity-iso-qemu.sh"}
+CAPACITY_ISO_INSPECT_SCRIPT=${O_KERNEL_CAPACITY_ISO_INSPECT_SCRIPT:-"$ROOT/scripts/ostadix_capacity_iso.py"}
 MEDIA_WRITER_SCRIPT=${O_KERNEL_MEDIA_WRITER_SCRIPT:-"$ROOT/scripts/ostadix_media_writer.py"}
 PHYSICAL_EVIDENCE_SCRIPT=${O_KERNEL_PHYSICAL_EVIDENCE_SCRIPT:-"$ROOT/scripts/ostadix_physical_evidence.py"}
 
@@ -39,6 +42,8 @@ Commands:
   inspect-media  Strictly inspect a generated OSTADIX disk image
   iso          Build a deterministic x86_64 UEFI bootable ISO
   inspect-iso  Strictly inspect a generated OSTADIX bootable ISO
+  capacity-iso  Build the opt-in O-core plus foreign-systems x86_64 ISO
+  inspect-capacity-iso  Strictly inspect an absorbed-capacity ISO
   prepare-write  Inspect external media and derive a bound confirmation token
   write-media   Write and verify external media using that exact token
   boot-challenge  Generate a fresh challenge for one physical boot attempt
@@ -47,6 +52,7 @@ Commands:
   boot         Boot the baseline kernel with an interactive serial terminal
   boot-media   Boot the generated disk through edk2/OVMF (no QEMU -kernel)
   boot-iso     Boot the generated read-only ISO through edk2/OVMF
+  boot-capacity-iso  Boot a capacity ISO and select O-core/Alpine/Guix/OpenBSD/9front/Redox
   console      Boot the bounded native M5 `o> ` control console
   smoke        Run the bounded baseline boot assertion
   smoke-media  Prove deterministic media rebuild and UEFI disk boot
@@ -63,6 +69,10 @@ The media path builds a physical-writeable GPT image but validates it under
 QEMU/TCG. Mode 34 proves only bounded four-vCPU startup and one barrier; neither
 the media path nor that probe is general or physical SMP, Linux/Plan 9, or
 device-isolation evidence.
+
+Capacity ISO foreign entries run through an embedded Linux/QEMU TCG adapter.
+They are real upstream guests, but do not imply O-core governance, hardware
+virtualization, or physical-machine qualification.
 USAGE
 }
 
@@ -174,6 +184,17 @@ case "$command_name" in
         iso_path=${1:-"$ROOT/target/ostadix-iso/x86_64/ostadix-x86_64-uefi.iso"}
         exec "$ISO_INSPECT_SCRIPT" inspect "$iso_path"
         ;;
+    capacity-iso)
+        require_at_most_one_arg "$@"
+        require_executable "$CAPACITY_ISO_BUILD_SCRIPT"
+        exec "$CAPACITY_ISO_BUILD_SCRIPT" "$@"
+        ;;
+    inspect-capacity-iso)
+        require_at_most_one_arg "$@"
+        require_executable "$CAPACITY_ISO_INSPECT_SCRIPT"
+        capacity_iso_path=${1:-"$ROOT/target/ostadix-capacity-iso/x86_64/ostadix-absorbed-capacity-x86_64-uefi.iso"}
+        exec "$CAPACITY_ISO_INSPECT_SCRIPT" inspect "$capacity_iso_path"
+        ;;
     prepare-write)
         require_executable "$MEDIA_WRITER_SCRIPT"
         exec "$MEDIA_WRITER_SCRIPT" prepare "$@"
@@ -212,6 +233,11 @@ case "$command_name" in
         require_no_args "$@"
         require_executable "$ISO_BOOT_SCRIPT"
         exec "$ISO_BOOT_SCRIPT"
+        ;;
+    boot-capacity-iso)
+        require_at_most_one_arg "$@"
+        require_executable "$CAPACITY_ISO_BOOT_SCRIPT"
+        exec "$CAPACITY_ISO_BOOT_SCRIPT" "$@"
         ;;
     console)
         require_no_args "$@"

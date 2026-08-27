@@ -1,10 +1,11 @@
 # Foreign-kernel QEMU lab
 
-The foreign-kernel lab boots five checksum-pinned, unmodified upstream systems:
-Alpine Linux 3.24.1 and FreeBSD 15.1-RELEASE on AArch64, plus 9front 11983,
-GNU Guix System 1.5.0, and Redox OS 0.9.0 on x86_64. It is an opt-in host-side
-substrate test. It is deliberately separate from O-core's portable evidence
-aggregate and from the World G7 real-KernelWorld gate.
+The foreign-kernel lab boots seven checksum-pinned, unmodified upstream
+profiles: Alpine Linux 3.24.1 on both AArch64 and x86_64, FreeBSD
+15.1-RELEASE on AArch64, and OpenBSD 7.9, 9front 11983, GNU Guix System 1.5.0,
+and Redox OS 0.9.0 on x86_64. It is an opt-in host-side substrate test. It is
+deliberately separate from O-core's portable evidence aggregate and from the
+World G7 real-KernelWorld gate.
 
 ## What the lab establishes
 
@@ -32,12 +33,25 @@ post-run identity. An explicit `run --qemu PATH` override remains useful for
 diagnostics, but even successful mechanics are labeled `synthetic-passed` with
 `claim_admissible: false`; an arbitrary override cannot mint a QEMU/TCG pass.
 
-The Alpine profile reaches the upstream initramfs `/bin/sh`, emits an exact
-readiness marker, answers `busybox uname -srm`, and powers down. FreeBSD follows
-UEFI, its arm64 loader, the 15.1-RELEASE kernel, and rc startup into the
-installer userland's terminal prompt. 9front boots its `pc64` Plan 9 kernel from
-the official read-only snapshot, answers the root-device and user prompts as
-two ordered console actions, mounts HJFS, starts rc, and reaches `term%`.
+Both Alpine profiles reach the upstream initramfs `/bin/sh`, emit
+architecture-specific readiness markers, answer `busybox uname -srm`, and
+power down. The x86_64 profile therefore proves the exact x86_64 upstream
+kernel and initramfs independently of the existing AArch64 evidence. FreeBSD
+follows UEFI, its arm64 loader, the 15.1-RELEASE kernel, and rc startup into the
+installer userland's terminal prompt.
+
+OpenBSD boots the complete, unmodified `install79.iso` through its upstream
+`OpenBSD/amd64 BOOTX64 3.71` loader. Its loader initially selects `pc0`, so the
+manifest uses two counted actions on the same prompt: occurrence one sends
+`set tty com0`, then occurrence two sends `boot` only after the loader has
+reinitialized and emitted a second `boot>`. The proof requires the OpenBSD 7.9
+`RAMDISK_CD` kernel, the `rd0` root, and the real installer question. The host
+OVMF image is descriptor-pinned and recorded as an external local trust anchor;
+it is not presented as an OpenBSD artifact.
+
+9front boots its `pc64` Plan 9 kernel from the official read-only snapshot,
+answers the root-device and user prompts as two ordered console actions, mounts
+HJFS, starts rc, and reaches `term%`.
 
 GNU Guix System is the Guile-based Linux target. The profile proves three
 different layers instead of collapsing them into one claim: Linux-libre
@@ -81,6 +95,12 @@ ISO-member extraction:
 ./setup.sh --with-guest-tools --deps-only
 ```
 
+The OpenBSD x86_64 profile additionally requires one complete OVMF image that
+QEMU accepts through `-bios`. On Debian or Ubuntu, install `ovmf`; the proven
+`moral-gaur` path is `/usr/share/ovmf/OVMF.fd`. Split code and variable-store
+files such as `OVMF_CODE_4M.fd` are not interchangeable with that complete
+image for this launch shape.
+
 On Lee's macOS system, run the actual boots inside the existing Linux VM. The
 `/home/ubuntu/Ostadix-host` path is the SSHFS-mounted host checkout, not a
 disposable VM copy, so do not copy a repository over it or treat it as scratch.
@@ -107,13 +127,16 @@ UEFI firmware manually, then run:
 ./setup.sh --with-guest-tools --check
 ```
 
-Firmware discovery checks `OSTADIX_AARCH64_UEFI` first, followed by the known
-Debian/Ubuntu, edk2, and Homebrew locations. If the runner's manifest candidates
-do not include the installed path, pass it explicitly:
+Firmware discovery checks the manifest's known Debian/Ubuntu, edk2, and
+Homebrew locations. If the runner's manifest candidates do not include the
+installed path, pass it explicitly:
 
 ```bash
 python3 scripts/foreign_kernel_lab.py run freebsd-15.1-release-aarch64 \
   --firmware aarch64_uefi=/absolute/path/to/QEMU_EFI.fd
+
+python3 scripts/foreign_kernel_lab.py run openbsd-7.9-amd64 \
+  --firmware x86_64_uefi=/absolute/path/to/complete/OVMF.fd
 ```
 
 ## Fetch, verify, and run
@@ -134,7 +157,9 @@ Run one profile or the complete matrix:
 
 ```bash
 python3 scripts/foreign_kernel_lab.py run linux-alpine-3.24.1-aarch64
+python3 scripts/foreign_kernel_lab.py run linux-alpine-3.24.1-x86_64
 python3 scripts/foreign_kernel_lab.py run freebsd-15.1-release-aarch64
+python3 scripts/foreign_kernel_lab.py run openbsd-7.9-amd64
 python3 scripts/foreign_kernel_lab.py run plan9-9front-11983-amd64
 python3 scripts/foreign_kernel_lab.py run guix-system-1.5.0-x86_64
 python3 scripts/foreign_kernel_lab.py run redox-0.9.0-server-x86_64
@@ -173,7 +198,9 @@ without the admitted numeric QEMU banner cannot establish the claim. During
 execution the harness fails on a
 timeout, capture overflow, forbidden marker, missing or out-of-order required
 marker, duplicated marker declared unique, or an interactive profile that does
-not complete every ordered prompt-triggered console action. A nonzero
+not complete every ordered prompt-triggered console action. Counted actions
+fire only after the declared positive, bounded occurrence of their trigger;
+occurrences for a repeated trigger must be strictly increasing. A nonzero
 pre-cleanup exit, pre-cleanup QEMU
 stderr, input mutation, unresolved process group, or incomplete pipe drain also
 fails the run. Failure observations retain the bounded output and cleanup facts
@@ -183,10 +210,13 @@ for diagnosis; they do not establish the profile's boot claim.
 
 | Profile | Artifact | Bytes | SHA-256 |
 |---|---|---:|---|
-| Alpine Linux | `vmlinuz-virt` | 10,351,104 | `47970e0ee0478fe5c60824a89f162d5a353fa29466e5d3bddb0f9c506f1ed756` |
-| Alpine Linux | `initramfs-virt` | 9,385,851 | `e47d38bc88509a3db11affc09f9762f9643b026bd29441724a4729ad8e97add6` |
+| Alpine Linux AArch64 | `vmlinuz-virt` | 10,351,104 | `47970e0ee0478fe5c60824a89f162d5a353fa29466e5d3bddb0f9c506f1ed756` |
+| Alpine Linux AArch64 | `initramfs-virt` | 9,385,851 | `e47d38bc88509a3db11affc09f9762f9643b026bd29441724a4729ad8e97add6` |
+| Alpine Linux x86_64 | `vmlinuz-virt` | 12,575,744 | `1e6bf9027720c75c3ed0d79171f21b5791ee40ca9795d07c7c6e04dc5ea2ae90` |
+| Alpine Linux x86_64 | `initramfs-virt` | 9,637,032 | `6d80a739fedeeb6cd63e24dd208845e22199c41a5fb2054941ef61ec30264fa9` |
 | FreeBSD | `bootonly.iso.xz` | 96,421,460 | `33e2dc303b5dce5a374727ba12c41c303db70fe0676e76333e09e0ea8cb2fbd0` |
 | FreeBSD | expanded `bootonly.iso` | 460,095,488 | `359136c2af73e03da6f15ad59f0c67bc561ca8b69631d78bfb8f2225e2c9a5ef` |
+| OpenBSD | `install79.iso` | 798,625,792 | `7a4a92e953618035097c796a90b54424a0f3ae775552e1e7d102cf8a5130449f` |
 | 9front | `9front-11983.amd64.qcow2.gz` | 257,961,445 | `b96617b6eebcec8621a4c176e7acc29a1835ed09d4b61f9fe2e3e64c18d20867` |
 | 9front | expanded qcow2 | 550,240,256 | `0326632e2d90f4038069edbadd2918f7662397ad879a97d91cdac474d31a9746` |
 | GNU Guix System | installer ISO | 1,188,261,888 | `107e0a8082f03a10b15c1fb9383d2d752c1cdeda41b8db575a15550e1c2d8b4a` |
@@ -219,9 +249,12 @@ committed manifest without refetching upstream checksum or signature documents.
 Upstream references:
 
 - [Alpine 3.24.1 AArch64 netboot members](https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/aarch64/netboot-3.24.1/)
+- [Alpine 3.24.1 x86_64 netboot members](https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/x86_64/netboot-3.24.1/)
 - [Alpine download and signing information](https://www.alpinelinux.org/downloads/)
 - [FreeBSD 15.1-RELEASE image index](https://download.freebsd.org/releases/ISO-IMAGES/15.1/)
 - [FreeBSD 15.1 AArch64 signed checksums](https://www.freebsd.org/releases/15.1R/checksums/CHECKSUM.SHA256-FreeBSD-15.1-RELEASE-arm64-aarch64.asc)
+- [OpenBSD 7.9 amd64 release artifacts](https://cdn.openbsd.org/pub/OpenBSD/7.9/amd64/)
+- [OpenBSD 7.9 amd64 signed checksums](https://cdn.openbsd.org/pub/OpenBSD/7.9/amd64/SHA256.sig)
 - [9front official builds](https://build.9front.org/)
 - [9front build 11983 source commit](https://git.9front.org/plan9front/plan9front/50aefa0743c8cfd83fdc7f568d24e1bba8b9848e/commit.html)
 - [GNU Guix 1.5.0 downloads](https://ftp.gnu.org/gnu/guix/)

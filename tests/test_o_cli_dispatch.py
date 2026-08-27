@@ -11,6 +11,7 @@ import unittest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 O_CLI = PROJECT_ROOT / "scripts" / "o-cli.sh"
+O_KERNEL_CLI = PROJECT_ROOT / "scripts" / "o-kernel.sh"
 QUICKSTART = PROJECT_ROOT / "o-node-quickstart.sh"
 
 
@@ -20,7 +21,7 @@ class LowercaseCliDispatchTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.fake = Path(self.temporary.name) / "capture"
         self.fake.write_text(
-            "#!/bin/sh\nprintf 'arg=<%s>\\n' \"$@\"\n",
+            "#!/bin/sh\nfor arg in \"$@\"; do printf 'arg=<%s>\\n' \"$arg\"; done\n",
             encoding="utf-8",
         )
         self.fake.chmod(0o755)
@@ -28,6 +29,7 @@ class LowercaseCliDispatchTests(unittest.TestCase):
         for variable in (
             "O_LANG_OCLI_BIN",
             "O_LANG_EVALUATOR_BIN",
+            "O_LANG_CAPACITY_BIN",
             "O_LANG_LIVE_BIN",
             "O_LANG_OGIT_BIN",
             "O_LANG_NODE_BIN",
@@ -125,6 +127,17 @@ class LowercaseCliDispatchTests(unittest.TestCase):
             "state",
         ])
 
+    def test_absorbed_capacity_commands_forward_exact_arguments(self) -> None:
+        self.assert_dispatch(("capacity", "install", "guix-system"), [
+            "install",
+            "guix-system",
+        ])
+        self.assert_dispatch(("capacity", "plan", "guix-system", "openbsd"), [
+            "plan",
+            "guix-system",
+            "openbsd",
+        ])
+
     def test_information_command_forwards_exact_local_cli_arguments(self) -> None:
         self.assert_dispatch(("info", "head", "--state", "facts"), [
             "head",
@@ -142,6 +155,65 @@ class LowercaseCliDispatchTests(unittest.TestCase):
 
     def test_unknown_command_forms_still_fall_through_to_the_evaluator(self) -> None:
         self.assert_dispatch(("program.O", "backends"), ["program.O", "backends"])
+
+
+class KernelCapacityCliDispatchTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.fake = Path(self.temporary.name) / "capture"
+        self.fake.write_text(
+            "#!/bin/sh\nfor arg in \"$@\"; do printf 'arg=<%s>\\n' \"$arg\"; done\n",
+            encoding="utf-8",
+        )
+        self.fake.chmod(0o755)
+        self.environment = os.environ.copy()
+        for variable in (
+            "O_KERNEL_CAPACITY_ISO_BUILD_SCRIPT",
+            "O_KERNEL_CAPACITY_ISO_BOOT_SCRIPT",
+            "O_KERNEL_CAPACITY_ISO_INSPECT_SCRIPT",
+        ):
+            self.environment[variable] = str(self.fake)
+
+    def run_kernel(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["/bin/bash", str(O_KERNEL_CLI), *arguments],
+            cwd=PROJECT_ROOT,
+            env=self.environment,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+
+    def assert_dispatch(self, arguments: tuple[str, ...], expected: list[str]) -> None:
+        result = self.run_kernel(*arguments)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), [f"arg=<{arg}>" for arg in expected])
+
+    def test_capacity_iso_commands_forward_exact_arguments(self) -> None:
+        explicit = "/tmp/capacity.iso"
+        default = str(
+            PROJECT_ROOT
+            / "target/ostadix-capacity-iso/x86_64/ostadix-absorbed-capacity-x86_64-uefi.iso"
+        )
+        for arguments, expected in (
+            (("capacity-iso",), []),
+            (("capacity-iso", explicit), [explicit]),
+            (("inspect-capacity-iso",), ["inspect", default]),
+            (("inspect-capacity-iso", explicit), ["inspect", explicit]),
+            (("boot-capacity-iso",), []),
+            (("boot-capacity-iso", explicit), [explicit]),
+        ):
+            with self.subTest(arguments=arguments):
+                self.assert_dispatch(arguments, expected)
+
+    def test_capacity_iso_commands_reject_extra_paths(self) -> None:
+        for command in ("capacity-iso", "inspect-capacity-iso", "boot-capacity-iso"):
+            with self.subTest(command=command):
+                result = self.run_kernel(command, "one.iso", "two.iso")
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("accepts at most one path argument", result.stderr)
 
 
 class NodeQuickstartDispatchTests(unittest.TestCase):

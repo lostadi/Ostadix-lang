@@ -758,6 +758,9 @@ setup_kernel_media_cli_fixture() {
     KERNEL_ISO_INSPECT_STUB="$KERNEL_MEDIA_STUB_DIR/iso-inspect"
     KERNEL_ISO_BOOT_STUB="$KERNEL_MEDIA_STUB_DIR/iso-boot"
     KERNEL_ISO_SMOKE_STUB="$KERNEL_MEDIA_STUB_DIR/iso-smoke"
+    KERNEL_CAPACITY_ISO_BUILD_STUB="$KERNEL_MEDIA_STUB_DIR/capacity-iso-build"
+    KERNEL_CAPACITY_ISO_INSPECT_STUB="$KERNEL_MEDIA_STUB_DIR/capacity-iso-inspect"
+    KERNEL_CAPACITY_ISO_BOOT_STUB="$KERNEL_MEDIA_STUB_DIR/capacity-iso-boot"
     KERNEL_BOOT_INFO_SMOKE_STUB="$KERNEL_MEDIA_STUB_DIR/boot-info-smoke"
     KERNEL_SMP_SMOKE_STUB="$KERNEL_MEDIA_STUB_DIR/smp-smoke"
     KERNEL_MEDIA_WRITER_STUB="$KERNEL_MEDIA_STUB_DIR/media-writer"
@@ -784,6 +787,9 @@ EOF
     cp "$KERNEL_MEDIA_BUILD_STUB" "$KERNEL_ISO_INSPECT_STUB"
     cp "$KERNEL_MEDIA_BUILD_STUB" "$KERNEL_ISO_BOOT_STUB"
     cp "$KERNEL_MEDIA_BUILD_STUB" "$KERNEL_ISO_SMOKE_STUB"
+    cp "$KERNEL_MEDIA_BUILD_STUB" "$KERNEL_CAPACITY_ISO_BUILD_STUB"
+    cp "$KERNEL_MEDIA_BUILD_STUB" "$KERNEL_CAPACITY_ISO_INSPECT_STUB"
+    cp "$KERNEL_MEDIA_BUILD_STUB" "$KERNEL_CAPACITY_ISO_BOOT_STUB"
     cp "$KERNEL_MEDIA_BUILD_STUB" "$KERNEL_BOOT_INFO_SMOKE_STUB"
     cp "$KERNEL_MEDIA_BUILD_STUB" "$KERNEL_SMP_SMOKE_STUB"
     cp "$KERNEL_MEDIA_BUILD_STUB" "$KERNEL_MEDIA_WRITER_STUB"
@@ -798,6 +804,9 @@ EOF
         "$KERNEL_ISO_INSPECT_STUB" \
         "$KERNEL_ISO_BOOT_STUB" \
         "$KERNEL_ISO_SMOKE_STUB" \
+        "$KERNEL_CAPACITY_ISO_BUILD_STUB" \
+        "$KERNEL_CAPACITY_ISO_INSPECT_STUB" \
+        "$KERNEL_CAPACITY_ISO_BOOT_STUB" \
         "$KERNEL_BOOT_INFO_SMOKE_STUB" \
         "$KERNEL_SMP_SMOKE_STUB" \
         "$KERNEL_MEDIA_WRITER_STUB" \
@@ -817,6 +826,9 @@ run_kernel_media_cli() {
         O_KERNEL_ISO_INSPECT_SCRIPT="$KERNEL_ISO_INSPECT_STUB" \
         O_KERNEL_ISO_BOOT_SCRIPT="$KERNEL_ISO_BOOT_STUB" \
         O_KERNEL_ISO_SMOKE_SCRIPT="$KERNEL_ISO_SMOKE_STUB" \
+        O_KERNEL_CAPACITY_ISO_BUILD_SCRIPT="$KERNEL_CAPACITY_ISO_BUILD_STUB" \
+        O_KERNEL_CAPACITY_ISO_INSPECT_SCRIPT="$KERNEL_CAPACITY_ISO_INSPECT_STUB" \
+        O_KERNEL_CAPACITY_ISO_BOOT_SCRIPT="$KERNEL_CAPACITY_ISO_BOOT_STUB" \
         O_KERNEL_BOOT_INFO_SMOKE_SCRIPT="$KERNEL_BOOT_INFO_SMOKE_STUB" \
         O_KERNEL_SMP_SMOKE_SCRIPT="$KERNEL_SMP_SMOKE_STUB" \
         O_KERNEL_MEDIA_WRITER_SCRIPT="$KERNEL_MEDIA_WRITER_STUB" \
@@ -1018,6 +1030,23 @@ check_kernel_media_dispatch "kernel inspect-iso forwards the default ISO path" \
 check_kernel_media_dispatch "kernel inspect-iso forwards an explicit ISO path" \
     "$(printf 'script=iso-inspect\nargc=2\narg=inspect\narg=%s' "$KERNEL_ISO_OUTPUT")" \
     inspect-iso "$KERNEL_ISO_OUTPUT"
+KERNEL_CAPACITY_ISO_DEFAULT="$ROOT/target/ostadix-capacity-iso/x86_64/ostadix-absorbed-capacity-x86_64-uefi.iso"
+KERNEL_CAPACITY_ISO_OUTPUT="$ARTIFACT_DIR/custom-capacity.iso"
+check_kernel_media_dispatch "kernel capacity-iso accepts no output path" \
+    $'script=capacity-iso-build\nargc=0' \
+    capacity-iso
+check_kernel_media_dispatch "kernel capacity-iso forwards one output path" \
+    "$(printf 'script=capacity-iso-build\nargc=1\narg=%s' "$KERNEL_CAPACITY_ISO_OUTPUT")" \
+    capacity-iso "$KERNEL_CAPACITY_ISO_OUTPUT"
+check_kernel_media_rejection "kernel capacity-iso rejects extra output paths" \
+    'command accepts at most one path argument' \
+    capacity-iso "$KERNEL_CAPACITY_ISO_OUTPUT" unexpected.iso
+check_kernel_media_dispatch "kernel inspect-capacity-iso forwards the default ISO path" \
+    "$(printf 'script=capacity-iso-inspect\nargc=2\narg=inspect\narg=%s' "$KERNEL_CAPACITY_ISO_DEFAULT")" \
+    inspect-capacity-iso
+check_kernel_media_dispatch "kernel inspect-capacity-iso forwards an explicit ISO path" \
+    "$(printf 'script=capacity-iso-inspect\nargc=2\narg=inspect\narg=%s' "$KERNEL_CAPACITY_ISO_OUTPUT")" \
+    inspect-capacity-iso "$KERNEL_CAPACITY_ISO_OUTPUT"
 check_kernel_media_dispatch "kernel boot-media dispatches its exact boot script" \
     $'script=media-boot\nargc=0' \
     boot-media
@@ -1030,6 +1059,15 @@ check_kernel_media_dispatch "kernel boot-iso dispatches its exact boot script" \
 check_kernel_media_rejection "kernel boot-iso rejects arguments" \
     'command does not accept arguments' \
     boot-iso unexpected
+check_kernel_media_dispatch "kernel boot-capacity-iso dispatches its exact boot script" \
+    $'script=capacity-iso-boot\nargc=0' \
+    boot-capacity-iso
+check_kernel_media_dispatch "kernel boot-capacity-iso forwards one ISO path" \
+    "$(printf 'script=capacity-iso-boot\nargc=1\narg=%s' "$KERNEL_CAPACITY_ISO_OUTPUT")" \
+    boot-capacity-iso "$KERNEL_CAPACITY_ISO_OUTPUT"
+check_kernel_media_rejection "kernel boot-capacity-iso rejects extra ISO paths" \
+    'command accepts at most one path argument' \
+    boot-capacity-iso "$KERNEL_CAPACITY_ISO_OUTPUT" unexpected.iso
 check_kernel_media_dispatch "kernel smoke-media dispatches its exact smoke script" \
     $'script=media-smoke\nargc=0' \
     smoke-media

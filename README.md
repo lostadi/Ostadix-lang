@@ -1450,6 +1450,201 @@ environment. It does not establish physical-hardware, Secure Boot, measured
 boot, SMP, or release-qualification evidence. The ISO is optical-media output;
 use the separate raw GPT/ESP `.img` workflow for removable-media writing.
 
+#### Install absorbed OS, kernel, and userspace capacity
+
+The host-side absorbed-capacity manager installs exact OS, kernel, userspace,
+firmware, and bundle artifacts into an immutable content-addressed store. It
+keeps installed, active, and qualified states separate. Installation proves
+that the pinned bytes are present, and activation commits an exact dependency
+closure into a revisioned generation. Neither state by itself claims a
+successful boot, grants O authority, or qualifies a foreign system under
+O-core.
+
+The lowercase `o` front door routes the manager directly:
+
+```bash
+# Inspect the catalog record and its exact dependency closure.
+o capacity inspect ostadix-foreign-x86_64-bundle
+
+# Fetch, hash-check, and immutably install the complete x86_64 bundle.
+o capacity install ostadix-foreign-x86_64-bundle
+
+# Activate only the exact installed identities captured by this plan.
+CAPACITY_PLAN=/tmp/ostadix-capacity-plan.json
+o capacity plan ostadix-foreign-x86_64-bundle --output "$CAPACITY_PLAN"
+o capacity apply "$CAPACITY_PLAN"
+
+# Inspect the three separate states and rehash the retained store.
+o capacity list
+o capacity status
+o capacity verify
+```
+
+The default state root is
+`${XDG_STATE_HOME:-$HOME/.local/state}/ostadix/absorbed-capacity`, and the
+default strict catalog is
+[`evidence/absorbed_capacity_catalog.toml`](evidence/absorbed_capacity_catalog.toml).
+Use `--state PATH` before the subcommand to select another state root. Use
+`--source PACKAGE/ARTIFACT=/path/to/file` with `install` to consume an existing
+local copy without weakening its required byte length or SHA-256.
+
+The package manager does not decompress or modify media. The ISO workflow below
+uses the same repository-pinned identities through the foreign-kernel lab,
+which additionally prepares the exact expanded qcow2, livedisk, Linux-libre,
+and initramfs inputs needed for boot. See
+[`docs/ABSORBED_CAPACITY.md`](docs/ABSORBED_CAPACITY.md) for the package,
+transaction, rollback, and non-destructive garbage-collection contracts.
+
+#### Build the absorbed-capacity x86_64 UEFI ISO
+
+Build this larger profile on x86_64 Linux or in the Linux Multipass VM named
+`moral-gaur`. Its GRUB, x86_64 UEFI, GNU `cpio`, Alpine chroot, and ISO tooling
+make Linux the supported build substrate. On Lee's Apple Silicon host, use a
+native VM checkout such as `/home/ubuntu/Ostadix-lang`; do not run Cargo or
+large QEMU writes through the SSHFS-mounted host checkout.
+
+From the Linux checkout, install the opt-in tools:
+
+```bash
+./setup.sh --with-ocore-media --with-guest-tools --deps-only -y
+
+# Needed when moral-gaur is AArch64 and prepares an x86_64 Alpine chroot.
+sudo apt-get update
+sudo apt-get install -y qemu-user qemu-user-binfmt ovmf squashfs-tools
+```
+
+Dependency installation, guest fetching, and capacity-host preparation are
+explicit networked phases. After installing prerequisites, fetch only the five
+x86_64 profiles embedded by this ISO, then verify the complete cache without
+network access:
+
+```bash
+python3 scripts/foreign_kernel_lab.py fetch \
+  --guest linux-alpine-3.24.1-x86_64 \
+  --guest guix-system-1.5.0-x86_64 \
+  --guest openbsd-7.9-amd64 \
+  --guest plan9-9front-11983-amd64 \
+  --guest redox-0.9.0-server-x86_64
+
+python3 scripts/foreign_kernel_lab.py verify \
+  --guest linux-alpine-3.24.1-x86_64 \
+  --guest guix-system-1.5.0-x86_64 \
+  --guest openbsd-7.9-amd64 \
+  --guest plan9-9front-11983-amd64 \
+  --guest redox-0.9.0-server-x86_64
+
+sudo env \
+  OSTADIX_GUEST_ROOT="$HOME/.local/share/ostadix/guests" \
+  OSTADIX_CAPACITY_HOST_CACHE="$HOME/.cache/ostadix/capacity-host" \
+  ./scripts/prepare-x86_64-capacity-host.sh
+```
+
+The preparation command constructs the embedded Alpine/QEMU capacity-host
+initramfs from exact base-initramfs, minirootfs, and modloop inputs. It resolves
+the QEMU package closure from the configured Alpine v3.24 repositories, records
+that closure inside the initramfs, and prints the final byte length and SHA-256.
+After this point, the capacity ISO builder forces Cargo offline and downloads no
+guest media, so its Cargo dependencies must already be cached. Build,
+strictly inspect, and boot the image with:
+
+```bash
+o kernel capacity-iso
+
+CAPACITY_ISO="$PWD/target/ostadix-capacity-iso/x86_64/ostadix-absorbed-capacity-x86_64-uefi.iso"
+o kernel inspect-capacity-iso "$CAPACITY_ISO"
+
+# Interactive OVMF/QEMU TCG boot. Select with o/a/g/b/p/r or the arrow keys.
+o kernel boot-capacity-iso "$CAPACITY_ISO"
+```
+
+If the `o` wrapper is not installed, use the repository-owned entrypoints:
+
+```bash
+./ocore/kernel/build-x86_64-capacity-iso.sh "$CAPACITY_ISO"
+python3 scripts/ostadix_capacity_iso.py inspect "$CAPACITY_ISO"
+./ocore/kernel/run-x86_64-capacity-iso-qemu.sh "$CAPACITY_ISO"
+```
+
+The builder refuses to overwrite an existing ISO. Move an older image aside or
+pass a new output path when preserving multiple builds. In the canonical macOS
+checkout, place the finished artifact at:
+
+```text
+/Users/ustad/Ostadix-lang/target/ostadix-capacity-iso/x86_64/ostadix-absorbed-capacity-x86_64-uefi.iso
+```
+
+When the build runs in `moral-gaur`, copy the inspected VM artifact to that
+host path after leaving the VM:
+
+```bash
+CAPACITY_ISO=/Users/ustad/Ostadix-lang/target/ostadix-capacity-iso/x86_64/ostadix-absorbed-capacity-x86_64-uefi.iso
+mkdir -p "$(dirname "$CAPACITY_ISO")"
+multipass transfer \
+  moral-gaur:/home/ubuntu/Ostadix-lang/target/ostadix-capacity-iso/x86_64/ostadix-absorbed-capacity-x86_64-uefi.iso \
+  "$CAPACITY_ISO"
+python3 /Users/ustad/Ostadix-lang/scripts/ostadix_capacity_iso.py inspect "$CAPACITY_ISO"
+```
+
+The generated GRUB menu contains these exact paths:
+
+| Key | System | Boot path |
+|---|---|---|
+| `o` | OSTADIX O-core | Direct Multiboot2 kernel entry |
+| `a` | Alpine Linux 3.24.1 | Direct upstream Linux kernel and initramfs entry |
+| `g` | GNU Guix System 1.5.0 | Embedded Linux capacity host launches its Linux-libre kernel, initrd, and ISO under QEMU TCG |
+| `b` | OpenBSD 7.9 | Embedded Linux capacity host launches the offline installer ISO under QEMU TCG |
+| `p` | 9front Plan 9 build 11983 | Embedded Linux capacity host launches the read-only qcow2 under QEMU TCG |
+| `r` | Redox OS 0.9.0 | Embedded Linux capacity host launches the livedisk under QEMU TCG |
+
+The artifact built and verified on 2026-08-27 is:
+
+```text
+path:   /Users/ustad/Ostadix-lang/target/ostadix-capacity-iso/x86_64/ostadix-absorbed-capacity-x86_64-uefi.iso
+bytes:  3199778816
+sha256: a3c95fdfe3cbf6d077f9facb142900e43246be2ac9c179ad2a7dac68ab7612f6
+lock:   2389bb8e2f67f203fa3b0bc9793a3ee92b66a835f72a25561b4972e7121c07b4
+```
+
+Two independent builds were byte-identical. The transferred macOS copy was
+then re-inspected from its read-only path. Exact-disc QEMU TCG results were:
+
+| Entry | Exact-disc result |
+|---|---|
+| O-core | Direct Multiboot2 boot reached `O-core kernel: serial online` and its live kernel checks. |
+| Alpine | Direct Linux boot reached the initramfs shell and reported Linux `6.18.35-0-virt` on x86_64. |
+| Guix | The adapter mounted the disc, launched the pinned guest, booted Linux-libre `6.17.12-gnu`, and reached early-boot Guile. Shepherd did not appear within the bounded double-TCG exact-disc run; the fresh independent direct harness reached GNU Shepherd 1.0.9 and loaded its configuration. |
+| OpenBSD | The adapter mounted the disc and reached the OpenBSD/amd64 7.9 installer greeting. The independent direct UEFI harness reached the literal install/upgrade/autoinstall/shell prompt. |
+| 9front | Booted Plan 9, mounted `/dev/sdF0/fs` with HJFS as `glenda`, and reached `term%`. |
+| Redox | Booted Redox, mounted the live RedoxFS, started `ptyd`, and reached `redox login:`. |
+
+These observations were made in the AArch64 `moral-gaur` VM, so adapted
+entries used slow nested x86 TCG. They establish executable integration of the
+exact disc in that environment, not physical x86 qualification.
+
+GNU Guix System is Guile-defined and Guile-orchestrated userspace running on a
+Linux-libre kernel. It is not a Lisp-implemented kernel. The four virtualized
+entries boot a real embedded Alpine Linux capacity host first because a GRUB
+loopback device cannot remain attached after control passes to an unrelated
+guest kernel.
+
+The foreign-kernel manifest and absorbed-capacity catalog bind upstream
+artifacts by exact byte length and SHA-256. The ISO profile defines the typed
+entry, path, role, and adapter closure; the generated ISO lock then binds every
+staged byte, including the derived capacity-host initramfs, by exact length and
+SHA-256. Once the ISO exists, its outer capacity host and embedded QEMU adapters
+use no network, so selecting a menu entry requires no further download. The
+inspector is the source of the current ISO hash, size, lock hash, and entry
+inventory. The table above records the bounded results for the named hash only.
+A later build must be inspected and booted again before inheriting those
+observations.
+
+These virtualized paths are QEMU TCG integration evidence. They are not
+physical-machine, KVM/SVM, Secure Boot, measured-boot, device-isolation, World
+G7, or O-core-governance evidence. The foreign systems remain upstream guests,
+not personalities executing inside O-core. See
+[`docs/FOREIGN_KERNEL_LAB.md`](docs/FOREIGN_KERNEL_LAB.md) for their independent
+host-launched boot contracts and exact nonclaims.
+
 `o kernel console` builds probe mode 16 and prints the exact embedded package
 digest plus the currently usable commands before entering QEMU:
 

@@ -1,0 +1,308 @@
+schema = "ostadix.absorbed-capacity-catalog/v1"
+name = "ostadix-pinned-foreign-capacity"
+
+# These records bind artifact identity and provenance only.  They are not
+# qualification records and do not claim O-core governance or boot success.
+
+[[packages]]
+id = "alpine-linux-3.24.1-aarch64-kernel"
+name = "alpine-linux-kernel"
+version = "6.18.35-0-virt"
+kind = "kernel"
+architecture = "aarch64"
+loader = "linux"
+license = "GPL-2.0-only"
+redistribution = "permitted"
+requires_acceptance = false
+aliases = ["kernel/alpine-linux-aarch64"]
+description = "Repository-pinned Alpine Linux aarch64 virt kernel from the foreign-kernel lab."
+dependencies = []
+
+[[packages.artifacts]]
+id = "kernel"
+role = "kernel-image"
+filename = "vmlinuz-virt"
+source = "https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/aarch64/netboot-3.24.1/vmlinuz-virt"
+size_bytes = 10351104
+sha256 = "47970e0ee0478fe5c60824a89f162d5a353fa29466e5d3bddb0f9c506f1ed756"
+integrity = "Repository-pinned digest observed from Alpine's versioned HTTPS release member."
+
+[[packages]]
+id = "alpine-linux-3.24.1-aarch64-initramfs"
+name = "alpine-linux-initramfs"
+version = "3.24.1"
+kind = "userspace"
+architecture = "aarch64"
+loader = "none"
+license = "LicenseRef-Alpine-aggregate"
+redistribution = "permitted"
+requires_acceptance = false
+aliases = ["userspace/alpine-3.24-aarch64"]
+description = "Repository-pinned Alpine Linux aarch64 initramfs userspace from the foreign-kernel lab."
+dependencies = []
+
+[[packages.artifacts]]
+id = "initramfs"
+role = "initramfs"
+filename = "initramfs-virt"
+source = "https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/aarch64/netboot-3.24.1/initramfs-virt"
+size_bytes = 9385851
+sha256 = "e47d38bc88509a3db11affc09f9762f9643b026bd29441724a4729ad8e97add6"
+integrity = "Repository-pinned digest observed from Alpine's versioned HTTPS release member."
+
+[[packages]]
+id = "alpine-linux-3.24.1-aarch64"
+name = "alpine-linux"
+version = "3.24.1"
+kind = "os"
+architecture = "aarch64"
+loader = "linux"
+license = "LicenseRef-Alpine-aggregate"
+redistribution = "permitted"
+requires_acceptance = false
+aliases = ["os/alpine-aarch64"]
+description = "Exact composition of the pinned Alpine kernel and initramfs packages."
+artifacts = []
+
+[[packages.dependencies]]
+package = "alpine-linux-3.24.1-aarch64-kernel"
+kind = "kernel"
+
+[[packages.dependencies]]
+package = "alpine-linux-3.24.1-aarch64-initramfs"
+kind = "userspace"
+
+[[packages]]
+id = "alpine-linux-3.24.1-x86_64-kernel"
+name = "alpine-linux-kernel"
+version = "6.18.35-0-virt"
+kind = "kernel"
+architecture = "x86_64"
+loader = "linux"
+license = "GPL-2.0-only"
+redistribution = "permitted"
+requires_acceptance = false
+aliases = ["kernel/alpine-linux-x86_64"]
+description = "Repository-pinned Alpine Linux x86_64 virt kernel from the versioned netboot release."
+dependencies = []
+
+[[packages.artifacts]]
+id = "kernel"
+role = "kernel-image"
+filename = "vmlinuz-virt"
+source = "https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/x86_64/netboot-3.24.1/vmlinuz-virt"
+size_bytes = 12575744
+sha256 = "1e6bf9027720c75c3ed0d79171f21b5791ee40ca9795d07c7c6e04dc5ea2ae90"
+integrity = "Repository-pinned digest observed from Alpine's versioned x86_64 HTTPS release member."
+
+[[packages.artifacts]]
+id = "modloop"
+role = "kernel-modules"
+filename = "modloop-virt"
+source = "https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/x86_64/netboot-3.24.1/modloop-virt"
+size_bytes = 22867968
+sha256 = "78907e7cc812d555f08d4e1133d090cf11fa197370882adfe67b0a5986ccb3f9"
+integrity = "Repository-pinned matching Alpine virt kernel-module image used by the optical-media capacity host."
+
+[[packages]]
+id = "alpine-linux-3.24.1-x86_64-initramfs"
+name = "alpine-linux-initramfs"
+version = "3.24.1"
+kind = "userspace"
+architecture = "x86_64"
+loader = "none"
+license = "LicenseRef-Alpine-aggregate"
+redistribution = "permitted"
+requires_acceptance = false
+aliases = ["userspace/alpine-3.24-x86_64"]
+description = "Repository-pinned Alpine Linux x86_64 initramfs userspace from the versioned netboot release."
+dependencies = []
+
+[[packages.artifacts]]
+id = "initramfs"
+role = "initramfs"
+filename = "initramfs-virt"
+source = "https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/x86_64/netboot-3.24.1/initramfs-virt"
+size_bytes = 9637032
+sha256 = "6d80a739fedeeb6cd63e24dd208845e22199c41a5fb2054941ef61ec30264fa9"
+integrity = "Repository-pinned digest observed from Alpine's versioned x86_64 HTTPS release member."
+
+[[packages]]
+id = "alpine-linux-3.24.1-x86_64"
+name = "alpine-linux"
+version = "3.24.1"
+kind = "os"
+architecture = "x86_64"
+loader = "linux"
+license = "LicenseRef-Alpine-aggregate"
+redistribution = "permitted"
+requires_acceptance = false
+aliases = ["os/alpine-x86_64"]
+description = "Exact composition of the pinned Alpine x86_64 kernel and initramfs packages."
+artifacts = []
+
+[[packages.dependencies]]
+package = "alpine-linux-3.24.1-x86_64-kernel"
+kind = "kernel"
+
+[[packages.dependencies]]
+package = "alpine-linux-3.24.1-x86_64-initramfs"
+kind = "userspace"
+
+[[packages]]
+id = "freebsd-15.1-release-aarch64-bootonly"
+name = "freebsd"
+version = "15.1-RELEASE"
+kind = "os"
+architecture = "aarch64"
+loader = "uefi"
+license = "BSD-2-Clause"
+redistribution = "permitted"
+requires_acceptance = false
+aliases = ["os/freebsd-15.1-aarch64"]
+description = "Pinned compressed FreeBSD 15.1-RELEASE aarch64 boot-only installer media."
+dependencies = []
+
+[[packages.artifacts]]
+id = "media-xz"
+role = "compressed-install-media"
+filename = "FreeBSD-15.1-RELEASE-arm64-aarch64-bootonly.iso.xz"
+source = "https://download.freebsd.org/releases/ISO-IMAGES/15.1/FreeBSD-15.1-RELEASE-arm64-aarch64-bootonly.iso.xz"
+size_bytes = 96421460
+sha256 = "33e2dc303b5dce5a374727ba12c41c303db70fe0676e76333e09e0ea8cb2fbd0"
+integrity = "FreeBSD 15.1-RELEASE published SHA-256 checksum, as pinned by the foreign-kernel lab."
+
+[[packages]]
+id = "plan9-9front-11983-amd64"
+name = "9front"
+version = "11983"
+kind = "os"
+architecture = "x86_64"
+loader = "plan9"
+license = "LicenseRef-9front-aggregate"
+redistribution = "permitted"
+requires_acceptance = false
+aliases = ["os/9front-amd64", "os/plan9-amd64"]
+description = "Pinned compressed 9front build 11983 amd64 qcow2 media."
+dependencies = []
+
+[[packages.artifacts]]
+id = "disk-gz"
+role = "compressed-disk"
+filename = "9front-11983.amd64.qcow2.gz"
+source = "https://build.9front.org/9front/9front-11983.amd64.qcow2.gz"
+size_bytes = 257961445
+sha256 = "b96617b6eebcec8621a4c176e7acc29a1835ed09d4b61f9fe2e3e64c18d20867"
+integrity = "Official 9front build 11983 artifact tied to source commit 50aefa0743c8cfd83fdc7f568d24e1bba8b9848e; repository-observed digest."
+
+[[packages]]
+id = "guix-system-1.5.0-x86_64"
+name = "gnu-guix-system"
+version = "1.5.0"
+kind = "os"
+architecture = "x86_64"
+loader = "linux"
+license = "LicenseRef-Guix-System-aggregate"
+redistribution = "permitted"
+requires_acceptance = false
+aliases = ["os/guix-1.5-x86_64", "os/guile-defined-linux"]
+description = "Pinned GNU Guix System ISO, a Guile-defined and Guile-orchestrated userspace using Linux-libre as its kernel."
+dependencies = []
+
+[[packages.artifacts]]
+id = "media"
+role = "install-media"
+filename = "guix-system-install-1.5.0.x86_64-linux.iso"
+source = "https://ftp.gnu.org/gnu/guix/guix-system-install-1.5.0.x86_64-linux.iso"
+size_bytes = 1188261888
+sha256 = "107e0a8082f03a10b15c1fb9383d2d752c1cdeda41b8db575a15550e1c2d8b4a"
+integrity = "Official GNU Guix 1.5.0 ISO; its detached signature was independently validated during the foreign-kernel audit."
+
+[[packages.artifacts]]
+id = "media-signature"
+role = "detached-signature"
+filename = "guix-system-install-1.5.0.x86_64-linux.iso.sig"
+source = "https://ftp.gnu.org/gnu/guix/guix-system-install-1.5.0.x86_64-linux.iso.sig"
+size_bytes = 566
+sha256 = "fac1d7af22f7dd6598f7599295544061202002617d2aee23cf56bd0a40a67d60"
+integrity = "Pinned detached-signature bytes; the capacity manager records identity but does not invoke GPG or promote the audit to qualification."
+
+[[packages]]
+id = "redox-0.9.0-server-x86_64"
+name = "redox-os"
+version = "0.9.0"
+kind = "os"
+architecture = "x86_64"
+loader = "redox"
+license = "MIT"
+redistribution = "permitted"
+requires_acceptance = false
+aliases = ["os/redox-0.9-x86_64"]
+description = "Pinned compressed Redox OS 0.9.0 x86_64 server livedisk media."
+dependencies = []
+
+[[packages.artifacts]]
+id = "media-zst"
+role = "compressed-live-media"
+filename = "redox_server_x86_64_2024-09-07_1225_livedisk.iso.zst"
+source = "https://static.redox-os.org/releases/0.9.0/x86_64/redox_server_x86_64_2024-09-07_1225_livedisk.iso.zst"
+size_bytes = 70108737
+sha256 = "a73c3783a72a15eba8dd85dee941298cdd34e125a37008a3bcc7227b5f073e93"
+integrity = "Redox OS 0.9.0 published SHA256SUM, as pinned by the foreign-kernel lab."
+
+[[packages]]
+id = "openbsd-7.9-amd64-install"
+name = "openbsd"
+version = "7.9"
+kind = "os"
+architecture = "x86_64"
+loader = "uefi"
+license = "LicenseRef-OpenBSD-aggregate"
+redistribution = "permitted"
+requires_acceptance = false
+aliases = ["os/openbsd-7.9-amd64"]
+description = "Official OpenBSD 7.9 amd64 installation ISO, pinned to its exact published artifact identity."
+dependencies = []
+
+[[packages.artifacts]]
+id = "media"
+role = "install-media"
+filename = "install79.iso"
+source = "https://cdn.openbsd.org/pub/OpenBSD/7.9/amd64/install79.iso"
+size_bytes = 798625792
+sha256 = "7a4a92e953618035097c796a90b54424a0f3ae775552e1e7d102cf8a5130449f"
+integrity = "Official OpenBSD 7.9 amd64 SHA256 file and CDN Content-Length observed during the capacity audit."
+
+[[packages]]
+id = "ostadix-foreign-x86_64-bundle"
+name = "ostadix-foreign-systems"
+version = "1"
+kind = "bundle"
+architecture = "x86_64"
+loader = "none"
+license = "LicenseRef-Aggregate"
+redistribution = "permitted"
+requires_acceptance = false
+aliases = ["bundle/foreign-x86_64"]
+description = "Metadata-only exact composition of the pinned x86_64 foreign-system packages."
+artifacts = []
+
+[[packages.dependencies]]
+package = "plan9-9front-11983-amd64"
+kind = "os"
+
+[[packages.dependencies]]
+package = "guix-system-1.5.0-x86_64"
+kind = "os"
+
+[[packages.dependencies]]
+package = "redox-0.9.0-server-x86_64"
+kind = "os"
+
+[[packages.dependencies]]
+package = "openbsd-7.9-amd64-install"
+kind = "os"
+
+[[packages.dependencies]]
+package = "alpine-linux-3.24.1-x86_64"
+kind = "os"
