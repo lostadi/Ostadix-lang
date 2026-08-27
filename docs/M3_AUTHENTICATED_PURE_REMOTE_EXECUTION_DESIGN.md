@@ -201,6 +201,21 @@ Connection, TLS, authority, currentness, framing, digest, deadline, and output
 contract failures map to infrastructure/authority aborts, not O-language
 semantic errors. A selected remote failure never invokes the local renderer.
 
+## Delivered claim and proof boundary
+
+Fabric V1 can authenticate and execute the admitted M2 pure renderer profile on
+an explicitly selected `o-node`, returning a bounded provisional candidate
+whose graph publication and settlement remain coordinator-controlled.
+
+The same-host proof in `tests/execution_fabric_two_node.rs` launches two real
+`o-node` processes with separate ports, TLS and node identities, state
+directories, ledgers, node generations, and Fabric authority enrollment. It
+checks local-result equivalence on both nodes, cross-node lease rejection,
+wrong-node candidate rejection, infrastructure failure without local-renderer
+fallback when a selected node stops, and continued Hosted and Mesh ALPN
+operation. Process separation is the evidence boundary: M3 does not claim
+physical multinode, distinct-kernel, or heterogeneous-architecture execution.
+
 ## Module and commit split
 
 - M3a: narrow M2 accessors; reusable signing helper; additive placement V3;
@@ -209,10 +224,14 @@ semantic errors. A selected remote failure never invokes the local renderer.
   durable ledger; explicit `o-node` configuration.
 - M3c: `RemotePureAttemptDriver`, private token mapping, ordered coordinator
   validation bridge, and no-fallback failure mapping.
-- M3d: two-process proof, equivalence/tamper/replay/restart/ALPN regression
-  coverage, claims and version surfaces, architecture/AOT/source-release
-  inventories, and executable evidence.
+- M3d: same-host two-process proof, equivalence/tamper/replay/restart/ALPN
+  regression coverage, claims and version surfaces,
+  architecture/AOT/source-release inventories, and executable evidence.
 
-No layer in this split introduces cancellation, arbitrary OIR, object transfer,
-capacity scheduling, actors, effects, retry, coordinator journaling, hardware
-execution, migration, or graph authority on the provider.
+No layer in this split introduces arbitrary OIR region execution, general `.O`
+distribution, automatic placement, a capacity scheduler, scope transport, an
+object plane, bulk node-to-node data transfer, actors, external effects,
+automatic retry, coordinator crash recovery, hardware-resource execution, GPU
+or camera driver mediation, cancellation, process migration, a shared address
+space, physical-multinode, distinct-kernel, heterogeneous-architecture, or
+exactly-once-external-effect authority. The provider has no graph authority.

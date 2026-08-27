@@ -27,6 +27,17 @@ def string_constant(relative: str, name: str) -> str:
     return match.group(1)
 
 
+def byte_string_constant(relative: str, name: str) -> str:
+    source = read(relative)
+    match = re.search(
+        rf"\b{name}\b[^=]*=\s*b\"([^\"]+)\"\s*;",
+        source,
+    )
+    if match is None:
+        raise AssertionError(f"missing byte-string constant {name} in {relative}")
+    return match.group(1)
+
+
 def integer_constant(relative: str, name: str) -> int:
     source = read(relative)
     match = re.search(rf"\b{name}\b[^=]*=\s*(\d+)\s*;", source)
@@ -147,12 +158,70 @@ class GovernanceSurfaceTests(unittest.TestCase):
             ("crates/ostadix-api/src/information/decision.rs", "DECISION_RECEIPT_SCHEMA_V1"),
             ("crates/ostadix-api/src/information/decision.rs", "OBSERVATION_RECORD_SCHEMA_V1"),
             ("crates/ostadix-api/src/backend_morphism.rs", "BACKEND_MORPHISM_SCHEMA_V1"),
+            (
+                "crates/ostadix-api/src/execution_fabric/protocol.rs",
+                "EXECUTION_CAPSULE_SCHEMA_V1",
+            ),
+            (
+                "crates/ostadix-api/src/execution_fabric/protocol.rs",
+                "EXECUTION_CANDIDATE_SCHEMA_V1",
+            ),
+            (
+                "crates/ostadix-api/src/execution_fabric_authority/protocol.rs",
+                "FABRIC_REQUEST_SCHEMA_V1",
+            ),
+            (
+                "crates/ostadix-api/src/execution_fabric_authority/protocol.rs",
+                "FABRIC_RESPONSE_SCHEMA_V1",
+            ),
+            (
+                "crates/ostadix-api/src/execution_fabric_authority/protocol.rs",
+                "FABRIC_SUBMISSION_SCHEMA_V1",
+            ),
+            (
+                "crates/ostadix-api/src/execution_fabric_authority/protocol.rs",
+                "FABRIC_SOURCE_CLOSURE_SCHEMA_V1",
+            ),
+            (
+                "crates/ostadix-api/src/execution_fabric_authority/protocol.rs",
+                "FABRIC_SOURCE_CLOSURE_DIALECT_V1",
+            ),
+            (
+                "crates/ostadix-api/src/execution_fabric_authority/protocol.rs",
+                "FABRIC_PLACEMENT_LEASE_SCHEMA_V3",
+            ),
+            (
+                "crates/ostadix-api/src/execution_fabric_authority/protocol.rs",
+                "FABRIC_SIGNED_LEASE_SCHEMA_V3",
+            ),
+            (
+                "crates/ostadix-api/src/execution_fabric_authority/protocol.rs",
+                "FABRIC_TERMINAL_RECEIPT_SCHEMA_V1",
+            ),
+            (
+                "crates/ostadix-api/src/execution_fabric_authority/protocol.rs",
+                "FABRIC_SIGNED_TERMINAL_RECEIPT_SCHEMA_V1",
+            ),
         )
         for relative, name in constants:
             with self.subTest(name=name):
                 self.assertIn(f"`{name}`", versioning)
                 self.assertIn(f"`{relative}`", versioning)
                 self.assertIn(string_constant(relative, name), versioning)
+
+        fabric_alpns = (
+            ("HOSTED_TLS_ALPN_V1", "ostadix-hosted/1"),
+            ("HOSTED_TLS_ALPN_V2", "ostadix-hosted/2"),
+            ("HOSTED_TLS_ALPN_MESH_V1", "ostadix-mesh/1"),
+            ("EXECUTION_FABRIC_TLS_ALPN_V1", "ostadix-execution-fabric/1"),
+        )
+        alpn_source = "crates/ostadix-api/src/hosted_remote/tls.rs"
+        for name, expected in fabric_alpns:
+            with self.subTest(name=name):
+                self.assertEqual(byte_string_constant(alpn_source, name), expected)
+                self.assertIn(f"`{name}`", versioning)
+                self.assertIn(f"`{alpn_source}`", versioning)
+                self.assertIn(f"`{expected}`", versioning)
 
         world_constants = (
             ("crates/ostadix-api/src/world/protocol.rs", "WORLD_SCHEMA_V1"),
@@ -177,6 +246,48 @@ class GovernanceSurfaceTests(unittest.TestCase):
         self.assertIn("Hosted Placement V6", versioning)
         self.assertIn("not a source-level schema constant", versioning)
         self.assertIn("not execution authority", versioning)
+
+    def test_m3_execution_fabric_claim_and_nonclaims_are_exact(self) -> None:
+        positive_claim = (
+            "Fabric V1 can authenticate and execute the admitted M2 pure renderer "
+            "profile on an explicitly selected `o-node`, returning a bounded "
+            "provisional candidate whose graph publication and settlement remain "
+            "coordinator-controlled."
+        )
+        nonclaims = (
+            "no arbitrary OIR region execution",
+            "no general `.O` distribution",
+            "no automatic placement",
+            "no capacity scheduler",
+            "no scope transport",
+            "no object plane",
+            "no bulk node-to-node data transfer",
+            "no actors",
+            "no external effects",
+            "no automatic retry",
+            "no coordinator crash recovery",
+            "no hardware-resource execution",
+            "no GPU or camera driver mediation",
+            "no process migration",
+            "no shared address space",
+            "no physical multinode claim",
+            "no distinct-kernel claim",
+            "no heterogeneous-architecture claim",
+            "no exactly-once external effect claim",
+        )
+        for relative in ("docs/OIR_EXECUTION_FABRIC_V1.md", "docs/CLAIMS.md"):
+            body = read(relative)
+            with self.subTest(relative=relative, surface="positive claim"):
+                self.assertIn(positive_claim, body)
+            for nonclaim in nonclaims:
+                with self.subTest(relative=relative, nonclaim=nonclaim):
+                    self.assertIn(nonclaim, body)
+
+        invariant = (
+            "The coordinator is the sole graph-commit authority and the sole "
+            "linearization locus for graph transitions."
+        )
+        self.assertIn(invariant, read("docs/OIR_EXECUTION_FABRIC_V1.md"))
 
 
 if __name__ == "__main__":

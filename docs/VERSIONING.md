@@ -27,6 +27,8 @@ authorized, that an information projection is fresh, or that a World is live.
 | Backend catalog | `ostadix.backend-catalog/v5` | `crates/ostadix-api/src/backend_catalog.inc.rs` `current_schema` | Canonical backend specification and implementation-identity projection. V5 extends frozen V4 identity with one explicit optional bounded morphism-profile label per backend. |
 | Backend morphism | `ostadix.backend-morphism/v1` | `crates/ostadix-api/src/backend_morphism.rs` `BACKEND_MORPHISM_SCHEMA_V1` | Experimental shadow-only crossing kernel. Catalog V5 binds which profile applies, but does not enforce its assessment through evidence, admission, placement, or dispatch. |
 | Hosted transport | `ostadix.hosted-transport/v1`, `ostadix.hosted-transport/v2` | `crates/ostadix-api/src/hosted_remote/protocol.rs` `HOSTED_PROTOCOL_V1`; `crates/ostadix-api/src/hosted_remote/v2/protocol.rs` `HOSTED_PROTOCOL_V2`; `crates/ostadix-api/src/hosted_remote/v2/store.rs` `HOSTED_STATE_AUTHORITY_SCHEMA_V1` = `ostadix.hosted-state-authority/v1` | Frozen single-operation V1 and opt-in durable-session V2 wire contracts. Package 0.3 and later roots bind their durable state to current Graph V2/V6/placement V2 and reject older journals without migration. |
+| Pure execution records | `ostadix.oir-execution-capsule/v1`, `ostadix.oir-execution-candidate/v1` | `crates/ostadix-api/src/execution_fabric/protocol.rs` `EXECUTION_CAPSULE_SCHEMA_V1`, `EXECUTION_CANDIDATE_SCHEMA_V1` | Frozen M2 authority-free capsule and provisional-candidate records. M3 nests their exact canonical bytes and does not add node, transport, placement, TLS, or HGraph fields. |
+| Authenticated execution Fabric | ALPN `ostadix-execution-fabric/1`; request/response/submission/source-closure V1; placement lease V3; terminal receipt V1 | `crates/ostadix-api/src/hosted_remote/tls.rs` `EXECUTION_FABRIC_TLS_ALPN_V1`; `crates/ostadix-api/src/execution_fabric_authority/protocol.rs` `FABRIC_*` constants | Opt-in M3 transport and authority envelopes for the frozen pure profile. They authorize one exact provider attempt and return a provisional result; they confer no graph mutation, publication, or settlement authority. |
 | Placement milestone | Hosted Placement V6 | `docs/HOSTED_PLACEMENT_V6.md` | A placement/evidence milestone name, not a source-level schema constant and not an automatic conversion from archival Admission V5. |
 | World wire family | V1 | `crates/ostadix-api/src/world/protocol.rs` `WORLD_SCHEMA_V1`; codec constants under `crates/ostadix-api/src/world/` | Offline World record, identity, value, and receipt codecs. These coordinates do not establish a live World. |
 | Information kernel family | V1 | `INFORMATION_SCHEMA_V1` and record constants under `crates/ostadix-api/src/information/` | Authority-free, immutable information identities, deltas, projections, and receipts. Each record validates its own exact schema. |
@@ -180,6 +182,36 @@ commits to them.
     Provenance V2 is an additive sidecar keyed by `AtomIdV1`; a raw sidecar is
     descriptive, while verified provenance requires an opaque admitted handle
     returned after trusted contextual reanalysis.
+11. The M2 execution capsule and candidate remain frozen, and Hosted
+    `PlacementLeaseV2` retains its signed Hosted V2 meaning. Fabric
+    `PlacementLeaseV3` is additive and authorizes only the exact M3 pure
+    attempt. Fabric uses the exact opt-in `ostadix-execution-fabric/1` ALPN;
+    unknown or malformed traffic is never sniffed, uplifted, or routed to
+    Hosted or Mesh fallback. The provider's node-local `FabricAttemptLedgerV1`
+    is replay/fencing state, not the deferred M4 coordinator journal. The M3
+    delivery label is neither a wire-schema version nor the separate O-core M3
+    IPC milestone.
+
+The frozen M2 records, additive Fabric authority, and exact ALPN routes use
+these exported coordinates:
+
+| Constant | Literal value | Defining source |
+|---|---|---|
+| `EXECUTION_CAPSULE_SCHEMA_V1` | `ostadix.oir-execution-capsule/v1` | `crates/ostadix-api/src/execution_fabric/protocol.rs` |
+| `EXECUTION_CANDIDATE_SCHEMA_V1` | `ostadix.oir-execution-candidate/v1` | `crates/ostadix-api/src/execution_fabric/protocol.rs` |
+| `FABRIC_REQUEST_SCHEMA_V1` | `ostadix.execution-fabric-request/v1` | `crates/ostadix-api/src/execution_fabric_authority/protocol.rs` |
+| `FABRIC_RESPONSE_SCHEMA_V1` | `ostadix.execution-fabric-response/v1` | `crates/ostadix-api/src/execution_fabric_authority/protocol.rs` |
+| `FABRIC_SUBMISSION_SCHEMA_V1` | `ostadix.execution-fabric-submission/v1` | `crates/ostadix-api/src/execution_fabric_authority/protocol.rs` |
+| `FABRIC_SOURCE_CLOSURE_SCHEMA_V1` | `ostadix.execution-source-closure/v1` | `crates/ostadix-api/src/execution_fabric_authority/protocol.rs` |
+| `FABRIC_SOURCE_CLOSURE_DIALECT_V1` | `ostadix-source-closure/v1` | `crates/ostadix-api/src/execution_fabric_authority/protocol.rs` |
+| `FABRIC_PLACEMENT_LEASE_SCHEMA_V3` | `ostadix.execution-placement-lease/v3` | `crates/ostadix-api/src/execution_fabric_authority/protocol.rs` |
+| `FABRIC_SIGNED_LEASE_SCHEMA_V3` | `ostadix.signed-execution-lease/v3` | `crates/ostadix-api/src/execution_fabric_authority/protocol.rs` |
+| `FABRIC_TERMINAL_RECEIPT_SCHEMA_V1` | `ostadix.execution-fabric-terminal-receipt/v1` | `crates/ostadix-api/src/execution_fabric_authority/protocol.rs` |
+| `FABRIC_SIGNED_TERMINAL_RECEIPT_SCHEMA_V1` | `ostadix.signed-execution-fabric-terminal-receipt/v1` | `crates/ostadix-api/src/execution_fabric_authority/protocol.rs` |
+| `HOSTED_TLS_ALPN_V1` | `ostadix-hosted/1` | `crates/ostadix-api/src/hosted_remote/tls.rs` |
+| `HOSTED_TLS_ALPN_V2` | `ostadix-hosted/2` | `crates/ostadix-api/src/hosted_remote/tls.rs` |
+| `HOSTED_TLS_ALPN_MESH_V1` | `ostadix-mesh/1` | `crates/ostadix-api/src/hosted_remote/tls.rs` |
+| `EXECUTION_FABRIC_TLS_ALPN_V1` | `ostadix-execution-fabric/1` | `crates/ostadix-api/src/hosted_remote/tls.rs` |
 
 Execution Intent V1 continues to bind the solved graph V1 identity and the
 process's current backend-catalog projection. The V5 catalog rollover therefore

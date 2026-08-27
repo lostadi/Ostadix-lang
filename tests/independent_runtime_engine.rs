@@ -46,6 +46,18 @@ fn compatibility_modules_preserve_the_engine_type_identities() {
         ostadix_api::hosted_remote::v2::HostedV2RuntimeConfig
     );
     assert_same!(
+        o_lang::execution_fabric::ExecutionCapsuleV1,
+        ostadix_api::execution_fabric::ExecutionCapsuleV1
+    );
+    assert_same!(
+        o_lang::execution_fabric_authority::FabricTargetBindingV1,
+        ostadix_api::execution_fabric_authority::FabricTargetBindingV1
+    );
+    assert_same!(
+        o_lang::hosted_remote::RemotePureExecutionConfigV1,
+        ostadix_api::hosted_remote::RemotePureExecutionConfigV1
+    );
+    assert_same!(
         o_lang::project::LogicalHGraphV1,
         ostadix_api::project::LogicalHGraphV1
     );

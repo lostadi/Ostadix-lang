@@ -10,6 +10,13 @@ records session mutations in a node-signed hash-chain journal. Both transports
 require an operator-selected node. None of these pieces implements an OSTADIX
 World.
 
+Authenticated Execution Fabric V1 is a separate additive protocol, not a third
+Hosted transport. Its `PlacementLeaseV3` authorizes one exact frozen M2 pure
+renderer attempt on an explicitly selected node. It neither reinterprets nor
+migrates Hosted `PlacementLeaseV2`, Hosted V2 sessions, or Project Mesh
+authority. Selection is explicit, and a failed Fabric target does not fall back
+to the local renderer.
+
 The profile has deliberately narrow authority:
 
 - the placement core models requirements, targets, warrants, capacity, and

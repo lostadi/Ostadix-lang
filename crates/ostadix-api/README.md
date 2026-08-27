@@ -20,8 +20,11 @@ assert_eq!(value, OValue::Null);
 ```
 
 Advanced consumers may use the versioned engine modules directly, including
-`parser`, `ir`, `hgraph`, `evidence`, `placement`, `hosted_remote`, `world`,
-and `information`.
+`parser`, `ir`, `hgraph`, `evidence`, `placement`, `execution_fabric`,
+`execution_fabric_authority`, `hosted_remote`, `world`, and `information`.
+The Fabric modules expose frozen authority-free execution records and additive
+authenticated attempt authority; a remote result remains provisional, and the
+coordinator alone may publish or settle graph state.
 
 The repository-root `o-lang` package is the compatibility and CLI shell. It
 depends one-way on this engine and explicitly reexports the historical module

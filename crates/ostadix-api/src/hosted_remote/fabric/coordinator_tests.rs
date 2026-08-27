@@ -421,6 +421,25 @@ fn wrong_tls_principal_stops_at_gate_02() {
 }
 
 #[test]
+fn terminal_from_prior_execution_cell_incarnation_stops_at_gate_07() {
+    let fixture = acceptance_fixture();
+    let current = fixture.prepared.target.execution_cell_incarnation().get();
+    assert!(
+        current > 1,
+        "fixture needs a representable prior incarnation"
+    );
+    let terminal = resign_terminal(
+        &fixture,
+        encode_execution_candidate_v1(&fixture.candidate).unwrap(),
+        |receipt| {
+            *value_field_mut(receipt, &["execution_cell_incarnation"]) = Value::from(current - 1);
+        },
+    );
+
+    assert_gate(7, &fixture, &terminal);
+}
+
+#[test]
 fn candidate_payload_digest_is_gate_17_not_gate_01() {
     let fixture = acceptance_fixture();
     let mut changed = fixture.candidate.clone();

@@ -36,6 +36,7 @@ cargo build --workspace --all-targets --all-features --verbose
 bash scripts/check_declared_bins.sh
 cargo test --workspace --all-targets --all-features --verbose
 cargo test --package ostadix-api
+cargo test --locked --package o-lang --test execution_fabric_two_node -- --nocapture --test-threads=1
 bash scripts/smoke-hosted-live-reference.sh
 bash scripts/smoke-world-resource-keys.sh
 bash scripts/smoke-project-hgraph.sh
@@ -49,6 +50,8 @@ cargo clippy --locked --manifest-path mcp/ostadix_lang_mcp_server/Cargo.toml -- 
 cargo build --release --locked --manifest-path mcp/ostadix_lang_mcp_server/Cargo.toml
 python3 scripts/smoke_ostadix_mcp.py
 python3 scripts/release_evidence.py validate
+python3 scripts/check_architecture_boundaries.py
+python3 scripts/contract_surfaces.py validate
 cargo test --package o-lang --test world_identity_wire
 ./ocore/kernel/smoke-world-identity-qemu.sh
 ./ocore/kernel/smoke-world-value-qemu.sh
@@ -69,6 +72,18 @@ bash scripts/check_release_claims.sh
 python3 -m unittest -v tests.test_source_release
 python3 scripts/local_ci_posture.py --profile baseline --format text
 ```
+
+The M3 Fabric command must launch two real same-host `o-node` processes with
+separate ports, TLS identities, node identities, state directories, ledgers,
+node generations, and explicit Fabric authority enrollment. Evidence must show
+that both nodes match direct local execution, a node-A lease is rejected by
+node B, a wrong-node result cannot enter coordinator acceptance, stopping a
+selected node produces an infrastructure failure with no local-renderer
+fallback, and Hosted plus Mesh ALPN routes still work. This is a same-host
+process-boundary gate, not physical-multinode, distinct-kernel, or
+heterogeneous-architecture evidence. The exact positive claim and all M3
+nonclaims are frozen in
+[`OIR_EXECUTION_FABRIC_V1.md`](OIR_EXECUTION_FABRIC_V1.md).
 
 The posture command is a standard-library-only, read-only contract check. See
 [`CI_POSTURE.md`](CI_POSTURE.md) for its machine-readable form, optional local

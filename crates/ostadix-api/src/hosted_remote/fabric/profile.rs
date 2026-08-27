@@ -298,6 +298,20 @@ pub(crate) fn trusted_inline_fabric_profile_v1(
     })
 }
 
+/// Return the canonical realization-pipeline identity for one current
+/// deterministic trusted-inline backend.
+///
+/// This is a read-only configuration surface for explicit Fabric targets. It
+/// does not admit work, construct a renderer command, grant execution
+/// authority, or expose the sealed implementation profile.
+pub fn trusted_inline_fabric_realization_pipeline_sha256_v1(
+    backend: &str,
+) -> anyhow::Result<SemanticDigestV1> {
+    let interface = BackendRegistry::global().interface_for(backend);
+    let profile = trusted_inline_fabric_profile_v1(&interface).map_err(anyhow::Error::new)?;
+    Ok(profile.realization_pipeline_sha256().clone())
+}
+
 #[derive(Serialize)]
 struct TrustedInlineRealizationMaterialV1<'a> {
     schema: &'static str,

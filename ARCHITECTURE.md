@@ -71,7 +71,13 @@ executable repository contracts:
   `crates/ostadix-api/src/backend_state.rs` are canonical lower seams for execution policy,
   evaluator-independent graph execution, and backend lifecycle state. Their
   historical public paths preserve type identity without recompiling the
-  implementation or reopening the higher realization roots.
+  implementation or reopening the higher realization roots;
+- `execution_fabric` owns the frozen authority-free capsule and candidate
+  records below `execution_fabric_authority`, which adds signed transport and
+  placement bindings. `hosted_remote` is the higher realization layer that
+  owns Fabric TLS, provider, ledger, realizer, client, and remote-driver code.
+  `executor` remains protocol-neutral: it consumes the unchanged five-method
+  `AttemptDriver` seam and does not import Fabric transport or authority types.
 
 [`ci/architecture-roots.toml`](ci/architecture-roots.toml) is the executable
 root-dependency contract. It declares every current production root, allowed
@@ -102,8 +108,8 @@ runtime implementation outside its CLI entrypoints.
 Facades bind an unconditionally public owner and exact public alias or glob
 projection. The checker then rejects undeclared roots and edges, retains
 the narrow semantic rules above, and runs Tarjan's algorithm over the observed
-root graph. The frozen baseline contains 152 production engine module files,
-41 roots, 179 cross-root edges, and zero multi-root strongly connected
+root graph. The frozen baseline contains 178 production engine module files,
+44 roots, 211 cross-root edges, and zero multi-root strongly connected
 components. The separately scanned include fragment has no cross-root edge.
 
 That is a root-level acyclicity claim only. Dependencies and bounded strongly

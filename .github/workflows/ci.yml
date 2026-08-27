@@ -209,6 +209,9 @@ jobs:
           cargo +1.97.1 test --locked --package o-lang --test hosted_remote_v2
           cargo +1.97.1 test --locked --package o-lang --test placement_v6
           cargo +1.97.1 test --locked --package o-lang --test registry_v1
+      - name: Prove authenticated two-o-node Fabric boundary
+        timeout-minutes: 3
+        run: bash scripts/smoke-execution-fabric-v1.sh
       - name: Run hosted semantic smokes
         run: |
           O_RELEASE_BIN="$PWD/target/debug/O" OLANGC_RELEASE_BIN="$PWD/target/debug/olangc" \

@@ -177,7 +177,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         self.assertEqual(
             result.stdout,
             "architecture dependency boundaries: PASS "
-            "(174 production files, 44 roots, 211 cross-root edges)\n",
+            "(178 production files, 44 roots, 211 cross-root edges)\n",
         )
 
     def test_manifest_inventories_every_current_root_edge_override_and_facade(self) -> None:
@@ -1336,6 +1336,75 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         self.assertIn(
             "root edge `canonical_cbor -> value` is not declared", result.stderr
         )
+
+    def test_execution_fabric_protocol_root_cannot_import_authority_or_runtime_layers(
+        self,
+    ) -> None:
+        for forbidden in (
+            "execution_fabric_authority",
+            "eval",
+            "executor",
+            "hgraph",
+            "hosted_remote",
+            "placement",
+            "project",
+            "runtime_exec",
+        ):
+            with self.subTest(forbidden=forbidden), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                write_minimal_tree(root)
+                (root / "crates/ostadix-api/src/execution_fabric.rs").write_text(
+                    f"use crate::{forbidden}::Boundary;\n",
+                    encoding="utf-8",
+                )
+                result = run_checker(root)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn(
+                f"root edge `execution_fabric -> {forbidden}` is not declared",
+                result.stderr,
+            )
+
+    def test_execution_fabric_authority_cannot_import_transport_or_graph_authority(
+        self,
+    ) -> None:
+        for forbidden in (
+            "eval",
+            "executor",
+            "hgraph",
+            "hosted_remote",
+            "project",
+            "runtime_exec",
+            "world",
+        ):
+            with self.subTest(forbidden=forbidden), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                write_minimal_tree(root)
+                (
+                    root
+                    / "crates/ostadix-api/src/execution_fabric_authority.rs"
+                ).write_text(
+                    f"use crate::{forbidden}::Boundary;\n",
+                    encoding="utf-8",
+                )
+                result = run_checker(root)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn(
+                "root edge `execution_fabric_authority -> "
+                f"{forbidden}` is not declared",
+                result.stderr,
+            )
+
+    def test_hosted_remote_adapter_can_consume_both_fabric_layers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "crates/ostadix-api/src/hosted_remote.rs").write_text(
+                "use crate::execution_fabric::Boundary;\n"
+                "use crate::execution_fabric_authority::Boundary as AuthorityBoundary;\n",
+                encoding="utf-8",
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_native_roots_cannot_depend_back_on_information_bridge(self) -> None:
         for native_root in (

@@ -942,6 +942,7 @@ class SourceReleaseTests(unittest.TestCase):
             "ocore/world/value_codec.oc": "module world::value_codec;\n",
             "scripts/smoke_ostadix_mcp.py": "#!/usr/bin/env python3\n",
             "scripts/smoke-docker.sh": "#!/usr/bin/env bash\n",
+            "scripts/smoke-execution-fabric-v1.sh": "#!/usr/bin/env bash\n",
             "scripts/smoke-zero-config-lan-netns.sh": "#!/usr/bin/env bash\n",
             "scripts/semantic_custody_demo.sh": "#!/usr/bin/env bash\n",
             "scripts/contract_surfaces.py": "#!/usr/bin/env python3\n",
@@ -1130,6 +1131,10 @@ class SourceReleaseTests(unittest.TestCase):
             "tests/test_bundled_shim_protocol.py": "# fixture bundled shim protocol tests\n",
             "tests/backend_morphism_v1.rs": "#[test] fn backend_morphism_fixture() {}\n",
             "tests/test_world_alpha_evidence.py": "# fixture World evidence tests\n",
+            "tests/execution_fabric_two_node.rs": (
+                "#[test]\n"
+                "fn two_real_o_nodes_execute_provisional_pure_candidates_without_graph_authority() {}\n"
+            ),
             "tests/hosted_remote_cli.rs": "#[test] fn hosted_remote_cli_fixture() {}\n",
             "tests/project_mesh_cli.rs": "#[test] fn project_mesh_cli_fixture() {}\n",
             "tests/support/mod.rs": "// fixture shared integration-test support\n",
@@ -1199,6 +1204,7 @@ class SourceReleaseTests(unittest.TestCase):
                     "scripts/ostadix_physical_evidence.py",
                     "scripts/benchmark_hgraph_hosted.sh",
                     "scripts/install-o-cli-wrapper.sh",
+                    "scripts/smoke-execution-fabric-v1.sh",
                     "scripts/smoke-zero-config-lan-netns.sh",
                     "scripts/smoke-project-hgraph-exec.sh",
                     "scripts/smoke-project-hgraph.sh",
@@ -1453,6 +1459,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "ocore/world/value_codec.oc",
                 "scripts/smoke_ostadix_mcp.py",
                 "scripts/smoke-docker.sh",
+                "scripts/smoke-execution-fabric-v1.sh",
                 "scripts/smoke-zero-config-lan-netns.sh",
                 "scripts/semantic_custody_demo.sh",
                 "scripts/contract_surfaces.py",
@@ -1637,6 +1644,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "tests/test_bundled_shim_protocol.py",
                 "tests/backend_morphism_v1.rs",
                 "tests/test_world_alpha_evidence.py",
+                "tests/execution_fabric_two_node.rs",
                 "tests/hosted_remote_cli.rs",
                 "tests/project_mesh_cli.rs",
                 "tests/hosted_remote_v2.rs",
@@ -1722,6 +1730,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "scripts/ostadix_boot_info_qemu.py",
                 "scripts/ostadix_media_writer.py",
                 "scripts/ostadix_physical_evidence.py",
+                "scripts/smoke-execution-fabric-v1.sh",
             ):
                 self.assertEqual(modes[executable_path], "100755")
             self.assertEqual(modes["ocore/kernel/x86_64/grub.cfg"], "100644")
@@ -2633,6 +2642,8 @@ class SourceReleaseTests(unittest.TestCase):
         required = (
             "docs/OIR_EXECUTION_FABRIC_V1.md",
             "docs/M3_AUTHENTICATED_PURE_REMOTE_EXECUTION_DESIGN.md",
+            "scripts/smoke-execution-fabric-v1.sh",
+            "tests/execution_fabric_two_node.rs",
             "crates/ostadix-api/src/execution_fabric/codec.rs",
             "crates/ostadix-api/src/execution_fabric/protocol.rs",
             "crates/ostadix-api/src/execution_fabric_authority/mod.rs",

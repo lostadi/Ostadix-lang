@@ -20,6 +20,7 @@ pub use keys::{
     write_new_fabric_node_signing_key_v1, write_new_fabric_public_key_v1,
 };
 pub(crate) use profile::trusted_inline_fabric_profile_v1;
+pub use profile::trusted_inline_fabric_realization_pipeline_sha256_v1;
 pub(crate) use provider::serve_fabric_stream_v1;
 pub use provider::{FabricAttemptProviderConfigV1, FabricAttemptProviderV1};
 pub use wire::{

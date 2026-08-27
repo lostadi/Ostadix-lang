@@ -7,6 +7,21 @@ Package SemVer is only one of the independent coordinates documented in
 
 ## [Unreleased]
 
+### Added
+
+- M3 Authenticated Pure Remote Execution Fabric V1 can authenticate and
+  execute the admitted frozen M2 pure renderer profile on an explicitly
+  selected `o-node`, returning only a bounded provisional candidate. The
+  coordinator remains the sole graph-commit authority and sole linearization
+  locus for graph transitions; candidate validation, publication, and
+  settlement remain coordinator-owned.
+- A same-host integration proof launches two real `o-node` processes with
+  separate transport/node identities, ports, generations, state roots, ledgers,
+  and Fabric authority enrollment. It checks local-result equivalence,
+  cross-node authority and result rejection, infrastructure failure without
+  local fallback, and preservation of Hosted and Mesh ALPN routes. It makes no
+  physical-multinode, distinct-kernel, or heterogeneous-architecture claim.
+
 ### Changed
 
 - Project authorship metadata and new commit attribution now reject Claude and

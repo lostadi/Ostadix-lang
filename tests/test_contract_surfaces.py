@@ -58,6 +58,40 @@ class ContractSurfacesTests(unittest.TestCase):
         ):
             self.assertEqual(smoke.count(marker), 1)
 
+    def test_execution_fabric_smoke_is_governed_in_the_hosted_lane(self) -> None:
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        contracts.validate_execution_fabric_smoke_contract(workflow)
+        hosted_job = contracts.workflow_job_body(workflow, "rust-hosted")
+        self.assertEqual(
+            hosted_job.count("bash scripts/smoke-execution-fabric-v1.sh"),
+            1,
+        )
+
+        smoke = contracts.EXECUTION_FABRIC_SMOKE.read_text(encoding="utf-8")
+        self.assertEqual(smoke.count("--test execution_fabric_two_node"), 1)
+        self.assertEqual(smoke.count("OSTADIX_TEST_RUNTIME_POLICY=required"), 1)
+        self.assertEqual(
+            smoke.count(
+                f"test_name={contracts.EXECUTION_FABRIC_TWO_NODE_TEST_NAME}"
+            ),
+            1,
+        )
+        for marker in contracts.EXECUTION_FABRIC_SMOKE_MARKERS:
+            self.assertEqual(smoke.count(marker), 1)
+        self.assertIn("Same-host, distinct-process", smoke)
+        self.assertIn("not distinct-kernel, physical-multinode", smoke)
+        self.assertIn("heterogeneous-hardware evidence", smoke)
+
+        two_node = contracts.EXECUTION_FABRIC_TWO_NODE_TEST.read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(
+            two_node.count(
+                f"fn {contracts.EXECUTION_FABRIC_TWO_NODE_TEST_NAME}()"
+            ),
+            1,
+        )
+
     def test_openssl_probe_uses_the_authoritative_version_subcommand(self) -> None:
         probe = contracts.runtime_probes()["openssl"]
         self.assertEqual(probe, {"executable": "openssl", "probe_args": ["version"]})
