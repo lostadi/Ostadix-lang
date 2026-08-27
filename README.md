@@ -1383,6 +1383,73 @@ o kernel record-physical --intent intent.json --transcript serial.log \
   --output observation.json
 ```
 
+#### Build the bootable x86_64 UEFI ISO
+
+Run the ISO workflow from the repository root. The automatic media profile is
+supported on macOS with Homebrew and Debian-family Linux:
+
+```bash
+# Install the O-core and boot-media dependencies, then verify them without
+# building an image.
+./setup.sh --with-ocore-media -y
+o kernel doctor-media
+```
+
+The required media tools are an x86_64 EFI-capable `grub-mkrescue`, its
+`x86_64-efi` GRUB module directory, mtools, `xorriso`, Python 3,
+`qemu-system-x86_64`, and an OVMF/edk2 x86_64 firmware image. The ordinary
+O-core compiler, Clang, LLD-compatible linker, and ELF inspection tools are
+also required. On another host, install those tools manually and run
+`./setup.sh --with-ocore-media --check` before building.
+
+Build and strictly inspect the default image:
+
+```bash
+o kernel iso
+
+ISO="$PWD/target/ostadix-iso/x86_64/ostadix-x86_64-uefi.iso"
+o kernel inspect-iso "$ISO"
+```
+
+`o kernel iso` builds the current mode-0 O-core kernel, packages it as
+`/boot/kernel.elf` in an ISO9660/El Torito UEFI no-emulation image, validates
+the complete container, and atomically publishes the ISO with write-permission
+bits cleared. The inspector prints canonical JSON containing the complete ISO,
+kernel, EFI image, EFI executable, and GRUB configuration hashes.
+
+To choose a different output path, pass it to the builder:
+
+```bash
+ISO="$PWD/target/ostadix-iso/x86_64/ostadix-development.iso"
+o kernel iso "$ISO"
+o kernel inspect-iso "$ISO"
+```
+
+If the `o` wrapper has not been installed, invoke the repository tools
+directly:
+
+```bash
+ISO="${ISO:-$PWD/target/ostadix-iso/x86_64/ostadix-x86_64-uefi.iso}"
+./ocore/kernel/build-x86_64-uefi-iso.sh "$ISO"
+python3 scripts/ostadix_boot_iso.py inspect "$ISO"
+```
+
+Boot the selected image interactively through OVMF/QEMU TCG, or run the
+automated deterministic rebuild and boot gate:
+
+```bash
+# Exit the interactive serial session with Ctrl-A X.
+OSTADIX_ISO_IMAGE="$ISO" o kernel boot-iso
+
+# Rebuild twice, require byte identity, inspect, boot, and verify liveness.
+o kernel smoke-iso
+```
+
+The smoke gate proves the exact ISO under QEMU TCG in the current toolchain and
+environment. It does not establish physical-hardware, Secure Boot, measured
+boot, SMP, or release-qualification evidence. The ISO is optical-media output;
+use the separate raw GPT/ESP `.img` workflow for removable-media writing.
+
 `o kernel console` builds probe mode 16 and prints the exact embedded package
 digest plus the currently usable commands before entering QEMU:
 
