@@ -20,6 +20,7 @@ pub mod eval;
 pub(crate) mod eval_core;
 pub mod evidence;
 pub mod execution_contract;
+pub mod execution_fabric;
 pub mod executor;
 pub mod hgraph;
 pub mod hosted_remote;

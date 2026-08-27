@@ -768,6 +768,7 @@ class SourceReleaseTests(unittest.TestCase):
             "docs/HOSTED_PLACEMENT_V6.md": "fixture hosted placement contract\n",
             "docs/PROJECT_MESH_V1.md": "fixture project mesh contract\n",
             "docs/UNIFIED_INTENT_FRONT_DOOR_V1.md": "fixture unified intent front door contract\n",
+            "docs/OIR_EXECUTION_FABRIC_V1.md": "fixture OIR execution-fabric contract\n",
             "docs/KERNEL_WORLD_CONTRACT.md": "fixture kernel World contract\n",
             "docs/HOSTED_WORLD_REFERENCE_PROFILE.md": WORLD_NORMATIVE_BYTES[
                 "docs/HOSTED_WORLD_REFERENCE_PROFILE.md"
@@ -978,6 +979,8 @@ class SourceReleaseTests(unittest.TestCase):
             "crates/ostadix-api/src/executor/driver.rs": "// fixture attempt-driver boundary\n",
             "crates/ostadix-api/src/executor/pool.rs": "// fixture persistent local-worker pool\n",
             "crates/ostadix-api/src/executor/task.rs": "// fixture prepared-task contract\n",
+            "crates/ostadix-api/src/execution_fabric/codec.rs": "// fixture execution-fabric codec\n",
+            "crates/ostadix-api/src/execution_fabric/protocol.rs": "// fixture execution-fabric protocol\n",
             "crates/ostadix-api/src/hgraph/graph.rs": "// fixture HGraph validation\n",
             "crates/ostadix-api/src/hgraph/kinds.rs": "// fixture HGraph operation vocabulary\n",
             "crates/ostadix-api/src/hgraph/from_oir.rs": "// fixture HGraph effect lowering\n",
@@ -1314,6 +1317,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "docs/HOSTED_PLACEMENT_V6.md",
                 "docs/PROJECT_MESH_V1.md",
                 "docs/UNIFIED_INTENT_FRONT_DOOR_V1.md",
+                "docs/OIR_EXECUTION_FABRIC_V1.md",
                 "docs/HOSTED_WORLD_REFERENCE_PROFILE.md",
                 "docs/KERNEL_WORLD_CONTRACT.md",
                 "docs/O_MACHINE_CONTRACT.md",
@@ -1468,6 +1472,8 @@ class SourceReleaseTests(unittest.TestCase):
                 "crates/ostadix-api/src/executor/driver.rs",
                 "crates/ostadix-api/src/executor/pool.rs",
                 "crates/ostadix-api/src/executor/task.rs",
+                "crates/ostadix-api/src/execution_fabric/codec.rs",
+                "crates/ostadix-api/src/execution_fabric/protocol.rs",
                 "crates/ostadix-api/src/hgraph/graph.rs",
                 "crates/ostadix-api/src/hgraph/kinds.rs",
                 "crates/ostadix-api/src/hgraph/from_oir.rs",
@@ -2567,6 +2573,21 @@ class SourceReleaseTests(unittest.TestCase):
             r"crates/ostadix-api/src/executor/task\.rs",
         ):
             self._build("missing-prepared-task-pool.zip")
+
+    def test_execution_fabric_profile_and_codec_surface_are_required(self) -> None:
+        required = (
+            "docs/OIR_EXECUTION_FABRIC_V1.md",
+            "crates/ostadix-api/src/execution_fabric/codec.rs",
+            "crates/ostadix-api/src/execution_fabric/protocol.rs",
+        )
+        self._commit()
+        self._git("rm", *required)
+        self._git("commit", "-q", "-m", "remove execution-fabric release closure")
+
+        self._assert_missing_required_paths(
+            "missing-execution-fabric-profile.zip",
+            required,
+        )
 
     def test_unified_intent_front_door_contract_and_acceptance_are_required(
         self,
