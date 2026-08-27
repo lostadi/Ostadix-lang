@@ -1025,6 +1025,11 @@ fn write_runtime_sources(src_dir: &Path) -> Result<()> {
         src_dir.join("execution_contract.rs"),
         RUNTIME_EXECUTION_CONTRACT_RS,
     )?;
+    let execution_fabric_dir = src_dir.join("execution_fabric");
+    fs::create_dir_all(&execution_fabric_dir)?;
+    for &(relative_path, source) in RUNTIME_EXECUTION_FABRIC_SOURCES {
+        fs::write(execution_fabric_dir.join(relative_path), source)?;
+    }
     fs::write(src_dir.join("eval_core.rs"), RUNTIME_EVAL_CORE_RS)?;
     fs::write(src_dir.join("eval.rs"), RUNTIME_EVAL_RS)?;
     fs::write(src_dir.join("process.rs"), RUNTIME_PROCESS_RS)?;
@@ -1887,6 +1892,7 @@ pub mod registry;
 pub mod ir;
 pub mod effects;
 pub mod execution_contract;
+pub mod execution_fabric;
 pub(crate) mod eval_core;
 pub mod evidence;
 pub mod hgraph;
@@ -2760,6 +2766,7 @@ mod tests {
         assert!(lib_rs.contains("pub mod evidence;"));
         assert!(lib_rs.contains("pub mod hgraph;"));
         assert!(lib_rs.contains("pub mod executor;"));
+        assert!(lib_rs.contains("pub mod execution_fabric;"));
         assert!(lib_rs.contains("pub mod runtime_exec;"));
         assert!(lib_rs.contains("pub mod resource_identity;"));
         assert!(lib_rs.contains("pub mod world;"));
@@ -2782,6 +2789,9 @@ mod tests {
             "environment.rs",
             "effects.rs",
             "execution_contract.rs",
+            "execution_fabric/mod.rs",
+            "execution_fabric/codec.rs",
+            "execution_fabric/protocol.rs",
             "eval_core.rs",
             "runtime_exec.rs",
             "placement/mod.rs",
@@ -2889,6 +2899,13 @@ mod tests {
             RUNTIME_EXECUTION_CONTRACT_RS,
             "generated runtimes must receive the canonical execution contract verbatim"
         );
+        for &(relative_path, source) in RUNTIME_EXECUTION_FABRIC_SOURCES {
+            assert_eq!(
+                fs::read_to_string(src_dir.join("execution_fabric").join(relative_path)).unwrap(),
+                source,
+                "generated runtimes must receive execution-fabric source {relative_path} verbatim"
+            );
+        }
         assert_eq!(
             fs::read_to_string(src_dir.join("eval_core.rs")).unwrap(),
             RUNTIME_EVAL_CORE_RS,
