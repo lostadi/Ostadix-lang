@@ -975,6 +975,7 @@ class SourceReleaseTests(unittest.TestCase):
             "crates/ostadix-api/src/ocore/driver.rs": "// fixture O-core target driver\n",
             "crates/ostadix-api/src/ocore/mod.rs": "// fixture O-core module exports\n",
             "crates/ostadix-api/src/executor/mod.rs": "// fixture public executor effects surface\n",
+            "crates/ostadix-api/src/executor/driver.rs": "// fixture attempt-driver boundary\n",
             "crates/ostadix-api/src/executor/pool.rs": "// fixture persistent local-worker pool\n",
             "crates/ostadix-api/src/executor/task.rs": "// fixture prepared-task contract\n",
             "crates/ostadix-api/src/hgraph/graph.rs": "// fixture HGraph validation\n",
@@ -1464,6 +1465,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "crates/ostadix-api/src/ocore/driver.rs",
                 "crates/ostadix-api/src/ocore/mod.rs",
                 "crates/ostadix-api/src/executor/mod.rs",
+                "crates/ostadix-api/src/executor/driver.rs",
                 "crates/ostadix-api/src/executor/pool.rs",
                 "crates/ostadix-api/src/executor/task.rs",
                 "crates/ostadix-api/src/hgraph/graph.rs",
@@ -2548,10 +2550,11 @@ class SourceReleaseTests(unittest.TestCase):
         ):
             release.verify_archive(tampered)
 
-    def test_prepared_task_pool_surface_is_required(self) -> None:
+    def test_prepared_task_driver_pool_surface_is_required(self) -> None:
         self._commit()
         self._git(
             "rm",
+            "crates/ostadix-api/src/executor/driver.rs",
             "crates/ostadix-api/src/executor/pool.rs",
             "crates/ostadix-api/src/executor/task.rs",
         )
@@ -2559,7 +2562,8 @@ class SourceReleaseTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             release.ReleaseError,
-            r"missing required path\(s\): .*crates/ostadix-api/src/executor/pool\.rs.*"
+            r"missing required path\(s\): .*crates/ostadix-api/src/executor/driver\.rs.*"
+            r"crates/ostadix-api/src/executor/pool\.rs.*"
             r"crates/ostadix-api/src/executor/task\.rs",
         ):
             self._build("missing-prepared-task-pool.zip")

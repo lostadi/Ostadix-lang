@@ -552,6 +552,7 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "crates/ostadix-api/src/ocore/driver.rs",
         "crates/ostadix-api/src/ocore/mod.rs",
         "crates/ostadix-api/src/executor/mod.rs",
+        "crates/ostadix-api/src/executor/driver.rs",
         "crates/ostadix-api/src/executor/pool.rs",
         "crates/ostadix-api/src/executor/task.rs",
         "crates/ostadix-api/src/hgraph/graph.rs",

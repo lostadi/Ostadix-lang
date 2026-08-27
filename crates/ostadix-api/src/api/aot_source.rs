@@ -124,6 +124,7 @@ pub const RUNTIME_EXECUTOR_MOD_RS: &str = include_str!("../executor/mod.rs");
 pub const RUNTIME_EXECUTOR_ACTOR_RS: &str = include_str!("../executor/actor.rs");
 pub const RUNTIME_EXECUTOR_CANCELLATION_RS: &str = include_str!("../executor/cancellation.rs");
 pub const RUNTIME_EXECUTOR_COORDINATOR_RS: &str = include_str!("../executor/coordinator.rs");
+pub const RUNTIME_EXECUTOR_DRIVER_RS: &str = include_str!("../executor/driver.rs");
 pub const RUNTIME_EXECUTOR_EFFECTS_RS: &str = include_str!("../executor/effects.rs");
 pub const RUNTIME_EXECUTOR_PARALLEL_RS: &str = include_str!("../executor/parallel.rs");
 pub const RUNTIME_EXECUTOR_POOL_RS: &str = include_str!("../executor/pool.rs");

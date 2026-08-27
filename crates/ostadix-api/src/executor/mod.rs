@@ -11,6 +11,7 @@
 pub mod actor;
 pub mod cancellation;
 pub mod coordinator;
+mod driver;
 pub mod effects;
 pub mod parallel;
 pub mod pool;

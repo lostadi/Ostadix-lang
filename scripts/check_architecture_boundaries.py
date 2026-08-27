@@ -48,6 +48,7 @@ EXECUTOR_RUNTIME_PATHS = (
     "src/executor/actor.rs",
     "src/executor/cancellation.rs",
     "src/executor/coordinator.rs",
+    "src/executor/driver.rs",
     "src/executor/effects.rs",
     "src/executor/mod.rs",
     "src/executor/parallel.rs",
