@@ -203,6 +203,7 @@ def fixture_readme(extra: str = "") -> str:
 # Release fixture
 
 committed [index](llms.txt)
+[technical whitepaper](Ostadix-lang_Technical_Whitepaper.pdf)
 
 ## License
 
@@ -742,6 +743,7 @@ class SourceReleaseTests(unittest.TestCase):
             "Dockerfile": "FROM scratch\n",
             "LICENSE": FIXTURE_LICENSE,
             "NOTICE": FIXTURE_NOTICE,
+            "Ostadix-lang_Technical_Whitepaper.pdf": b"%PDF-1.4\n% fixture\n%%EOF\n",
             "README.md": fixture_readme(),
             "SECURITY.md": "# Security\n",
             "boot-and-test.sh": "#!/bin/sh\nexit 0\n",
@@ -1299,6 +1301,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "Dockerfile",
                 "LICENSE",
                 "NOTICE",
+                "Ostadix-lang_Technical_Whitepaper.pdf",
                 "o-node-quickstart.sh",
                 "README.md",
                 "SECURITY.md",
@@ -3195,6 +3198,133 @@ class SourceReleaseTests(unittest.TestCase):
         self.assertEqual(first.prefix, second.prefix)
         self.assertEqual(first.archive_sha256, second.archive_sha256)
         self.assertEqual(first.output.read_bytes(), second.output.read_bytes())
+
+    def test_cli_actual_tree_closes_readme_links_and_excludes_private_debris(
+        self,
+    ) -> None:
+        live_repo = self.root / "actual-tree"
+        cloned = subprocess.run(
+            [
+                "git",
+                "clone",
+                "--quiet",
+                "--shared",
+                os.fspath(PROJECT_ROOT),
+                os.fspath(live_repo),
+            ],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.assertEqual(cloned.returncode, 0, cloned.stderr)
+        commit = subprocess.run(
+            ["git", "-C", os.fspath(live_repo), "rev-parse", "HEAD"],
+            check=True,
+            stdout=subprocess.PIPE,
+            text=True,
+        ).stdout.strip()
+        untracked_source = live_repo / "crates/ostadix-api/src/private_generated.rs"
+        untracked_source.write_text("// untracked private source\n", encoding="utf-8")
+        untracked_output = live_repo / "target/generated-private.bin"
+        untracked_output.parent.mkdir(parents=True, exist_ok=True)
+        untracked_output.write_bytes(b"generated private bytes\n")
+
+        archives = [self.root / "cli-first.zip", self.root / "cli-second.zip"]
+        archive_prefix = "Ostadix-lang-source-p0-integration"
+        for ref, archive in zip(("HEAD", commit), archives, strict=True):
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    os.fspath(SCRIPT),
+                    "--repo",
+                    os.fspath(live_repo),
+                    "--ref",
+                    ref,
+                    "--prefix",
+                    archive_prefix,
+                    "--allow-dirty",
+                    "--output",
+                    os.fspath(archive),
+                ],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+
+        self.assertEqual(archives[0].read_bytes(), archives[1].read_bytes())
+        verified = subprocess.run(
+            [sys.executable, os.fspath(SCRIPT), "--verify", os.fspath(archives[0])],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.assertEqual(verified.returncode, 0, verified.stderr)
+        manifest = release.verify_archive(archives[0])
+        prefix = manifest["prefix"]
+        self.assertEqual(prefix, archive_prefix)
+        with zipfile.ZipFile(archives[0]) as archive:
+            relative_paths = {
+                name.removeprefix(f"{prefix}/") for name in archive.namelist()
+            }
+            relative_directories = {""} | {
+                "/".join(path.split("/")[:index])
+                for path in relative_paths
+                for index in range(1, len(path.split("/")))
+            }
+            readme = archive.read(f"{prefix}/README.md").decode("utf-8")
+            local_targets = {
+                target
+                for destination in release._markdown_destinations(readme)
+                if (target := release._resolve_document_target("README.md", destination))
+                is not None
+            }
+            self.assertGreaterEqual(len(local_targets), 60)
+            primary_artifact_targets = {
+                "ARCHITECTURE.md",
+                "Ostadix-lang_Technical_Whitepaper.pdf",
+                "SPEC.md",
+                "docs/CLAIMS.md",
+                "docs/OCORE.md",
+                "docs/Ostadix-lang_Technical_Whitepaper.tex",
+                "docs/figures/o-linked-codebase-hgraph.dot",
+                "docs/figures/o-linked-codebase-hgraph.svg",
+            }
+            self.assertTrue(primary_artifact_targets <= local_targets)
+            self.assertTrue(
+                local_targets <= relative_paths | relative_directories,
+                sorted(local_targets - relative_paths - relative_directories),
+            )
+            self.assertIn("Ostadix-lang_Technical_Whitepaper.pdf", relative_paths)
+            committed_whitepaper = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    os.fspath(live_repo),
+                    "show",
+                    f"{commit}:Ostadix-lang_Technical_Whitepaper.pdf",
+                ],
+                check=True,
+                stdout=subprocess.PIPE,
+            ).stdout
+            self.assertTrue(committed_whitepaper.startswith(b"%PDF-"))
+            self.assertEqual(
+                archive.read(f"{prefix}/Ostadix-lang_Technical_Whitepaper.pdf"),
+                committed_whitepaper,
+            )
+            self.assertNotIn("AGENTS.md", relative_paths)
+            self.assertNotIn("opencode.jsonc", relative_paths)
+            self.assertNotIn(
+                "output/pdf/Ostadix-lang_Technical_Whitepaper.pdf", relative_paths
+            )
+            self.assertNotIn("examples/hello.html", relative_paths)
+            self.assertNotIn(
+                "crates/ostadix-api/src/private_generated.rs", relative_paths
+            )
+            self.assertNotIn("target/generated-private.bin", relative_paths)
 
     def test_dirty_tree_requires_override_and_override_uses_commit_bytes(self) -> None:
         self._commit({"src/lib.rs": FIXTURE_ROOT_LIB_SOURCE + "// clean\n"})
