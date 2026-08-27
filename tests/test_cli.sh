@@ -754,6 +754,10 @@ setup_kernel_media_cli_fixture() {
     KERNEL_MEDIA_INSPECT_STUB="$KERNEL_MEDIA_STUB_DIR/media-inspect"
     KERNEL_MEDIA_BOOT_STUB="$KERNEL_MEDIA_STUB_DIR/media-boot"
     KERNEL_MEDIA_SMOKE_STUB="$KERNEL_MEDIA_STUB_DIR/media-smoke"
+    KERNEL_ISO_BUILD_STUB="$KERNEL_MEDIA_STUB_DIR/iso-build"
+    KERNEL_ISO_INSPECT_STUB="$KERNEL_MEDIA_STUB_DIR/iso-inspect"
+    KERNEL_ISO_BOOT_STUB="$KERNEL_MEDIA_STUB_DIR/iso-boot"
+    KERNEL_ISO_SMOKE_STUB="$KERNEL_MEDIA_STUB_DIR/iso-smoke"
     KERNEL_BOOT_INFO_SMOKE_STUB="$KERNEL_MEDIA_STUB_DIR/boot-info-smoke"
     KERNEL_SMP_SMOKE_STUB="$KERNEL_MEDIA_STUB_DIR/smp-smoke"
     KERNEL_MEDIA_WRITER_STUB="$KERNEL_MEDIA_STUB_DIR/media-writer"
@@ -776,6 +780,10 @@ EOF
     cp "$KERNEL_MEDIA_BUILD_STUB" "$KERNEL_MEDIA_SETUP_STUB"
     cp "$KERNEL_MEDIA_BUILD_STUB" "$KERNEL_MEDIA_BOOT_STUB"
     cp "$KERNEL_MEDIA_BUILD_STUB" "$KERNEL_MEDIA_SMOKE_STUB"
+    cp "$KERNEL_MEDIA_BUILD_STUB" "$KERNEL_ISO_BUILD_STUB"
+    cp "$KERNEL_MEDIA_BUILD_STUB" "$KERNEL_ISO_INSPECT_STUB"
+    cp "$KERNEL_MEDIA_BUILD_STUB" "$KERNEL_ISO_BOOT_STUB"
+    cp "$KERNEL_MEDIA_BUILD_STUB" "$KERNEL_ISO_SMOKE_STUB"
     cp "$KERNEL_MEDIA_BUILD_STUB" "$KERNEL_BOOT_INFO_SMOKE_STUB"
     cp "$KERNEL_MEDIA_BUILD_STUB" "$KERNEL_SMP_SMOKE_STUB"
     cp "$KERNEL_MEDIA_BUILD_STUB" "$KERNEL_MEDIA_WRITER_STUB"
@@ -786,6 +794,10 @@ EOF
         "$KERNEL_MEDIA_INSPECT_STUB" \
         "$KERNEL_MEDIA_BOOT_STUB" \
         "$KERNEL_MEDIA_SMOKE_STUB" \
+        "$KERNEL_ISO_BUILD_STUB" \
+        "$KERNEL_ISO_INSPECT_STUB" \
+        "$KERNEL_ISO_BOOT_STUB" \
+        "$KERNEL_ISO_SMOKE_STUB" \
         "$KERNEL_BOOT_INFO_SMOKE_STUB" \
         "$KERNEL_SMP_SMOKE_STUB" \
         "$KERNEL_MEDIA_WRITER_STUB" \
@@ -801,6 +813,10 @@ run_kernel_media_cli() {
         O_KERNEL_MEDIA_INSPECT_SCRIPT="$KERNEL_MEDIA_INSPECT_STUB" \
         O_KERNEL_MEDIA_BOOT_SCRIPT="$KERNEL_MEDIA_BOOT_STUB" \
         O_KERNEL_MEDIA_SMOKE_SCRIPT="$KERNEL_MEDIA_SMOKE_STUB" \
+        O_KERNEL_ISO_BUILD_SCRIPT="$KERNEL_ISO_BUILD_STUB" \
+        O_KERNEL_ISO_INSPECT_SCRIPT="$KERNEL_ISO_INSPECT_STUB" \
+        O_KERNEL_ISO_BOOT_SCRIPT="$KERNEL_ISO_BOOT_STUB" \
+        O_KERNEL_ISO_SMOKE_SCRIPT="$KERNEL_ISO_SMOKE_STUB" \
         O_KERNEL_BOOT_INFO_SMOKE_SCRIPT="$KERNEL_BOOT_INFO_SMOKE_STUB" \
         O_KERNEL_SMP_SMOKE_SCRIPT="$KERNEL_SMP_SMOKE_STUB" \
         O_KERNEL_MEDIA_WRITER_SCRIPT="$KERNEL_MEDIA_WRITER_STUB" \
@@ -985,18 +1001,47 @@ check_kernel_media_dispatch "kernel inspect-media forwards the default image pat
 check_kernel_media_dispatch "kernel inspect-media forwards an explicit image path" \
     "$(printf 'script=media-inspect\nargc=2\narg=inspect\narg=%s' "$KERNEL_MEDIA_OUTPUT")" \
     inspect-media "$KERNEL_MEDIA_OUTPUT"
+check_kernel_media_dispatch "kernel iso accepts no output path" \
+    $'script=iso-build\nargc=0' \
+    iso
+KERNEL_ISO_OUTPUT="$ARTIFACT_DIR/custom-ostadix.iso"
+check_kernel_media_dispatch "kernel iso forwards one output path" \
+    "$(printf 'script=iso-build\nargc=1\narg=%s' "$KERNEL_ISO_OUTPUT")" \
+    iso "$KERNEL_ISO_OUTPUT"
+check_kernel_media_rejection "kernel iso rejects extra output paths" \
+    'command accepts at most one path argument' \
+    iso "$KERNEL_ISO_OUTPUT" "$ARTIFACT_DIR/unexpected.iso"
+KERNEL_ISO_DEFAULT="$ROOT/target/ostadix-iso/x86_64/ostadix-x86_64-uefi.iso"
+check_kernel_media_dispatch "kernel inspect-iso forwards the default ISO path" \
+    "$(printf 'script=iso-inspect\nargc=2\narg=inspect\narg=%s' "$KERNEL_ISO_DEFAULT")" \
+    inspect-iso
+check_kernel_media_dispatch "kernel inspect-iso forwards an explicit ISO path" \
+    "$(printf 'script=iso-inspect\nargc=2\narg=inspect\narg=%s' "$KERNEL_ISO_OUTPUT")" \
+    inspect-iso "$KERNEL_ISO_OUTPUT"
 check_kernel_media_dispatch "kernel boot-media dispatches its exact boot script" \
     $'script=media-boot\nargc=0' \
     boot-media
 check_kernel_media_rejection "kernel boot-media rejects arguments" \
     'command does not accept arguments' \
     boot-media unexpected
+check_kernel_media_dispatch "kernel boot-iso dispatches its exact boot script" \
+    $'script=iso-boot\nargc=0' \
+    boot-iso
+check_kernel_media_rejection "kernel boot-iso rejects arguments" \
+    'command does not accept arguments' \
+    boot-iso unexpected
 check_kernel_media_dispatch "kernel smoke-media dispatches its exact smoke script" \
     $'script=media-smoke\nargc=0' \
     smoke-media
 check_kernel_media_rejection "kernel smoke-media rejects arguments" \
     'command does not accept arguments' \
     smoke-media unexpected
+check_kernel_media_dispatch "kernel smoke-iso dispatches its exact smoke script" \
+    $'script=iso-smoke\nargc=0' \
+    smoke-iso
+check_kernel_media_rejection "kernel smoke-iso rejects arguments" \
+    'command does not accept arguments' \
+    smoke-iso unexpected
 check_kernel_media_dispatch "kernel smoke-boot-info dispatches its exact smoke script" \
     $'script=boot-info-smoke\nargc=0' \
     smoke-boot-info

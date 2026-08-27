@@ -1,0 +1,378 @@
+schema = "ostadix.foreign-kernel-lab/v1"
+claim_class = "qemu_tcg_upstream_foreign_kernel_boot"
+claims = [
+  "The exact repository-pinned upstream artifacts were supplied to QEMU.",
+  "The declared unmodified foreign kernel reached its bounded serial boot markers under QEMU TCG.",
+  "The declared guest reached its specified root-filesystem, initramfs, installer, service-manager, or interactive-user-space marker within the manifest timeout.",
+]
+nonclaims = [
+  "These host-launched QEMU boots do not execute under O-core or pass World G7.",
+  "They do not establish KernelWorld admission, containment, service export, withdrawal, or authority.",
+  "They are not KVM, physical-machine, Secure Boot, measured-boot, PCI assignment, DMA, or IOMMU evidence.",
+  "The manifest-named host QEMU executable and any host UEFI firmware are external local trust anchors; the harness records and pins their runtime bytes but does not authenticate their producer.",
+  "The harness minimizes QEMU's environment and working directory but does not sandbox QEMU from the invoking host user or its readable mounts.",
+  "They do not establish a persistent installed distribution, general device support, or production readiness.",
+]
+
+[firmware.aarch64_uefi]
+candidates = [
+  "/usr/share/qemu-efi-aarch64/QEMU_EFI.fd",
+  "/usr/share/AAVMF/AAVMF_CODE.fd",
+  "/opt/homebrew/share/qemu/edk2-aarch64-code.fd",
+  "/usr/local/share/qemu/edk2-aarch64-code.fd",
+]
+
+[[guests]]
+id = "linux-alpine-3.24.1-aarch64"
+family = "linux"
+version = "Alpine Linux 3.24.1, Linux 6.18.35-0-virt"
+architecture = "aarch64"
+qemu_profile = "aarch64-virt"
+cache_dir = "alpine-3.24.1-aarch64"
+qemu_executable = "qemu-system-aarch64"
+timeout_seconds = 30
+post_completion_seconds = 0.25
+max_capture_bytes = 2097152
+claim = "An unmodified Alpine Linux aarch64 virt kernel reached its upstream initramfs shell and answered a bounded uname probe under QEMU TCG."
+nonclaims = [
+  "The rdinit shell is not an installed or persistent Alpine system.",
+  "This boot does not prove O-core or KernelWorld governance of Linux.",
+  "This QEMU TCG observation is not physical ARM or hardware-acceleration evidence.",
+]
+required_markers = [
+  "Linux version 6.18.35-0-virt",
+  "/bin/sh: can't access tty; job control turned off",
+  "OSTADIX_LINUX_USERSPACE_READY",
+  "Linux 6.18.35-0-virt aarch64",
+  "reboot: Power down",
+]
+unique_markers = [
+  "Linux version 6.18.35-0-virt",
+  "/bin/sh: can't access tty; job control turned off",
+  "Linux 6.18.35-0-virt aarch64",
+  "reboot: Power down",
+]
+forbidden_markers = [
+  "Kernel panic - not syncing",
+  "Failed to execute /bin/sh",
+  "No working init found",
+]
+console_actions = [
+  { trigger = "/bin/sh: can't access tty; job control turned off", commands = ["echo OSTADIX_LINUX_USERSPACE_READY", "/bin/busybox uname -srm", "/bin/busybox poweroff -f"] },
+]
+qemu_args = [
+  "-machine", "virt,gic-version=3,accel=tcg",
+  "-cpu", "cortex-a57",
+  "-smp", "1",
+  "-m", "512M",
+  "-nic", "none",
+  "-display", "none",
+  "-serial", "stdio",
+  "-monitor", "none",
+  "-no-reboot",
+  "-kernel", "{artifact:kernel}",
+  "-initrd", "{artifact:initramfs}",
+  "-append", "console=ttyAMA0 earlycon=pl011,0x09000000 rdinit=/bin/sh panic=-1 loglevel=4",
+]
+
+[[guests.artifacts]]
+id = "kernel"
+filename = "vmlinuz-virt"
+url = "https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/aarch64/netboot-3.24.1/vmlinuz-virt"
+size_bytes = 10351104
+sha256 = "47970e0ee0478fe5c60824a89f162d5a353fa29466e5d3bddb0f9c506f1ed756"
+integrity = "repository-pinned digest observed from Alpine's versioned HTTPS release member"
+
+[[guests.artifacts]]
+id = "initramfs"
+filename = "initramfs-virt"
+url = "https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/aarch64/netboot-3.24.1/initramfs-virt"
+size_bytes = 9385851
+sha256 = "e47d38bc88509a3db11affc09f9762f9643b026bd29441724a4729ad8e97add6"
+integrity = "repository-pinned digest observed from Alpine's versioned HTTPS release member"
+
+[[guests]]
+id = "freebsd-15.1-release-aarch64"
+family = "freebsd"
+version = "FreeBSD 15.1-RELEASE GENERIC"
+architecture = "aarch64"
+qemu_profile = "aarch64-virt"
+cache_dir = "freebsd-15.1-aarch64"
+qemu_executable = "qemu-system-aarch64"
+timeout_seconds = 150
+post_completion_seconds = 0.5
+max_capture_bytes = 4194304
+claim = "An unmodified FreeBSD 15.1-RELEASE aarch64 kernel booted through UEFI and reached the upstream installer userland under QEMU TCG."
+nonclaims = [
+  "The installer prompt is not an installed or persistent FreeBSD system.",
+  "This boot does not prove O-core or KernelWorld governance of FreeBSD.",
+  "This QEMU TCG observation is not physical ARM, hardware-acceleration, or device-isolation evidence.",
+]
+required_markers = [
+  "FreeBSD/arm64 EFI loader, Revision 3.0",
+  "---<<BOOT>>---",
+  "FreeBSD 15.1-RELEASE",
+  "Starting primary installer on ttyu0",
+  "Welcome to FreeBSD!",
+  "Console type [vt100]:",
+]
+unique_markers = [
+  "FreeBSD/arm64 EFI loader, Revision 3.0",
+  "---<<BOOT>>---",
+  "FreeBSD 15.1-RELEASE",
+  "Starting primary installer on ttyu0",
+  "Welcome to FreeBSD!",
+  "Console type [vt100]:",
+]
+forbidden_markers = [
+  "panic:",
+  "Fatal data abort",
+  "mountroot>",
+  "No bootable option or device was found",
+  "UEFI Interactive Shell",
+]
+console_actions = []
+qemu_args = [
+  "-machine", "virt,gic-version=3,accel=tcg",
+  "-cpu", "cortex-a72",
+  "-smp", "1",
+  "-m", "1024M",
+  "-bios", "{firmware:aarch64_uefi}",
+  "-device", "virtio-scsi-pci,id=scsi0",
+  "-drive", "if=none,id=cd0,media=cdrom,format=raw,readonly=on,file={artifact:media}",
+  "-device", "scsi-cd,drive=cd0,bus=scsi0.0",
+  "-nic", "none",
+  "-display", "none",
+  "-serial", "stdio",
+  "-monitor", "none",
+  "-no-reboot",
+]
+
+[[guests.artifacts]]
+id = "media_xz"
+filename = "FreeBSD-15.1-RELEASE-arm64-aarch64-bootonly.iso.xz"
+url = "https://download.freebsd.org/releases/ISO-IMAGES/15.1/FreeBSD-15.1-RELEASE-arm64-aarch64-bootonly.iso.xz"
+size_bytes = 96421460
+sha256 = "33e2dc303b5dce5a374727ba12c41c303db70fe0676e76333e09e0ea8cb2fbd0"
+integrity = "FreeBSD 15.1-RELEASE published SHA-256 checksum"
+checksum_url = "https://www.freebsd.org/releases/15.1R/checksums/CHECKSUM.SHA256-FreeBSD-15.1-RELEASE-arm64-aarch64.asc"
+unpack = "xz"
+expanded_id = "media"
+expanded_filename = "FreeBSD-15.1-RELEASE-arm64-aarch64-bootonly.iso"
+expanded_size_bytes = 460095488
+expanded_sha256 = "359136c2af73e03da6f15ad59f0c67bc561ca8b69631d78bfb8f2225e2c9a5ef"
+
+[[guests]]
+id = "plan9-9front-11983-amd64"
+family = "plan9"
+version = "9front build 11983, amd64 pc64"
+architecture = "x86_64"
+qemu_profile = "x86_64-q35"
+cache_dir = "9front-11983-amd64"
+qemu_executable = "qemu-system-x86_64"
+timeout_seconds = 45
+post_completion_seconds = 0.5
+max_capture_bytes = 2097152
+claim = "The unmodified official 9front 11983 amd64 qcow2 booted its Plan 9 pc64 kernel, mounted its HJFS root, started rc, and reached term% under QEMU TCG."
+nonclaims = [
+  "The serial term% prompt is not graphical rio readiness, an installation, or a persistent workload result.",
+  "This boot does not prove O-core or KernelWorld governance of Plan 9 or 9front.",
+  "This QEMU TCG observation is not physical x86_64, networking, storage-durability, or hardware-acceleration evidence.",
+]
+required_markers = [
+  "Plan 9",
+  "pc64.bootfs: Wed Aug 26 07:07:44 GMT 2026",
+  "bootargs is (tcp, tls, il, local!device)[local!/dev/sdF0/fs]",
+  "user[glenda]:",
+  "hjfs: fs is /dev/sdF0/fs",
+  "term%",
+]
+unique_markers = [
+  "Plan 9",
+  "pc64.bootfs: Wed Aug 26 07:07:44 GMT 2026",
+  "bootargs is (tcp, tls, il, local!device)[local!/dev/sdF0/fs]",
+  "user[glenda]:",
+  "hjfs: fs is /dev/sdF0/fs",
+  "term%",
+]
+forbidden_markers = [
+  "panic:",
+  "i/o error",
+  "can't open boot file",
+  "boot failed",
+]
+console_actions = [
+  { trigger = "bootargs is (tcp, tls, il, local!device)[local!/dev/sdF0/fs]", commands = ["local!/dev/sdF0/fs"] },
+  { trigger = "user[glenda]:", commands = ["glenda"] },
+]
+qemu_args = [
+  "-machine", "q35,accel=tcg",
+  "-cpu", "qemu64",
+  "-smp", "1",
+  "-m", "512M",
+  "-boot", "order=c,strict=on",
+  "-drive", "file={artifact:disk},if=none,id=disk0,media=disk,readonly=on,snapshot=on,format=qcow2",
+  "-device", "virtio-blk-pci,drive=disk0",
+  "-nic", "none",
+  "-display", "none",
+  "-serial", "stdio",
+  "-monitor", "none",
+  "-nodefaults",
+  "-no-reboot",
+]
+
+[[guests.artifacts]]
+id = "disk_gz"
+filename = "9front-11983.amd64.qcow2.gz"
+url = "https://build.9front.org/9front/9front-11983.amd64.qcow2.gz"
+size_bytes = 257961445
+sha256 = "b96617b6eebcec8621a4c176e7acc29a1835ed09d4b61f9fe2e3e64c18d20867"
+integrity = "official 9front build 11983 artifact tied to source commit 50aefa0743c8cfd83fdc7f568d24e1bba8b9848e; repository-observed digest"
+unpack = "gzip"
+expanded_id = "disk"
+expanded_filename = "9front-11983.amd64.qcow2"
+expanded_size_bytes = 550240256
+expanded_sha256 = "0326632e2d90f4038069edbadd2918f7662397ad879a97d91cdac474d31a9746"
+
+[[guests]]
+id = "guix-system-1.5.0-x86_64"
+family = "guix"
+version = "GNU Guix System 1.5.0, Linux-libre 6.17.12, Guile 3.0.9"
+architecture = "x86_64"
+qemu_profile = "x86_64-q35"
+cache_dir = "guix-1.5.0-x86_64"
+qemu_executable = "qemu-system-x86_64"
+timeout_seconds = 90
+post_completion_seconds = 0.5
+max_capture_bytes = 4194304
+claim = "The Linux-libre 6.17.12 kernel embedded in the official GNU Guix System 1.5.0 ISO reached early-boot Guile and the GNU Shepherd Guile service manager under QEMU TCG."
+nonclaims = [
+  "Guix is Guile-defined and Guile-orchestrated, but Linux-libre is the kernel; this is not a claim that the kernel itself is implemented in Lisp.",
+  "Direct kernel and initrd loading is used for deterministic serial evidence while the unmodified ISO remains attached read-only as the system store.",
+  "Reaching Shepherd configuration is not an installation, serial login, persistent system, or proof of O-core or KernelWorld governance.",
+]
+required_markers = [
+  "Linux version 6.17.12-gnu (guix@guix)",
+  "Run /init as init process",
+  "Welcome, this is GNU's early boot Guile.",
+  "making '/gnu/store/63qbjpi3vph650zyr1mayjpgh8h39vj3-system' the current system...",
+  "GNU Shepherd 1.0.9 (Guile 3.0.9, Fibers 1.4.2, x86_64-unknown-linux-gnu)",
+  "Configuration successfully loaded from '/gnu/store/2vj7npfsrwk8gj4sw6b5q8cq3iv8dbs3-shepherd.conf'.",
+]
+unique_markers = [
+  "Linux version 6.17.12-gnu (guix@guix)",
+  "Run /init as init process",
+  "Welcome, this is GNU's early boot Guile.",
+  "making '/gnu/store/63qbjpi3vph650zyr1mayjpgh8h39vj3-system' the current system...",
+  "GNU Shepherd 1.0.9 (Guile 3.0.9, Fibers 1.4.2, x86_64-unknown-linux-gnu)",
+  "Configuration successfully loaded from '/gnu/store/2vj7npfsrwk8gj4sw6b5q8cq3iv8dbs3-shepherd.conf'.",
+]
+forbidden_markers = [
+  "Kernel panic - not syncing",
+  "Failed to execute /init",
+  "No working init found",
+  "You are in emergency mode",
+]
+console_actions = []
+qemu_args = [
+  "-machine", "q35,accel=tcg",
+  "-cpu", "qemu64",
+  "-smp", "1",
+  "-m", "1024M",
+  "-nic", "none",
+  "-display", "none",
+  "-serial", "stdio",
+  "-monitor", "none",
+  "-no-reboot",
+  "-kernel", "{artifact:kernel}",
+  "-initrd", "{artifact:initrd}",
+  "-append", "root=31393730-3031-3031-3139-313133333833 gnu.system=/gnu/store/63qbjpi3vph650zyr1mayjpgh8h39vj3-system gnu.load=/gnu/store/63qbjpi3vph650zyr1mayjpgh8h39vj3-system/boot modprobe.blacklist=radeon,amdgpu console=tty0 console=ttyS0,115200n8 earlycon=uart8250,io,0x3f8,115200n8 loglevel=7",
+  "-drive", "if=none,id=cd0,media=cdrom,format=raw,readonly=on,file={artifact:media}",
+  "-device", "ide-cd,drive=cd0,bus=ide.0",
+]
+
+[[guests.artifacts]]
+id = "media"
+filename = "guix-system-install-1.5.0.x86_64-linux.iso"
+url = "https://ftp.gnu.org/gnu/guix/guix-system-install-1.5.0.x86_64-linux.iso"
+size_bytes = 1188261888
+sha256 = "107e0a8082f03a10b15c1fb9383d2d752c1cdeda41b8db575a15550e1c2d8b4a"
+integrity = "official GNU Guix 1.5.0 ISO; detached signature validated during the audit against Efraim Flashner fingerprint A28BF40C3E551372662D14F741AAE7DCCA3D8351"
+members = [
+  { id = "kernel", path = "/gnu/store/pbpfl2ll5qz36bqfnl3g3vvag764714h-linux-libre-6.17.12/bzImage", filename = "linux-libre-6.17.12-bzImage", size_bytes = 16688128, sha256 = "eba328fc22572bf8f6523fdec52e1f1ceeb8817f2d7caea3b312067f831f6e48" },
+  { id = "initrd", path = "/gnu/store/lwalc924v2jaa3r029qk19v6685d6snn-raw-initrd/initrd.cpio.gz", filename = "guix-1.5.0-initrd.cpio.gz", size_bytes = 14104469, sha256 = "bd3d4323d77e4ad94289c512bcccf4c712c3c401d707cb538364808d08287994" },
+]
+
+[[guests.artifacts]]
+id = "media_signature"
+filename = "guix-system-install-1.5.0.x86_64-linux.iso.sig"
+url = "https://ftp.gnu.org/gnu/guix/guix-system-install-1.5.0.x86_64-linux.iso.sig"
+size_bytes = 566
+sha256 = "fac1d7af22f7dd6598f7599295544061202002617d2aee23cf56bd0a40a67d60"
+integrity = "pinned GNU detached-signature file; the runtime harness records its identity but does not itself invoke GPG"
+
+[[guests]]
+id = "redox-0.9.0-server-x86_64"
+family = "redox"
+version = "Redox OS 0.9.0 server livedisk"
+architecture = "x86_64"
+qemu_profile = "x86_64-q35"
+cache_dir = "redox-0.9.0-server-x86_64"
+qemu_executable = "qemu-system-x86_64"
+timeout_seconds = 60
+post_completion_seconds = 0.5
+max_capture_bytes = 4194304
+claim = "The unmodified Redox OS 0.9.0 server livedisk booted its kernel, mounted its live RedoxFS, started ptyd, and reached the login prompt under QEMU TCG."
+nonclaims = [
+  "The no-monitor serial profile intentionally omits VGA and networking; expected graphics, input, smolnet, and DNS service panics are exclusions, not evidence of those services.",
+  "The login prompt is not an authenticated login, installation, persistence, graphical-readiness, or network-readiness result.",
+  "This boot does not prove O-core or KernelWorld governance of Redox or physical x86_64 hardware support.",
+]
+required_markers = [
+  "Redox OS starting...",
+  "redoxfs: mounted filesystem on /scheme/disk.live/0 to file:",
+  "ptyd daemon ready",
+  "########## Redox OS ##########",
+  "redox login:",
+]
+unique_markers = [
+  "Redox OS starting...",
+  "redoxfs: mounted filesystem on /scheme/disk.live/0 to file:",
+  "ptyd daemon ready",
+  "########## Redox OS ##########",
+]
+forbidden_markers = [
+  "Kernel panic",
+  "No bootable device",
+  "failed to mount filesystem",
+]
+console_actions = []
+qemu_args = [
+  "-machine", "q35,accel=tcg",
+  "-cpu", "qemu64",
+  "-smp", "1",
+  "-m", "1024M",
+  "-boot", "order=d,strict=on",
+  "-drive", "if=none,id=cd0,media=cdrom,format=raw,readonly=on,file={artifact:media}",
+  "-device", "ide-cd,drive=cd0,bus=ide.0",
+  "-nic", "none",
+  "-display", "none",
+  "-serial", "stdio",
+  "-monitor", "none",
+  "-nodefaults",
+  "-no-reboot",
+]
+
+[[guests.artifacts]]
+id = "media_zst"
+filename = "redox_server_x86_64_2024-09-07_1225_livedisk.iso.zst"
+url = "https://static.redox-os.org/releases/0.9.0/x86_64/redox_server_x86_64_2024-09-07_1225_livedisk.iso.zst"
+size_bytes = 70108737
+sha256 = "a73c3783a72a15eba8dd85dee941298cdd34e125a37008a3bcc7227b5f073e93"
+integrity = "Redox OS 0.9.0 published SHA256SUM"
+checksum_url = "https://static.redox-os.org/releases/0.9.0/x86_64/SHA256SUM"
+unpack = "zstd"
+expanded_id = "media"
+expanded_filename = "redox_server_x86_64_2024-09-07_1225_livedisk.iso"
+expanded_size_bytes = 536870912
+expanded_sha256 = "33e85a8f9fc9207a6e075a170207a18bccd53ad00781e58d12b466a61958c994"

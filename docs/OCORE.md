@@ -329,6 +329,10 @@ o kernel media
 o kernel inspect-media
 o kernel boot-media
 o kernel smoke-media
+o kernel iso
+o kernel inspect-iso
+o kernel boot-iso
+o kernel smoke-iso
 ```
 
 `boot` selects the baseline probe mode. `console` selects mode 16, builds the
@@ -344,9 +348,13 @@ Interactive images are loaded by QEMU and use a multiplexed serial terminal;
 prove only their documented QEMU/TCG boundaries, not a physical-machine boot,
 SMP, Linux or Plan 9 boot, or hardware-device isolation.
 
-The deterministic x86_64 GPT/UEFI path and guarded external-media workflow are
-documented in [OSTADIX_BOOT.md](OSTADIX_BOOT.md). Their current automated smoke
-boots the exact disk through OVMF/QEMU and is not physical or SMP evidence.
+The deterministic x86_64 GPT/UEFI disk path, separate ISO9660/El Torito UEFI
+path, and guarded external-media workflow are documented in
+[OSTADIX_BOOT.md](OSTADIX_BOOT.md). The disk and ISO smoke gates rebuild their
+respective containers twice and boot the exact admitted read-only artifact
+through OVMF/QEMU TCG. They are not physical-machine, KVM, SMP, Secure Boot,
+measured-boot, hardware-driver, or hardware-isolation evidence. Only the raw
+GPT/ESP disk image is accepted by the external-media writer; the ISO is not.
 
 ## 11. Implemented bounded O-core milestone boundary
 

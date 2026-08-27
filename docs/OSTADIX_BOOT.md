@@ -1,12 +1,18 @@
 # OSTADIX Alpha x86_64 UEFI boot media
 
-This guide covers the implemented OSTADIX Alpha disk-image path for the
-freestanding O-core kernel. The current path is **x86_64 UEFI only**. It builds
-one deterministic GPT disk image, validates its bounded layout, boots that
-exact disk through OVMF under QEMU/TCG, and can derive and write a
-capacity-bound target plan for an external device on macOS or Linux. For a
-larger target, the planner relocates the backup GPT to the target's final LBA
-without enlarging or moving the admitted ESP.
+This guide covers the two implemented OSTADIX Alpha boot containers for the
+freestanding O-core kernel. Both paths are **x86_64 UEFI only**:
+
+- a deterministic raw GPT disk image with one EFI System Partition; and
+- a deterministic ISO9660 image with an El Torito UEFI no-emulation boot
+  image.
+
+Each path validates its own bounded structure and boots the exact admitted
+artifact through OVMF under QEMU/TCG. Only the raw GPT image participates in
+the capacity-bound external-device writer on macOS or Linux. For a larger raw
+target, the planner relocates the backup GPT to the target's final LBA without
+enlarging or moving the admitted ESP. The ISO remains a read-only optical
+artifact and is not accepted by the removable-media writer.
 
 The current automated evidence is virtual. Building an image, passing the
 OVMF/QEMU smoke, or writing the bytes to removable media does **not** establish
@@ -15,7 +21,7 @@ four-vCPU SMP bring-up under QEMU/TCG; it does not make the general kernel SMP
 safe and does not establish physical SMP. Physical-machine boot remains
 unpassed until separately observed under the authority-free workflow below.
 
-## Implemented image
+## Implemented raw disk image
 
 The media builder produces:
 
@@ -100,8 +106,8 @@ export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$O_LANG_ROOT/target/release:$PATH
 cd "$O_LANG_ROOT"
 ```
 
-The media setup profile includes the O-core profile and adds an x86_64 EFI
-GRUB builder, mtools, and OVMF/edk2 firmware:
+The media setup profile includes the O-core profile and adds x86_64 EFI GRUB
+standalone and rescue-image builders, mtools, xorriso, and OVMF/edk2 firmware:
 
 ```bash
 ./setup.sh --with-ocore-media -y
@@ -126,7 +132,10 @@ The checked media prerequisites are:
   LLD-compatible linker, ELF inspection tools, Python 3, and
   `qemu-system-x86_64`;
 - `x86_64-elf-grub-mkstandalone` or `grub-mkstandalone`;
+- `x86_64-elf-grub-mkrescue` or `grub-mkrescue`, plus its x86_64-efi platform
+  directory;
 - `mformat` and `mcopy`;
+- `xorriso`;
 - `tar` for challenged committed-source snapshots; and
 - an x86_64 OVMF/edk2 code image.
 
@@ -192,7 +201,9 @@ Inspection validates and hashes the bounded outer image. It does not provide a
 signature, Secure Boot chain, measured boot, or independent authentication of
 the producer.
 
-## Boot the exact disk under OVMF/QEMU
+## Boot the exact disk and ISO under OVMF/QEMU
+
+### Raw GPT disk
 
 Interactive boot rebuilds the default image, attaches it read-only as a
 virtio block device, and starts x86_64 OVMF under QEMU/TCG:
@@ -251,6 +262,105 @@ seconds and can be changed for a slow local TCG host:
 ```bash
 OSTADIX_MEDIA_TIMEOUT_SECONDS=30 o kernel smoke-media
 ```
+
+### Build, inspect, and boot the UEFI ISO
+
+The ISO builder packages the mode-0 x86_64 kernel at `/boot/kernel.elf`, the
+exact committed ISO-specific GRUB configuration at `/boot/grub/grub.cfg`, and
+an embedded FAT EFI image containing `/EFI/BOOT/BOOTX64.EFI`. Unlike the raw
+disk configuration, the ISO configuration performs no FAT UUID search; GRUB
+loads the kernel directly from the mounted ISO filesystem.
+
+Build the default ISO:
+
+```bash
+o kernel iso
+```
+
+The default output is:
+
+```text
+target/ostadix-iso/x86_64/ostadix-x86_64-uefi.iso
+```
+
+Or build and inspect one explicit output path:
+
+```bash
+ISO="$O_LANG_ROOT/target/ostadix-iso/x86_64/ostadix-alpha.iso"
+o kernel iso "$ISO"
+o kernel inspect-iso "$ISO"
+```
+
+The builder uses `grub-mkrescue` with an explicit x86_64-efi GRUB platform
+directory and a repository-owned xorriso canonicalization wrapper. It builds a
+private candidate, strictly inspects it, and only then atomically publishes the
+requested regular-file output. Source, build-directory, and output symlinks
+are rejected rather than followed. As with the raw disk, deterministic rebuild
+claims are limited to the same source, toolchain, inputs, and relevant
+environment; they are not a cross-version GRUB or xorriso guarantee.
+
+The wrapper replaces GRUB's wall-clock token exactly once in `efi.img`, the
+private `efi/boot/bootx64.efi`, and exactly one admitted auxiliary EFI layout:
+`boot.efi` or `System/Library/CoreServices/boot.efi`. It rejects both or neither
+layout and never scans or rewrites `/boot/kernel.elf` or arbitrary rescue-tree
+payloads.
+
+`inspect-iso` emits canonical JSON with schema `ostadix.boot-iso/v1`. The
+strict inspector independently validates the ISO9660 volume, El Torito catalog
+checksum, exactly one UEFI platform `0xef` entry using no-emulation media, the
+embedded FAT EFI image, and `/EFI/BOOT/BOOTX64.EFI`. The EFI executable must
+have a PE signature, x86_64 COFF machine `0x8664`, PE32+ optional-header magic
+`0x20b`, EFI application subsystem `10`, and a nonzero entry point in a
+file-backed executable section. It also requires an executable x86_64 ELF at
+`/boot/kernel.elf`, at least one valid `PT_LOAD` segment, a file-backed
+executable entry point, and exactly one valid Multiboot2 header in the admitted
+header window. The exact committed ISO GRUB configuration is required, and the
+inspector reports hashes for the complete ISO, EFI boot image, EFI bootloader,
+kernel, and GRUB configuration. Structural admission and hashing do not
+authenticate the producer or establish a signing, Secure Boot, or measured
+boot chain.
+
+Interactive boot rebuilds and strictly inspects the selected ISO, then attaches
+those exact bytes as a read-only IDE CD-ROM behind read-only OVMF firmware:
+
+```bash
+o kernel boot-iso
+
+# Select a non-default output; boot-iso accepts no positional arguments.
+OSTADIX_ISO_IMAGE="$ISO" o kernel boot-iso
+```
+
+Exit the multiplexed serial monitor with `Ctrl-A X`. The VM uses QEMU TCG,
+`q35`, 128 MiB RAM, firmware boot order `d`, `-nodefaults`, `-nic none`, and no
+QEMU `-kernel` shortcut.
+
+Run the automated ISO gate with:
+
+```bash
+o kernel smoke-iso
+```
+
+The gate builds two complete ISOs in separate kernel and container build
+directories, requires full byte identity, strictly inspects both, and requires
+the exact first ISO to be published with all write-permission bits cleared. It
+opens that ISO once without following links, hashes and validates the held
+descriptor, and gives QEMU an inherited descriptor for the same bytes as
+read-only CD media. It likewise descriptor-pins OVMF firmware as read-only
+media. The streamed validator requires the ordered kernel, W^X, CPL3, timer, and
+heartbeat markers, rejects fatal output, and then requires continued process
+liveness after the heartbeat for
+`min(1 second, timeout / 4)`. The configured timeout is the total deadline: the
+ordered markers and the complete post-heartbeat window must both finish before
+it. A positive deadline override must be supplied as:
+
+```bash
+OSTADIX_ISO_TIMEOUT_SECONDS=30 o kernel smoke-iso
+```
+
+This is deterministic-container and firmware-mediated boot evidence for one
+exact ISO under QEMU q35/OVMF/TCG. It is not physical-machine, KVM, SMP,
+Secure Boot, measured-boot, PCI, DMA, IOMMU, hardware-driver, installer,
+external-media-write, or release-qualification evidence.
 
 ### Firmware handoff and challenged lifecycle gate
 
@@ -618,6 +728,9 @@ execution, trusted firmware, a trusted source build, or a completed write.
 | `o kernel media` succeeds | A mode-0 x86_64 kernel was packed into a bounded GPT/ESP image and the resulting container passed strict structural inspection. | A second reproducible build, any boot, physical hardware, SMP, or authenticity. |
 | `o kernel inspect-media` succeeds | The supplied bytes conform to `ostadix.boot-media/v1` and produce the reported hashes and GUIDs. | That the image was produced by a trusted party, that its EFI/kernel payloads execute, or that it is safe to write to an arbitrary device. |
 | `o kernel smoke-media` succeeds | Two local rebuilds are byte-identical and one exact disk boots under x86_64 OVMF/QEMU TCG far enough to emit the five required kernel/CPL3/timer markers and remain alive to timeout. | Physical boot, KVM, SMP, secure/measured boot, hardware driver support, PCI/DMA/IOMMU isolation, or a release qualification gate. |
+| `o kernel iso` succeeds | A mode-0 x86_64 kernel was packed into a strictly admitted ISO9660/El Torito UEFI no-emulation container and atomically published. | A second reproducible build, any boot, physical hardware, SMP, authenticity, or suitability for the raw-media writer. |
+| `o kernel inspect-iso` succeeds | The supplied bytes conform to `ostadix.boot-iso/v1`, including the admitted UEFI PE32+ application, x86_64 kernel ELF, exact GRUB configuration, and reported component hashes. | That the ISO was produced by a trusted party, that its payloads execute, or that it is signed, measured, or authenticated. |
+| `o kernel smoke-iso` succeeds | Two local ISO rebuilds are byte-identical and the descriptor-pinned first ISO boots as read-only CD media under x86_64 OVMF/QEMU TCG, emits the five required markers in order without fatal output, and remains live for the bounded post-heartbeat window without changing identity. | Physical boot, KVM, SMP, secure/measured boot, hardware driver support, PCI/DMA/IOMMU isolation, external-media writing, or a release qualification gate. |
 | `o kernel smoke-boot-info` succeeds | A bounded challenged Multiboot2 handoff derives the page allocator's admitted subwindow, closes its temporary mapping before W^X, and a challenged mode-0 boot reaches CPL3/timer/heartbeat while the shared transcript parser rejects a wrong challenge. | Physical execution, general firmware/ACPI support, initrd loading, KVM, secure/measured boot, or hardware trust. |
 | `o kernel smoke-smp` succeeds | One challenged four-vCPU QEMU/TCG image performs bounded ACPI/MADT admission, PIT-timed x2APIC INIT/SIPI, unique-stack AP entry, trampoline retirement, and one atomic barrier; the same image rejects under one vCPU. | Physical SMP, KVM, arbitrary topologies, a general SMP scheduler, interrupt balancing, per-CPU allocation, or SMP safety of other kernel subsystems. |
 | `prepare-write` succeeds | One privately snapshotted and validated source image, one stable external/removable device identity and capacity, and one canonical sparse target plan are bound by `target_plan_sha256` and a confirmation token. | A device write, the contents of `unwritten_ranges`, or a boot. |
@@ -627,8 +740,8 @@ execution, trusted firmware, a trusted source build, or a completed write.
 
 Additional current nonclaims:
 
-- No AArch64, Apple Silicon, BIOS/CSM, ISO, PXE, or network-boot image is
-  implemented by this path.
+- No AArch64, Apple Silicon, BIOS/CSM, PXE, or network-boot image is
+  implemented. The ISO path is x86_64 UEFI El Torito only.
 - The default mode-0 media path remains single-CPU. Mode 34 is a bounded
   four-vCPU QEMU proof; the observation schema cannot turn it into physical SMP
   evidence.
@@ -653,7 +766,10 @@ Run:
 
 The builder also permits explicit tool paths through
 `OSTADIX_GRUB_MKSTANDALONE`, `OSTADIX_MFORMAT`, `OSTADIX_MCOPY`, and
-`OSTADIX_PYTHON`. Use them only for the exact executables you inspected.
+`OSTADIX_PYTHON`. The ISO builder additionally accepts
+`OSTADIX_GRUB_MKRESCUE`, `OSTADIX_GRUB_EFI_DIRECTORY`, and
+`OSTADIX_XORRISO`. Use them only for the exact executables or platform
+directory you inspected.
 
 ### Missing OVMF firmware
 
@@ -662,6 +778,8 @@ Set the code image and retry:
 ```bash
 OSTADIX_OVMF_CODE=/absolute/path/to/OVMF_CODE.fd o kernel boot-media
 OSTADIX_OVMF_CODE=/absolute/path/to/OVMF_CODE.fd o kernel smoke-media
+OSTADIX_OVMF_CODE=/absolute/path/to/OVMF_CODE.fd o kernel boot-iso
+OSTADIX_OVMF_CODE=/absolute/path/to/OVMF_CODE.fd o kernel smoke-iso
 ```
 
 ### Inspection or determinism failure
@@ -670,6 +788,11 @@ Do not write the image. Remove only the known generated output, rebuild it with
 `o kernel media`, and inspect it again. A malformed GPT, CRC mismatch, geometry
 change, digest/GUID mismatch, or non-identical smoke rebuild is a hard failure,
 not a warning to bypass.
+
+For an ISO failure, remove only the known generated `.iso`, rebuild it with
+`o kernel iso`, and inspect it again. An invalid ISO9660/El Torito/FAT/PE/ELF
+structure, changed committed GRUB configuration, component-hash mismatch, or
+non-identical smoke rebuild is likewise a hard failure.
 
 ### QEMU boot failure
 

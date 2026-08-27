@@ -243,7 +243,7 @@ jobs:
           python3 -m tests.test_parser
           python3 tests/example_manifest.py validate
           python3 -m unittest -v tests.test_example_manifest tests.test_benchmark_hgraph_hosted
-          python3 -m unittest -v tests.test_ostadix_boot_media tests.test_ostadix_boot_info_qemu tests.test_ostadix_media_writer tests.test_ostadix_physical_evidence tests.test_setup tests.test_o_cli_dispatch
+          python3 -m unittest -v tests.test_foreign_kernel_lab tests.test_ostadix_boot_media tests.test_ostadix_boot_iso tests.test_ostadix_boot_info_qemu tests.test_ostadix_media_writer tests.test_ostadix_physical_evidence tests.test_setup tests.test_o_cli_dispatch
           python3 -m tests.test_evaluator
           python3 -B tests/test_backend_state_protocol.py -v
           python3 -B tests/test_bundled_shim_protocol.py -v
@@ -320,12 +320,14 @@ jobs:
             fi
           done
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends clang lld llvm binutils qemu-system-x86 qemu-system-arm grub-efi-amd64-bin mtools ovmf
+          sudo apt-get install --yes --no-install-recommends clang lld llvm binutils qemu-system-x86 qemu-system-arm grub-efi-amd64-bin mtools ovmf xorriso
           qemu-system-x86_64 --version
       - name: Verify isolated minimal Linux personality corpus
         run: ocore/kernel/check-linux-minimal-slice.sh
       - name: Prove deterministic x86_64 UEFI media boot through OVMF
         run: ocore/kernel/smoke-x86_64-uefi-media-qemu.sh
+      - name: Prove deterministic x86_64 UEFI ISO boot through OVMF
+        run: ocore/kernel/smoke-x86_64-uefi-iso-qemu.sh
       # BEGIN GENERATED: REQUIRED_QEMU_EVIDENCE_CI
       - name: Validate central release-evidence manifest
         run: python3 scripts/release_evidence.py validate

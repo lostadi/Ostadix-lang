@@ -196,10 +196,12 @@ class SetupScriptTests(unittest.TestCase):
                 "qemu-system-x86",
                 "qemu-system-arm",
                 "cmake",
+                "qemu-efi-aarch64",
                 "qemu-utils",
                 "gzip",
                 "xz-utils",
                 "zstd",
+                "xorriso",
                 "openssl",
                 "bc",
                 "bison",
@@ -216,6 +218,47 @@ class SetupScriptTests(unittest.TestCase):
         self.assertIn("linux_kernel_tools=true", output)
         self.assertIn("guest_tools=true", output)
         self.assertNotIn("multipass", output.lower())
+
+    def test_fedora_guest_tools_dry_run_requires_manual_install(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = self.run_setup(
+                "--with-guest-tools",
+                "--dry-run",
+                "--deps-only",
+                "--no-env",
+                home=Path(temp_dir),
+                platform="linux",
+                distro="fedora",
+            )
+
+        output = self.combined_output(result)
+        self.assertEqual(result.returncode, 2, output)
+        self.assertIn(
+            "automatic --with-guest-tools installation is validated only for "
+            "macOS/Homebrew and Debian-family Linux hosts",
+            output,
+        )
+        self.assertIn("then use --with-guest-tools --check", output)
+        self.assertNotIn("dnf install", output)
+
+    def test_windows_ubuntu_vm_plan_remains_independent_of_guest_lab(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = self.run_setup(
+                "--with-ubuntu-vm",
+                "--dry-run",
+                "--deps-only",
+                "--no-env",
+                home=Path(temp_dir),
+                platform="windows",
+                distro="unknown",
+            )
+
+        output = self.combined_output(result)
+        self.assertEqual(result.returncode, 0, output)
+        self.assertIn("winget install --id Canonical.Multipass", output)
+        self.assertNotIn("SoftwareFreedomConservancy.QEMU", output)
+        self.assertIn("guest_tools=false", output)
+        self.assertIn("ubuntu_vm=true", output)
 
     def test_dry_run_does_not_create_env_hook_or_guest_files(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -259,15 +302,16 @@ class SetupScriptTests(unittest.TestCase):
         output = self.combined_output(result)
         self.assertEqual(result.returncode, 0, output)
         self.assertIn(
-            "Supply checksum-pinned Linux/9front/OpenBSD media explicitly.",
+            "Pinned Alpine/FreeBSD/9front/Guix/Redox media is fetched only by an explicit lab command.",
             output,
         )
+        self.assertIn("Supply any additional foreign media explicitly.", output)
         self.assertIn(
             "No foreign OS image is downloaded or booted by setup.sh.",
             output,
         )
         self.assertIn(
-            "They do not establish Linux, Plan 9, or OpenBSD support in O-core.",
+            "These host-side boots do not establish foreign-kernel support in O-core.",
             output,
         )
 
@@ -320,6 +364,7 @@ class SetupScriptTests(unittest.TestCase):
         packages = shlex.split(brew_line)
         self.assertIn("x86_64-elf-grub", packages)
         self.assertIn("mtools", packages)
+        self.assertIn("xorriso", packages)
         self.assertIn("qemu", packages)
         self.assertIn("ocore=true", output)
         self.assertIn("ocore_media=true", output)
@@ -340,6 +385,19 @@ class SetupScriptTests(unittest.TestCase):
         self.assertIn("grub-efi-amd64-bin", packages)
         self.assertIn("mtools", packages)
         self.assertIn("ovmf", packages)
+        self.assertIn("xorriso", packages)
+
+    def test_ocore_media_check_requires_iso_grub_platform_modules(self) -> None:
+        setup = SETUP.read_text(encoding="utf-8")
+
+        self.assertIn('${OSTADIX_GRUB_EFI_DIRECTORY:-}', setup)
+        self.assertIn('"GRUB x86_64 EFI platform"', setup)
+        for module in ("modinfo.sh", "normal.mod", "multiboot2.mod"):
+            with self.subTest(module=module):
+                self.assertIn(module, setup)
+        self.assertIn("GRUB x86_64 EFI/rescue modules, mtools, xorriso, and OVMF", setup)
+        self.assertIn("resolve-x86_64-ovmf-code.sh", setup)
+        self.assertIn("resolve_ostadix_x86_64_ovmf_code qemu-system-x86_64", setup)
 
     def test_normal_build_plans_every_public_rust_binary(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

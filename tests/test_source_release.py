@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -781,6 +782,7 @@ class SourceReleaseTests(unittest.TestCase):
             "setup.sh": "#!/bin/sh\nexit 0\n",
             "docs/CLAIMS.md": "fixture claims\n",
             "docs/CI_POSTURE.md": "fixture local CI posture contract\n",
+            "docs/FOREIGN_KERNEL_LAB.md": "# Fixture foreign-kernel lab\n",
             "docs/IMAGE_ADMISSION.md": "fixture image-admission contract\n",
             "docs/INFORMATION_KERNEL_V1.md": "fixture information kernel contract\n",
             "docs/releases/v0.3.0.md": "# Ostadix-lang v0.3.0 fixture\n",
@@ -803,6 +805,9 @@ class SourceReleaseTests(unittest.TestCase):
             ],
             "docs/SEMANTIC_CUSTODY.md": "fixture semantic custody boundary\n",
             "docs/VERSIONING.md": "fixture version axes\n",
+            "evidence/foreign_kernel_lab.toml": (
+                'schema = "ostadix.foreign-kernel-lab/v1"\n'
+            ),
             "evidence/gates.toml": fixture_evidence_manifest(),
             "evidence/world_alpha_gates.toml": WORLD_NORMATIVE_BYTES[
                 "evidence/world_alpha_gates.toml"
@@ -869,6 +874,7 @@ class SourceReleaseTests(unittest.TestCase):
             "ocore/kernel/aarch64/linker.ld": "ENTRY(_start)\n",
             "ocore/kernel/aarch64/vectors.S": ".section .text\n",
             "ocore/kernel/build-aarch64-g2.sh": "#!/bin/sh\nexit 0\n",
+            "ocore/kernel/build-x86_64-uefi-iso.sh": "#!/bin/sh\nexit 0\n",
             "ocore/kernel/build-x86_64-uefi-media.sh": "#!/bin/sh\nexit 0\n",
             "ocore/kernel/build.sh": "#!/bin/sh\nexit 0\n",
             "ocore/kernel/main.oc": "module kernel::main;\n",
@@ -881,9 +887,11 @@ class SourceReleaseTests(unittest.TestCase):
             "ocore/kernel/resolve-x86_64-ovmf-code.sh": "# resolver fixture\n",
             "ocore/kernel/smp_probe.oc": "module kernel::smp_probe;\n",
             "ocore/kernel/smp_probe_stub.oc": "module kernel::smp_probe;\n",
+            "ocore/kernel/run-x86_64-uefi-iso-qemu.sh": "#!/bin/sh\nexit 0\n",
             "ocore/kernel/run-x86_64-uefi-media-qemu.sh": "#!/bin/sh\nexit 0\n",
             "ocore/kernel/smoke-x86_64-boot-info-qemu.sh": "#!/bin/sh\nexit 0\n",
             "ocore/kernel/smoke-x86_64-smp-qemu.sh": "#!/bin/sh\nexit 0\n",
+            "ocore/kernel/smoke-x86_64-uefi-iso-qemu.sh": "#!/bin/sh\nexit 0\n",
             "ocore/kernel/smoke-x86_64-uefi-media-qemu.sh": "#!/bin/sh\nexit 0\n",
             "ocore/kernel/smoke-world-project-receipt-qemu.sh": "#!/bin/sh\nexit 0\n",
             "ocore/kernel/smoke-world-project-runtime-qemu.sh": "#!/bin/sh\nexit 0\n",
@@ -925,6 +933,7 @@ class SourceReleaseTests(unittest.TestCase):
             "ocore/kernel/world_receipt_semantics_stub.oc": (
                 "module kernel::world_receipt_semantics;\n"
             ),
+            "ocore/kernel/x86_64/grub-iso.cfg": "multiboot2 /boot/kernel.elf\n",
             "ocore/kernel/x86_64/grub.cfg": "multiboot2 /boot/okernel.elf\n",
             "ocore/kernel/x86_64/boot_info.oc": "module kernel::boot_info;\n",
             "ocore/kernel/x86_64/boot_info_stub.oc": "module kernel::boot_info;\n",
@@ -941,6 +950,7 @@ class SourceReleaseTests(unittest.TestCase):
             "ocore/world/value.oc": "module world::value;\n",
             "ocore/world/value_codec.oc": "module world::value_codec;\n",
             "scripts/smoke_ostadix_mcp.py": "#!/usr/bin/env python3\n",
+            "scripts/foreign_kernel_lab.py": "#!/usr/bin/env python3\n",
             "scripts/smoke-docker.sh": "#!/usr/bin/env bash\n",
             "scripts/smoke-execution-fabric-v1.sh": "#!/usr/bin/env bash\n",
             "scripts/smoke-zero-config-lan-netns.sh": "#!/usr/bin/env bash\n",
@@ -952,10 +962,12 @@ class SourceReleaseTests(unittest.TestCase):
             "scripts/install-o-cli-wrapper.sh": "#!/usr/bin/env bash\n",
             "scripts/o-cli.sh": "#!/usr/bin/env bash\nexec true\n",
             "scripts/o-kernel.sh": "#!/usr/bin/env bash\nexec true\n",
+            "scripts/ostadix_boot_iso.py": "#!/usr/bin/env python3\n",
             "scripts/ostadix_boot_media.py": "#!/usr/bin/env python3\n",
             "scripts/ostadix_boot_info_qemu.py": "#!/usr/bin/env python3\n",
             "scripts/ostadix_media_writer.py": "#!/usr/bin/env python3\n",
             "scripts/ostadix_physical_evidence.py": "#!/usr/bin/env python3\n",
+            "scripts/ostadix_xorriso_reproducible.py": "#!/usr/bin/env python3\n",
             "scripts/smoke-project-hgraph-exec.sh": "#!/usr/bin/env bash\n",
             "scripts/smoke-project-hgraph.sh": "#!/usr/bin/env bash\n",
             "scripts/smoke-world-resource-keys.sh": "#!/usr/bin/env bash\n",
@@ -1119,6 +1131,7 @@ class SourceReleaseTests(unittest.TestCase):
             "tests/test_backend_state_protocol.py": "# fixture backend state protocol tests\n",
             "tests/test_mcp_smoke.py": "# fixture MCP smoke tests\n",
             "tests/test_ostadix_boot_media.py": "# fixture boot-media tests\n",
+            "tests/test_ostadix_boot_iso.py": "# fixture boot-iso tests\n",
             "tests/test_ostadix_boot_info_qemu.py": "# fixture boot-info QEMU tests\n",
             "tests/test_ostadix_media_writer.py": "# fixture media-writer tests\n",
             "tests/test_ostadix_physical_evidence.py": "# fixture physical-evidence tests\n",
@@ -1128,6 +1141,7 @@ class SourceReleaseTests(unittest.TestCase):
             "tests/unified_plan_boundaries.rs": "#[test] fn unified_plan_boundaries_fixture() {}\n",
             "tests/test_release_evidence.py": "# fixture release evidence tests\n",
             "tests/test_setup.py": "# fixture setup tests\n",
+            "tests/test_foreign_kernel_lab.py": "# fixture foreign-kernel lab tests\n",
             "tests/test_bundled_shim_protocol.py": "# fixture bundled shim protocol tests\n",
             "tests/backend_morphism_v1.rs": "#[test] fn backend_morphism_fixture() {}\n",
             "tests/test_world_alpha_evidence.py": "# fixture World evidence tests\n",
@@ -1183,10 +1197,13 @@ class SourceReleaseTests(unittest.TestCase):
                     "okernel-multikernel/boot-and-test.sh",
                     "ocore/kernel/build.sh",
                     "ocore/kernel/build-aarch64-g2.sh",
+                    "ocore/kernel/build-x86_64-uefi-iso.sh",
                     "ocore/kernel/build-x86_64-uefi-media.sh",
+                    "ocore/kernel/run-x86_64-uefi-iso-qemu.sh",
                     "ocore/kernel/run-x86_64-uefi-media-qemu.sh",
                     "ocore/kernel/smoke-x86_64-boot-info-qemu.sh",
                     "ocore/kernel/smoke-x86_64-smp-qemu.sh",
+                    "ocore/kernel/smoke-x86_64-uefi-iso-qemu.sh",
                     "ocore/kernel/smoke-x86_64-uefi-media-qemu.sh",
                     "ocore/kernel/smoke-world-project-receipt-qemu.sh",
                     "ocore/kernel/smoke-world-project-runtime-qemu.sh",
@@ -1198,10 +1215,13 @@ class SourceReleaseTests(unittest.TestCase):
                     "ocore/kernel/stress-live-linux-personality-qemu.sh",
                     "scripts/o-cli.sh",
                     "scripts/o-kernel.sh",
+                    "scripts/foreign_kernel_lab.py",
+                    "scripts/ostadix_boot_iso.py",
                     "scripts/ostadix_boot_media.py",
                     "scripts/ostadix_boot_info_qemu.py",
                     "scripts/ostadix_media_writer.py",
                     "scripts/ostadix_physical_evidence.py",
+                    "scripts/ostadix_xorriso_reproducible.py",
                     "scripts/benchmark_hgraph_hosted.sh",
                     "scripts/install-o-cli-wrapper.sh",
                     "scripts/smoke-execution-fabric-v1.sh",
@@ -1355,6 +1375,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "setup.sh",
                 "docs/CLAIMS.md",
                 "docs/CI_POSTURE.md",
+                "docs/FOREIGN_KERNEL_LAB.md",
                 "docs/IMAGE_ADMISSION.md",
                 "docs/INFORMATION_KERNEL_V1.md",
                 "docs/releases/v0.3.0.md",
@@ -1371,6 +1392,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "docs/OSTADIX_WORLD.md",
                 "docs/SEMANTIC_CUSTODY.md",
                 "docs/VERSIONING.md",
+                "evidence/foreign_kernel_lab.toml",
                 "evidence/gates.toml",
                 "evidence/o_machine_contract_v1.toml",
                 "evidence/world_alpha_gates.toml",
@@ -1412,6 +1434,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "ocore/kernel/aarch64/linker.ld",
                 "ocore/kernel/aarch64/vectors.S",
                 "ocore/kernel/build-aarch64-g2.sh",
+                "ocore/kernel/build-x86_64-uefi-iso.sh",
                 "ocore/kernel/build-x86_64-uefi-media.sh",
                 "ocore/kernel/build.sh",
                 "ocore/kernel/main.oc",
@@ -1420,9 +1443,11 @@ class SourceReleaseTests(unittest.TestCase):
                 "ocore/kernel/resolve-x86_64-ovmf-code.sh",
                 "ocore/kernel/smp_probe.oc",
                 "ocore/kernel/smp_probe_stub.oc",
+                "ocore/kernel/run-x86_64-uefi-iso-qemu.sh",
                 "ocore/kernel/run-x86_64-uefi-media-qemu.sh",
                 "ocore/kernel/smoke-x86_64-boot-info-qemu.sh",
                 "ocore/kernel/smoke-x86_64-smp-qemu.sh",
+                "ocore/kernel/smoke-x86_64-uefi-iso-qemu.sh",
                 "ocore/kernel/smoke-x86_64-uefi-media-qemu.sh",
                 "ocore/kernel/smoke-world-project-receipt-qemu.sh",
                 "ocore/kernel/smoke-world-project-runtime-qemu.sh",
@@ -1442,6 +1467,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "ocore/kernel/world_project_receipt_semantics_stub.oc",
                 "ocore/kernel/world_receipt_semantics.oc",
                 "ocore/kernel/world_receipt_semantics_stub.oc",
+                "ocore/kernel/x86_64/grub-iso.cfg",
                 "ocore/kernel/x86_64/grub.cfg",
                 "ocore/kernel/x86_64/boot_info.oc",
                 "ocore/kernel/x86_64/boot_info_stub.oc",
@@ -1458,6 +1484,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "ocore/world/value.oc",
                 "ocore/world/value_codec.oc",
                 "scripts/smoke_ostadix_mcp.py",
+                "scripts/foreign_kernel_lab.py",
                 "scripts/smoke-docker.sh",
                 "scripts/smoke-execution-fabric-v1.sh",
                 "scripts/smoke-zero-config-lan-netns.sh",
@@ -1469,10 +1496,12 @@ class SourceReleaseTests(unittest.TestCase):
                 "scripts/install-o-cli-wrapper.sh",
                 "scripts/o-cli.sh",
                 "scripts/o-kernel.sh",
+                "scripts/ostadix_boot_iso.py",
                 "scripts/ostadix_boot_media.py",
                 "scripts/ostadix_boot_info_qemu.py",
                 "scripts/ostadix_media_writer.py",
                 "scripts/ostadix_physical_evidence.py",
+                "scripts/ostadix_xorriso_reproducible.py",
                 "scripts/smoke-project-hgraph-exec.sh",
                 "scripts/smoke-project-hgraph.sh",
                 "scripts/smoke-world-resource-keys.sh",
@@ -1631,6 +1660,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "tests/test_local_ci_posture.py",
                 "tests/test_backend_state_protocol.py",
                 "tests/test_mcp_smoke.py",
+                "tests/test_ostadix_boot_iso.py",
                 "tests/test_ostadix_boot_media.py",
                 "tests/test_ostadix_boot_info_qemu.py",
                 "tests/test_ostadix_media_writer.py",
@@ -1641,6 +1671,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "tests/unified_plan_boundaries.rs",
                 "tests/test_release_evidence.py",
                 "tests/test_setup.py",
+                "tests/test_foreign_kernel_lab.py",
                 "tests/test_bundled_shim_protocol.py",
                 "tests/backend_morphism_v1.rs",
                 "tests/test_world_alpha_evidence.py",
@@ -1720,19 +1751,26 @@ class SourceReleaseTests(unittest.TestCase):
                 "100755",
             )
             for executable_path in (
+                "ocore/kernel/build-x86_64-uefi-iso.sh",
                 "ocore/kernel/build-x86_64-uefi-media.sh",
+                "ocore/kernel/run-x86_64-uefi-iso-qemu.sh",
                 "ocore/kernel/run-x86_64-uefi-media-qemu.sh",
                 "ocore/kernel/smoke-x86_64-boot-info-qemu.sh",
                 "ocore/kernel/smoke-x86_64-smp-qemu.sh",
+                "ocore/kernel/smoke-x86_64-uefi-iso-qemu.sh",
                 "ocore/kernel/smoke-x86_64-uefi-media-qemu.sh",
                 "ocore/kernel/stress-live-linux-personality-qemu.sh",
+                "scripts/ostadix_boot_iso.py",
                 "scripts/ostadix_boot_media.py",
                 "scripts/ostadix_boot_info_qemu.py",
                 "scripts/ostadix_media_writer.py",
                 "scripts/ostadix_physical_evidence.py",
+                "scripts/ostadix_xorriso_reproducible.py",
                 "scripts/smoke-execution-fabric-v1.sh",
+                "scripts/foreign_kernel_lab.py",
             ):
                 self.assertEqual(modes[executable_path], "100755")
+            self.assertEqual(modes["ocore/kernel/x86_64/grub-iso.cfg"], "100644")
             self.assertEqual(modes["ocore/kernel/x86_64/grub.cfg"], "100644")
             self.assertEqual(modes["ocore/kernel/x86_64/boot_info.oc"], "100644")
             self.assertEqual(modes["ocore/kernel/x86_64/boot_info_stub.oc"], "100644")
@@ -2295,22 +2333,29 @@ class SourceReleaseTests(unittest.TestCase):
     def test_boot_media_and_bootinfo_surface_is_required(self) -> None:
         required = (
             "docs/OSTADIX_BOOT.md",
+            "ocore/kernel/build-x86_64-uefi-iso.sh",
             "ocore/kernel/build-x86_64-uefi-media.sh",
             "ocore/kernel/resolve-x86_64-ovmf-code.sh",
+            "ocore/kernel/run-x86_64-uefi-iso-qemu.sh",
             "ocore/kernel/run-x86_64-uefi-media-qemu.sh",
             "ocore/kernel/smoke-x86_64-boot-info-qemu.sh",
             "ocore/kernel/smoke-x86_64-smp-qemu.sh",
+            "ocore/kernel/smoke-x86_64-uefi-iso-qemu.sh",
             "ocore/kernel/smoke-x86_64-uefi-media-qemu.sh",
             "ocore/kernel/smp_probe.oc",
             "ocore/kernel/smp_probe_stub.oc",
+            "ocore/kernel/x86_64/grub-iso.cfg",
             "ocore/kernel/x86_64/grub.cfg",
             "ocore/kernel/x86_64/boot_info.oc",
             "ocore/kernel/x86_64/boot_info_stub.oc",
+            "scripts/ostadix_boot_iso.py",
             "scripts/ostadix_boot_media.py",
             "scripts/ostadix_boot_info_qemu.py",
             "scripts/ostadix_media_writer.py",
             "scripts/ostadix_physical_evidence.py",
+            "scripts/ostadix_xorriso_reproducible.py",
             "crates/ostadix-api/src/ocore/boot_info.rs",
+            "tests/test_ostadix_boot_iso.py",
             "tests/test_ostadix_boot_media.py",
             "tests/test_ostadix_boot_info_qemu.py",
             "tests/test_ostadix_media_writer.py",
@@ -3297,6 +3342,40 @@ class SourceReleaseTests(unittest.TestCase):
             text=True,
         )
         self.assertEqual(cloned.returncode, 0, cloned.stderr)
+        # Exercise the actual working-tree release surface even when a caller
+        # intentionally asks us to validate changes before committing them.
+        # The main checkout remains untouched; this private clone receives a
+        # synthetic commit containing every currently required release path.
+        for relative in release.REQUIRED_RELEASE_PATHS:
+            source = PROJECT_ROOT / relative
+            destination = live_repo / relative
+            self.assertTrue(source.is_file(), relative)
+            self.assertFalse(source.is_symlink(), relative)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination, follow_symlinks=False)
+        subprocess.run(
+            ["git", "-C", os.fspath(live_repo), "add", "-f", "--all"],
+            check=True,
+        )
+        staged = subprocess.run(
+            ["git", "-C", os.fspath(live_repo), "diff", "--cached", "--quiet"],
+            check=False,
+        )
+        if staged.returncode == 1:
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    os.fspath(live_repo),
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "fixture actual release tree",
+                ],
+                check=True,
+            )
+        else:
+            self.assertEqual(staged.returncode, 0)
         commit = subprocess.run(
             ["git", "-C", os.fspath(live_repo), "rev-parse", "HEAD"],
             check=True,
