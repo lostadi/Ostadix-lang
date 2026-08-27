@@ -1724,8 +1724,8 @@ rejects malformed and zero-valued records; separate hierarchical
 current/reference checks reject stale generations and same-generation logical
 mismatches. Serialized capability IDs are descriptive non-authority. `OWIDENT`
 remains the identity-only nested format rather than a transport, OValue
-envelope, or receipt codec; it implements no Governor or consensus and passes
-no G0--G13 gate.
+envelope, or receipt codec; it implements no Governor or consensus and
+passes no G0--G13 gate.
 
 Run the bounded canonical World-protocol gate with:
 
@@ -1887,6 +1887,9 @@ digest. Permissive decode plus canonical re-encoding normalizes the
 `HostWorld` read/write, and the hosted profile emits an empty governed-authority
 requirement set. Planner-local logical IDs identify graph operations; a World
 launch supplies separate `TaskIdentity` values.
+
+The logical graph digest is not a whitespace-insensitive or
+source-format-insensitive identity.
 
 World PR8-2 adds canonical `PlacementSnapshotV1` and `DeploymentPlanV1`
 records. For policies implemented by the current hosted coordinator, the

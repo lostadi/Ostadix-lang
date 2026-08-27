@@ -176,7 +176,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         self.assertEqual(
             result.stdout,
             "architecture dependency boundaries: PASS "
-            "(156 production files, 41 roots, 181 cross-root edges)\n",
+            "(159 production files, 42 roots, 193 cross-root edges)\n",
         )
 
     def test_manifest_inventories_every_current_root_edge_override_and_facade(self) -> None:
@@ -197,9 +197,9 @@ class ArchitectureBoundaryTests(unittest.TestCase):
                 }
             ],
         )
-        self.assertEqual(len(roots), 41)
+        self.assertEqual(len(roots), 42)
         self.assertEqual(
-            sum(len(root["allowed_dependencies"]) for root in roots), 181
+            sum(len(root["allowed_dependencies"]) for root in roots), 193
         )
         api_root = next(root for root in roots if root["name"] == "api")
         self.assertIn("ir", api_root["allowed_dependencies"])
@@ -210,6 +210,25 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         self.assertEqual(
             provenance_root["allowed_dependencies"],
             ["evidence", "information", "ir", "world"],
+        )
+        intent_root = next(root for root in roots if root["name"] == "intent")
+        self.assertEqual(intent_root["layer"], 14)
+        self.assertEqual(
+            intent_root["allowed_dependencies"],
+            [
+                "backend_catalog",
+                "canonical_cbor",
+                "eval",
+                "evidence",
+                "execution_contract",
+                "hgraph",
+                "hosted_remote",
+                "ir",
+                "parser",
+                "project",
+                "runtime_exec",
+                "value",
+            ],
         )
         self.assertEqual(
             {
