@@ -17,6 +17,10 @@ MEDIA_SMOKE_SCRIPT=${O_KERNEL_MEDIA_SMOKE_SCRIPT:-"$ROOT/ocore/kernel/smoke-x86_
 BOOT_INFO_SMOKE_SCRIPT=${O_KERNEL_BOOT_INFO_SMOKE_SCRIPT:-"$ROOT/ocore/kernel/smoke-x86_64-boot-info-qemu.sh"}
 SMP_SMOKE_SCRIPT=${O_KERNEL_SMP_SMOKE_SCRIPT:-"$ROOT/ocore/kernel/smoke-x86_64-smp-qemu.sh"}
 MEDIA_INSPECT_SCRIPT=${O_KERNEL_MEDIA_INSPECT_SCRIPT:-"$ROOT/scripts/ostadix_boot_media.py"}
+ISO_BUILD_SCRIPT=${O_KERNEL_ISO_BUILD_SCRIPT:-"$ROOT/ocore/kernel/build-x86_64-uefi-iso.sh"}
+ISO_BOOT_SCRIPT=${O_KERNEL_ISO_BOOT_SCRIPT:-"$ROOT/ocore/kernel/run-x86_64-uefi-iso-qemu.sh"}
+ISO_SMOKE_SCRIPT=${O_KERNEL_ISO_SMOKE_SCRIPT:-"$ROOT/ocore/kernel/smoke-x86_64-uefi-iso-qemu.sh"}
+ISO_INSPECT_SCRIPT=${O_KERNEL_ISO_INSPECT_SCRIPT:-"$ROOT/scripts/ostadix_boot_iso.py"}
 MEDIA_WRITER_SCRIPT=${O_KERNEL_MEDIA_WRITER_SCRIPT:-"$ROOT/scripts/ostadix_media_writer.py"}
 PHYSICAL_EVIDENCE_SCRIPT=${O_KERNEL_PHYSICAL_EVIDENCE_SCRIPT:-"$ROOT/scripts/ostadix_physical_evidence.py"}
 
@@ -33,6 +37,8 @@ Commands:
   image        Rebuild and describe the baseline kernel ELF
   media        Build a deterministic x86_64 GPT/UEFI disk image
   inspect-media  Strictly inspect a generated OSTADIX disk image
+  iso          Build a deterministic x86_64 UEFI bootable ISO
+  inspect-iso  Strictly inspect a generated OSTADIX bootable ISO
   prepare-write  Inspect external media and derive a bound confirmation token
   write-media   Write and verify external media using that exact token
   boot-challenge  Generate a fresh challenge for one physical boot attempt
@@ -40,9 +46,11 @@ Commands:
   record-physical   Validate and record one authority-free serial observation
   boot         Boot the baseline kernel with an interactive serial terminal
   boot-media   Boot the generated disk through edk2/OVMF (no QEMU -kernel)
+  boot-iso     Boot the generated read-only ISO through edk2/OVMF
   console      Boot the bounded native M5 `o> ` control console
   smoke        Run the bounded baseline boot assertion
   smoke-media  Prove deterministic media rebuild and UEFI disk boot
+  smoke-iso    Prove deterministic ISO rebuild and exact read-only UEFI boot
   smoke-boot-info  Prove bounded firmware handoff and challenged mode-0 lifecycle
   smoke-smp    Prove bounded challenged four-vCPU INIT/SIPI and barrier progress
   smoke-live   Drive and verify the native M5 console lifecycle
@@ -155,6 +163,17 @@ case "$command_name" in
         media_path=${1:-"$ROOT/target/ostadix-media/x86_64/ostadix-x86_64-uefi.img"}
         exec "$MEDIA_INSPECT_SCRIPT" inspect "$media_path"
         ;;
+    iso)
+        require_at_most_one_arg "$@"
+        require_executable "$ISO_BUILD_SCRIPT"
+        exec "$ISO_BUILD_SCRIPT" "$@"
+        ;;
+    inspect-iso)
+        require_at_most_one_arg "$@"
+        require_executable "$ISO_INSPECT_SCRIPT"
+        iso_path=${1:-"$ROOT/target/ostadix-iso/x86_64/ostadix-x86_64-uefi.iso"}
+        exec "$ISO_INSPECT_SCRIPT" inspect "$iso_path"
+        ;;
     prepare-write)
         require_executable "$MEDIA_WRITER_SCRIPT"
         exec "$MEDIA_WRITER_SCRIPT" prepare "$@"
@@ -189,6 +208,11 @@ case "$command_name" in
         require_executable "$MEDIA_BOOT_SCRIPT"
         exec "$MEDIA_BOOT_SCRIPT"
         ;;
+    boot-iso)
+        require_no_args "$@"
+        require_executable "$ISO_BOOT_SCRIPT"
+        exec "$ISO_BOOT_SCRIPT"
+        ;;
     console)
         require_no_args "$@"
         require_executable "$BOOT_SCRIPT"
@@ -206,6 +230,11 @@ case "$command_name" in
         require_no_args "$@"
         require_executable "$MEDIA_SMOKE_SCRIPT"
         exec "$MEDIA_SMOKE_SCRIPT"
+        ;;
+    smoke-iso)
+        require_no_args "$@"
+        require_executable "$ISO_SMOKE_SCRIPT"
+        exec "$ISO_SMOKE_SCRIPT"
         ;;
     smoke-boot-info)
         require_no_args "$@"

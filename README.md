@@ -1112,12 +1112,15 @@ LLD prefixes. If your linker lives somewhere custom, set
 Python is used by the four-second QEMU smoke-test harness. It is not linked
 into the kernel and is not used after the machine starts executing O-core.
 
-Linux kernel development, foreign guest experiments, and O-core are separate
-scopes. The Linux-only kernel profile installs host build dependencies, not a
-Linux source tree, kernel, root filesystem, or boot image. Guest tooling is for
-user-supplied, checksum-pinned Linux, 9front, or OpenBSD media; installing it
-does not mean that O-core boots or supports those foreign kernels or operating
-systems.
+Linux kernel development, host-side foreign-kernel boots, and O-core are
+separate scopes. The Linux-only kernel profile installs host build dependencies,
+not a Linux source tree, kernel, root filesystem, or boot image. The explicit
+[foreign-kernel QEMU lab](docs/FOREIGN_KERNEL_LAB.md) checksum-pins and boots
+unmodified Alpine Linux, FreeBSD, 9front, GNU Guix System/Linux-libre, and
+Redox OS kernels under host-launched QEMU TCG. Guix is the Guile-defined target;
+its kernel is Linux-libre rather than a Lisp implementation.
+Installing its tools does not download media, run the lab, pass World G7, or
+mean that O-core boots, contains, or governs those foreign kernels.
 
 ### Option A: Automatic setup
 
@@ -1166,10 +1169,16 @@ MATLAB-compatible code. Use `--with-hosted-runtimes --check` to inventory those
 executables without installing packages.
 `--with-linux-kernel-tools` is Linux-only and installs build prerequisites such
 as Bison, Flex, libelf/pahole, CPIO, rsync, and kmod; it does not fetch kernel
-sources. `--with-guest-tools` adds QEMU image and compression tools and prepares
+sources. On the validated Debian/Ubuntu-family and macOS/Homebrew package maps,
+`--with-guest-tools` adds AArch64/x86_64 QEMU, AArch64 UEFI, image,
+compression, and ISO-extraction tools and prepares
 `${XDG_DATA_HOME:-$HOME/.local/share}/ostadix/guests` for media supplied by the
-user. `--with-ubuntu-vm` also selects guest tools and installs Multipass for the
-`ubuntu_vm^` backend where the host package manager supports it.
+explicit lab or by the user. It does not fetch or boot media. On other
+hosts, install those tools and firmware manually, then use
+`--with-guest-tools --check`; automatic guest-tool installation fails closed.
+`--with-ubuntu-vm` installs Multipass for the `ubuntu_vm^` backend where the
+host package manager supports it. It is independent of the native guest-lab
+profile; combine it with `--with-guest-tools` when both are wanted.
 
 `--verify` checks the hosted Rust, C17, AOT, and Python forms after a build.
 `--verify-ocore` implies `--with-ocore` and runs the bounded x86_64 O-core
@@ -1354,6 +1363,14 @@ o kernel smoke-media
 o kernel smoke-boot-info
 o kernel smoke-smp
 
+# Build, strictly inspect, and boot-test the deterministic read-only UEFI ISO.
+o kernel iso
+o kernel inspect-iso
+o kernel smoke-iso
+
+# Interactive ISO boot through OVMF/QEMU TCG; leave with Ctrl-A X.
+o kernel boot-iso
+
 # Capacity-bound removable-media and authority-free observation workflow.
 o kernel prepare-write --image "$IMAGE" --device "$DEVICE"
 o kernel write-media --image "$IMAGE" --device "$DEVICE" --confirm "$TOKEN"
@@ -1380,9 +1397,12 @@ a bounded control plane, not a general shell: installation and activation are
 the implemented interactive lifecycle. The smoke command is the finite,
 asserted alternative suitable for automation.
 
-For the OVMF path and confirmation-gated removable-media writer, see
-[OSTADIX Alpha x86_64 UEFI boot media](docs/OSTADIX_BOOT.md). That image is
-structurally suitable for raw physical media. Writer v2 derives a
+For the deterministic raw-disk and read-only ISO OVMF paths, plus the
+confirmation-gated removable-media writer, see
+[OSTADIX Alpha x86_64 UEFI boot media](docs/OSTADIX_BOOT.md). Only the raw
+GPT/ESP `.img` is structurally suitable for the writer; the ISO is a separate
+ISO9660/El Torito optical artifact and is never admitted by that workflow.
+Writer v2 derives a
 capacity-bound `ostadix.boot-media-target-plan/v2`, relocates the backup GPT to
 a larger target's final LBA, and writes and verifies only its exact admitted
 extents through one held device descriptor. `target_plan_sha256` binds that

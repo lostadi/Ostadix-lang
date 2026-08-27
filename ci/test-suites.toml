@@ -29,6 +29,10 @@ probe_args = ["--version"]
 executable = "docker"
 probe_args = ["--version"]
 
+[runtime_probes.grub-mkrescue]
+executable = "grub-mkrescue"
+probe_args = ["--version"]
+
 [runtime_probes.grub-mkstandalone]
 executable = "grub-mkstandalone"
 probe_args = ["--version"]
@@ -73,6 +77,10 @@ probe_args = ["--version"]
 executable = "sqlite3"
 probe_args = ["--version"]
 
+[runtime_probes.xorriso]
+executable = "xorriso"
+probe_args = ["-version"]
+
 [suites.contracts]
 required_executables = ["python3"]
 
@@ -104,4 +112,4 @@ required_executables = ["python3"]
 required_executables = ["bash", "python3"]
 
 [suites.ocore-qemu]
-required_executables = ["clang", "grub-mkstandalone", "mcopy", "qemu-system-aarch64", "qemu-system-x86_64"]
+required_executables = ["clang", "grub-mkrescue", "grub-mkstandalone", "mcopy", "qemu-system-aarch64", "qemu-system-x86_64", "xorriso"]

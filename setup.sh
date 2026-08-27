@@ -72,7 +72,7 @@ Options:
   --with-ocore-media          Also install deterministic x86_64 UEFI-media tools
   --with-hosted-runtimes      Open-source backend runtimes (macOS/Debian; excludes Java/licensed tools)
   --with-linux-kernel-tools   Linux-only kernel development dependencies (tools, not sources)
-  --with-guest-tools          QEMU image/compression tools for user-supplied guest media
+  --with-guest-tools          QEMU/UEFI/image tools for the explicit pinned guest lab
   --with-ubuntu-vm            Also install Multipass for the ubuntu_vm^ backend
   --verify-ocore              Build and run the bounded x86 O-core QEMU smoke
   --check                     Non-installing capability check for selected profiles
@@ -96,8 +96,9 @@ Examples:
   ./setup.sh --full --dry-run
 
 Scope:
-  Guest tooling is a reference lab for user-supplied Linux/9front/OpenBSD media.
-  It is not evidence that O-core boots or supports those foreign kernels.
+  Guest tooling prepares the explicit pinned Alpine, FreeBSD, 9front, Guix,
+  and Redox QEMU lab. Setup never downloads or boots an operating system.
+  These host-side boots are not evidence that O-core governs foreign kernels.
 EOF
   exit "$status"
 }
@@ -116,7 +117,7 @@ while [[ $# -gt 0 ]]; do
     --with-hosted-runtimes) WITH_HOSTED_RUNTIMES=true; shift ;;
     --with-linux-kernel-tools) WITH_LINUX_KERNEL_TOOLS=true; shift ;;
     --with-guest-tools) WITH_GUEST_TOOLS=true; shift ;;
-    --with-ubuntu-vm) WITH_UBUNTU_VM=true; WITH_GUEST_TOOLS=true; shift ;;
+    --with-ubuntu-vm) WITH_UBUNTU_VM=true; shift ;;
     --verify-ocore) VERIFY_OCORE=true; WITH_OCORE=true; shift ;;
     --check) CHECK_ONLY=true; shift ;;
     --deps-only) DEPS_ONLY=true; shift ;;
@@ -257,7 +258,7 @@ fi
 if $WITH_OCORE_MEDIA && ! $CHECK_ONLY && \
     [[ "$PLATFORM" != "macos" && !( "$PLATFORM" == "linux" && "$DISTRO" == "debian" ) ]]; then
   echo "Error: automatic --with-ocore-media installation is currently validated only for macOS/Homebrew and Debian-family hosts." >&2
-  echo "Install GRUB x86_64 EFI, mtools, and OVMF manually, then use --check." >&2
+  echo "Install GRUB x86_64 EFI/rescue modules, mtools, xorriso, and OVMF manually, then use --check." >&2
   exit 2
 fi
 
@@ -407,6 +408,13 @@ install_system_deps() {
     echo "On macOS, use --with-guest-tools --with-ubuntu-vm for an isolated Linux development VM." >&2
     return 2
   fi
+  if $WITH_GUEST_TOOLS && \
+      [[ "$PLATFORM" != "macos" ]] && \
+      [[ ! ( "$PLATFORM" == "linux" && "$DISTRO" == "debian" ) ]]; then
+    echo "Error: automatic --with-guest-tools installation is validated only for macOS/Homebrew and Debian-family Linux hosts." >&2
+    echo "Install QEMU, AArch64 UEFI firmware, and compression tools manually, then use --with-guest-tools --check." >&2
+    return 2
+  fi
 
   case "$PLATFORM" in
     macos)
@@ -423,13 +431,13 @@ install_system_deps() {
         append_unique mac_packages llvm lld binutils qemu cmake
       fi
       if $WITH_OCORE_MEDIA; then
-        append_unique mac_packages x86_64-elf-grub mtools
+        append_unique mac_packages x86_64-elf-grub mtools xorriso
       fi
       if $WITH_HOSTED_RUNTIMES; then
         append_unique mac_packages node ruby racket ghc ocaml sbcl mono wabt wasmtime
       fi
       if $WITH_GUEST_TOOLS; then
-        append_unique mac_packages qemu coreutils xz zstd
+        append_unique mac_packages qemu coreutils xz zstd xorriso
       fi
       # Setup installs only declared prerequisites. Avoid an implicit global
       # Homebrew update/cleanup of unrelated packages and caches.
@@ -461,13 +469,13 @@ install_system_deps() {
             append_unique debian_packages clang lld llvm binutils qemu-system-x86 qemu-system-arm cmake
           fi
           if $WITH_OCORE_MEDIA; then
-            append_unique debian_packages grub-efi-amd64-bin mtools ovmf
+            append_unique debian_packages grub-efi-amd64-bin mtools ovmf xorriso
           fi
           if $WITH_HOSTED_RUNTIMES; then
             append_unique debian_packages nodejs ruby racket ghc ocaml sbcl mono-devel octave wabt
           fi
           if $WITH_GUEST_TOOLS; then
-            append_unique debian_packages qemu-system-x86 qemu-system-arm qemu-utils gzip xz-utils zstd
+            append_unique debian_packages qemu-system-x86 qemu-system-arm qemu-efi-aarch64 qemu-utils gzip xz-utils zstd xorriso
           fi
           if $WITH_LINUX_KERNEL_TOOLS; then
             append_unique debian_packages openssl bc bison flex libelf-dev dwarves cpio rsync kmod libncurses-dev xz-utils zstd
@@ -1193,32 +1201,83 @@ check_capabilities() {
 
   if $WITH_OCORE_MEDIA; then
     check_any_tool "GRUB x86_64 EFI builder" x86_64-elf-grub-mkstandalone grub-mkstandalone
+    check_any_tool "GRUB rescue ISO builder" x86_64-elf-grub-mkrescue grub-mkrescue
     check_any_tool "FAT formatter" mformat
     check_any_tool "FAT copier" mcopy
+    check_any_tool "ISO-9660 builder" xorriso
     check_any_tool "committed source snapshot extractor" tar
-    local firmware_candidate=""
-    for firmware_candidate in \
-      "${OSTADIX_OVMF_CODE:-}" \
-      /opt/homebrew/opt/qemu/share/qemu/edk2-x86_64-code.fd \
-      /usr/local/opt/qemu/share/qemu/edk2-x86_64-code.fd \
-      /usr/share/OVMF/OVMF_CODE.fd \
-      /usr/share/edk2/x64/OVMF_CODE.fd; do
-      if [[ -f "$firmware_candidate" ]]; then
-        printf '  [ok] %-28s %s\n' "OVMF/edk2 firmware" "$firmware_candidate"
+    local grub_efi_candidate=""
+    local grub_efi_ready=false
+    local grub_module=""
+    for grub_efi_candidate in \
+      "${OSTADIX_GRUB_EFI_DIRECTORY:-}" \
+      /opt/homebrew/opt/x86_64-elf-grub/lib/x86_64-elf/grub/x86_64-efi \
+      /usr/local/opt/x86_64-elf-grub/lib/x86_64-elf/grub/x86_64-efi \
+      /usr/lib/grub/x86_64-efi; do
+      if [[ -z "$grub_efi_candidate" || -L "$grub_efi_candidate" \
+          || ! -d "$grub_efi_candidate" ]]; then
+        continue
+      fi
+      grub_efi_ready=true
+      for grub_module in modinfo.sh normal.mod multiboot2.mod; do
+        if [[ -L "$grub_efi_candidate/$grub_module" \
+            || ! -f "$grub_efi_candidate/$grub_module" ]]; then
+          grub_efi_ready=false
+          break
+        fi
+      done
+      if $grub_efi_ready; then
+        printf '  [ok] %-28s %s\n' "GRUB x86_64 EFI platform" "$grub_efi_candidate"
         break
       fi
     done
-    if [[ ! -f "$firmware_candidate" ]]; then
+    if ! $grub_efi_ready; then
+      echo "  [missing] GRUB x86_64 EFI platform directory with modinfo.sh, normal.mod, and multiboot2.mod" >&2
+      ((CHECK_FAILURES+=1))
+    fi
+    local firmware_candidate=""
+    local ovmf_resolver="$PROJECT_ROOT/ocore/kernel/resolve-x86_64-ovmf-code.sh"
+    if [[ ! -L "$ovmf_resolver" && -f "$ovmf_resolver" ]]; then
+      # shellcheck source=ocore/kernel/resolve-x86_64-ovmf-code.sh
+      source "$ovmf_resolver"
+      firmware_candidate="$(
+        resolve_ostadix_x86_64_ovmf_code qemu-system-x86_64 2>/dev/null || true
+      )"
+    fi
+    if [[ -n "$firmware_candidate" && ! -L "$firmware_candidate" \
+        && -f "$firmware_candidate" ]]; then
+      printf '  [ok] %-28s %s\n' "OVMF/edk2 firmware" "$firmware_candidate"
+    else
       echo "  [missing] OVMF/edk2 x86_64 code firmware" >&2
       ((CHECK_FAILURES+=1))
     fi
   fi
 
   if $WITH_GUEST_TOOLS; then
+    check_any_tool "AArch64 QEMU" qemu-system-aarch64
+    check_any_tool "x86_64 QEMU" qemu-system-x86_64
     check_any_tool "QEMU image tool" qemu-img
     check_any_tool "gzip" gzip
     check_any_tool "xz" xz
     check_any_tool "zstd" zstd
+    check_any_tool "ISO member extractor" xorriso
+    local guest_firmware_candidate=""
+    for guest_firmware_candidate in \
+      "${OSTADIX_AARCH64_UEFI:-}" \
+      /usr/share/qemu-efi-aarch64/QEMU_EFI.fd \
+      /usr/share/AAVMF/AAVMF_CODE.fd \
+      /usr/share/edk2/aarch64/QEMU_EFI.fd \
+      /opt/homebrew/share/qemu/edk2-aarch64-code.fd \
+      /usr/local/share/qemu/edk2-aarch64-code.fd; do
+      if [[ -f "$guest_firmware_candidate" ]]; then
+        printf '  [ok] %-28s %s\n' "AArch64 UEFI firmware" "$guest_firmware_candidate"
+        break
+      fi
+    done
+    if [[ ! -f "$guest_firmware_candidate" ]]; then
+      echo "  [missing] AArch64 UEFI firmware for the FreeBSD lab" >&2
+      ((CHECK_FAILURES+=1))
+    fi
   fi
 
   if $WITH_HOSTED_RUNTIMES; then
@@ -1432,7 +1491,8 @@ prepare_guest_lab() {
   fi
   run_cmd mkdir -p "$GUESTS_DIR"
   echo "Guest lab directory: $GUESTS_DIR"
-  echo "  Supply checksum-pinned Linux/9front/OpenBSD media explicitly."
+  echo "  Pinned Alpine/FreeBSD/9front/Guix/Redox media is fetched only by an explicit lab command."
+  echo "  Supply any additional foreign media explicitly."
   echo "  No foreign OS image is downloaded or booted by setup.sh."
 }
 
@@ -1620,9 +1680,10 @@ if $WITH_OCORE_MEDIA; then
   echo "  # QEMU validation is not physical-machine or SMP evidence."
 fi
 if $WITH_GUEST_TOOLS; then
-  echo "  Guest tools are for explicit, user-supplied media under:"
+  echo "  Guest tools and explicit pinned-lab media use:"
   echo "    $GUESTS_DIR"
-  echo "  They do not establish Linux, Plan 9, or OpenBSD support in O-core."
+  echo "  python3 scripts/foreign_kernel_lab.py list"
+  echo "  These host-side boots do not establish foreign-kernel support in O-core."
 fi
 echo
 echo "For clean testing in docker (as mentioned in history):"
