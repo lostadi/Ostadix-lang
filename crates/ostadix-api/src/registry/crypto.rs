@@ -1,5 +1,6 @@
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
-use sha2::{Digest, Sha256};
+
+pub use crate::canonical_cbor::registry_public_key_id;
 
 use super::model::{
     NamespaceDelegationV1, NamespaceRootV1, ProfilePublicationV1, ProfileStalenessPolicyV1,
@@ -9,7 +10,6 @@ use super::model::{
 use super::{canonical_registry_bytes, registry_event_sha256, RegistryError};
 
 const REGISTRY_SIGNING_DOMAIN_V1: &[u8] = b"OSTADIX/REGISTRY-EVENT/V1\0";
-const REGISTRY_KEY_ID_DOMAIN_V1: &[u8] = b"OSTADIX/REGISTRY-ED25519-KEY/V1\0";
 
 /// In-memory Ed25519 authority. Debug is intentionally redacted and secret
 /// bytes are exposed only to the persistence module.
@@ -58,13 +58,6 @@ impl RegistrySignerV1 {
             self.signing_key.sign(&preimage).to_bytes(),
         ))
     }
-}
-
-pub fn registry_public_key_id(public_key: &RegistryPublicKeyV1) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(REGISTRY_KEY_ID_DOMAIN_V1);
-    hasher.update(public_key);
-    hasher.finalize().into()
 }
 
 pub fn create_registry_root(

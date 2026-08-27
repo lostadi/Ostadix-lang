@@ -412,9 +412,22 @@ mod tests {
         let bytes = encode_execution_capsule_v1(&capsule).unwrap();
         let decoded = decode_execution_capsule_v1(&bytes).unwrap();
         assert_eq!(decoded, capsule);
+        assert_eq!(*decoded.region().expected_oir_sha256(), digest(3));
+        assert_eq!(*decoded.region().expected_plan_sha256(), digest(4));
+        assert_eq!(*decoded.region().backend_catalog_sha256(), digest(5));
+        assert_eq!(*decoded.region().backend_implementation_sha256(), digest(6));
+        assert_eq!(
+            decoded.region().source_sha256(),
+            capsule.region().source_sha256()
+        );
+        assert_eq!(*decoded.admission_sha256(), digest(7));
         assert_eq!(encode_execution_capsule_v1(&decoded).unwrap(), bytes);
         assert_eq!(
             execution_capsule_sha256_v1(&decoded).unwrap(),
+            execution_capsule_sha256_v1(&capsule).unwrap()
+        );
+        assert_eq!(
+            decoded.canonical_sha256().unwrap(),
             execution_capsule_sha256_v1(&capsule).unwrap()
         );
         assert_eq!(bytes.len(), 1367);
@@ -436,6 +449,19 @@ mod tests {
         let bytes = encode_execution_candidate_v1(&candidate).unwrap();
         let decoded = decode_execution_candidate_v1(&bytes).unwrap();
         decoded.validate_against(&capsule).unwrap();
+        let capsule_sha256 = execution_capsule_sha256_v1(&capsule).unwrap();
+        assert_eq!(decoded.attempt(), capsule.attempt());
+        assert_eq!(decoded.capsule_sha256(), &capsule_sha256);
+        assert_eq!(decoded.region_sha256(), capsule.region().region_sha256());
+        assert_eq!(
+            decoded.input_manifest_sha256(),
+            capsule.inputs().manifest_sha256()
+        );
+        assert_eq!(
+            decoded.output_contract_sha256(),
+            capsule.output().contract_sha256()
+        );
+        assert_eq!(decoded.completed_unix_ms(), 1_999_999_999_999);
         assert_eq!(bytes.len(), 759);
         assert_eq!(
             hex::encode(Sha256::digest(&bytes)),

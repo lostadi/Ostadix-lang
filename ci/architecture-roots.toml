@@ -139,6 +139,11 @@ layer = 8
 allowed_dependencies = ["canonical_cbor", "world"]
 
 [[root]]
+name = "execution_fabric_authority"
+layer = 9
+allowed_dependencies = ["canonical_cbor", "execution_contract", "execution_fabric", "placement_protocol"]
+
+[[root]]
 name = "executor"
 layer = 10
 allowed_dependencies = ["backend_catalog", "capability", "dispatch_model", "effects", "environment", "eval_core", "evidence", "execution_contract", "hgraph", "ir", "process", "runtime_exec", "value"]
@@ -151,7 +156,7 @@ allowed_dependencies = ["backend_catalog", "backend_morphism", "dispatch_model",
 [[root]]
 name = "hosted_remote"
 layer = 12
-allowed_dependencies = ["backend_catalog", "backend_state", "environment", "eval", "executor", "parser", "placement", "process", "project", "registry", "runtime_exec", "value", "wire"]
+allowed_dependencies = ["backend_catalog", "backend_state", "canonical_cbor", "environment", "eval", "executor", "parser", "placement", "process", "project", "registry", "runtime_exec", "value", "wire"]
 
 [[root]]
 name = "information"
@@ -231,7 +236,7 @@ allowed_dependencies = ["backend_catalog", "effects", "executor", "hgraph", "ir"
 [[root]]
 name = "registry"
 layer = 3
-allowed_dependencies = ["backend_catalog", "placement_protocol", "wire"]
+allowed_dependencies = ["backend_catalog", "canonical_cbor", "placement_protocol", "wire"]
 
 [[root]]
 name = "resource_identity"

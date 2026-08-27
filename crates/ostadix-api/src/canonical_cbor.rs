@@ -7,6 +7,18 @@
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::{Map, Number, Value};
+use sha2::{Digest, Sha256};
+
+const REGISTRY_KEY_ID_DOMAIN_V1: &[u8] = b"OSTADIX/REGISTRY-ED25519-KEY/V1\0";
+
+/// Stable Ostadix Ed25519 public-key identity used by the registry and every
+/// protocol that binds one of its key IDs.
+pub fn registry_public_key_id(public_key: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(REGISTRY_KEY_ID_DOMAIN_V1);
+    hasher.update(public_key);
+    hasher.finalize().into()
+}
 
 pub(crate) fn encode<T: Serialize>(message: &T) -> Result<Vec<u8>> {
     let value = serde_json::to_value(message).context("failed to lower message to wire value")?;
@@ -44,6 +56,23 @@ pub(crate) fn decode_bounded<T: DeserializeOwned>(
     let value = decoder.decode_value()?;
     decoder.finish()?;
     serde_json::from_value(value).context("failed to lift wire value into message")
+}
+
+/// Builds the domain-separated preimage used by canonical signed records.
+///
+/// The byte formula is exactly `domain || u64_be(body.len()) || body`.
+pub(crate) fn signing_preimage(domain: &[u8], body: &[u8]) -> Result<Vec<u8>> {
+    let body_len = u64::try_from(body.len()).context("canonical signing body is too large")?;
+    let capacity = domain
+        .len()
+        .checked_add(8)
+        .and_then(|size| size.checked_add(body.len()))
+        .context("canonical signing preimage is too large")?;
+    let mut preimage = Vec::with_capacity(capacity);
+    preimage.extend_from_slice(domain);
+    preimage.extend_from_slice(&body_len.to_be_bytes());
+    preimage.extend_from_slice(body);
+    Ok(preimage)
 }
 
 fn encode_value(value: &Value, out: &mut Vec<u8>) -> Result<()> {
@@ -391,5 +420,24 @@ mod tests {
         let left = BTreeMap::from([("aa", 2_u64), ("b", 1)]);
         let right = BTreeMap::from([("b", 1_u64), ("aa", 2)]);
         assert_eq!(encode(&left).unwrap(), encode(&right).unwrap());
+    }
+
+    #[test]
+    fn signing_preimage_known_answer_pins_domain_length_and_body() {
+        let preimage =
+            signing_preimage(b"OSTADIX/HOSTED-JOURNAL/V2\0", &[0xa1, 0x61, 0x78, 0x01]).unwrap();
+
+        assert_eq!(
+            hex::encode(preimage),
+            "4f5354414449582f484f535445442d4a4f55524e414c2f5632000000000000000004a1617801"
+        );
+    }
+
+    #[test]
+    fn registry_public_key_identity_remains_domain_separated() {
+        assert_eq!(
+            hex::encode(registry_public_key_id(&[0x42; 32])),
+            "c17f43f677080cb8f77403e60826cd0b00c516e05038837f673b316fbcd46361"
+        );
     }
 }

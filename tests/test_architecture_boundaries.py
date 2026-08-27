@@ -177,7 +177,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         self.assertEqual(
             result.stdout,
             "architecture dependency boundaries: PASS "
-            "(163 production files, 43 roots, 195 cross-root edges)\n",
+            "(168 production files, 44 roots, 201 cross-root edges)\n",
         )
 
     def test_manifest_inventories_every_current_root_edge_override_and_facade(self) -> None:
@@ -198,9 +198,9 @@ class ArchitectureBoundaryTests(unittest.TestCase):
                 }
             ],
         )
-        self.assertEqual(len(roots), 43)
+        self.assertEqual(len(roots), 44)
         self.assertEqual(
-            sum(len(root["allowed_dependencies"]) for root in roots), 195
+            sum(len(root["allowed_dependencies"]) for root in roots), 201
         )
         api_root = next(root for root in roots if root["name"] == "api")
         self.assertIn("ir", api_root["allowed_dependencies"])
@@ -236,6 +236,23 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         self.assertEqual(
             fabric_root["allowed_dependencies"], ["canonical_cbor", "world"]
         )
+        fabric_authority_root = next(
+            root for root in roots if root["name"] == "execution_fabric_authority"
+        )
+        self.assertEqual(fabric_authority_root["layer"], 9)
+        self.assertEqual(
+            fabric_authority_root["allowed_dependencies"],
+            [
+                "canonical_cbor",
+                "execution_contract",
+                "execution_fabric",
+                "placement_protocol",
+            ],
+        )
+        hosted_remote_root = next(
+            root for root in roots if root["name"] == "hosted_remote"
+        )
+        self.assertIn("canonical_cbor", hosted_remote_root["allowed_dependencies"])
         self.assertEqual(
             {
                 (entry["path"], entry["kind"], tuple(entry["module_path"]))

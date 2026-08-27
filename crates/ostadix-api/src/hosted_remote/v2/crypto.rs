@@ -10,6 +10,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+use crate::canonical_cbor::signing_preimage;
 use crate::placement::{SemanticDigestV1, StateCapacityObservationV2};
 use crate::registry::registry_public_key_id;
 
@@ -493,18 +494,6 @@ pub(crate) fn domain_sha256(domain: &[u8], body: &[u8]) -> String {
     hex::encode(hash.finalize())
 }
 
-pub(crate) fn signing_preimage(domain: &[u8], body: &[u8]) -> Result<Vec<u8>> {
-    let len: u64 = body
-        .len()
-        .try_into()
-        .context("signed hosted record is too large")?;
-    let mut preimage = Vec::with_capacity(domain.len() + 8 + body.len());
-    preimage.extend_from_slice(domain);
-    preimage.extend_from_slice(&len.to_be_bytes());
-    preimage.extend_from_slice(body);
-    Ok(preimage)
-}
-
 pub(crate) fn decode_fixed_hex<const N: usize>(field: &str, text: &str) -> Result<[u8; N]> {
     let decoded = hex::decode(text).with_context(|| format!("{field} is not hexadecimal"))?;
     decoded
@@ -531,4 +520,36 @@ pub(crate) fn salted_bearer_hash(salt: &[u8; 32], bearer: &[u8; 32]) -> String {
     bytes.extend_from_slice(salt);
     bytes.extend_from_slice(bearer);
     sha256_hex(&bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frozen_hosted_v2_signing_preimage(domain: &[u8], body: &[u8]) -> Vec<u8> {
+        let mut preimage = Vec::with_capacity(domain.len() + 8 + body.len());
+        preimage.extend_from_slice(domain);
+        preimage.extend_from_slice(&(body.len() as u64).to_be_bytes());
+        preimage.extend_from_slice(body);
+        preimage
+    }
+
+    #[test]
+    fn shared_signing_preimage_matches_frozen_hosted_v2_formula() {
+        let fixtures = [
+            (NODE_SIGNING_DOMAIN_V2, &[][..]),
+            (NODE_SIGNING_DOMAIN_V2, b"journal-body".as_slice()),
+            (
+                PLACEMENT_SIGNING_DOMAIN_V2,
+                b"placement-envelope-body".as_slice(),
+            ),
+        ];
+
+        for (domain, body) in fixtures {
+            assert_eq!(
+                signing_preimage(domain, body).unwrap(),
+                frozen_hosted_v2_signing_preimage(domain, body)
+            );
+        }
+    }
 }
