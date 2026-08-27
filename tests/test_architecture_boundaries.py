@@ -60,6 +60,7 @@ def write_minimal_tree(root: Path) -> None:
         "crates/ostadix-api/src/executor/actor.rs",
         "crates/ostadix-api/src/executor/cancellation.rs",
         "crates/ostadix-api/src/executor/coordinator.rs",
+        "crates/ostadix-api/src/executor/driver.rs",
         "crates/ostadix-api/src/executor/effects.rs",
         "crates/ostadix-api/src/executor/mod.rs",
         "crates/ostadix-api/src/executor/parallel.rs",
@@ -176,7 +177,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         self.assertEqual(
             result.stdout,
             "architecture dependency boundaries: PASS "
-            "(159 production files, 42 roots, 193 cross-root edges)\n",
+            "(160 production files, 42 roots, 193 cross-root edges)\n",
         )
 
     def test_manifest_inventories_every_current_root_edge_override_and_facade(self) -> None:
@@ -1878,6 +1879,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
             "crates/ostadix-api/src/executor/actor.rs",
             "crates/ostadix-api/src/executor/cancellation.rs",
             "crates/ostadix-api/src/executor/coordinator.rs",
+            "crates/ostadix-api/src/executor/driver.rs",
             "crates/ostadix-api/src/executor/effects.rs",
             "crates/ostadix-api/src/executor/mod.rs",
             "crates/ostadix-api/src/executor/parallel.rs",

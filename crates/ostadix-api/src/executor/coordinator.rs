@@ -29,8 +29,8 @@ use crate::hgraph::{schedule::ReadySchedule, NodeId, ValueState};
 use crate::ir::{ExecutionPlan, OIr, OIrProgram, PlanNodeId, PlanNodeKind};
 use crate::value::OValue;
 
+use super::driver::{AttemptDriver, LocalWorkerDriver};
 use super::parallel;
-use super::pool::WorkerPool;
 use super::task::{
     TaskCallbackFailure, TaskCompletion, TaskEvalRequest, TaskOutcome, TaskSubmission, TaskToken,
     WorkerEvent,
@@ -267,25 +267,25 @@ impl<'a> Coordinator<'a> {
         let worker_capacity = parallel::worker_count_hint()
             .unwrap_or(worker_capacity)
             .max(1);
-        let mut pool = (worker_operations > 0)
-            .then(|| WorkerPool::new(worker_capacity))
+        let mut driver = (worker_operations > 0)
+            .then(|| LocalWorkerDriver::new(worker_capacity))
             .transpose()?;
 
         loop {
-            if let Some(pool) = pool.as_mut() {
+            if let Some(driver) = driver.as_mut() {
                 loop {
-                    let event = match pool.try_recv_event() {
+                    let event = match driver.try_recv_event() {
                         Ok(Some(event)) => event,
                         Ok(None) => break,
                         Err(error) => {
                             return Err(self.abort_after_worker_error(
-                                Some(pool),
+                                Some(driver),
                                 "local worker completion channel failed",
                                 error,
                             ));
                         }
                     };
-                    self.accept_worker_event_or_abort(evaluator, pool, event)?;
+                    self.accept_worker_event_or_abort(evaluator, driver, event)?;
                 }
             }
 
@@ -301,7 +301,12 @@ impl<'a> Coordinator<'a> {
                         failed_id.0
                     ),
                 };
-                self.discard_started_workers(pool.as_mut(), &reason);
+                self.discard_started_workers(
+                    driver
+                        .as_mut()
+                        .map(|driver| driver as &mut dyn AttemptDriver),
+                    &reason,
+                );
                 return Err(failure.error);
             }
 
@@ -321,20 +326,24 @@ impl<'a> Coordinator<'a> {
                     self.ops[index].plan_node.0
                 );
                 return Err(self.abort_after_worker_error(
-                    pool.as_mut(),
+                    driver
+                        .as_mut()
+                        .map(|driver| driver as &mut dyn AttemptDriver),
                     "scheduler aborted after a local-worker preparation contract mismatch",
                     error,
                 ));
             }
 
             let mut dispatched = false;
-            if let Some(worker_pool) = pool.as_mut() {
+            if let Some(attempt_driver) = driver.as_mut() {
                 let candidates =
-                    self.worker_dispatch_candidates(&ready, worker_pool.available_slots());
+                    self.worker_dispatch_candidates(&ready, attempt_driver.available_slots());
                 if !candidates.is_empty() {
-                    if let Err(error) = self.dispatch_workers(evaluator, worker_pool, &candidates) {
+                    if let Err(error) =
+                        self.dispatch_workers(evaluator, attempt_driver, &candidates)
+                    {
                         return Err(self.abort_after_worker_error(
-                            Some(worker_pool),
+                            Some(attempt_driver),
                             "scheduler aborted while submitting prepared local-worker tasks",
                             error,
                         ));
@@ -346,12 +355,14 @@ impl<'a> Coordinator<'a> {
                 continue;
             }
 
-            let workers_outstanding = pool.as_ref().map_or(0, WorkerPool::outstanding);
+            let workers_outstanding = driver.as_ref().map_or(0, AttemptDriver::outstanding);
             if workers_outstanding == 0 {
                 if let Some(coordinator) = self.coordinator_at_settlement_frontier(&ready) {
                     if let Err(error) = self.run_coordinator_op(evaluator, coordinator) {
                         self.discard_started_workers(
-                            pool.as_mut(),
+                            driver
+                                .as_mut()
+                                .map(|driver| driver as &mut dyn AttemptDriver),
                             &format!(
                                 "strict fail-stop withheld result after operation {} failed",
                                 self.ops[coordinator].plan_node.0
@@ -363,18 +374,19 @@ impl<'a> Coordinator<'a> {
                 }
             }
 
-            if let Some(worker_pool) = pool.as_mut().filter(|pool| pool.outstanding() > 0) {
-                let event = match worker_pool.recv_event() {
+            if let Some(attempt_driver) = driver.as_mut().filter(|driver| driver.outstanding() > 0)
+            {
+                let event = match attempt_driver.recv_event() {
                     Ok(event) => event,
                     Err(error) => {
                         return Err(self.abort_after_worker_error(
-                            Some(worker_pool),
+                            Some(attempt_driver),
                             "local worker completion channel failed",
                             error,
                         ));
                     }
                 };
-                self.accept_worker_event_or_abort(evaluator, worker_pool, event)?;
+                self.accept_worker_event_or_abort(evaluator, attempt_driver, event)?;
                 continue;
             }
 
@@ -384,7 +396,9 @@ impl<'a> Coordinator<'a> {
                 .filter(|op| op.state != OpRunState::Settled)
                 .count();
             self.discard_started_workers(
-                pool.as_mut(),
+                driver
+                    .as_mut()
+                    .map(|driver| driver as &mut dyn AttemptDriver),
                 "scheduler stalled before a started local-worker result could settle",
             );
             bail!(
@@ -560,7 +574,7 @@ impl<'a> Coordinator<'a> {
     fn dispatch_workers(
         &mut self,
         evaluator: &dyn GraphEvaluationHost,
-        pool: &mut WorkerPool,
+        driver: &mut dyn AttemptDriver,
         selected: &[usize],
     ) -> Result<()> {
         if selected.iter().any(|&index| {
@@ -617,7 +631,7 @@ impl<'a> Coordinator<'a> {
         }
 
         for (index, id, task) in prepared {
-            pool.submit(TaskSubmission::new(TaskToken(index), task))?;
+            driver.submit(TaskSubmission::new(TaskToken(index), task))?;
             crate::process::lifecycle_trace(
                 "coordinator.task_submitted",
                 format!("token={index} plan_node={}", id.0),
@@ -631,19 +645,19 @@ impl<'a> Coordinator<'a> {
 
     fn accept_worker_completion(
         &mut self,
-        pool: &mut WorkerPool,
+        driver: &mut dyn AttemptDriver,
         completion: TaskCompletion,
     ) -> Result<()> {
         match self.buffer_worker_completion(completion) {
             Ok(WorkerCompletionDisposition::Continue) => Ok(()),
             Ok(WorkerCompletionDisposition::AbortInfrastructure) => Err(self
                 .abort_after_worker_error(
-                    Some(pool),
+                    Some(driver),
                     "local worker reported an infrastructure failure",
                     anyhow::anyhow!("local worker reported an infrastructure failure"),
                 )),
             Err(error) => Err(self.abort_after_worker_error(
-                Some(pool),
+                Some(driver),
                 "local worker returned an invalid completion",
                 error,
             )),
@@ -653,7 +667,7 @@ impl<'a> Coordinator<'a> {
     fn accept_worker_event(
         &mut self,
         evaluator: &mut dyn GraphEvaluationHost,
-        pool: &mut WorkerPool,
+        driver: &mut dyn AttemptDriver,
         event: WorkerEvent,
     ) -> Result<()> {
         match event {
@@ -662,7 +676,7 @@ impl<'a> Coordinator<'a> {
                     "coordinator.completion_received",
                     format!("token={}", completion.token.0),
                 );
-                self.accept_worker_completion(pool, completion)
+                self.accept_worker_completion(driver, completion)
             }
             WorkerEvent::EvalRequest(request) => {
                 self.handle_worker_eval_request(evaluator, request)
@@ -676,13 +690,13 @@ impl<'a> Coordinator<'a> {
     fn accept_worker_event_or_abort(
         &mut self,
         evaluator: &mut dyn GraphEvaluationHost,
-        pool: &mut WorkerPool,
+        driver: &mut dyn AttemptDriver,
         event: WorkerEvent,
     ) -> Result<()> {
-        match self.accept_worker_event(evaluator, pool, event) {
+        match self.accept_worker_event(evaluator, driver, event) {
             Ok(()) => Ok(()),
             Err(error) => Err(self.abort_after_worker_error(
-                Some(pool),
+                Some(driver),
                 "scheduler aborted while handling a local-worker event",
                 error,
             )),
@@ -903,10 +917,10 @@ impl<'a> Coordinator<'a> {
 
     /// Drain every physically started task and give it one deterministic
     /// terminal trace event before returning from an abort or semantic failure.
-    fn discard_started_workers(&mut self, pool: Option<&mut WorkerPool>, reason: &str) {
-        if let Some(pool) = pool {
-            while pool.outstanding() > 0 {
-                match pool.recv_event() {
+    fn discard_started_workers(&mut self, driver: Option<&mut dyn AttemptDriver>, reason: &str) {
+        if let Some(driver) = driver {
+            while driver.outstanding() > 0 {
+                match driver.recv_event() {
                     Ok(WorkerEvent::Completion(completion)) => {
                         let _ = self.buffer_worker_completion(completion);
                     }
@@ -953,14 +967,14 @@ impl<'a> Coordinator<'a> {
     /// prefix, and prefer an error discovered there over the scheduler fault.
     fn abort_after_worker_error(
         &mut self,
-        pool: Option<&mut WorkerPool>,
+        driver: Option<&mut dyn AttemptDriver>,
         reason: &str,
         scheduler_error: anyhow::Error,
     ) -> anyhow::Error {
         let mut drain_error = None;
-        if let Some(pool) = pool {
-            while pool.outstanding() > 0 {
-                match pool.recv_event() {
+        if let Some(driver) = driver {
+            while driver.outstanding() > 0 {
+                match driver.recv_event() {
                     Ok(WorkerEvent::Completion(completion)) => {
                         if let Err(error) = self.buffer_worker_completion(completion) {
                             if drain_error.is_none() {
@@ -1097,7 +1111,7 @@ impl<'a> Coordinator<'a> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
     use std::time::Duration;
 
     use super::*;
@@ -1142,6 +1156,78 @@ mod tests {
         ) -> Result<OValue> {
             std::thread::sleep(self.delay);
             context.eval_o_source("text^(callback)_text".to_string(), HashMap::new())
+        }
+    }
+
+    struct ReorderingAttemptDriver {
+        capacity: usize,
+        outstanding: usize,
+        events: VecDeque<WorkerEvent>,
+    }
+
+    impl ReorderingAttemptDriver {
+        fn new(capacity: usize, events: impl IntoIterator<Item = WorkerEvent>) -> Self {
+            let events = events.into_iter().collect::<VecDeque<_>>();
+            let outstanding = events
+                .iter()
+                .filter(|event| matches!(event, WorkerEvent::Completion(_)))
+                .count();
+            assert!(outstanding <= capacity);
+            Self {
+                capacity,
+                outstanding,
+                events,
+            }
+        }
+
+        fn pop_event(&mut self) -> Result<Option<WorkerEvent>> {
+            let Some(event) = self.events.pop_front() else {
+                return Ok(None);
+            };
+            if matches!(&event, WorkerEvent::Completion(_)) {
+                if self.outstanding == 0 {
+                    bail!("scripted attempt driver produced an unexpected completion");
+                }
+                self.outstanding -= 1;
+            }
+            Ok(Some(event))
+        }
+    }
+
+    impl AttemptDriver for ReorderingAttemptDriver {
+        fn available_slots(&self) -> usize {
+            self.capacity - self.outstanding
+        }
+
+        fn outstanding(&self) -> usize {
+            self.outstanding
+        }
+
+        fn submit(&mut self, _submission: TaskSubmission) -> Result<()> {
+            bail!("scripted reordering driver does not accept submissions")
+        }
+
+        fn try_recv_event(&mut self) -> Result<Option<WorkerEvent>> {
+            self.pop_event()
+        }
+
+        fn recv_event(&mut self) -> Result<WorkerEvent> {
+            self.pop_event()?
+                .ok_or_else(|| anyhow::anyhow!("scripted attempt driver has no pending event"))
+        }
+    }
+
+    fn recv_completion(driver: &mut dyn AttemptDriver) -> TaskCompletion {
+        match driver.recv_event().unwrap() {
+            WorkerEvent::Completion(completion) => completion,
+            WorkerEvent::EvalRequest(request) => {
+                request
+                    .respond(Err(TaskCallbackFailure::Infrastructure(
+                        "unexpected callback in completion-only test".to_string(),
+                    )))
+                    .unwrap();
+                panic!("unexpected callback in completion-only test")
+            }
         }
     }
 
@@ -1300,7 +1386,7 @@ mod tests {
         let admitted =
             admit_execution(&program, &plan, graph, Policy::Eager, runtime, evidence).unwrap();
         let mut coordinator = Coordinator::new(admitted).unwrap();
-        let mut pool = WorkerPool::new(1).unwrap();
+        let mut pool = LocalWorkerDriver::new(1).unwrap();
         let first = 0;
         let id = coordinator.ops[first].plan_node;
         let task = parallel::prepare(
@@ -1366,7 +1452,7 @@ mod tests {
         coordinator.ops[valid].state = OpRunState::InFlight;
         coordinator.trace.started(coordinator.ops[valid].plan_node);
 
-        let mut pool = WorkerPool::new(2).unwrap();
+        let mut pool = LocalWorkerDriver::new(2).unwrap();
         pool.submit(TaskSubmission::new(
             TaskToken(usize::MAX),
             Box::new(CallbackTask {
@@ -1414,7 +1500,7 @@ mod tests {
         let admitted =
             admit_execution(&program, &plan, graph, Policy::Eager, runtime, evidence).unwrap();
         let mut coordinator = Coordinator::new(admitted).unwrap();
-        let mut pool = WorkerPool::new(1).unwrap();
+        let mut pool = LocalWorkerDriver::new(1).unwrap();
         let first = 0;
         let second = 1;
         let first_id = coordinator.ops[first].plan_node;
@@ -1471,7 +1557,7 @@ mod tests {
             admit_execution(&program, &plan, graph, Policy::Eager, runtime, evidence).unwrap();
         let mut coordinator = Coordinator::new(admitted).unwrap();
         let id = coordinator.ops[0].plan_node;
-        let mut pool = WorkerPool::new(1).unwrap();
+        let mut pool = LocalWorkerDriver::new(1).unwrap();
         pool.submit(TaskSubmission::new(
             TaskToken(0),
             Box::new(PanicPreparedTask),
@@ -1479,7 +1565,7 @@ mod tests {
         .unwrap();
         coordinator.ops[0].state = OpRunState::InFlight;
         coordinator.trace.started(id);
-        let completion = pool.recv_completion().unwrap();
+        let completion = recv_completion(&mut pool);
         let error = coordinator
             .accept_worker_completion(&mut pool, completion)
             .expect_err("caught panic must immediately enter infrastructure abort");
@@ -1518,7 +1604,7 @@ mod tests {
             admit_execution(&program, &plan, graph, Policy::Eager, runtime, evidence).unwrap();
         let mut coordinator = Coordinator::new(admitted).unwrap();
         let id = coordinator.ops[0].plan_node;
-        let mut pool = WorkerPool::new(1).unwrap();
+        let mut pool = LocalWorkerDriver::new(1).unwrap();
         pool.submit(TaskSubmission::new(
             TaskToken(0),
             Box::new(ErrorPreparedTask),
@@ -1526,7 +1612,7 @@ mod tests {
         .unwrap();
         coordinator.ops[0].state = OpRunState::InFlight;
         coordinator.trace.started(id);
-        let completion = pool.recv_completion().unwrap();
+        let completion = recv_completion(&mut pool);
         let error = coordinator
             .accept_worker_completion(&mut pool, completion)
             .expect_err("an admitted-infallible error must immediately abort infrastructure");
@@ -1621,6 +1707,66 @@ mod tests {
             event,
             crate::eval::TraceEvent::NodeFinished { id, .. } if *id == later_id
         )));
+    }
+
+    #[test]
+    fn reordered_attempt_driver_events_still_settle_the_lowest_ordinal_failure() {
+        let program = OIrProgram {
+            nodes: vec![OIr::Load("first".into()), OIr::Load("second".into())],
+        };
+        let plan = program.plan();
+        let mut graph = build_program(&program);
+        solve_types(&mut graph).unwrap();
+        let mut evaluator = Evaluator::new("/tmp".into());
+        let runtime = evaluator.admission_runtime_binding(&plan);
+        let evidence = analyze_execution(&program, &plan, &graph, runtime.clone()).unwrap();
+        let admitted =
+            admit_execution(&program, &plan, graph, Policy::Eager, runtime, evidence).unwrap();
+        let mut coordinator = Coordinator::new(admitted).unwrap();
+        let first = 0;
+        let second = 1;
+        for index in [first, second] {
+            coordinator.ops[index].state = OpRunState::InFlight;
+            coordinator.trace.ready(coordinator.ops[index].plan_node);
+            coordinator.trace.started(coordinator.ops[index].plan_node);
+        }
+
+        let mut driver = ReorderingAttemptDriver::new(
+            2,
+            [
+                WorkerEvent::Completion(TaskCompletion::completed(
+                    TaskToken(second),
+                    Err(anyhow::anyhow!("second failure")),
+                )),
+                WorkerEvent::Completion(TaskCompletion::completed(
+                    TaskToken(first),
+                    Err(anyhow::anyhow!("first failure")),
+                )),
+            ],
+        );
+        assert_eq!(driver.available_slots(), 0);
+
+        let event = driver.recv_event().unwrap();
+        coordinator
+            .accept_worker_event(&mut evaluator, &mut driver, event)
+            .unwrap();
+        assert_eq!(coordinator.ops[second].state, OpRunState::Buffered);
+        assert_eq!(coordinator.ops[first].state, OpRunState::InFlight);
+        assert_eq!(driver.available_slots(), 1);
+
+        let event = driver.recv_event().unwrap();
+        coordinator
+            .accept_worker_event(&mut evaluator, &mut driver, event)
+            .unwrap();
+        assert_eq!(driver.outstanding(), 0);
+
+        let failure = coordinator
+            .settle_buffered_results()
+            .expect("ordinal settlement must select a failure");
+        assert_eq!(failure.kind, WorkerFailureKind::Semantic);
+        assert_eq!(failure.index, first);
+        assert_eq!(failure.error.to_string(), "first failure");
+        assert_eq!(coordinator.ops[second].state, OpRunState::Buffered);
     }
 
     #[test]

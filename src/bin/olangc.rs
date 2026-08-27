@@ -1124,6 +1124,7 @@ fn write_runtime_sources(src_dir: &Path) -> Result<()> {
         executor_dir.join("coordinator.rs"),
         RUNTIME_EXECUTOR_COORDINATOR_RS,
     )?;
+    fs::write(executor_dir.join("driver.rs"), RUNTIME_EXECUTOR_DRIVER_RS)?;
     fs::write(executor_dir.join("effects.rs"), RUNTIME_EXECUTOR_EFFECTS_RS)?;
     fs::write(
         executor_dir.join("parallel.rs"),
@@ -2824,6 +2825,7 @@ mod tests {
             "executor/actor.rs",
             "executor/cancellation.rs",
             "executor/coordinator.rs",
+            "executor/driver.rs",
             "executor/effects.rs",
             "executor/parallel.rs",
             "executor/pool.rs",
@@ -2906,6 +2908,11 @@ mod tests {
             fs::read_to_string(src_dir.join("executor/pool.rs")).unwrap(),
             RUNTIME_EXECUTOR_POOL_RS,
             "generated runtimes must receive the persistent worker pool verbatim"
+        );
+        assert_eq!(
+            fs::read_to_string(src_dir.join("executor/driver.rs")).unwrap(),
+            RUNTIME_EXECUTOR_DRIVER_RS,
+            "generated runtimes must receive the attempt-driver boundary verbatim"
         );
         assert_eq!(
             fs::read_to_string(src_dir.join("executor/task.rs")).unwrap(),
