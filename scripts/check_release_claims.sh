@@ -611,6 +611,114 @@ require_fixed .github/workflows/ci.yml \
     'run: ./boot-and-test.sh smoke' \
     'CI no longer runs the manifest-driven portable QEMU evidence aggregate'
 
+# M3 is one authenticated same-host, distinct-process Fabric proof. Pin its
+# deliberately narrow claim, exact nonclaims, protocol coordinates, and
+# executable evidence without promoting it to physical or distinct-kernel
+# multinode execution.
+fabric_positive_claim='Fabric V1 can authenticate and execute the admitted M2 pure renderer profile on an explicitly selected `o-node`, returning a bounded provisional candidate whose graph publication and settlement remain coordinator-controlled.'
+require_fixed docs/OIR_EXECUTION_FABRIC_V1.md \
+    "$fabric_positive_claim" \
+    'the narrow M3 execution-Fabric claim drifted'
+require_fixed docs/CLAIMS.md \
+    "$fabric_positive_claim" \
+    'the public M3 execution-Fabric claim drifted'
+require_fixed docs/OIR_EXECUTION_FABRIC_V1.md \
+    'The coordinator is the sole graph-commit authority and the sole linearization locus for graph transitions.' \
+    'the coordinator-only graph-commit invariant is missing'
+
+for nonclaim in \
+    'no arbitrary OIR region execution' \
+    'no general `.O` distribution' \
+    'no automatic placement' \
+    'no capacity scheduler' \
+    'no scope transport' \
+    'no object plane' \
+    'no bulk node-to-node data transfer' \
+    'no actors' \
+    'no external effects' \
+    'no automatic retry' \
+    'no coordinator crash recovery' \
+    'no hardware-resource execution' \
+    'no GPU or camera driver mediation' \
+    'no process migration' \
+    'no shared address space' \
+    'no physical multinode claim' \
+    'no distinct-kernel claim' \
+    'no heterogeneous-architecture claim' \
+    'no exactly-once external effect claim'
+do
+    require_fixed docs/OIR_EXECUTION_FABRIC_V1.md "$nonclaim" \
+        "the OIR execution-Fabric contract lost M3 nonclaim: $nonclaim"
+    require_fixed docs/CLAIMS.md "$nonclaim" \
+        "the public claims surface lost M3 nonclaim: $nonclaim"
+done
+
+fabric_coordinates=(
+    'EXECUTION_CAPSULE_SCHEMA_V1|ostadix.oir-execution-capsule/v1'
+    'EXECUTION_CANDIDATE_SCHEMA_V1|ostadix.oir-execution-candidate/v1'
+    'FABRIC_REQUEST_SCHEMA_V1|ostadix.execution-fabric-request/v1'
+    'FABRIC_RESPONSE_SCHEMA_V1|ostadix.execution-fabric-response/v1'
+    'FABRIC_SUBMISSION_SCHEMA_V1|ostadix.execution-fabric-submission/v1'
+    'FABRIC_SOURCE_CLOSURE_SCHEMA_V1|ostadix.execution-source-closure/v1'
+    'FABRIC_SOURCE_CLOSURE_DIALECT_V1|ostadix-source-closure/v1'
+    'FABRIC_PLACEMENT_LEASE_SCHEMA_V3|ostadix.execution-placement-lease/v3'
+    'FABRIC_SIGNED_LEASE_SCHEMA_V3|ostadix.signed-execution-lease/v3'
+    'FABRIC_TERMINAL_RECEIPT_SCHEMA_V1|ostadix.execution-fabric-terminal-receipt/v1'
+    'FABRIC_SIGNED_TERMINAL_RECEIPT_SCHEMA_V1|ostadix.signed-execution-fabric-terminal-receipt/v1'
+    'HOSTED_TLS_ALPN_V1|ostadix-hosted/1'
+    'HOSTED_TLS_ALPN_V2|ostadix-hosted/2'
+    'HOSTED_TLS_ALPN_MESH_V1|ostadix-mesh/1'
+    'EXECUTION_FABRIC_TLS_ALPN_V1|ostadix-execution-fabric/1'
+)
+for coordinate in "${fabric_coordinates[@]}"; do
+    coordinate_name=${coordinate%%|*}
+    coordinate_value=${coordinate#*|}
+    require_fixed docs/VERSIONING.md "\`$coordinate_name\`" \
+        "versioning omits M3 coordinate name $coordinate_name"
+    require_fixed docs/VERSIONING.md "\`$coordinate_value\`" \
+        "versioning omits M3 coordinate value $coordinate_value"
+done
+require_fixed docs/VERSIONING.md \
+    '`crates/ostadix-api/src/execution_fabric/protocol.rs`' \
+    'versioning omits the frozen M2 record source coordinate'
+require_fixed docs/VERSIONING.md \
+    '`crates/ostadix-api/src/execution_fabric_authority/protocol.rs`' \
+    'versioning omits the Fabric authority source coordinate'
+require_fixed docs/VERSIONING.md \
+    '`crates/ostadix-api/src/hosted_remote/tls.rs`' \
+    'versioning omits the Fabric and Hosted ALPN source coordinate'
+require_fixed crates/ostadix-api/src/hosted_remote/tls.rs \
+    'pub const EXECUTION_FABRIC_TLS_ALPN_V1: &[u8] = b"ostadix-execution-fabric/1";' \
+    'the opt-in execution-Fabric ALPN drifted'
+require_fixed crates/ostadix-api/src/hosted_remote/tls.rs \
+    'pub const HOSTED_TLS_ALPN_MESH_V1: &[u8] = b"ostadix-mesh/1";' \
+    'the existing Mesh ALPN drifted during Fabric integration'
+
+require_fixed tests/execution_fabric_two_node.rs \
+    'fn two_real_o_nodes_execute_provisional_pure_candidates_without_graph_authority()' \
+    'the governed two-o-node integration proof is missing'
+require_fixed scripts/smoke-execution-fabric-v1.sh \
+    '--test execution_fabric_two_node "$test_name"' \
+    'the M3 smoke no longer invokes the governed two-o-node test'
+require_fixed scripts/smoke-execution-fabric-v1.sh \
+    'OSTADIX_TEST_RUNTIME_POLICY=required' \
+    'the M3 smoke no longer fails closed when OpenSSL is unavailable'
+require_fixed .github/workflows/ci.yml \
+    'run: bash scripts/smoke-execution-fabric-v1.sh' \
+    'rust-hosted CI no longer invokes the M3 Fabric smoke'
+for marker in \
+    'Fabric V1 authenticated two-o-node pure execution: PASS' \
+    'Fabric V1 wrong-node lease rejection: PASS' \
+    'Fabric V1 wrong-node result no-commit boundary: PASS' \
+    'Fabric V1 stopped-node infrastructure failure and no fallback: PASS' \
+    'Fabric V1 Hosted and Mesh ALPN preservation: PASS' \
+    'Fabric V1 same-host distinct-process boundary: PASS' \
+    'Execution Fabric V1 M3: PASS'
+do
+    require_fixed scripts/smoke-execution-fabric-v1.sh "$marker" \
+        "the M3 Fabric smoke lost evidence marker: $marker"
+done
+
 for file in README.md llms.txt docs/CLAIMS.md docs/ODOMAIN_PLAN.md \
     okernel-multikernel/MULTIKERNEL_PERSONALITY_PROPOSAL.md
 do

@@ -1,8 +1,8 @@
 # OIR Execution Fabric V1
 
-Status: frozen M2 loopback profile with additive M3 authority and provider
-staging. This document specifies the canonical capsule and
-provisional-candidate boundary implemented by
+Status: frozen M2 loopback profile with an implemented additive M3
+authenticated remote-execution boundary. This document specifies the canonical
+capsule and provisional-candidate boundary implemented by
 `crates/ostadix-api/src/execution_fabric/`; M3 does not mutate those records.
 
 ## Authority boundary
@@ -11,9 +11,9 @@ An execution-fabric worker computes a candidate result. It does not publish an
 HGraph value, advance resource state, settle trace state, or commit an effect.
 Those transitions remain coordinator-owned.
 
-The coordinator is the sole graph-commit authority and the sole linearization
-locus for graph transitions. Physical execution and provisionally safe pure
-publication may overlap; this authority boundary does not serialize all
+The coordinator is the sole graph-commit authority and the sole linearization locus for graph transitions.
+Physical execution and provisionally safe pure publication may overlap; this
+authority boundary does not serialize all
 computation. It preserves three distinct coordinator gates:
 
 1. candidate validation checks the candidate against the coordinator-supplied
@@ -32,6 +32,18 @@ worker-selected HGraph node identity. A coordinator must call
 observation time before interpreting the candidate. Structural
 `validate_against` alone does not establish timeliness, and successful
 acceptance does not itself publish or settle anything.
+
+## Narrow M3 claim
+
+Fabric V1 can authenticate and execute the admitted M2 pure renderer profile on an explicitly selected `o-node`, returning a bounded provisional candidate whose graph publication and settlement remain coordinator-controlled.
+
+The remote node may authenticate the request, validate the execution lease,
+reconstruct the admitted operation, compute a candidate value, persist its own
+attempt status, and return the provisional candidate. It must not mutate the
+HGraph, publish an HGraph value, identify an authoritative HGraph node, choose
+the winning attempt, settle trace order, advance resource versions, commit
+external effects, or initiate retry. The coordinator remains the sole
+graph-commit authority and the sole linearization locus for graph transitions.
 
 ## Frozen records
 
@@ -194,19 +206,52 @@ execution contract. Idempotent or prepared effects require their own stable
 effect/transaction contracts, while opaque, irreversible, or unknown-effect
 ambiguity remains fail-closed and may become `Indeterminate`.
 
+## Same-host two-process evidence
+
+`tests/execution_fabric_two_node.rs` launches two real `o-node` processes on
+one host with separate ports, TLS identities, node identities, state
+directories, ledgers, node generations, and explicit Fabric authority
+enrollment. Nodes A and B both execute admitted pure attempts, and their
+provisional results match direct local execution. The proof also establishes
+that a lease for A is rejected by B, a wrong-node result cannot pass
+coordinator acceptance, stopping a selected node yields an infrastructure
+failure without invoking the local renderer, and the existing Hosted and Mesh
+ALPN routes continue to function.
+
+This is authenticated remote execution across real process boundaries on one
+host. It is not evidence of distinct kernels, physical multinode operation, or
+heterogeneous hardware.
+
 ## Explicit nonclaims
 
 The frozen M2 profile alone does not provide a network endpoint, remote node
 dispatch, placement authority, leases, or durability. The additive M3 provider
 adds only an explicitly enabled authenticated endpoint, one-use execution
-authority, source reconstruction, and a node-local replay ledger. It does not
-provide arbitrary OIR regions, general `.O` distribution, automatic placement,
-a capacity scheduler, scope transport, object transfer, bulk node-to-node data,
-actors, effects, automatic retry, coordinator crash recovery, governed hardware
-lowering, GPU or camera mediation, cancellation, process migration, shared
-address space, distributed HGraph settlement, physical multinode evidence,
-distinct-kernel evidence, heterogeneous-architecture evidence, or exactly-once
-external effects.
+authority, source reconstruction, and a node-local replay ledger. M3 makes
+these exact nonclaims:
 
+- no arbitrary OIR region execution;
+- no general `.O` distribution;
+- no automatic placement;
+- no capacity scheduler;
+- no scope transport;
+- no object plane;
+- no bulk node-to-node data transfer;
+- no actors;
+- no external effects;
+- no automatic retry;
+- no coordinator crash recovery;
+- no hardware-resource execution;
+- no GPU or camera driver mediation;
+- no process migration;
+- no shared address space;
+- no physical multinode claim;
+- no distinct-kernel claim;
+- no heterogeneous-architecture claim;
+- no exactly-once external effect claim.
+
+M3 also adds no cancellation mechanism and no distributed HGraph settlement.
 None of those capabilities may be inferred from either the M2 loopback or the
-M3 provider staging. Graph publication and settlement remain coordinator-owned.
+M3 authenticated provider. Graph mutation, publication, winner selection,
+settlement, resource-version advancement, effect commitment, and retry remain
+outside remote-node authority.

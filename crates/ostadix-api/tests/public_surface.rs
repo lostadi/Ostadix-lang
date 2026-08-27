@@ -1,5 +1,22 @@
 use std::path::PathBuf;
 
+use ostadix_api::execution_fabric::{
+    ExecutionCandidateV1, ExecutionCapsuleV1, ExecutionIdV1,
+    EXECUTION_CANDIDATE_SCHEMA_V1, EXECUTION_CAPSULE_SCHEMA_V1,
+};
+use ostadix_api::execution_fabric_authority::{
+    FabricRequestV1, FabricResponseV1, FabricSigningKeyV1, FabricSubmissionV1,
+    FabricTargetBindingV1, PlacementLeaseV3, FABRIC_PLACEMENT_LEASE_SCHEMA_V3,
+    FABRIC_REQUEST_SCHEMA_V1, FABRIC_RESPONSE_SCHEMA_V1, FABRIC_SIGNED_LEASE_SCHEMA_V3,
+    FABRIC_SIGNED_TERMINAL_RECEIPT_SCHEMA_V1, FABRIC_SOURCE_CLOSURE_DIALECT_V1,
+    FABRIC_SOURCE_CLOSURE_SCHEMA_V1, FABRIC_SUBMISSION_SCHEMA_V1,
+    FABRIC_TERMINAL_RECEIPT_SCHEMA_V1,
+};
+use ostadix_api::hosted_remote::{
+    trusted_inline_fabric_realization_pipeline_sha256_v1, FabricAttemptProviderConfigV1,
+    FabricAttemptProviderV1, RemotePureExecutionConfigV1, EXECUTION_FABRIC_TLS_ALPN_V1,
+    HOSTED_TLS_ALPN_MESH_V1, HOSTED_TLS_ALPN_V1, HOSTED_TLS_ALPN_V2,
+};
 use ostadix_api::{
     BackendAuthority, BigInt, CapabilityKind, DecimalSpecial, FloatFormat, FloatSpecial, GraphNode,
     GroupMode, NativeBoundary, NativeCodecSafety, NativeIdentity, NodeId, OBytes, OKeyword,
@@ -19,6 +36,78 @@ fn independent_package_carries_its_license_and_notice() {
     assert!(notice
         .windows(b"Ostadix".len())
         .any(|window| window == b"Ostadix"));
+}
+
+#[test]
+fn authenticated_execution_fabric_is_nameable_from_the_engine_root() {
+    assert_public::<ExecutionCapsuleV1>();
+    assert_public::<ExecutionCandidateV1>();
+    assert_public::<ExecutionIdV1>();
+    assert_public::<FabricRequestV1>();
+    assert_public::<FabricResponseV1>();
+    assert_public::<FabricSubmissionV1>();
+    assert_public::<FabricTargetBindingV1>();
+    assert_public::<PlacementLeaseV3>();
+    assert_public::<FabricSigningKeyV1>();
+    assert_public::<FabricAttemptProviderConfigV1>();
+    assert_public::<FabricAttemptProviderV1>();
+    assert_public::<RemotePureExecutionConfigV1>();
+
+    assert_eq!(
+        EXECUTION_CAPSULE_SCHEMA_V1,
+        "ostadix.oir-execution-capsule/v1"
+    );
+    assert_eq!(
+        EXECUTION_CANDIDATE_SCHEMA_V1,
+        "ostadix.oir-execution-candidate/v1"
+    );
+    assert_eq!(
+        FABRIC_REQUEST_SCHEMA_V1,
+        "ostadix.execution-fabric-request/v1"
+    );
+    assert_eq!(
+        FABRIC_RESPONSE_SCHEMA_V1,
+        "ostadix.execution-fabric-response/v1"
+    );
+    assert_eq!(
+        FABRIC_SUBMISSION_SCHEMA_V1,
+        "ostadix.execution-fabric-submission/v1"
+    );
+    assert_eq!(
+        FABRIC_SOURCE_CLOSURE_SCHEMA_V1,
+        "ostadix.execution-source-closure/v1"
+    );
+    assert_eq!(
+        FABRIC_SOURCE_CLOSURE_DIALECT_V1,
+        "ostadix-source-closure/v1"
+    );
+    assert_eq!(
+        FABRIC_PLACEMENT_LEASE_SCHEMA_V3,
+        "ostadix.execution-placement-lease/v3"
+    );
+    assert_eq!(
+        FABRIC_SIGNED_LEASE_SCHEMA_V3,
+        "ostadix.signed-execution-lease/v3"
+    );
+    assert_eq!(
+        FABRIC_TERMINAL_RECEIPT_SCHEMA_V1,
+        "ostadix.execution-fabric-terminal-receipt/v1"
+    );
+    assert_eq!(
+        FABRIC_SIGNED_TERMINAL_RECEIPT_SCHEMA_V1,
+        "ostadix.signed-execution-fabric-terminal-receipt/v1"
+    );
+    assert_eq!(HOSTED_TLS_ALPN_V1, &b"ostadix-hosted/1"[..]);
+    assert_eq!(HOSTED_TLS_ALPN_V2, &b"ostadix-hosted/2"[..]);
+    assert_eq!(HOSTED_TLS_ALPN_MESH_V1, &b"ostadix-mesh/1"[..]);
+    assert_eq!(
+        EXECUTION_FABRIC_TLS_ALPN_V1,
+        &b"ostadix-execution-fabric/1"[..]
+    );
+
+    let pipeline = trusted_inline_fabric_realization_pipeline_sha256_v1("text")
+        .expect("trusted text renderer must expose its Fabric pipeline identity");
+    assert_eq!(pipeline.as_sha256().len(), 64);
 }
 
 #[test]
@@ -87,6 +176,8 @@ fn engine_owns_the_full_runtime_without_a_compatibility_dependency() {
     for owned_module in [
         "pub mod eval;",
         "pub mod evidence;",
+        "pub mod execution_fabric;",
+        "pub mod execution_fabric_authority;",
         "pub mod executor;",
         "pub mod hgraph;",
         "pub mod information_bridge;",

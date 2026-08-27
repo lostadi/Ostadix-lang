@@ -32,6 +32,20 @@ EVIDENCE_ADMISSION = ENGINE_SOURCE / "evidence" / "admit.rs"
 HGRAPH_BENCHMARK = ROOT / "scripts" / "benchmark_hgraph_hosted.sh"
 CLI_TEST = ROOT / "tests" / "test_cli.sh"
 LAN_PAIRING_SMOKE = ROOT / "scripts" / "smoke-zero-config-lan-netns.sh"
+EXECUTION_FABRIC_SMOKE = ROOT / "scripts" / "smoke-execution-fabric-v1.sh"
+EXECUTION_FABRIC_TWO_NODE_TEST = ROOT / "tests" / "execution_fabric_two_node.rs"
+EXECUTION_FABRIC_TWO_NODE_TEST_NAME = (
+    "two_real_o_nodes_execute_provisional_pure_candidates_without_graph_authority"
+)
+EXECUTION_FABRIC_SMOKE_MARKERS = (
+    "Fabric V1 authenticated two-o-node pure execution: PASS",
+    "Fabric V1 wrong-node lease rejection: PASS",
+    "Fabric V1 wrong-node result no-commit boundary: PASS",
+    "Fabric V1 stopped-node infrastructure failure and no fallback: PASS",
+    "Fabric V1 Hosted and Mesh ALPN preservation: PASS",
+    "Fabric V1 same-host distinct-process boundary: PASS",
+    "Execution Fabric V1 M3: PASS",
+)
 
 SCHEDULE_EXPLANATION_STRUCT_FIELDS = {
     "ScheduleExplanationV2": ("schema", "admission", "realizability", "prediction"),
@@ -393,6 +407,62 @@ def validate_runtime_probe_consumers(workflow: str) -> None:
         )
 
 
+def validate_execution_fabric_smoke_contract(workflow: str) -> None:
+    hosted_job = workflow_job_body(workflow, "rust-hosted")
+    invocation = "bash scripts/smoke-execution-fabric-v1.sh"
+    if hosted_job.count(invocation) != 1:
+        raise ContractError(
+            "rust-hosted CI must run the authenticated two-o-node Fabric smoke "
+            "exactly once"
+        )
+    for path in (EXECUTION_FABRIC_SMOKE, EXECUTION_FABRIC_TWO_NODE_TEST):
+        if not path.is_file():
+            raise ContractError(
+                f"missing execution-Fabric proof surface: {path.relative_to(ROOT)}"
+            )
+
+    smoke = EXECUTION_FABRIC_SMOKE.read_text(encoding="utf-8")
+    if smoke.count("--test execution_fabric_two_node") != 1:
+        raise ContractError(
+            "execution-Fabric smoke must select tests/execution_fabric_two_node.rs once"
+        )
+    if smoke.count("OSTADIX_TEST_RUNTIME_POLICY=required") != 1:
+        raise ContractError(
+            "execution-Fabric smoke must fail closed when OpenSSL is unavailable"
+        )
+    if smoke.count(
+        f"test_name={EXECUTION_FABRIC_TWO_NODE_TEST_NAME}"
+    ) != 1:
+        raise ContractError(
+            "execution-Fabric smoke must name the exact two-o-node integration test once"
+        )
+    missing_markers = [
+        marker for marker in EXECUTION_FABRIC_SMOKE_MARKERS if smoke.count(marker) != 1
+    ]
+    if missing_markers:
+        raise ContractError(
+            "execution-Fabric smoke must retain every M3 PASS marker: "
+            + ", ".join(missing_markers)
+        )
+    for boundary in (
+        "Same-host, distinct-process",
+        "not distinct-kernel, physical-multinode",
+        "heterogeneous-hardware evidence",
+    ):
+        if smoke.count(boundary) != 1:
+            raise ContractError(
+                "execution-Fabric smoke must retain its same-host evidence boundary: "
+                + boundary
+            )
+
+    test_source = EXECUTION_FABRIC_TWO_NODE_TEST.read_text(encoding="utf-8")
+    declaration = f"fn {EXECUTION_FABRIC_TWO_NODE_TEST_NAME}()"
+    if test_source.count("#[test]") < 1 or test_source.count(declaration) != 1:
+        raise ContractError(
+            "tests/execution_fabric_two_node.rs must retain the exact governed test"
+        )
+
+
 def validate_local_ci_posture_consumer(workflow: str) -> None:
     contracts = workflow_job_body(workflow, "contracts")
     posture_command = (
@@ -450,6 +520,7 @@ def validate() -> None:
     validate_manifest_versions()
     validate_action_pins()
     validate_runtime_probe_consumers(workflow)
+    validate_execution_fabric_smoke_contract(workflow)
     validate_local_ci_posture_consumer(workflow)
     validate_schedule_explanation_contract()
     catalog_schema()

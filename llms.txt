@@ -29,6 +29,11 @@ Key facts for agents:
   later block. Escape a literal dollar sign as `\$`.
 - Quoting: `quote^( ... )_quote` captures unevaluated O source; `O.eval(expr)`
   inside Python evaluates it (homoiconicity).
+- Fabric V1 can execute only the admitted M2 pure renderer profile on an
+  explicitly selected authenticated `o-node`. The result is a bounded
+  provisional candidate; only the coordinator may validate, publish, or settle
+  it. Current evidence uses two real processes on one host and makes no
+  physical-multinode, distinct-kernel, or heterogeneous-architecture claim.
 
 ## Docs
 
@@ -43,6 +48,11 @@ Key facts for agents:
   non-qualifying simulator/oracle boundary retained for development
 - [Hosted Placement V6](docs/HOSTED_PLACEMENT_V6.md): target descriptors,
   warrants, the local signed registry, and the bounded direct-node preview
+- [OIR Execution Fabric V1](docs/OIR_EXECUTION_FABRIC_V1.md): frozen M2 pure
+  records, additive authenticated M3 transport, coordinator-only graph authority,
+  evidence, and exact nonclaims
+- [M3 authenticated pure remote-execution design](docs/M3_AUTHENTICATED_PURE_REMOTE_EXECUTION_DESIGN.md):
+  unchanged M2 types, additive M3 types, dependency split, and same-host proof
 
 ## Examples
 

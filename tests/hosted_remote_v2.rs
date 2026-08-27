@@ -822,7 +822,10 @@ fn signed_session_journal_binds_principal_bearer_and_exact_duplicate_sequence() 
     );
 
     let mut operation = operation("op-a", opened.tier);
-    operation.deadline_unix_ms = unix_time_ms().unwrap() + 1_000;
+    // This test exercises exact durable replay after expiry, not a one-second
+    // preparation SLA. Leave enough room for a cold debug actor to prepare;
+    // the explicit sleep below still crosses this exact captured deadline.
+    operation.deadline_unix_ms = unix_time_ms().unwrap() + 5_000;
     let operation_deadline = operation.deadline_unix_ms;
     let request = SubmitOperationRequestV2 {
         credentials: opened.capability.clone().into(),

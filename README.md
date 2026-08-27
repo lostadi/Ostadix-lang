@@ -82,6 +82,10 @@ historical evidence continuity defect are recorded in
 [Validation at the audited master](#validation-at-the-audited-master) and
 [Exact implementation boundaries](#exact-implementation-boundaries).
 
+The current M3 boundary is specified separately by [OIR Execution Fabric
+V1](docs/OIR_EXECUTION_FABRIC_V1.md) and the [authenticated pure
+remote-execution design note](docs/M3_AUTHENTICATED_PURE_REMOTE_EXECUTION_DESIGN.md).
+
 ## How to read Ostadix-lang
 
 Read the system from left to right:
@@ -95,7 +99,7 @@ flowchart LR
     G["Construct graph<br/>OIR and Logical HGraph"]
     A["Admit graph<br/>Evidence V6 and Admission V6"]
     L{"Place admitted work"}
-    X["Execute<br/>local workers, Hosted V2, or mesh peer"]
+    X["Execute<br/>local workers, Hosted V2, Fabric V1, or mesh peer"]
     R["Observe<br/>OValue and RuntimeGraph"]
     E["Prove<br/>trace, receipt, DOT, and release gates"]
 
@@ -135,7 +139,9 @@ can be rendered, explained, hashed, and rejected before an operation starts.
 The unified lowercase `o` front door accepts a `.O` file, a directory, or an
 already lifted project. It resolves the intended route, constructs the graph,
 performs fresh admission, and selects local workers, a directly addressed
-Hosted V2 session, or a paired Project Mesh V1 peer. Placement profiles bind
+Hosted V2 session, or a paired Project Mesh V1 peer. The narrower Fabric V1
+path is selected explicitly for an admitted M2 pure renderer attempt; it does
+not perform automatic placement or local fallback. Placement profiles bind
 backend requirements to exact executable realizations and short-lived capacity
 proofs.
 
@@ -327,6 +333,57 @@ Planning is static by default; use
 observations. Node lifecycle remains an explicit `o node` operation. See the complete
 [Unified Intent Front Door V1 contract](docs/UNIFIED_INTENT_FRONT_DOOR_V1.md).
 
+### Authenticated pure Fabric execution
+
+Fabric V1 can authenticate and execute the admitted M2 pure renderer profile on
+an explicitly selected `o-node`, returning a bounded provisional candidate
+whose graph publication and settlement remain coordinator-controlled.
+
+The remote node may authenticate and authorize the request, reconstruct the
+source-closed operation, compute it, durably fence replay, and return a
+candidate. It may not mutate or publish HGraph state, identify an authoritative
+HGraph node, select the winning attempt, settle the trace, advance resource
+versions, commit effects, or initiate retry. Candidate validation, provisional
+publication, and deterministic settlement remain separate coordinator-owned
+transitions. The coordinator is the sole graph-commit authority and the sole
+linearization locus for graph transitions.
+
+The focused proof in `tests/execution_fabric_two_node.rs` runs two real
+`o-node` processes on the same host with separate ports, TLS identities, node
+identities, state directories, ledgers, node generations, and explicit Fabric
+authority enrollment. Both nodes match local execution. Cross-node leases and
+wrong-node candidates are rejected; stopping the selected node produces an
+infrastructure failure without invoking the local renderer; Hosted and Mesh
+ALPN routes remain operational. This is process-boundary evidence, not a
+physical-multinode, distinct-kernel, or heterogeneous-hardware claim.
+
+M3 makes these exact nonclaims:
+
+- no arbitrary OIR region execution;
+- no general `.O` distribution;
+- no automatic placement;
+- no capacity scheduler;
+- no scope transport;
+- no object plane;
+- no bulk node-to-node data transfer;
+- no actors;
+- no external effects;
+- no automatic retry;
+- no coordinator crash recovery;
+- no hardware-resource execution;
+- no GPU or camera driver mediation;
+- no process migration;
+- no shared address space;
+- no physical multinode claim;
+- no distinct-kernel claim;
+- no heterogeneous-architecture claim;
+- no exactly-once external effect claim.
+
+The frozen records, authority envelope, transport constraints, and complete
+evidence boundary are documented in [OIR Execution Fabric
+V1](docs/OIR_EXECUTION_FABRIC_V1.md) and the [M3 internal design
+note](docs/M3_AUTHENTICATED_PURE_REMOTE_EXECUTION_DESIGN.md).
+
 ### Independent Rust runtime engine
 
 The current development tree makes `ostadix-api` the independently packageable
@@ -345,9 +402,10 @@ let mut runtime = Runtime::new("/absolute/path/to/backends");
 let value: OValue = runtime.evaluate("text^(hello)_text")?;
 ```
 
-Direct engine users may import the 36 public runtime modules from
+Direct engine users may import the 38 public runtime modules from
 `ostadix_api`, including `parser`, `ir`, `hgraph`, `evidence`, `eval`,
-`executor`, `hosted_remote`, `project`, and `world`. Historical
+`execution_fabric`, `execution_fabric_authority`, `executor`, `hosted_remote`,
+`project`, and `world`. Historical
 `o_lang::<module>` paths explicitly reexport the same nominal types. Reflected
 diagnostic paths such as `type_name` name the defining `ostadix_api` crate even
 when code imports the compatibility path. Six additional engine modules remain
@@ -379,6 +437,7 @@ Choose the next path according to what you want to inspect:
 | Explicit Graph V1 / Evidence and Admission V5 / Why V1 | Archival inspection and compatibility verification only |
 | Information Kernel V1 and backend-morphism V1 | Experimental local shadow surfaces; non-authorizing |
 | Hosted V2 durable sessions and direct-node placement | Experimental integration with dedicated lifecycle and recovery tests |
+| Authenticated pure Execution Fabric M3 | Experimental same-host, two-real-process proof; coordinator-only graph authority |
 | Project lifting, route execution, and live supervision | Experimental integration |
 | O-core compiler and OKernel gates | Bounded research implementation; see exact QEMU nonclaims |
 | O-Machine and elastic governed World | Research direction with bounded offline records and milestone proofs |
@@ -3580,7 +3639,7 @@ Native computation
 ```text
 Ostadix-lang/
 ├── crates/ostadix-api/src/
-│   ├── lib.rs                  # 42 engine modules, 36 public
+│   ├── lib.rs                  # 44 engine modules, 38 public
 │   ├── parser.rs               # hosted typed-parenthesis parser
 │   ├── value.rs                # OValue and hosted wire protocol
 │   ├── ir.rs                   # OIR and ExecutionPlan
@@ -3588,14 +3647,16 @@ Ostadix-lang/
 │   ├── eval.rs                 # evaluator and rendering semantics
 │   ├── process.rs              # persistent backend IPC
 │   ├── scheduler.rs            # readiness-driven graph execution
-│   ├── hosted_remote/          # Hosted V1/V2 placement and lifecycle
+│   ├── execution_fabric/       # frozen pure capsule and candidate records
+│   ├── execution_fabric_authority/ # M3 signed leases and Fabric envelopes
+│   ├── hosted_remote/          # Hosted V1/V2, Mesh, and Fabric realization
 │   ├── project/                # project lift, routes, mesh, and RuntimeGraph
 │   ├── information/            # Information Kernel V1
 │   ├── world/                  # World identities, values, and hosted references
 │   ├── live_system/            # package CAS, policy, and supervisor oracle
 │   └── ocore/                  # native front end, IRs, codegen, capability bridge
 ├── src/
-│   ├── lib.rs                  # 36 public compatibility reexports
+│   ├── lib.rs                  # 38 public compatibility reexports
 │   ├── main.rs                 # O interpreter and REPL
 │   └── bin/                    # the other 13 declared root binaries
 ├── mcp/ostadix_lang_mcp_server/ # separate locked MCP crate with 10 tools
@@ -4387,6 +4448,19 @@ python3 scripts/contract_surfaces.py probe-runtimes --suite docker
 The Rust test helpers and CI jobs consume those declarations. A successful
 probe establishes invocability for that command; it is not evidence that every
 backend, daemon, VM, or container required by a later test is healthy.
+
+The focused M3 gate launches two real same-host `o-node` processes and checks
+the authenticated pure Fabric boundary, exact local-result equivalence,
+cross-node authority rejection, no local fallback, and Hosted/Mesh ALPN
+compatibility:
+
+```bash
+cargo test --locked --package o-lang --test execution_fabric_two_node -- --nocapture --test-threads=1
+```
+
+Run Cargo gates in the isolated Linux checkout described above. This gate does
+not establish physical multinode, distinct-kernel, or heterogeneous-architecture
+execution.
 
 The focused Hosted V2 suites cover signed admission and session semantics,
 durable restart/recovery and storage boundaries, and the public CLI lifecycle:

@@ -527,6 +527,45 @@
   `crates/ostadix-api/src/hosted_remote/v2/dev.rs` together with the V2 protocol, cryptography,
   authorizer, client, server, runtime, and store modules, so the documented
   development bridge is not omitted from the source archive.
+- Fabric V1 can authenticate and execute the admitted M2 pure renderer profile on an explicitly selected `o-node`, returning a bounded provisional candidate whose graph publication and settlement remain coordinator-controlled. The
+  remote may authenticate, validate its exact signed lease, reconstruct and
+  compute the admitted operation, persist provider-local attempt status, and
+  return the candidate. It cannot mutate or publish HGraph state, name an
+  authoritative HGraph node, choose a winner, settle trace order, advance a
+  resource version, commit an external effect, or initiate retry. Candidate
+  validation, candidate publication, and deterministic settlement remain
+  distinct transitions owned by the coordinator, which is the sole
+  graph-commit authority and sole linearization locus for graph transitions.
+- The executable Fabric evidence in `tests/execution_fabric_two_node.rs` starts
+  two real `o-node` processes on one host with separate ports, TLS identities,
+  node identities, state directories, ledgers, node generations, and explicit
+  Fabric authority enrollment. Both nodes produce provisional results matching
+  local execution. The test rejects a node-A lease at node B, prevents a
+  wrong-node result from entering coordinator acceptance, reports a stopped
+  selected node as infrastructure failure without local-renderer fallback, and
+  preserves the Hosted and Mesh ALPN routes. It proves process separation on
+  one host, not distinct kernels, physical multinode operation, or
+  heterogeneous hardware.
+- M3 makes these exact nonclaims:
+  - no arbitrary OIR region execution;
+  - no general `.O` distribution;
+  - no automatic placement;
+  - no capacity scheduler;
+  - no scope transport;
+  - no object plane;
+  - no bulk node-to-node data transfer;
+  - no actors;
+  - no external effects;
+  - no automatic retry;
+  - no coordinator crash recovery;
+  - no hardware-resource execution;
+  - no GPU or camera driver mediation;
+  - no process migration;
+  - no shared address space;
+  - no physical multinode claim;
+  - no distinct-kernel claim;
+  - no heterogeneous-architecture claim;
+  - no exactly-once external effect claim.
 - Hosted Placement V6 is not World membership, Governor admission/commit,
   WorldFS, G1 or G10 evidence, a physical-machine or hardware-isolation proof,
   a global exactly-once protocol, arbitrary project/HGraph-island placement,
