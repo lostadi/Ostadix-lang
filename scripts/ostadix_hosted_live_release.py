@@ -24,15 +24,26 @@ from typing import Callable, Sequence
 
 ROOT = Path(__file__).resolve().parent.parent
 CANONICAL_REMOTE = "https://github.com/lostadi/Ostadix-lang.git"
-DEFAULT_OUTPUT_DIRECTORY = ROOT / "target/ostadix-capacity-iso/x86_64"
+DEFAULT_OUTPUT_DIRECTORY = ROOT / "target/ostadix-hosted-live/x86_64"
 DEFAULT_VM = "moral-gaur"
 GUEST_RELEASE_BASE = Path("/home/ubuntu/.cache/ostadix/hosted-live-release")
 MIN_GUEST_FREE_BYTES = 12 * 1024 * 1024 * 1024
+MIN_GRAPHICAL_NONBLACK_PIXELS = 2_000
+MIN_GRAPHICAL_UNIQUE_COLORS = 2
+MIN_GRAPHICAL_CHANGED_PIXELS = 200
 ARCHIVE_MTIME = "@315532800"
 NATIVE_GUEST_FILESYSTEMS = frozenset({"ext4", "xfs", "btrfs"})
 PINNED_MINIROOTFS_BYTES = 3698422
 PINNED_MINIROOTFS_SHA256 = (
     "41f73e3cf5fa919b8aa5ca6b30dc48f0da2720776d7423e2a7748211456fe081"
+)
+PINNED_LTS_KERNEL_BYTES = 14_468_096
+PINNED_LTS_KERNEL_SHA256 = (
+    "77007123c0591ab4b2a5434ffa1b6a3985b3037d534be78bccfb30f3c9536c54"
+)
+PINNED_LTS_INITRAMFS_BYTES = 27_951_899
+PINNED_LTS_INITRAMFS_SHA256 = (
+    "e1649e94ef1b276bf22ea4ed2628dd17c7fa7505cd40b2c7aa7fd9ebb71fe5c9"
 )
 REQUIRED_SMOKE_MARKERS = (
     "OSTADIX HOSTED O SMOKE: PASS",
@@ -70,8 +81,9 @@ REQUIRED_ARCHIVE_PATHS = {
     "scripts/build-x86_64-hosted-live-linux.sh",
     "ocore/kernel/smoke-x86_64-hosted-live-qemu.py",
     "scripts/prepare-x86_64-capacity-host.sh",
-    "ocore/kernel/build-x86_64-capacity-iso.sh",
-    "evidence/hosted_live_apk_packages.txt",
+    "ocore/kernel/build-x86_64-hosted-live-iso.sh",
+    "evidence/hosted_live_physical_iso.toml",
+    "evidence/hosted_live_physical_apk_packages.txt",
 }
 
 
@@ -240,7 +252,9 @@ def _publication_lock(output: Path):
 def default_output_for(tree: str) -> Path:
     if len(tree) != 40 or any(character not in "0123456789abcdef" for character in tree):
         raise ReleaseError("cannot derive a release output from an invalid staged tree OID")
-    return DEFAULT_OUTPUT_DIRECTORY / f"ostadix-hosted-live-x86_64-uefi-{tree[:12]}.iso"
+    return DEFAULT_OUTPUT_DIRECTORY / (
+        f"ostadix-hosted-live-x86_64-uefi-{tree[:12]}_VTGRUB2.iso"
+    )
 
 
 def validate_no_clobber(output: Path) -> Path:
@@ -501,7 +515,7 @@ def _validate_receipt_binding(
     source = payload.get("source")
     publication = payload.get("host_publication")
     iso = payload.get("iso")
-    if payload.get("schema") != "ostadix.hosted-live-release/v1":
+    if payload.get("schema") != "ostadix.hosted-live-release/v2":
         raise ReleaseError("existing receipt has an unexpected schema")
     if not isinstance(source, dict) or (
         source.get("staged_tree") != snapshot.tree
@@ -560,13 +574,23 @@ def _validate_receipt_binding(
     ):
         raise ReleaseError("existing receipt has invalid strict ISO invariants")
     entries = inspection.get("entries")
-    if not isinstance(entries, list) or [entry.get("id") for entry in entries if isinstance(entry, dict)] != [
-        "hosted", "ostadix", "alpine", "guix", "openbsd", "plan9", "redox"
-    ]:
-        raise ReleaseError("existing receipt omitted the exact seven ISO boot entries")
+    if not isinstance(entries, list) or [
+        entry.get("id") for entry in entries if isinstance(entry, dict)
+    ] != ["hosted"]:
+        raise ReleaseError("existing receipt omitted the single physical hosted boot entry")
     artifacts = inspection.get("artifacts")
-    if not isinstance(artifacts, list) or len(artifacts) != 10:
-        raise ReleaseError("existing receipt omitted the exact ten strict ISO artifacts")
+    if not isinstance(artifacts, list) or len(artifacts) != 2:
+        raise ReleaseError("existing receipt omitted the exact two physical ISO artifacts")
+    artifact_closure = {
+        (artifact.get("iso_path"), artifact.get("role"))
+        for artifact in artifacts
+        if isinstance(artifact, dict)
+    }
+    if artifact_closure != {
+        ("/boot/hosted/vmlinuz-lts", "linux-kernel"),
+        ("/boot/hosted/initramfs.cpio.gz", "linux-initrd"),
+    }:
+        raise ReleaseError("existing receipt has the wrong physical ISO artifact closure")
     for index, artifact in enumerate(artifacts):
         identity(artifact, f"ISO artifact {index}")
         if not isinstance(artifact.get("iso_path"), str) or not isinstance(
@@ -596,7 +620,7 @@ def _validate_receipt_binding(
     ):
         raise ReleaseError("existing receipt omitted the exact hosted build/toolchain lock")
     identity(build.get("sysroot_manifest"), "sysroot manifest")
-    identity(build.get("capacity_host_package_lock"), "capacity-host package lock")
+    identity(build.get("hosted_live_package_lock"), "hosted-live package lock")
     apk_boundary = build.get("apk_repository_boundary")
     if apk_boundary != {
         "exact_versions": True,
@@ -606,18 +630,27 @@ def _validate_receipt_binding(
     }:
         raise ReleaseError("existing receipt omitted the signed APK repository boundary")
     cache = build.get("cache_inputs")
-    if not isinstance(cache, dict) or cache.get("guest_root") != "/home/ubuntu/.local/share/ostadix/guests":
-        raise ReleaseError("existing receipt omitted canonical cache input metadata")
-    guest_verification = cache.get("guest_verification")
-    if not isinstance(guest_verification, dict) or not isinstance(
-        guest_verification.get("records"), list
-    ) or not guest_verification["records"]:
-        raise ReleaseError("existing receipt omitted verified guest-cache records")
-    identity(guest_verification.get("identity"), "guest-cache verification")
-    minirootfs = identity(cache.get("capacity_host_minirootfs"), "capacity-host minirootfs")
+    if not isinstance(cache, dict) or set(cache) != {
+        "alpine_minirootfs",
+        "alpine_lts_kernel",
+        "alpine_lts_initramfs",
+    }:
+        raise ReleaseError("existing receipt omitted the exact physical cache inputs")
+    minirootfs = identity(cache.get("alpine_minirootfs"), "Alpine minirootfs")
     if minirootfs != {"bytes": PINNED_MINIROOTFS_BYTES, "sha256": PINNED_MINIROOTFS_SHA256}:
         raise ReleaseError("existing receipt has the wrong pinned Alpine minirootfs identity")
-    identity(cache.get("capacity_host_modloop"), "capacity-host modloop")
+    lts_kernel = identity(cache.get("alpine_lts_kernel"), "Alpine LTS kernel")
+    if lts_kernel != {
+        "bytes": PINNED_LTS_KERNEL_BYTES,
+        "sha256": PINNED_LTS_KERNEL_SHA256,
+    }:
+        raise ReleaseError("existing receipt has the wrong pinned Alpine LTS kernel identity")
+    lts_initramfs = identity(cache.get("alpine_lts_initramfs"), "Alpine LTS initramfs")
+    if lts_initramfs != {
+        "bytes": PINNED_LTS_INITRAMFS_BYTES,
+        "sha256": PINNED_LTS_INITRAMFS_SHA256,
+    }:
+        raise ReleaseError("existing receipt has the wrong pinned Alpine LTS initramfs identity")
 
     binaries = payload.get("binaries")
     if not isinstance(binaries, dict) or set(binaries) != {"O", "o-cli", "olangc", "o-link"}:
@@ -626,20 +659,64 @@ def _validate_receipt_binding(
         identity(binaries[name], f"hosted binary {name}")
     identity(payload.get("initramfs"), "hosted initramfs")
 
+    if payload.get("boot_profile") != {
+        "kind": "physical-hosted-live",
+        "kernel_flavor": "alpine-lts",
+        "preferred_console": "tty0",
+        "panic_timeout_seconds": 0,
+        "ventoy_mode": "grub2-filename-suffix",
+    }:
+        raise ReleaseError("existing receipt omitted the exact physical boot profile")
+
     smoke = payload.get("smoke")
-    if not isinstance(smoke, dict) or (
-        smoke.get("schema") != "ostadix.hosted-live-qemu-smoke/v1"
-        or smoke.get("markers") != list(REQUIRED_SMOKE_MARKERS)
-        or smoke.get("exit_code") != 0
-        or smoke.get("acceleration") != "tcg"
-        or smoke.get("firmware_path") != "ovmf-through-capacity-runner"
-        or smoke.get("physical_hardware_proof") is not False
+    if not isinstance(smoke, dict) or smoke.get("schema") != "ostadix.hosted-live-boot-gates/v2":
+        raise ReleaseError("existing receipt omitted the combined serial and graphical boot gates")
+    serial_smoke = smoke.get("serial")
+    if not isinstance(serial_smoke, dict) or (
+        serial_smoke.get("schema") != "ostadix.hosted-live-qemu-smoke/v1"
+        or serial_smoke.get("markers") != list(REQUIRED_SMOKE_MARKERS)
+        or serial_smoke.get("exit_code") != 0
+        or serial_smoke.get("acceleration") != "tcg"
+        or serial_smoke.get("firmware_path") != "ovmf-through-capacity-runner"
+        or serial_smoke.get("physical_hardware_proof") is not False
     ):
-        raise ReleaseError("existing receipt omitted the exact ordered hosted-live smoke gate")
+        raise ReleaseError("existing receipt omitted the exact ordered serial boot gate")
     identity(
-        {"bytes": smoke.get("transcript_bytes"), "sha256": smoke.get("transcript_sha256")},
-        "QEMU smoke transcript",
+        {
+            "bytes": serial_smoke.get("transcript_bytes"),
+            "sha256": serial_smoke.get("transcript_sha256"),
+        },
+        "QEMU serial smoke transcript",
     )
+    graphical = smoke.get("graphical")
+    if not isinstance(graphical, dict) or (
+        graphical.get("schema") != "ostadix.hosted-live-qemu-visual-smoke/v1"
+        or graphical.get("markers") != list(REQUIRED_SMOKE_MARKERS)
+        or graphical.get("input_marker") != "vga-input-pass"
+        or graphical.get("acceleration") != "tcg"
+        or graphical.get("display_device") != "VGA"
+        or graphical.get("input_device") != "usb-kbd"
+        or graphical.get("network") != "none"
+        or graphical.get("physical_hardware_proof") is not False
+        or type(graphical.get("changed_pixels")) is not int
+        or graphical["changed_pixels"] < MIN_GRAPHICAL_CHANGED_PIXELS
+    ):
+        raise ReleaseError("existing receipt omitted the interactive graphical boot gate")
+    identity(graphical.get("serial"), "QEMU graphical serial transcript")
+    identity(graphical.get("firmware"), "QEMU graphical firmware")
+    for label in ("frame_before", "frame_after"):
+        frame = identity(graphical.get(label), f"QEMU graphical {label}")
+        if (
+            type(frame.get("width")) is not int
+            or type(frame.get("height")) is not int
+            or type(frame.get("nonblack_pixels")) is not int
+            or type(frame.get("unique_colors")) is not int
+            or frame["width"] < 320
+            or frame["height"] < 200
+            or frame["nonblack_pixels"] < MIN_GRAPHICAL_NONBLACK_PIXELS
+            or frame["unique_colors"] < MIN_GRAPHICAL_UNIQUE_COLORS
+        ):
+            raise ReleaseError("existing receipt contains invalid graphical frame evidence")
     claim = payload.get("claim_boundary")
     if not isinstance(claim, dict) or (
         not isinstance(claim.get("substrate"), str)
@@ -870,7 +947,7 @@ def _complete_guest_release(
 ) -> dict[str, object]:
     guest_source = guest_run / "source"
     guest_archive = guest_run / "staged-source.tar"
-    guest_iso = guest_run / "output" / "ostadix-hosted-live-x86_64-uefi.iso"
+    guest_iso = guest_run / "output" / "ostadix-hosted-live-x86_64-uefi_VTGRUB2.iso"
     guest_receipt = guest_run / "output" / "hosted-live-release.json"
     native_paths = verify_guest_native_paths(
         client,
@@ -881,7 +958,6 @@ def _complete_guest_release(
             guest_iso,
             guest_receipt,
             Path("/home/ubuntu/.cache/ostadix/hosted-live-release/shared"),
-            Path("/home/ubuntu/.local/share/ostadix/guests"),
             Path("/home/ubuntu/.cache/ostadix/capacity-host"),
         ],
     )

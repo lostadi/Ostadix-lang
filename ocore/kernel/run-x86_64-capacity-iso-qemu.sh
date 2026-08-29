@@ -4,7 +4,7 @@ set -euo pipefail
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 QEMU_BIN=${OCORE_QEMU_BIN:-qemu-system-x86_64}
-ISO=${1:-${OSTADIX_CAPACITY_ISO_IMAGE:-"$ROOT/target/ostadix-capacity-iso/x86_64/ostadix-hosted-live-x86_64-uefi.iso"}}
+ISO=${1:-${OSTADIX_CAPACITY_ISO_IMAGE:-"$ROOT/target/ostadix-capacity-iso/x86_64/ostadix-absorbed-capacity-x86_64-uefi.iso"}}
 INSPECTOR=${OSTADIX_CAPACITY_ISO_INSPECTOR:-"$ROOT/scripts/ostadix_capacity_iso.py"}
 PYTHON=${OSTADIX_PYTHON:-python3}
 

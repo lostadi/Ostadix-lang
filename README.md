@@ -1506,12 +1506,14 @@ and initramfs inputs needed for boot. See
 [`docs/ABSORBED_CAPACITY.md`](docs/ABSORBED_CAPACITY.md) for the package,
 transaction, rollback, and non-destructive garbage-collection contracts.
 
-#### Build the hosted-live absorbed-capacity x86_64 UEFI ISO
+#### Build the physical Hosted Live x86_64 UEFI ISO
 
 The default publication name is staged-tree-addressed:
-`target/ostadix-capacity-iso/x86_64/ostadix-hosted-live-x86_64-uefi-<tree12>.iso`,
+`target/ostadix-hosted-live/x86_64/ostadix-hosted-live-x86_64-uefi-<tree12>_VTGRUB2.iso`,
 where `<tree12>` is the first 12 hexadecimal characters of the exact staged Git
-tree identity. On Lee's Apple Silicon host, the release route materializes that
+tree identity. The `_VTGRUB2.iso` suffix makes Ventoy use its GRUB2 path instead
+of its firmware-dependent virtual-CD handoff. On Lee's Apple Silicon host, the
+release route materializes that
 tree beneath a run-owned native guest path under
 `/home/ubuntu/.cache/ostadix/hosted-live-release/runs` in the Multipass VM named
 `moral-gaur`. The VM may expose unrelated host mounts; this is a build-path
@@ -1528,8 +1530,8 @@ git add -- <reviewed-source-paths>
 o kernel hosted-live-release
 
 # On success the command prints both exact paths:
-# hosted-live-output: /absolute/path/ostadix-hosted-live-x86_64-uefi-<tree12>.iso
-# hosted-live-receipt: /absolute/path/ostadix-hosted-live-x86_64-uefi-<tree12>.iso.release.json
+# hosted-live-output: /absolute/path/ostadix-hosted-live-x86_64-uefi-<tree12>_VTGRUB2.iso
+# hosted-live-receipt: /absolute/path/ostadix-hosted-live-x86_64-uefi-<tree12>_VTGRUB2.iso.release.json
 HOSTED_LIVE_ISO='<exact hosted-live-output path>'
 o kernel smoke-hosted-live "$HOSTED_LIVE_ISO"
 ```
@@ -1537,9 +1539,12 @@ o kernel smoke-hosted-live "$HOSTED_LIVE_ISO"
 Staging does not commit or push. The orchestrator binds the build to the staged
 index, builds static x86_64 `O`, `o-cli`, `olangc`, and `o-link` binaries, embeds
 the pinned Alpine package closure from
-[`evidence/hosted_live_apk_packages.txt`](evidence/hosted_live_apk_packages.txt),
-prepares the live initramfs, builds the ISO, strictly inspects the published
-bytes, and requires all seven in-guest markers in order:
+[`evidence/hosted_live_physical_apk_packages.txt`](evidence/hosted_live_physical_apk_packages.txt),
+uses the pinned Alpine LTS kernel and initramfs, builds the ISO, and strictly
+inspects the published bytes. It requires all seven in-guest markers in order:
+first on serial, then during a second boot with VGA and a USB keyboard. That
+second gate rejects a black or unchanged framebuffer, types into the visible
+`tty1` shell, and requires the typed command to report back over serial:
 
 ```text
 OSTADIX HOSTED O SMOKE: PASS
@@ -1559,37 +1564,32 @@ replaces either file.
 
 The command fails closed before publication if the staged snapshot changes, a
 pinned download or package closure drifts, a cross-compiled binary is not static
-x86_64 ELF, strict ISO inspection fails, or the bounded OVMF/QEMU marker gate
-does not pass. Network access is confined to the explicit dependency and pinned
-guest-fetch phases. The built live image requires no network to boot.
+x86_64 ELF, strict ISO inspection fails, or either bounded OVMF/QEMU boot gate
+does not pass. Network access is confined to explicit build dependencies and
+pinned Alpine downloads. The built live image requires no network to boot.
 
-The generated GRUB menu has seven entries and boots the hosted CLI by default:
+The physical image deliberately has one menu entry: `OSTADIX Hosted Live CLI`.
+The O-core and foreign-kernel seven-entry image remains a separate QEMU/serial
+laboratory artifact at
+`target/ostadix-capacity-iso/x86_64/ostadix-absorbed-capacity-x86_64-uefi.iso`.
+O-core currently has no framebuffer console, and the foreign adapters do not
+yet rediscover Ventoy's device-mapper ISO path, so they are not advertised as
+working physical menu options.
 
-| Key | System | Boot path |
-|---|---|---|
-| `h` | OSTADIX Hosted Live CLI | Direct embedded Alpine kernel/initramfs; self-tests `O` and `olangc`, then opens a shell |
-| `o` | OSTADIX O-core | Direct Multiboot2 kernel entry |
-| `a` | Alpine Linux 3.24.1 | Direct upstream Linux kernel and initramfs entry |
-| `g` | GNU Guix System 1.5.0 | Embedded Linux capacity host launches its Linux-libre kernel, initrd, and ISO under QEMU TCG |
-| `b` | OpenBSD 7.9 | Embedded Linux capacity host launches the offline installer ISO under QEMU TCG |
-| `p` | 9front Plan 9 build 11983 | Embedded Linux capacity host launches the read-only qcow2 under QEMU TCG |
-| `r` | Redox OS 0.9.0 | Embedded Linux capacity host launches the livedisk under QEMU TCG |
-
-The exact pre-automation artifact built and verified on 2026-08-28 remains an
-evidence anchor for the recorded hash, not the lifetime default output name:
+The previously copied seven-entry artifact is retained only as a failure record:
 
 ```text
-path:   /Users/ustad/Ostadix-lang/target/ostadix-capacity-iso/x86_64/ostadix-hosted-live-x86_64-uefi.iso
-bytes:  3227535360
-sha256: 2919fdb774cd0e2d9dfdd59a10a4cd9ad36d5c1a6d776eaafef21d782b655661
-lock:   f82ef060f0e5bca4e62ac8b7697705d0707c818f232780c265c2aacb6bbfd907
+path:   /Users/ustad/Ostadix-lang/target/ostadix-capacity-iso/x86_64/ostadix-hosted-live-x86_64-uefi-07bd1c7727b0.iso
+bytes:  3227592704
+sha256: 247a51f296e8b07238df32870a44c2a582ff802daafab631be822ea0f4539c6e
 entries: 7
 ```
 
-Those exact bytes passed strict inspection and the hosted marker gate under
-x86_64 OVMF/QEMU TCG nested in the AArch64 `moral-gaur` VM. Prior observations
-for O-core and the foreign entries are not automatically inherited by a new
-hash; select and test those entries again before making hash-specific claims.
+Those bytes passed the old serial marker gate but reproduced a black VGA screen;
+they are not physical-boot success evidence. The new release receipt still says
+`physical_hardware_proof: false` until the exact copied bytes boot on the target
+machine. This unsigned development chain is intended for Secure Boot **off**;
+Secure Boot is not claimed or tested.
 
 #### Install the hosted-live ISO on Ventoy
 
@@ -1602,7 +1602,7 @@ connection.
 HOSTED_LIVE_ISO='<exact hosted-live-output path>'
 VENTOY_DEVICE=/dev/disk4       # example only; resolve the live external device
 VENTOY_VOLUME=/Volumes/Ventoy
-VENTOY_NAME=OSTADIX-Hosted-Live-x86_64-UEFI.iso
+VENTOY_NAME=OSTADIX-Hosted-Live-x86_64-UEFI_VTGRUB2.iso
 
 o kernel prepare-ventoy \
   --iso "$HOSTED_LIVE_ISO" --device "$VENTOY_DEVICE" \

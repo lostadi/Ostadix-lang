@@ -243,7 +243,7 @@ jobs:
           python3 -m tests.test_parser
           python3 tests/example_manifest.py validate
           python3 -m unittest -v tests.test_example_manifest tests.test_benchmark_hgraph_hosted
-          python3 -m unittest -v tests.test_foreign_kernel_lab tests.test_ostadix_capacity tests.test_ostadix_capacity_iso tests.test_ostadix_boot_media tests.test_ostadix_boot_iso tests.test_ostadix_boot_info_qemu tests.test_ostadix_media_writer tests.test_ostadix_physical_evidence tests.test_setup tests.test_o_cli_dispatch
+          python3 -m unittest -v tests.test_foreign_kernel_lab tests.test_ostadix_capacity tests.test_ostadix_capacity_iso tests.test_ostadix_boot_media tests.test_ostadix_boot_iso tests.test_ostadix_boot_info_qemu tests.test_ostadix_hosted_live_release tests.test_ostadix_ventoy_installer tests.test_ostadix_media_writer tests.test_ostadix_physical_evidence tests.test_setup tests.test_o_cli_dispatch
           python3 -m tests.test_evaluator
           python3 -B tests/test_backend_state_protocol.py -v
           python3 -B tests/test_bundled_shim_protocol.py -v

@@ -43,12 +43,38 @@ class FakeCapacityModule:
             "sha256": digest,
             "capacity_lock_sha256": hashlib.sha256(b"lock" + data).hexdigest(),
             "default_entry": "hosted",
-            "entries": [{"id": "hosted"}],
+            "entries": [
+                {
+                    "id": "hosted",
+                    "adapter": "linux-selection",
+                    "arguments": [
+                        "console=ttyS0,115200n8",
+                        "console=tty0",
+                        "rdinit=/init",
+                        "panic=0",
+                        "loglevel=7",
+                        "ignore_loglevel",
+                    ],
+                    "kernel_path": "/boot/hosted/vmlinuz-lts",
+                    "initrd_paths": ["/boot/hosted/initramfs.cpio.gz"],
+                    "selection_id": "hosted",
+                }
+            ],
+            "artifacts": [
+                {
+                    "iso_path": "/boot/hosted/initramfs.cpio.gz",
+                    "role": "linux-initrd",
+                },
+                {
+                    "iso_path": "/boot/hosted/vmlinuz-lts",
+                    "role": "linux-kernel",
+                },
+            ],
         }
 
 
 class OstadixVentoyInstallerTests(unittest.TestCase):
-    NAME = "OSTADIX-Hosted-Live-x86_64-UEFI.iso"
+    NAME = "OSTADIX-Hosted-Live-x86_64-UEFI_VTGRUB2.iso"
     SOURCE = b"OSTADIX fixture capacity ISO bytes\n" * 128
 
     @staticmethod
@@ -428,6 +454,42 @@ class OstadixVentoyInstallerTests(unittest.TestCase):
     def test_destination_name_rejects_traversal(self) -> None:
         with self.assertRaisesRegex(VENTOY.VentoyError, "basename"):
             VENTOY._validate_name("../escape.iso")
+
+    def test_destination_name_requires_ventoy_grub2_suffix(self) -> None:
+        with self.assertRaisesRegex(VENTOY.VentoyError, "_VTGRUB2"):
+            VENTOY._validate_name("OSTADIX-Hosted-Live-x86_64-UEFI.iso")
+        self.assertEqual(VENTOY._validate_name(self.NAME), self.NAME)
+
+    def test_seven_entry_capacity_lab_is_rejected_before_device_probe(self) -> None:
+        class LabCapacityModule(FakeCapacityModule):
+            @staticmethod
+            def inspect_descriptor(descriptor: int, label: str) -> dict[str, object]:
+                metadata = FakeCapacityModule.inspect_descriptor(descriptor, label)
+                metadata["entries"] = [
+                    {"id": entry}
+                    for entry in (
+                        "hosted",
+                        "ostadix",
+                        "alpine",
+                        "guix",
+                        "openbsd",
+                        "plan9",
+                        "redox",
+                    )
+                ]
+                return metadata
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "capacity-lab.iso"
+            source.write_bytes(self.SOURCE)
+            with (
+                mock.patch.object(VENTOY, "_capacity_module", return_value=LabCapacityModule),
+                mock.patch.object(VENTOY, "probe_ventoy") as probe,
+                self.assertRaisesRegex(VENTOY.CapacityValidationError, "single-entry physical"),
+            ):
+                VENTOY.prepare(source, "/dev/disk9", root, self.NAME)
+            probe.assert_not_called()
 
     def _diskutil_fixtures(self, volume: Path) -> tuple[dict[str, dict[str, object]], dict[str, object]]:
         volume_uuid = "11111111-1111-4111-8111-111111111111"

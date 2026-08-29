@@ -816,6 +816,12 @@ class SourceReleaseTests(unittest.TestCase):
                 'schema = "ostadix.capacity-iso-profile/v1"\n'
             ),
             "evidence/hosted_live_apk_packages.txt": "alpine-package-fixture\n",
+            "evidence/hosted_live_physical_apk_packages.txt": (
+                "alpine-physical-package-fixture\n"
+            ),
+            "evidence/hosted_live_physical_iso.toml": (
+                'schema = "ostadix.capacity-iso-profile/v1"\n'
+            ),
             "evidence/gates.toml": fixture_evidence_manifest(),
             "evidence/world_alpha_gates.toml": WORLD_NORMATIVE_BYTES[
                 "evidence/world_alpha_gates.toml"
@@ -883,7 +889,11 @@ class SourceReleaseTests(unittest.TestCase):
             "ocore/kernel/aarch64/vectors.S": ".section .text\n",
             "ocore/kernel/build-aarch64-g2.sh": "#!/bin/sh\nexit 0\n",
             "ocore/kernel/build-x86_64-capacity-iso.sh": "#!/bin/sh\nexit 0\n",
+            "ocore/kernel/build-x86_64-hosted-live-iso.sh": "#!/bin/sh\nexit 0\n",
             "ocore/kernel/smoke-x86_64-hosted-live-qemu.py": (
+                "#!/usr/bin/env python3\n"
+            ),
+            "ocore/kernel/smoke-x86_64-hosted-live-vga-qemu.py": (
                 "#!/usr/bin/env python3\n"
             ),
             "ocore/kernel/build-x86_64-uefi-iso.sh": "#!/bin/sh\nexit 0\n",
@@ -1225,7 +1235,9 @@ class SourceReleaseTests(unittest.TestCase):
                     "ocore/kernel/build.sh",
                     "ocore/kernel/build-aarch64-g2.sh",
                     "ocore/kernel/build-x86_64-capacity-iso.sh",
+                    "ocore/kernel/build-x86_64-hosted-live-iso.sh",
                     "ocore/kernel/smoke-x86_64-hosted-live-qemu.py",
+                    "ocore/kernel/smoke-x86_64-hosted-live-vga-qemu.py",
                     "ocore/kernel/build-x86_64-uefi-iso.sh",
                     "ocore/kernel/build-x86_64-uefi-media.sh",
                     "ocore/kernel/run-x86_64-capacity-iso-qemu.sh",
@@ -1432,6 +1444,8 @@ class SourceReleaseTests(unittest.TestCase):
                 "evidence/absorbed_capacity_catalog.toml",
                 "evidence/absorbed_capacity_iso.toml",
                 "evidence/hosted_live_apk_packages.txt",
+                "evidence/hosted_live_physical_apk_packages.txt",
+                "evidence/hosted_live_physical_iso.toml",
                 "evidence/foreign_kernel_lab.toml",
                 "evidence/gates.toml",
                 "evidence/o_machine_contract_v1.toml",
@@ -1475,7 +1489,9 @@ class SourceReleaseTests(unittest.TestCase):
                 "ocore/kernel/aarch64/vectors.S",
                 "ocore/kernel/build-aarch64-g2.sh",
                 "ocore/kernel/build-x86_64-capacity-iso.sh",
+                "ocore/kernel/build-x86_64-hosted-live-iso.sh",
                 "ocore/kernel/smoke-x86_64-hosted-live-qemu.py",
+                "ocore/kernel/smoke-x86_64-hosted-live-vga-qemu.py",
                 "ocore/kernel/build-x86_64-uefi-iso.sh",
                 "ocore/kernel/build-x86_64-uefi-media.sh",
                 "ocore/kernel/build.sh",
@@ -1805,7 +1821,9 @@ class SourceReleaseTests(unittest.TestCase):
             )
             for executable_path in (
                 "ocore/kernel/build-x86_64-capacity-iso.sh",
+                "ocore/kernel/build-x86_64-hosted-live-iso.sh",
                 "ocore/kernel/smoke-x86_64-hosted-live-qemu.py",
+                "ocore/kernel/smoke-x86_64-hosted-live-vga-qemu.py",
                 "ocore/kernel/build-x86_64-uefi-iso.sh",
                 "ocore/kernel/build-x86_64-uefi-media.sh",
                 "ocore/kernel/run-x86_64-capacity-iso-qemu.sh",
@@ -2055,9 +2073,13 @@ class SourceReleaseTests(unittest.TestCase):
             "evidence/absorbed_capacity_catalog.toml",
             "evidence/absorbed_capacity_iso.toml",
             "evidence/hosted_live_apk_packages.txt",
+            "evidence/hosted_live_physical_apk_packages.txt",
+            "evidence/hosted_live_physical_iso.toml",
             "ocore/kernel/build-x86_64-capacity-iso.sh",
+            "ocore/kernel/build-x86_64-hosted-live-iso.sh",
             "ocore/kernel/run-x86_64-capacity-iso-qemu.sh",
             "ocore/kernel/smoke-x86_64-hosted-live-qemu.py",
+            "ocore/kernel/smoke-x86_64-hosted-live-vga-qemu.py",
             "scripts/build-x86_64-hosted-live-linux.sh",
             "scripts/ostadix_capacity.py",
             "scripts/ostadix_capacity_iso.py",

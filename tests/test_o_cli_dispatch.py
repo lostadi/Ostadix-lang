@@ -198,7 +198,7 @@ class KernelCapacityCliDispatchTests(unittest.TestCase):
         explicit = "/tmp/capacity.iso"
         default = str(
             PROJECT_ROOT
-            / "target/ostadix-capacity-iso/x86_64/ostadix-hosted-live-x86_64-uefi.iso"
+            / "target/ostadix-capacity-iso/x86_64/ostadix-absorbed-capacity-x86_64-uefi.iso"
         )
         for arguments, expected in (
             (("capacity-iso",), []),
@@ -219,7 +219,7 @@ class KernelCapacityCliDispatchTests(unittest.TestCase):
                 self.assertIn("accepts at most one path argument", result.stderr)
 
     def test_hosted_live_release_forwards_arbitrary_options(self) -> None:
-        output = "/tmp/ostadix-hosted-live-x86_64-uefi-0123456789ab.iso"
+        output = "/tmp/ostadix-hosted-live-x86_64-uefi-0123456789ab_VTGRUB2.iso"
         self.assert_dispatch(("hosted-live-release",), [])
         self.assert_dispatch(
             ("hosted-live-release", "--vm", "moral-gaur", "--output", output),
@@ -227,7 +227,7 @@ class KernelCapacityCliDispatchTests(unittest.TestCase):
         )
 
     def test_hosted_live_smoke_accepts_at_most_one_iso_path(self) -> None:
-        image = "/tmp/ostadix-hosted-live-x86_64-uefi-0123456789ab.iso"
+        image = "/tmp/ostadix-hosted-live-x86_64-uefi-0123456789ab_VTGRUB2.iso"
         self.assert_dispatch(("smoke-hosted-live",), [])
         self.assert_dispatch(("smoke-hosted-live", image), [image])
 
@@ -236,7 +236,7 @@ class KernelCapacityCliDispatchTests(unittest.TestCase):
         self.assertIn("accepts at most one path argument", result.stderr)
 
     def test_ventoy_commands_preserve_the_bound_target_arguments(self) -> None:
-        image = "/tmp/ostadix-hosted-live-x86_64-uefi-0123456789ab.iso"
+        image = "/tmp/ostadix-hosted-live-x86_64-uefi-0123456789ab_VTGRUB2.iso"
         target = [
             "--iso",
             image,
@@ -245,7 +245,7 @@ class KernelCapacityCliDispatchTests(unittest.TestCase):
             "--volume",
             "/Volumes/Ventoy",
             "--name",
-            "OSTADIX-Hosted-Live-x86_64-UEFI.iso",
+            "OSTADIX-Hosted-Live-x86_64-UEFI_VTGRUB2.iso",
         ]
         self.assert_dispatch(("prepare-ventoy", *target), ["prepare", *target])
         self.assert_dispatch(

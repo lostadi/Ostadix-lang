@@ -21,7 +21,7 @@ ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_RUNNER = ROOT / "ocore/kernel/run-x86_64-capacity-iso-qemu.sh"
 DEFAULT_ISO = (
     ROOT
-    / "target/ostadix-capacity-iso/x86_64/ostadix-hosted-live-x86_64-uefi.iso"
+    / "target/ostadix-hosted-live/x86_64/ostadix-hosted-live-x86_64-uefi_VTGRUB2.iso"
 )
 DEFAULT_TIMEOUT_SECONDS = 180.0
 MAX_TRANSCRIPT_BYTES = 8 * 1024 * 1024
