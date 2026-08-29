@@ -4,7 +4,7 @@ set -euo pipefail
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 QEMU_BIN=${OCORE_QEMU_BIN:-qemu-system-x86_64}
-ISO=${1:-${OSTADIX_CAPACITY_ISO_IMAGE:-"$ROOT/target/ostadix-capacity-iso/x86_64/ostadix-absorbed-capacity-x86_64-uefi.iso"}}
+ISO=${1:-${OSTADIX_CAPACITY_ISO_IMAGE:-"$ROOT/target/ostadix-capacity-iso/x86_64/ostadix-hosted-live-x86_64-uefi.iso"}}
 INSPECTOR=${OSTADIX_CAPACITY_ISO_INSPECTOR:-"$ROOT/scripts/ostadix_capacity_iso.py"}
 PYTHON=${OSTADIX_PYTHON:-python3}
 
@@ -39,7 +39,7 @@ OSTADIX absorbed-capacity x86_64 UEFI ISO
   iso:      $ISO
   media:    descriptor-pinned, read-only El Torito CD-ROM
   network:  disabled for the outer capacity host and every embedded adapter
-  select:   GRUB hotkeys o/a/g/b/p/r or arrow keys
+  select:   GRUB hotkeys h/o/a/g/b/p/r or arrow keys
   exit:     Ctrl-A X
 
 EOF

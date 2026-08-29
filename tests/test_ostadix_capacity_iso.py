@@ -497,7 +497,20 @@ class CapacityIsoTests(unittest.TestCase):
     def test_committed_toml_profile_matches_schema(self) -> None:
         parsed = ISO._load_profile(ROOT / "evidence" / "absorbed_capacity_iso.toml")
         self.assertEqual(len(parsed["artifacts"]), 10)
-        self.assertEqual(len(parsed["entries"]), 6)
+        self.assertEqual(len(parsed["entries"]), 7)
+        self.assertEqual(parsed["default_entry"], "hosted")
+        hosted = next(entry for entry in parsed["entries"] if entry["id"] == "hosted")
+        self.assertEqual(hosted["adapter"], "linux-selection")
+        self.assertEqual(hosted["selection_id"], "hosted")
+        self.assertEqual(
+            hosted["initrd_paths"], ["/boot/capacity-host/initramfs.cpio.gz"]
+        )
+        grub = ISO.render_grub(parsed["entries"], parsed["default_entry"]).decode("ascii")
+        self.assertIn("set default='hosted'", grub)
+        self.assertIn(
+            "linux /boot/capacity-host/vmlinuz-virt ostadix.capacity=hosted",
+            grub,
+        )
 
     def test_create_lock_is_deterministic_and_renders_real_qemu_entries(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -732,10 +745,9 @@ class CapacityIsoTests(unittest.TestCase):
 
     def test_builder_rejects_extra_outputs_before_preflight(self) -> None:
         builder = ROOT / "ocore/kernel/build-x86_64-capacity-iso.sh"
-        self.assertIn(
-            "export CARGO_NET_OFFLINE=true",
-            builder.read_text(encoding="utf-8"),
-        )
+        builder_source = builder.read_text(encoding="utf-8")
+        self.assertIn("export CARGO_NET_OFFLINE=true", builder_source)
+        self.assertIn("ostadix-hosted-live-x86_64-uefi.iso", builder_source)
         with tempfile.TemporaryDirectory() as directory:
             build_root = Path(directory) / "must-not-exist"
             environment = os.environ.copy()
@@ -754,6 +766,12 @@ class CapacityIsoTests(unittest.TestCase):
                 result.stderr,
             )
             self.assertFalse(build_root.exists())
+
+    def test_ocore_builder_resolves_an_external_cargo_target_directory(self) -> None:
+        source = (ROOT / "ocore/kernel/build.sh").read_text(encoding="utf-8")
+        self.assertIn('OCOREC_BIN="$CARGO_TARGET_DIR/debug/ocorec"', source)
+        self.assertIn('OCOREC_BIN="$(pwd -P)/$CARGO_TARGET_DIR/debug/ocorec"', source)
+        self.assertIn('"$OCOREC_BIN" \\', source)
 
     def test_interactive_runner_preserves_standard_input_through_qemu_exec(self) -> None:
         runner = ROOT / "ocore" / "kernel" / "run-x86_64-capacity-iso-qemu.sh"
@@ -820,6 +838,49 @@ print("FAKE_QEMU_STDIN=" + sys.stdin.readline().rstrip("\\n"))
         for module in ("cdrom.ko", "sr_mod.ko", "isofs.ko"):
             self.assertIn(module, source)
         self.assertIn('ln -s ../usr/lib/modules "$STAGE/lib/modules"', source)
+
+    def test_capacity_host_embeds_and_self_tests_hosted_ostadix_before_media_mount(self) -> None:
+        source = (ROOT / "scripts" / "prepare-x86_64-capacity-host.sh").read_text(
+            encoding="utf-8"
+        )
+        package_lock = (ROOT / "evidence" / "hosted_live_apk_packages.txt").read_text(
+            encoding="utf-8"
+        )
+        packages = [
+            line
+            for line in package_lock.splitlines()
+            if line and not line.startswith("#")
+        ]
+        self.assertEqual(packages, sorted(set(packages)))
+        for package in (
+            "bash=5.3.9-r1",
+            "python3=3.14.7-r1",
+            "qemu-system-x86_64=11.0.1-r0",
+            "qemu-ui-curses=11.0.1-r0",
+            "sqlite=3.53.4-r0",
+        ):
+            self.assertIn(package, packages)
+        self.assertIn("PACKAGE_SPECS", source)
+        self.assertIn("resolved Alpine package closure differs", source)
+        self.assertIn("nameserver 1.1.1.1", source)
+        self.assertIn("for binary in O o-cli olangc o-link; do", source)
+        self.assertIn(
+            'install -m 0555 "$HOSTED_BIN_DIR/$binary" "$STAGE/usr/local/bin/$binary"',
+            source,
+        )
+        for marker in (
+            "OSTADIX HOSTED O SMOKE: PASS",
+            "OSTADIX HOSTED BASH: PASS",
+            "OSTADIX HOSTED SQLITE: PASS",
+            "OSTADIX HOSTED OLANGC IR: PASS",
+            "OSTADIX HOSTED O-CLI: PASS",
+            "OSTADIX HOSTED O-LINK: PASS",
+            "OSTADIX HOSTED LIVE READY",
+        ):
+            self.assertIn(marker, source)
+        hosted_branch = source.index('if [ "$selected" = hosted ]; then')
+        media_mount = source.index("media=", hosted_branch)
+        self.assertLess(hosted_branch, media_mount)
 
 
 if __name__ == "__main__":

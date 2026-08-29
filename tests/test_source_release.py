@@ -815,6 +815,7 @@ class SourceReleaseTests(unittest.TestCase):
             "evidence/absorbed_capacity_iso.toml": (
                 'schema = "ostadix.capacity-iso-profile/v1"\n'
             ),
+            "evidence/hosted_live_apk_packages.txt": "alpine-package-fixture\n",
             "evidence/gates.toml": fixture_evidence_manifest(),
             "evidence/world_alpha_gates.toml": WORLD_NORMATIVE_BYTES[
                 "evidence/world_alpha_gates.toml"
@@ -882,6 +883,9 @@ class SourceReleaseTests(unittest.TestCase):
             "ocore/kernel/aarch64/vectors.S": ".section .text\n",
             "ocore/kernel/build-aarch64-g2.sh": "#!/bin/sh\nexit 0\n",
             "ocore/kernel/build-x86_64-capacity-iso.sh": "#!/bin/sh\nexit 0\n",
+            "ocore/kernel/smoke-x86_64-hosted-live-qemu.py": (
+                "#!/usr/bin/env python3\n"
+            ),
             "ocore/kernel/build-x86_64-uefi-iso.sh": "#!/bin/sh\nexit 0\n",
             "ocore/kernel/build-x86_64-uefi-media.sh": "#!/bin/sh\nexit 0\n",
             "ocore/kernel/build.sh": "#!/bin/sh\nexit 0\n",
@@ -971,8 +975,11 @@ class SourceReleaseTests(unittest.TestCase):
             "scripts/install-o-cli-wrapper.sh": "#!/usr/bin/env bash\n",
             "scripts/o-cli.sh": "#!/usr/bin/env bash\nexec true\n",
             "scripts/o-kernel.sh": "#!/usr/bin/env bash\nexec true\n",
+            "scripts/build-x86_64-hosted-live-linux.sh": "#!/usr/bin/env bash\n",
             "scripts/ostadix_capacity.py": "#!/usr/bin/env python3\n",
             "scripts/ostadix_capacity_iso.py": "#!/usr/bin/env python3\n",
+            "scripts/ostadix_hosted_live_release.py": "#!/usr/bin/env python3\n",
+            "scripts/ostadix_ventoy_installer.py": "#!/usr/bin/env python3\n",
             "scripts/prepare-x86_64-capacity-host.sh": "#!/usr/bin/env bash\n",
             "scripts/ostadix_boot_iso.py": "#!/usr/bin/env python3\n",
             "scripts/ostadix_boot_media.py": "#!/usr/bin/env python3\n",
@@ -1144,6 +1151,12 @@ class SourceReleaseTests(unittest.TestCase):
             "tests/test_mcp_smoke.py": "# fixture MCP smoke tests\n",
             "tests/test_ostadix_capacity.py": "# fixture absorbed-capacity tests\n",
             "tests/test_ostadix_capacity_iso.py": "# fixture capacity-ISO tests\n",
+            "tests/test_ostadix_hosted_live_release.py": (
+                "# fixture hosted-live release tests\n"
+            ),
+            "tests/test_ostadix_ventoy_installer.py": (
+                "# fixture Ventoy installer tests\n"
+            ),
             "tests/test_ostadix_boot_media.py": "# fixture boot-media tests\n",
             "tests/test_ostadix_boot_iso.py": "# fixture boot-iso tests\n",
             "tests/test_ostadix_boot_info_qemu.py": "# fixture boot-info QEMU tests\n",
@@ -1212,6 +1225,7 @@ class SourceReleaseTests(unittest.TestCase):
                     "ocore/kernel/build.sh",
                     "ocore/kernel/build-aarch64-g2.sh",
                     "ocore/kernel/build-x86_64-capacity-iso.sh",
+                    "ocore/kernel/smoke-x86_64-hosted-live-qemu.py",
                     "ocore/kernel/build-x86_64-uefi-iso.sh",
                     "ocore/kernel/build-x86_64-uefi-media.sh",
                     "ocore/kernel/run-x86_64-capacity-iso-qemu.sh",
@@ -1231,9 +1245,12 @@ class SourceReleaseTests(unittest.TestCase):
                     "ocore/kernel/stress-live-linux-personality-qemu.sh",
                     "scripts/o-cli.sh",
                     "scripts/o-kernel.sh",
+                    "scripts/build-x86_64-hosted-live-linux.sh",
                     "scripts/foreign_kernel_lab.py",
                     "scripts/ostadix_capacity.py",
                     "scripts/ostadix_capacity_iso.py",
+                    "scripts/ostadix_hosted_live_release.py",
+                    "scripts/ostadix_ventoy_installer.py",
                     "scripts/prepare-x86_64-capacity-host.sh",
                     "scripts/ostadix_boot_iso.py",
                     "scripts/ostadix_boot_media.py",
@@ -1414,6 +1431,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "docs/VERSIONING.md",
                 "evidence/absorbed_capacity_catalog.toml",
                 "evidence/absorbed_capacity_iso.toml",
+                "evidence/hosted_live_apk_packages.txt",
                 "evidence/foreign_kernel_lab.toml",
                 "evidence/gates.toml",
                 "evidence/o_machine_contract_v1.toml",
@@ -1457,6 +1475,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "ocore/kernel/aarch64/vectors.S",
                 "ocore/kernel/build-aarch64-g2.sh",
                 "ocore/kernel/build-x86_64-capacity-iso.sh",
+                "ocore/kernel/smoke-x86_64-hosted-live-qemu.py",
                 "ocore/kernel/build-x86_64-uefi-iso.sh",
                 "ocore/kernel/build-x86_64-uefi-media.sh",
                 "ocore/kernel/build.sh",
@@ -1520,8 +1539,11 @@ class SourceReleaseTests(unittest.TestCase):
                 "scripts/install-o-cli-wrapper.sh",
                 "scripts/o-cli.sh",
                 "scripts/o-kernel.sh",
+                "scripts/build-x86_64-hosted-live-linux.sh",
                 "scripts/ostadix_capacity.py",
                 "scripts/ostadix_capacity_iso.py",
+                "scripts/ostadix_hosted_live_release.py",
+                "scripts/ostadix_ventoy_installer.py",
                 "scripts/prepare-x86_64-capacity-host.sh",
                 "scripts/ostadix_boot_iso.py",
                 "scripts/ostadix_boot_media.py",
@@ -1689,6 +1711,8 @@ class SourceReleaseTests(unittest.TestCase):
                 "tests/test_mcp_smoke.py",
                 "tests/test_ostadix_capacity.py",
                 "tests/test_ostadix_capacity_iso.py",
+                "tests/test_ostadix_hosted_live_release.py",
+                "tests/test_ostadix_ventoy_installer.py",
                 "tests/test_ostadix_boot_iso.py",
                 "tests/test_ostadix_boot_media.py",
                 "tests/test_ostadix_boot_info_qemu.py",
@@ -1781,6 +1805,7 @@ class SourceReleaseTests(unittest.TestCase):
             )
             for executable_path in (
                 "ocore/kernel/build-x86_64-capacity-iso.sh",
+                "ocore/kernel/smoke-x86_64-hosted-live-qemu.py",
                 "ocore/kernel/build-x86_64-uefi-iso.sh",
                 "ocore/kernel/build-x86_64-uefi-media.sh",
                 "ocore/kernel/run-x86_64-capacity-iso-qemu.sh",
@@ -1793,6 +1818,9 @@ class SourceReleaseTests(unittest.TestCase):
                 "ocore/kernel/stress-live-linux-personality-qemu.sh",
                 "scripts/ostadix_capacity.py",
                 "scripts/ostadix_capacity_iso.py",
+                "scripts/build-x86_64-hosted-live-linux.sh",
+                "scripts/ostadix_hosted_live_release.py",
+                "scripts/ostadix_ventoy_installer.py",
                 "scripts/prepare-x86_64-capacity-host.sh",
                 "scripts/ostadix_boot_iso.py",
                 "scripts/ostadix_boot_media.py",
@@ -2026,13 +2054,20 @@ class SourceReleaseTests(unittest.TestCase):
             "docs/ABSORBED_CAPACITY.md",
             "evidence/absorbed_capacity_catalog.toml",
             "evidence/absorbed_capacity_iso.toml",
+            "evidence/hosted_live_apk_packages.txt",
             "ocore/kernel/build-x86_64-capacity-iso.sh",
             "ocore/kernel/run-x86_64-capacity-iso-qemu.sh",
+            "ocore/kernel/smoke-x86_64-hosted-live-qemu.py",
+            "scripts/build-x86_64-hosted-live-linux.sh",
             "scripts/ostadix_capacity.py",
             "scripts/ostadix_capacity_iso.py",
+            "scripts/ostadix_hosted_live_release.py",
+            "scripts/ostadix_ventoy_installer.py",
             "scripts/prepare-x86_64-capacity-host.sh",
             "tests/test_ostadix_capacity.py",
             "tests/test_ostadix_capacity_iso.py",
+            "tests/test_ostadix_hosted_live_release.py",
+            "tests/test_ostadix_ventoy_installer.py",
         )
         self._commit()
         self._git("rm", *required)

@@ -4,6 +4,14 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 KERNEL_DIR="$ROOT/ocore/kernel"
 BUILD_DIR="${OCORE_BUILD_DIR:-$ROOT/target/ocore-kernel}"
+if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
+  case "$CARGO_TARGET_DIR" in
+    /*) OCOREC_BIN="$CARGO_TARGET_DIR/debug/ocorec" ;;
+    *) OCOREC_BIN="$(pwd -P)/$CARGO_TARGET_DIR/debug/ocorec" ;;
+  esac
+else
+  OCOREC_BIN="$ROOT/target/debug/ocorec"
+fi
 PROBE_MODE="${OCORE_PROBE_MODE:-0}"
 case "$PROBE_MODE" in
   0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 | 24 | 25 | 26 | 27 | 28 | 29 | 30 | 31 | 32 | 33 | 34) ;;
@@ -31,6 +39,10 @@ fi
 mkdir -p "$BUILD_DIR"
 
 cargo build --manifest-path "$ROOT/Cargo.toml" --package o-lang --bin ocorec
+if [[ -L "$OCOREC_BIN" || ! -f "$OCOREC_BIN" || ! -x "$OCOREC_BIN" ]]; then
+  echo "error: Cargo did not produce the expected ocorec binary: $OCOREC_BIN" >&2
+  exit 1
+fi
 
 M4_IMAGE_DEFINE='-DOCORE_M4_IMAGE_PATH=""'
 M5_IMAGE_DEFINE='-DOCORE_M5_IMAGE_PATH=""'
@@ -355,7 +367,7 @@ if (( PROBE_MODE == 25 || PROBE_MODE == 26 || PROBE_MODE == 28 || PROBE_MODE == 
   M4_SOURCE="$KERNEL_DIR/m4_mode25_stub.oc"
 fi
 
-"$ROOT/target/debug/ocorec" \
+"$OCOREC_BIN" \
   ${WORLD_IDENTITY_SOURCES[@]+"${WORLD_IDENTITY_SOURCES[@]}"} \
   ${WORLD_PROTOCOL_SOURCES[@]+"${WORLD_PROTOCOL_SOURCES[@]}"} \
   ${WORLD_VALUE_SOURCES[@]+"${WORLD_VALUE_SOURCES[@]}"} \

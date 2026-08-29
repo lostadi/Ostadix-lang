@@ -761,6 +761,9 @@ setup_kernel_media_cli_fixture() {
     KERNEL_CAPACITY_ISO_BUILD_STUB="$KERNEL_MEDIA_STUB_DIR/capacity-iso-build"
     KERNEL_CAPACITY_ISO_INSPECT_STUB="$KERNEL_MEDIA_STUB_DIR/capacity-iso-inspect"
     KERNEL_CAPACITY_ISO_BOOT_STUB="$KERNEL_MEDIA_STUB_DIR/capacity-iso-boot"
+    KERNEL_HOSTED_LIVE_RELEASE_STUB="$KERNEL_MEDIA_STUB_DIR/hosted-live-release"
+    KERNEL_HOSTED_LIVE_SMOKE_STUB="$KERNEL_MEDIA_STUB_DIR/hosted-live-smoke"
+    KERNEL_VENTOY_INSTALLER_STUB="$KERNEL_MEDIA_STUB_DIR/ventoy-installer"
     KERNEL_BOOT_INFO_SMOKE_STUB="$KERNEL_MEDIA_STUB_DIR/boot-info-smoke"
     KERNEL_SMP_SMOKE_STUB="$KERNEL_MEDIA_STUB_DIR/smp-smoke"
     KERNEL_MEDIA_WRITER_STUB="$KERNEL_MEDIA_STUB_DIR/media-writer"
@@ -790,6 +793,9 @@ EOF
     cp "$KERNEL_MEDIA_BUILD_STUB" "$KERNEL_CAPACITY_ISO_BUILD_STUB"
     cp "$KERNEL_MEDIA_BUILD_STUB" "$KERNEL_CAPACITY_ISO_INSPECT_STUB"
     cp "$KERNEL_MEDIA_BUILD_STUB" "$KERNEL_CAPACITY_ISO_BOOT_STUB"
+    cp "$KERNEL_MEDIA_BUILD_STUB" "$KERNEL_HOSTED_LIVE_RELEASE_STUB"
+    cp "$KERNEL_MEDIA_BUILD_STUB" "$KERNEL_HOSTED_LIVE_SMOKE_STUB"
+    cp "$KERNEL_MEDIA_BUILD_STUB" "$KERNEL_VENTOY_INSTALLER_STUB"
     cp "$KERNEL_MEDIA_BUILD_STUB" "$KERNEL_BOOT_INFO_SMOKE_STUB"
     cp "$KERNEL_MEDIA_BUILD_STUB" "$KERNEL_SMP_SMOKE_STUB"
     cp "$KERNEL_MEDIA_BUILD_STUB" "$KERNEL_MEDIA_WRITER_STUB"
@@ -807,6 +813,9 @@ EOF
         "$KERNEL_CAPACITY_ISO_BUILD_STUB" \
         "$KERNEL_CAPACITY_ISO_INSPECT_STUB" \
         "$KERNEL_CAPACITY_ISO_BOOT_STUB" \
+        "$KERNEL_HOSTED_LIVE_RELEASE_STUB" \
+        "$KERNEL_HOSTED_LIVE_SMOKE_STUB" \
+        "$KERNEL_VENTOY_INSTALLER_STUB" \
         "$KERNEL_BOOT_INFO_SMOKE_STUB" \
         "$KERNEL_SMP_SMOKE_STUB" \
         "$KERNEL_MEDIA_WRITER_STUB" \
@@ -829,6 +838,9 @@ run_kernel_media_cli() {
         O_KERNEL_CAPACITY_ISO_BUILD_SCRIPT="$KERNEL_CAPACITY_ISO_BUILD_STUB" \
         O_KERNEL_CAPACITY_ISO_INSPECT_SCRIPT="$KERNEL_CAPACITY_ISO_INSPECT_STUB" \
         O_KERNEL_CAPACITY_ISO_BOOT_SCRIPT="$KERNEL_CAPACITY_ISO_BOOT_STUB" \
+        O_KERNEL_HOSTED_LIVE_RELEASE_SCRIPT="$KERNEL_HOSTED_LIVE_RELEASE_STUB" \
+        O_KERNEL_HOSTED_LIVE_SMOKE_SCRIPT="$KERNEL_HOSTED_LIVE_SMOKE_STUB" \
+        O_KERNEL_VENTOY_INSTALLER_SCRIPT="$KERNEL_VENTOY_INSTALLER_STUB" \
         O_KERNEL_BOOT_INFO_SMOKE_SCRIPT="$KERNEL_BOOT_INFO_SMOKE_STUB" \
         O_KERNEL_SMP_SMOKE_SCRIPT="$KERNEL_SMP_SMOKE_STUB" \
         O_KERNEL_MEDIA_WRITER_SCRIPT="$KERNEL_MEDIA_WRITER_STUB" \
@@ -987,6 +999,10 @@ check_stdout_contains "lowercase o dispatches local information help" 0 \
     "$O_CLI" info --help
 check_stdout_contains "lowercase o dispatches kernel help" 0 \
     '^Usage: o kernel <command>' "$O_CLI" kernel help
+check_stdout_contains "kernel help publishes the hosted-live release route" 0 \
+    '^  hosted-live-release  ' "$O_KERNEL_CLI" help
+check_stdout_contains "kernel help publishes the guarded Ventoy prepare route" 0 \
+    '^  prepare-ventoy  ' "$O_KERNEL_CLI" help
 check_stdout_contains "kernel CLI with no command is non-booting help" 0 \
     '^Usage: o kernel <command>' "$O_KERNEL_CLI"
 check_nonzero_stderr_contains "kernel CLI rejects an unknown command" \
@@ -1030,7 +1046,7 @@ check_kernel_media_dispatch "kernel inspect-iso forwards the default ISO path" \
 check_kernel_media_dispatch "kernel inspect-iso forwards an explicit ISO path" \
     "$(printf 'script=iso-inspect\nargc=2\narg=inspect\narg=%s' "$KERNEL_ISO_OUTPUT")" \
     inspect-iso "$KERNEL_ISO_OUTPUT"
-KERNEL_CAPACITY_ISO_DEFAULT="$ROOT/target/ostadix-capacity-iso/x86_64/ostadix-absorbed-capacity-x86_64-uefi.iso"
+KERNEL_CAPACITY_ISO_DEFAULT="$ROOT/target/ostadix-capacity-iso/x86_64/ostadix-hosted-live-x86_64-uefi.iso"
 KERNEL_CAPACITY_ISO_OUTPUT="$ARTIFACT_DIR/custom-capacity.iso"
 check_kernel_media_dispatch "kernel capacity-iso accepts no output path" \
     $'script=capacity-iso-build\nargc=0' \
@@ -1047,6 +1063,39 @@ check_kernel_media_dispatch "kernel inspect-capacity-iso forwards the default IS
 check_kernel_media_dispatch "kernel inspect-capacity-iso forwards an explicit ISO path" \
     "$(printf 'script=capacity-iso-inspect\nargc=2\narg=inspect\narg=%s' "$KERNEL_CAPACITY_ISO_OUTPUT")" \
     inspect-capacity-iso "$KERNEL_CAPACITY_ISO_OUTPUT"
+KERNEL_HOSTED_LIVE_OUTPUT="$ARTIFACT_DIR/ostadix-hosted-live-x86_64-uefi-0123456789ab.iso"
+check_kernel_media_dispatch "kernel hosted-live-release accepts the default workflow" \
+    $'script=hosted-live-release\nargc=0' \
+    hosted-live-release
+check_kernel_media_dispatch "kernel hosted-live-release forwards arbitrary release options" \
+    "$(printf 'script=hosted-live-release\nargc=4\narg=--vm\narg=moral-gaur\narg=--output\narg=%s' "$KERNEL_HOSTED_LIVE_OUTPUT")" \
+    hosted-live-release --vm moral-gaur --output "$KERNEL_HOSTED_LIVE_OUTPUT"
+check_kernel_media_dispatch "kernel smoke-hosted-live accepts its default ISO" \
+    $'script=hosted-live-smoke\nargc=0' \
+    smoke-hosted-live
+check_kernel_media_dispatch "kernel smoke-hosted-live forwards one exact ISO path" \
+    "$(printf 'script=hosted-live-smoke\nargc=1\narg=%s' "$KERNEL_HOSTED_LIVE_OUTPUT")" \
+    smoke-hosted-live "$KERNEL_HOSTED_LIVE_OUTPUT"
+check_kernel_media_rejection "kernel smoke-hosted-live rejects extra ISO paths" \
+    'command accepts at most one path argument' \
+    smoke-hosted-live "$KERNEL_HOSTED_LIVE_OUTPUT" unexpected.iso
+KERNEL_VENTOY_DEVICE=/dev/disk4
+KERNEL_VENTOY_NAME=OSTADIX-Hosted-Live-x86_64-UEFI.iso
+check_kernel_media_dispatch "kernel prepare-ventoy forwards the complete preparation request" \
+    "$(printf 'script=ventoy-installer\nargc=9\narg=prepare\narg=--iso\narg=%s\narg=--device\narg=%s\narg=--volume\narg=/Volumes/Ventoy\narg=--name\narg=%s' "$KERNEL_HOSTED_LIVE_OUTPUT" "$KERNEL_VENTOY_DEVICE" "$KERNEL_VENTOY_NAME")" \
+    prepare-ventoy --iso "$KERNEL_HOSTED_LIVE_OUTPUT" \
+    --device "$KERNEL_VENTOY_DEVICE" --volume /Volumes/Ventoy \
+    --name "$KERNEL_VENTOY_NAME"
+check_kernel_media_dispatch "kernel install-ventoy forwards the rebound target and confirmation" \
+    "$(printf 'script=ventoy-installer\nargc=12\narg=install\narg=--iso\narg=%s\narg=--device\narg=%s\narg=--volume\narg=/Volumes/Ventoy\narg=--name\narg=%s\narg=--confirm\narg=exact-token\narg=--eject' "$KERNEL_HOSTED_LIVE_OUTPUT" "$KERNEL_VENTOY_DEVICE" "$KERNEL_VENTOY_NAME")" \
+    install-ventoy --iso "$KERNEL_HOSTED_LIVE_OUTPUT" \
+    --device "$KERNEL_VENTOY_DEVICE" --volume /Volumes/Ventoy \
+    --name "$KERNEL_VENTOY_NAME" --confirm exact-token --eject
+check_kernel_media_dispatch "kernel verify-ventoy forwards arbitrary verification options" \
+    "$(printf 'script=ventoy-installer\nargc=9\narg=verify\narg=--iso\narg=%s\narg=--device\narg=%s\narg=--volume\narg=/Volumes/Ventoy\narg=--name\narg=%s' "$KERNEL_HOSTED_LIVE_OUTPUT" "$KERNEL_VENTOY_DEVICE" "$KERNEL_VENTOY_NAME")" \
+    verify-ventoy --iso "$KERNEL_HOSTED_LIVE_OUTPUT" \
+    --device "$KERNEL_VENTOY_DEVICE" --volume /Volumes/Ventoy \
+    --name "$KERNEL_VENTOY_NAME"
 check_kernel_media_dispatch "kernel boot-media dispatches its exact boot script" \
     $'script=media-boot\nargc=0' \
     boot-media
