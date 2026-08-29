@@ -1371,6 +1371,17 @@ o kernel smoke-iso
 # Interactive ISO boot through OVMF/QEMU TCG; leave with Ctrl-A X.
 o kernel boot-iso
 
+# Build and prove the staged-index hosted-live ISO, then prepare its guarded
+# Ventoy file-copy workflow.
+o kernel hosted-live-release
+o kernel smoke-hosted-live
+o kernel prepare-ventoy --iso "$HOSTED_LIVE_ISO" --device "$DEVICE" \
+  --volume "$VENTOY_VOLUME" --name "$VENTOY_NAME"
+o kernel install-ventoy --iso "$HOSTED_LIVE_ISO" --device "$DEVICE" \
+  --volume "$VENTOY_VOLUME" --name "$VENTOY_NAME" --confirm "$TOKEN"
+o kernel verify-ventoy --iso "$HOSTED_LIVE_ISO" --device "$DEVICE" \
+  --volume "$VENTOY_VOLUME" --name "$VENTOY_NAME"
+
 # Capacity-bound removable-media and authority-free observation workflow.
 o kernel prepare-write --image "$IMAGE" --device "$DEVICE"
 o kernel write-media --image "$IMAGE" --device "$DEVICE" --confirm "$TOKEN"
@@ -1495,100 +1506,68 @@ and initramfs inputs needed for boot. See
 [`docs/ABSORBED_CAPACITY.md`](docs/ABSORBED_CAPACITY.md) for the package,
 transaction, rollback, and non-destructive garbage-collection contracts.
 
-#### Build the absorbed-capacity x86_64 UEFI ISO
+#### Build the hosted-live absorbed-capacity x86_64 UEFI ISO
 
-Build this larger profile on x86_64 Linux or in the Linux Multipass VM named
-`moral-gaur`. Its GRUB, x86_64 UEFI, GNU `cpio`, Alpine chroot, and ISO tooling
-make Linux the supported build substrate. On Lee's Apple Silicon host, use a
-native VM checkout such as `/home/ubuntu/Ostadix-lang`; do not run Cargo or
-large QEMU writes through the SSHFS-mounted host checkout.
+The default publication name is staged-tree-addressed:
+`target/ostadix-capacity-iso/x86_64/ostadix-hosted-live-x86_64-uefi-<tree12>.iso`,
+where `<tree12>` is the first 12 hexadecimal characters of the exact staged Git
+tree identity. On Lee's Apple Silicon host, the release route materializes that
+tree beneath a run-owned native guest path under
+`/home/ubuntu/.cache/ostadix/hosted-live-release/runs` in the Multipass VM named
+`moral-gaur`. The VM may expose unrelated host mounts; this is a build-path
+ownership boundary, not a claim of hermetic or security isolation. The release
+source, Cargo work, x86_64-musl sysroot, Alpine initramfs construction, GRUB
+assembly, and nested QEMU output must remain below the guest-owned run path and
+never use the mounted macOS checkout as their build root.
 
-From the Linux checkout, install the opt-in tools:
-
-```bash
-./setup.sh --with-ocore-media --with-guest-tools --deps-only -y
-
-# Needed when moral-gaur is AArch64 and prepares an x86_64 Alpine chroot.
-sudo apt-get update
-sudo apt-get install -y qemu-user qemu-user-binfmt ovmf squashfs-tools
-```
-
-Dependency installation, guest fetching, and capacity-host preparation are
-explicit networked phases. After installing prerequisites, fetch only the five
-x86_64 profiles embedded by this ISO, then verify the complete cache without
-network access:
+Review and stage only the intended source changes, then run one release command:
 
 ```bash
-python3 scripts/foreign_kernel_lab.py fetch \
-  --guest linux-alpine-3.24.1-x86_64 \
-  --guest guix-system-1.5.0-x86_64 \
-  --guest openbsd-7.9-amd64 \
-  --guest plan9-9front-11983-amd64 \
-  --guest redox-0.9.0-server-x86_64
+git status --short
+git add -- <reviewed-source-paths>
+o kernel hosted-live-release
 
-python3 scripts/foreign_kernel_lab.py verify \
-  --guest linux-alpine-3.24.1-x86_64 \
-  --guest guix-system-1.5.0-x86_64 \
-  --guest openbsd-7.9-amd64 \
-  --guest plan9-9front-11983-amd64 \
-  --guest redox-0.9.0-server-x86_64
-
-sudo env \
-  OSTADIX_GUEST_ROOT="$HOME/.local/share/ostadix/guests" \
-  OSTADIX_CAPACITY_HOST_CACHE="$HOME/.cache/ostadix/capacity-host" \
-  ./scripts/prepare-x86_64-capacity-host.sh
+# On success the command prints both exact paths:
+# hosted-live-output: /absolute/path/ostadix-hosted-live-x86_64-uefi-<tree12>.iso
+# hosted-live-receipt: /absolute/path/ostadix-hosted-live-x86_64-uefi-<tree12>.iso.release.json
+HOSTED_LIVE_ISO='<exact hosted-live-output path>'
+o kernel smoke-hosted-live "$HOSTED_LIVE_ISO"
 ```
 
-The preparation command constructs the embedded Alpine/QEMU capacity-host
-initramfs from exact base-initramfs, minirootfs, and modloop inputs. It resolves
-the QEMU package closure from the configured Alpine v3.24 repositories, records
-that closure inside the initramfs, and prints the final byte length and SHA-256.
-After this point, the capacity ISO builder forces Cargo offline and downloads no
-guest media, so its Cargo dependencies must already be cached. Build,
-strictly inspect, and boot the image with:
-
-```bash
-o kernel capacity-iso
-
-CAPACITY_ISO="$PWD/target/ostadix-capacity-iso/x86_64/ostadix-absorbed-capacity-x86_64-uefi.iso"
-o kernel inspect-capacity-iso "$CAPACITY_ISO"
-
-# Interactive OVMF/QEMU TCG boot. Select with o/a/g/b/p/r or the arrow keys.
-o kernel boot-capacity-iso "$CAPACITY_ISO"
-```
-
-If the `o` wrapper is not installed, use the repository-owned entrypoints:
-
-```bash
-./ocore/kernel/build-x86_64-capacity-iso.sh "$CAPACITY_ISO"
-python3 scripts/ostadix_capacity_iso.py inspect "$CAPACITY_ISO"
-./ocore/kernel/run-x86_64-capacity-iso-qemu.sh "$CAPACITY_ISO"
-```
-
-The builder refuses to overwrite an existing ISO. Move an older image aside or
-pass a new output path when preserving multiple builds. In the canonical macOS
-checkout, place the finished artifact at:
+Staging does not commit or push. The orchestrator binds the build to the staged
+index, builds static x86_64 `O`, `o-cli`, `olangc`, and `o-link` binaries, embeds
+the pinned Alpine package closure from
+[`evidence/hosted_live_apk_packages.txt`](evidence/hosted_live_apk_packages.txt),
+prepares the live initramfs, builds the ISO, strictly inspects the published
+bytes, and requires all seven in-guest markers in order:
 
 ```text
-/Users/ustad/Ostadix-lang/target/ostadix-capacity-iso/x86_64/ostadix-absorbed-capacity-x86_64-uefi.iso
+OSTADIX HOSTED O SMOKE: PASS
+OSTADIX HOSTED BASH: PASS
+OSTADIX HOSTED SQLITE: PASS
+OSTADIX HOSTED OLANGC IR: PASS
+OSTADIX HOSTED O-CLI: PASS
+OSTADIX HOSTED O-LINK: PASS
+OSTADIX HOSTED LIVE READY
 ```
 
-When the build runs in `moral-gaur`, copy the inspected VM artifact to that
-host path after leaving the VM:
+The tree-addressed default prevents one staged tree from colliding with another.
+A repeated release of the same tree still resolves to the same name and fails
+closed if either its ISO or receipt already exists. Move the retained evidence
+aside or provide a new explicit output path; the release route never silently
+replaces either file.
 
-```bash
-CAPACITY_ISO=/Users/ustad/Ostadix-lang/target/ostadix-capacity-iso/x86_64/ostadix-absorbed-capacity-x86_64-uefi.iso
-mkdir -p "$(dirname "$CAPACITY_ISO")"
-multipass transfer \
-  moral-gaur:/home/ubuntu/Ostadix-lang/target/ostadix-capacity-iso/x86_64/ostadix-absorbed-capacity-x86_64-uefi.iso \
-  "$CAPACITY_ISO"
-python3 /Users/ustad/Ostadix-lang/scripts/ostadix_capacity_iso.py inspect "$CAPACITY_ISO"
-```
+The command fails closed before publication if the staged snapshot changes, a
+pinned download or package closure drifts, a cross-compiled binary is not static
+x86_64 ELF, strict ISO inspection fails, or the bounded OVMF/QEMU marker gate
+does not pass. Network access is confined to the explicit dependency and pinned
+guest-fetch phases. The built live image requires no network to boot.
 
-The generated GRUB menu contains these exact paths:
+The generated GRUB menu has seven entries and boots the hosted CLI by default:
 
 | Key | System | Boot path |
 |---|---|---|
+| `h` | OSTADIX Hosted Live CLI | Direct embedded Alpine kernel/initramfs; self-tests `O` and `olangc`, then opens a shell |
 | `o` | OSTADIX O-core | Direct Multiboot2 kernel entry |
 | `a` | Alpine Linux 3.24.1 | Direct upstream Linux kernel and initramfs entry |
 | `g` | GNU Guix System 1.5.0 | Embedded Linux capacity host launches its Linux-libre kernel, initrd, and ISO under QEMU TCG |
@@ -1596,52 +1575,78 @@ The generated GRUB menu contains these exact paths:
 | `p` | 9front Plan 9 build 11983 | Embedded Linux capacity host launches the read-only qcow2 under QEMU TCG |
 | `r` | Redox OS 0.9.0 | Embedded Linux capacity host launches the livedisk under QEMU TCG |
 
-The artifact built and verified on 2026-08-27 is:
+The exact pre-automation artifact built and verified on 2026-08-28 remains an
+evidence anchor for the recorded hash, not the lifetime default output name:
 
 ```text
-path:   /Users/ustad/Ostadix-lang/target/ostadix-capacity-iso/x86_64/ostadix-absorbed-capacity-x86_64-uefi.iso
-bytes:  3199778816
-sha256: a3c95fdfe3cbf6d077f9facb142900e43246be2ac9c179ad2a7dac68ab7612f6
-lock:   2389bb8e2f67f203fa3b0bc9793a3ee92b66a835f72a25561b4972e7121c07b4
+path:   /Users/ustad/Ostadix-lang/target/ostadix-capacity-iso/x86_64/ostadix-hosted-live-x86_64-uefi.iso
+bytes:  3227535360
+sha256: 2919fdb774cd0e2d9dfdd59a10a4cd9ad36d5c1a6d776eaafef21d782b655661
+lock:   f82ef060f0e5bca4e62ac8b7697705d0707c818f232780c265c2aacb6bbfd907
+entries: 7
 ```
 
-Two independent builds were byte-identical. The transferred macOS copy was
-then re-inspected from its read-only path. Exact-disc QEMU TCG results were:
+Those exact bytes passed strict inspection and the hosted marker gate under
+x86_64 OVMF/QEMU TCG nested in the AArch64 `moral-gaur` VM. Prior observations
+for O-core and the foreign entries are not automatically inherited by a new
+hash; select and test those entries again before making hash-specific claims.
 
-| Entry | Exact-disc result |
-|---|---|
-| O-core | Direct Multiboot2 boot reached `O-core kernel: serial online` and its live kernel checks. |
-| Alpine | Direct Linux boot reached the initramfs shell and reported Linux `6.18.35-0-virt` on x86_64. |
-| Guix | The adapter mounted the disc, launched the pinned guest, booted Linux-libre `6.17.12-gnu`, and reached early-boot Guile. Shepherd did not appear within the bounded double-TCG exact-disc run; the fresh independent direct harness reached GNU Shepherd 1.0.9 and loaded its configuration. |
-| OpenBSD | The adapter mounted the disc and reached the OpenBSD/amd64 7.9 installer greeting. The independent direct UEFI harness reached the literal install/upgrade/autoinstall/shell prompt. |
-| 9front | Booted Plan 9, mounted `/dev/sdF0/fs` with HJFS as `glenda`, and reached `term%`. |
-| Redox | Booted Redox, mounted the live RedoxFS, started `ptyd`, and reached `redox login:`. |
+#### Install the hosted-live ISO on Ventoy
 
-These observations were made in the AArch64 `moral-gaur` VM, so adapted
-entries used slow nested x86 TCG. They establish executable integration of the
-exact disc in that environment, not physical x86 qualification.
+Ventoy installation is a guarded file copy, not a raw-disk write. Identify the
+current external whole-disk device and mounted Ventoy data volume immediately
+before preparing the operation. Never reuse a device number from an earlier
+connection.
 
-GNU Guix System is Guile-defined and Guile-orchestrated userspace running on a
-Linux-libre kernel. It is not a Lisp-implemented kernel. The four virtualized
-entries boot a real embedded Alpine Linux capacity host first because a GRUB
-loopback device cannot remain attached after control passes to an unrelated
-guest kernel.
+```bash
+HOSTED_LIVE_ISO='<exact hosted-live-output path>'
+VENTOY_DEVICE=/dev/disk4       # example only; resolve the live external device
+VENTOY_VOLUME=/Volumes/Ventoy
+VENTOY_NAME=OSTADIX-Hosted-Live-x86_64-UEFI.iso
 
-The foreign-kernel manifest and absorbed-capacity catalog bind upstream
-artifacts by exact byte length and SHA-256. The ISO profile defines the typed
-entry, path, role, and adapter closure; the generated ISO lock then binds every
-staged byte, including the derived capacity-host initramfs, by exact length and
-SHA-256. Once the ISO exists, its outer capacity host and embedded QEMU adapters
-use no network, so selecting a menu entry requires no further download. The
-inspector is the source of the current ISO hash, size, lock hash, and entry
-inventory. The table above records the bounded results for the named hash only.
-A later build must be inspected and booted again before inheriting those
-observations.
+o kernel prepare-ventoy \
+  --iso "$HOSTED_LIVE_ISO" --device "$VENTOY_DEVICE" \
+  --volume "$VENTOY_VOLUME" --name "$VENTOY_NAME"
 
-These virtualized paths are QEMU TCG integration evidence. They are not
-physical-machine, KVM/SVM, Secure Boot, measured-boot, device-isolation, World
-G7, or O-core-governance evidence. The foreign systems remain upstream guests,
-not personalities executing inside O-core. See
+# Copy the exact confirmation token printed by prepare-ventoy.
+TOKEN='<exact-token>'
+o kernel install-ventoy \
+  --iso "$HOSTED_LIVE_ISO" --device "$VENTOY_DEVICE" \
+  --volume "$VENTOY_VOLUME" --name "$VENTOY_NAME" \
+  --confirm "$TOKEN" --eject
+```
+
+Preparation is read-only. Installation re-identifies the same USB, removable,
+writable Ventoy target, checks free capacity, copies to a private `.part` file,
+then syncs, hashes, and structurally inspects those bytes on the volume. When the
+filesystem supports no-replace rename, that verified private file is published
+atomically. macOS ExFAT may reject that primitive; the guarded fallback makes a
+second verified copy directly to an `O_EXCL` destination, so the basename is
+visible while that copy is in progress but an existing file is never overwritten.
+Any failed owned fallback copy is removed only if its inode identity is unchanged.
+An abrupt process or machine crash during that ExFAT fallback can leave a
+partial divergent basename. Identify and verify that exact target before
+removing it and preparing a retry; the installer will refuse to overwrite it.
+Identical bytes are a verified zero-write success, while divergent content is
+refused. Omit `--eject` when a separate mounted-volume verification is wanted:
+
+```bash
+o kernel verify-ventoy \
+  --iso "$HOSTED_LIVE_ISO" --device "$VENTOY_DEVICE" \
+  --volume "$VENTOY_VOLUME" --name "$VENTOY_NAME"
+```
+
+The older `prepare-write` and `write-media` commands remain exclusive to the raw
+GPT/ESP `.img` format. They intentionally do not admit this ISO.
+
+The hosted-live image is x86_64 UEFI, unsigned, RAM-backed, and non-persistent.
+Secure Boot may need to be disabled. It is not an installer and does not boot
+natively on Apple Silicon. The included hosted tools and selected Python, Bash,
+and SQLite shims are a useful live subset, not proof that every one of the 30
+backend runtimes is installed. OVMF/QEMU TCG proves the named virtual substrate,
+not physical-machine, KVM/SVM, Secure Boot, measured-boot, device-isolation,
+World G7, or O-core-governance qualification. Foreign systems remain upstream
+guests, not personalities executing inside O-core. See
 [`docs/FOREIGN_KERNEL_LAB.md`](docs/FOREIGN_KERNEL_LAB.md) for their independent
 host-launched boot contracts and exact nonclaims.
 

@@ -484,6 +484,42 @@ require_fixed scripts/o-kernel.sh \
 require_fixed scripts/o-kernel.sh \
     'exec "$SMOKE_LIVE_SCRIPT"' \
     'the O-core operator CLI no longer exposes the bounded native-console proof'
+require_fixed scripts/o-kernel.sh \
+    'exec "$HOSTED_LIVE_RELEASE_SCRIPT" "$@"' \
+    'the O-core operator CLI no longer exposes the staged-index hosted-live release route'
+require_fixed scripts/o-kernel.sh \
+    'exec "$HOSTED_LIVE_SMOKE_SCRIPT" "$@"' \
+    'the O-core operator CLI no longer exposes the bounded hosted-live ISO proof'
+require_fixed scripts/o-kernel.sh \
+    'exec "$VENTOY_INSTALLER_SCRIPT" prepare "$@"' \
+    'the O-core operator CLI no longer exposes guarded Ventoy target preparation'
+require_fixed scripts/o-kernel.sh \
+    'exec "$VENTOY_INSTALLER_SCRIPT" install "$@"' \
+    'the O-core operator CLI no longer exposes confirmation-bound Ventoy installation'
+require_fixed scripts/o-kernel.sh \
+    'exec "$VENTOY_INSTALLER_SCRIPT" verify "$@"' \
+    'the O-core operator CLI no longer exposes installed Ventoy ISO verification'
+require_fixed README.md \
+    'ostadix-hosted-live-x86_64-uefi-<tree12>.iso' \
+    'the staged-tree-addressed hosted-live ISO pattern is missing from public documentation'
+require_fixed README.md \
+    'hosted-live-output:' \
+    'the hosted-live release no longer teaches callers how to discover its exact artifact path'
+require_fixed README.md \
+    'hosted-live-receipt:' \
+    'the hosted-live release no longer teaches callers how to discover its exact receipt path'
+require_fixed README.md \
+    'the exact staged Git' \
+    'the hosted-live release could silently drift from its staged-index source boundary'
+require_fixed README.md \
+    'Ventoy installation is a guarded file copy, not a raw-disk write.' \
+    'the Ventoy ISO workflow could be confused with destructive raw-media writing'
+require_fixed README.md \
+    'requires all seven in-guest markers in order:' \
+    'the hosted-live QEMU claim is no longer bound to its complete marker set'
+require_fixed README.md \
+    '2919fdb774cd0e2d9dfdd59a10a4cd9ad36d5c1a6d776eaafef21d782b655661' \
+    'the documented hosted-live boot result is no longer bound to the verified ISO digest'
 require_fixed setup.sh \
     '"$PROJECT_ROOT/scripts/install-o-cli-wrapper.sh" "$CARGO_BIN_DIR/o"' \
     'the cargo-bin lowercase o wrapper no longer delegates to the repository installer'

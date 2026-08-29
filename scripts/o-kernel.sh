@@ -24,6 +24,9 @@ ISO_INSPECT_SCRIPT=${O_KERNEL_ISO_INSPECT_SCRIPT:-"$ROOT/scripts/ostadix_boot_is
 CAPACITY_ISO_BUILD_SCRIPT=${O_KERNEL_CAPACITY_ISO_BUILD_SCRIPT:-"$ROOT/ocore/kernel/build-x86_64-capacity-iso.sh"}
 CAPACITY_ISO_BOOT_SCRIPT=${O_KERNEL_CAPACITY_ISO_BOOT_SCRIPT:-"$ROOT/ocore/kernel/run-x86_64-capacity-iso-qemu.sh"}
 CAPACITY_ISO_INSPECT_SCRIPT=${O_KERNEL_CAPACITY_ISO_INSPECT_SCRIPT:-"$ROOT/scripts/ostadix_capacity_iso.py"}
+HOSTED_LIVE_RELEASE_SCRIPT=${O_KERNEL_HOSTED_LIVE_RELEASE_SCRIPT:-"$ROOT/scripts/ostadix_hosted_live_release.py"}
+HOSTED_LIVE_SMOKE_SCRIPT=${O_KERNEL_HOSTED_LIVE_SMOKE_SCRIPT:-"$ROOT/ocore/kernel/smoke-x86_64-hosted-live-qemu.py"}
+VENTOY_INSTALLER_SCRIPT=${O_KERNEL_VENTOY_INSTALLER_SCRIPT:-"$ROOT/scripts/ostadix_ventoy_installer.py"}
 MEDIA_WRITER_SCRIPT=${O_KERNEL_MEDIA_WRITER_SCRIPT:-"$ROOT/scripts/ostadix_media_writer.py"}
 PHYSICAL_EVIDENCE_SCRIPT=${O_KERNEL_PHYSICAL_EVIDENCE_SCRIPT:-"$ROOT/scripts/ostadix_physical_evidence.py"}
 
@@ -44,6 +47,11 @@ Commands:
   inspect-iso  Strictly inspect a generated OSTADIX bootable ISO
   capacity-iso  Build the opt-in O-core plus foreign-systems x86_64 ISO
   inspect-capacity-iso  Strictly inspect an absorbed-capacity ISO
+  hosted-live-release  Build and verify the staged-index x86_64 hosted-live ISO
+  smoke-hosted-live  Boot and assert the hosted-live O and olangc readiness markers
+  prepare-ventoy  Inspect a Ventoy volume and derive a bound install token
+  install-ventoy  Copy and verify the hosted-live ISO using that exact token
+  verify-ventoy  Re-identify and rehash an installed hosted-live Ventoy ISO
   prepare-write  Inspect external media and derive a bound confirmation token
   write-media   Write and verify external media using that exact token
   boot-challenge  Generate a fresh challenge for one physical boot attempt
@@ -52,7 +60,7 @@ Commands:
   boot         Boot the baseline kernel with an interactive serial terminal
   boot-media   Boot the generated disk through edk2/OVMF (no QEMU -kernel)
   boot-iso     Boot the generated read-only ISO through edk2/OVMF
-  boot-capacity-iso  Boot a capacity ISO and select O-core/Alpine/Guix/OpenBSD/9front/Redox
+  boot-capacity-iso  Boot a capacity ISO and select Hosted/O-core/Alpine/Guix/OpenBSD/9front/Redox
   console      Boot the bounded native M5 `o> ` control console
   smoke        Run the bounded baseline boot assertion
   smoke-media  Prove deterministic media rebuild and UEFI disk boot
@@ -70,9 +78,10 @@ QEMU/TCG. Mode 34 proves only bounded four-vCPU startup and one barrier; neither
 the media path nor that probe is general or physical SMP, Linux/Plan 9, or
 device-isolation evidence.
 
-Capacity ISO foreign entries run through an embedded Linux/QEMU TCG adapter.
-They are real upstream guests, but do not imply O-core governance, hardware
-virtualization, or physical-machine qualification.
+The capacity ISO's default hosted entry boots its embedded Linux userspace
+directly. Foreign entries run through its Linux/QEMU TCG adapter. They are real
+upstream guests, but do not imply O-core governance, hardware virtualization,
+or physical-machine qualification.
 USAGE
 }
 
@@ -192,8 +201,29 @@ case "$command_name" in
     inspect-capacity-iso)
         require_at_most_one_arg "$@"
         require_executable "$CAPACITY_ISO_INSPECT_SCRIPT"
-        capacity_iso_path=${1:-"$ROOT/target/ostadix-capacity-iso/x86_64/ostadix-absorbed-capacity-x86_64-uefi.iso"}
+        capacity_iso_path=${1:-"$ROOT/target/ostadix-capacity-iso/x86_64/ostadix-hosted-live-x86_64-uefi.iso"}
         exec "$CAPACITY_ISO_INSPECT_SCRIPT" inspect "$capacity_iso_path"
+        ;;
+    hosted-live-release)
+        require_executable "$HOSTED_LIVE_RELEASE_SCRIPT"
+        exec "$HOSTED_LIVE_RELEASE_SCRIPT" "$@"
+        ;;
+    smoke-hosted-live)
+        require_at_most_one_arg "$@"
+        require_executable "$HOSTED_LIVE_SMOKE_SCRIPT"
+        exec "$HOSTED_LIVE_SMOKE_SCRIPT" "$@"
+        ;;
+    prepare-ventoy)
+        require_executable "$VENTOY_INSTALLER_SCRIPT"
+        exec "$VENTOY_INSTALLER_SCRIPT" prepare "$@"
+        ;;
+    install-ventoy)
+        require_executable "$VENTOY_INSTALLER_SCRIPT"
+        exec "$VENTOY_INSTALLER_SCRIPT" install "$@"
+        ;;
+    verify-ventoy)
+        require_executable "$VENTOY_INSTALLER_SCRIPT"
+        exec "$VENTOY_INSTALLER_SCRIPT" verify "$@"
         ;;
     prepare-write)
         require_executable "$MEDIA_WRITER_SCRIPT"

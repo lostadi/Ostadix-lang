@@ -1,6 +1,6 @@
 schema = "ostadix.capacity-iso-profile/v1"
 architecture = "x86_64"
-default_entry = "ostadix"
+default_entry = "hosted"
 
 [[artifacts]]
 iso_path = "/boot/entry/000-ostadix/kernel.elf"
@@ -51,6 +51,22 @@ role = "guest-qcow2"
 iso_path = "/ostadix/redox/redox-server-0.9.0-livedisk.iso"
 stage_path = "ostadix/redox/redox-server-0.9.0-livedisk.iso"
 role = "guest-raw-cd"
+
+[[entries]]
+id = "hosted"
+title = "OSTADIX Hosted Live CLI [Alpine Linux]"
+hotkey = "h"
+adapter = "linux-selection"
+arguments = [
+  "console=tty0",
+  "console=ttyS0,115200n8",
+  "rdinit=/init",
+  "panic=-1",
+  "loglevel=4",
+]
+kernel_path = "/boot/capacity-host/vmlinuz-virt"
+initrd_paths = ["/boot/capacity-host/initramfs.cpio.gz"]
+selection_id = "hosted"
 
 [[entries]]
 id = "ostadix"

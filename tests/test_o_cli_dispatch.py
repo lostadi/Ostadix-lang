@@ -172,6 +172,9 @@ class KernelCapacityCliDispatchTests(unittest.TestCase):
             "O_KERNEL_CAPACITY_ISO_BUILD_SCRIPT",
             "O_KERNEL_CAPACITY_ISO_BOOT_SCRIPT",
             "O_KERNEL_CAPACITY_ISO_INSPECT_SCRIPT",
+            "O_KERNEL_HOSTED_LIVE_RELEASE_SCRIPT",
+            "O_KERNEL_HOSTED_LIVE_SMOKE_SCRIPT",
+            "O_KERNEL_VENTOY_INSTALLER_SCRIPT",
         ):
             self.environment[variable] = str(self.fake)
 
@@ -195,7 +198,7 @@ class KernelCapacityCliDispatchTests(unittest.TestCase):
         explicit = "/tmp/capacity.iso"
         default = str(
             PROJECT_ROOT
-            / "target/ostadix-capacity-iso/x86_64/ostadix-absorbed-capacity-x86_64-uefi.iso"
+            / "target/ostadix-capacity-iso/x86_64/ostadix-hosted-live-x86_64-uefi.iso"
         )
         for arguments, expected in (
             (("capacity-iso",), []),
@@ -214,6 +217,42 @@ class KernelCapacityCliDispatchTests(unittest.TestCase):
                 result = self.run_kernel(command, "one.iso", "two.iso")
                 self.assertEqual(result.returncode, 2)
                 self.assertIn("accepts at most one path argument", result.stderr)
+
+    def test_hosted_live_release_forwards_arbitrary_options(self) -> None:
+        output = "/tmp/ostadix-hosted-live-x86_64-uefi-0123456789ab.iso"
+        self.assert_dispatch(("hosted-live-release",), [])
+        self.assert_dispatch(
+            ("hosted-live-release", "--vm", "moral-gaur", "--output", output),
+            ["--vm", "moral-gaur", "--output", output],
+        )
+
+    def test_hosted_live_smoke_accepts_at_most_one_iso_path(self) -> None:
+        image = "/tmp/ostadix-hosted-live-x86_64-uefi-0123456789ab.iso"
+        self.assert_dispatch(("smoke-hosted-live",), [])
+        self.assert_dispatch(("smoke-hosted-live", image), [image])
+
+        result = self.run_kernel("smoke-hosted-live", image, "unexpected.iso")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("accepts at most one path argument", result.stderr)
+
+    def test_ventoy_commands_preserve_the_bound_target_arguments(self) -> None:
+        image = "/tmp/ostadix-hosted-live-x86_64-uefi-0123456789ab.iso"
+        target = [
+            "--iso",
+            image,
+            "--device",
+            "/dev/disk4",
+            "--volume",
+            "/Volumes/Ventoy",
+            "--name",
+            "OSTADIX-Hosted-Live-x86_64-UEFI.iso",
+        ]
+        self.assert_dispatch(("prepare-ventoy", *target), ["prepare", *target])
+        self.assert_dispatch(
+            ("install-ventoy", *target, "--confirm", "exact-token", "--eject"),
+            ["install", *target, "--confirm", "exact-token", "--eject"],
+        )
+        self.assert_dispatch(("verify-ventoy", *target), ["verify", *target])
 
 
 class NodeQuickstartDispatchTests(unittest.TestCase):

@@ -2,9 +2,10 @@
 """Build the lock for, inspect, and atomically publish OSTADIX capacity ISOs.
 
 This module is deliberately Python-stdlib-only.  It treats a capacity ISO as a
-closed, checksummed set of boot adapters: native Multiboot2/Linux entries and
-Linux capacity-host entries which launch foreign guests under QEMU TCG.  ISO
-inspection is descriptor-backed and streams all large payloads.
+closed, checksummed set of boot adapters: native Multiboot2/Linux entries,
+selected Linux live environments, and Linux capacity-host entries which launch
+foreign guests under QEMU TCG. ISO inspection is descriptor-backed and streams
+all large payloads.
 """
 
 from __future__ import annotations
@@ -53,6 +54,7 @@ ADAPTERS = frozenset(
     {
         "multiboot2",
         "linux",
+        "linux-selection",
         "qemu-tcg-linux-direct",
         "qemu-tcg-qcow2",
         "qemu-tcg-raw-cd",
@@ -287,6 +289,8 @@ def _entry(value: Any, label: str) -> dict[str, Any]:
         required = common | {"kernel_path"}
     elif adapter == "linux":
         required = common | {"kernel_path", "initrd_paths"}
+    elif adapter == "linux-selection":
+        required = common | {"kernel_path", "initrd_paths", "selection_id"}
     else:
         required = common | {
             "host_kernel_path",
@@ -304,12 +308,16 @@ def _entry(value: Any, label: str) -> dict[str, Any]:
     }
     if adapter == "multiboot2":
         normalized["kernel_path"] = _iso_path(entry["kernel_path"], f"{label}.kernel_path")
-    elif adapter == "linux":
+    elif adapter in {"linux", "linux-selection"}:
         normalized["kernel_path"] = _iso_path(entry["kernel_path"], f"{label}.kernel_path")
         initrds = _path_list(entry["initrd_paths"], f"{label}.initrd_paths", 16)
         if not initrds:
             raise CapacityIsoError(f"{label}.initrd_paths must not be empty")
         normalized["initrd_paths"] = initrds
+        if adapter == "linux-selection":
+            normalized["selection_id"] = _identifier(
+                entry["selection_id"], f"{label}.selection_id"
+            )
     else:
         if "[virtualized/TCG]" not in normalized["title"]:
             raise CapacityIsoError(f"{label}.title must explicitly contain [virtualized/TCG]")
@@ -367,10 +375,15 @@ def _validate_entries(
         adapter = entry["adapter"]
         if adapter == "multiboot2":
             require(entry["kernel_path"], {"ocore-kernel"}, f"{label}.kernel_path")
-        elif adapter == "linux":
+        elif adapter in {"linux", "linux-selection"}:
             require(entry["kernel_path"], {"linux-kernel"}, f"{label}.kernel_path")
             for path in entry["initrd_paths"]:
                 require(path, {"linux-initrd"}, f"{label}.initrd_paths")
+            if adapter == "linux-selection":
+                selection = entry["selection_id"]
+                if selection in selections:
+                    raise CapacityIsoError(f"duplicate Linux capacity selection_id: {selection}")
+                selections.add(selection)
         else:
             require(entry["host_kernel_path"], {"linux-kernel"}, f"{label}.host_kernel_path")
             require(entry["host_initrd_path"], {"linux-initrd"}, f"{label}.host_initrd_path")
@@ -429,7 +442,11 @@ def render_grub(entries: list[dict[str, Any]], default_entry: str) -> bytes:
         arguments = "" if not entry["arguments"] else " " + " ".join(entry["arguments"])
         if entry["adapter"] == "multiboot2":
             lines.append(f"    multiboot2 {entry['kernel_path']}{arguments}")
-        elif entry["adapter"] == "linux":
+        elif entry["adapter"] in {"linux", "linux-selection"}:
+            if entry["adapter"] == "linux-selection":
+                arguments = " " + " ".join(
+                    [f"ostadix.capacity={entry['selection_id']}", *entry["arguments"]]
+                )
             lines.append(f"    linux {entry['kernel_path']}{arguments}")
             lines.append("    initrd " + " ".join(entry["initrd_paths"]))
         else:

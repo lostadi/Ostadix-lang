@@ -9,6 +9,19 @@ Package SemVer is only one of the independent coordinates documented in
 
 ### Added
 
+- `o kernel hosted-live-release` turns the exact staged Git index into a
+  tree-addressed x86_64 hosted-live ISO from a run-owned native path inside
+  `moral-gaur`, then requires strict inspection and bounded OVMF/QEMU readiness
+  markers before publication. It prints the exact artifact and receipt paths;
+  the staged-tree suffix prevents a later default release from colliding with a
+  different tree. The seven-entry image boots the hosted Alpine O CLI by default
+  and retains direct O-core plus the pinned foreign-system entries.
+- `o kernel prepare-ventoy`, `install-ventoy`, and `verify-ventoy` provide a
+  separate confirmation-bound ISO copy path for an explicitly identified
+  Ventoy volume. They re-identify the removable USB target and verify the copied
+  digest; they do not weaken or reuse the raw GPT media-writer contract. When
+  ExFAT lacks atomic no-replace rename, installation falls back to a second
+  verified `O_EXCL` copy that still cannot overwrite an existing destination.
 - M3 Authenticated Pure Remote Execution Fabric V1 can authenticate and
   execute the admitted frozen M2 pure renderer profile on an explicitly
   selected `o-node`, returning only a bounded provisional candidate. The
