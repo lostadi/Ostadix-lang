@@ -494,10 +494,16 @@ def _capacity_fixture(
 
 
 class CapacityIsoTests(unittest.TestCase):
-    def test_committed_toml_profile_matches_schema(self) -> None:
+    def test_capacity_lab_remains_seven_entry_virt_profile(self) -> None:
         parsed = ISO._load_profile(ROOT / "evidence" / "absorbed_capacity_iso.toml")
         self.assertEqual(len(parsed["artifacts"]), 10)
         self.assertEqual(len(parsed["entries"]), 7)
+        self.assertEqual(
+            [entry["id"] for entry in parsed["entries"]],
+            ["hosted", "ostadix", "alpine", "guix", "openbsd", "plan9", "redox"],
+        )
+        for entry in parsed["entries"]:
+            self.assertNotIn("panic=-1", entry["arguments"])
         self.assertEqual(parsed["default_entry"], "hosted")
         hosted = next(entry for entry in parsed["entries"] if entry["id"] == "hosted")
         self.assertEqual(hosted["adapter"], "linux-selection")
@@ -511,6 +517,30 @@ class CapacityIsoTests(unittest.TestCase):
             "linux /boot/capacity-host/vmlinuz-virt ostadix.capacity=hosted",
             grub,
         )
+
+    def test_physical_hosted_profile_is_single_entry_lts_profile(self) -> None:
+        parsed = ISO._load_profile(ROOT / "evidence" / "hosted_live_physical_iso.toml")
+        self.assertEqual(parsed["default_entry"], "hosted")
+        self.assertEqual(len(parsed["artifacts"]), 2)
+        self.assertEqual(len(parsed["entries"]), 1)
+        hosted = parsed["entries"][0]
+        self.assertEqual(hosted["id"], "hosted")
+        self.assertEqual(hosted["adapter"], "linux-selection")
+        self.assertEqual(hosted["kernel_path"], "/boot/hosted/vmlinuz-lts")
+        self.assertEqual(hosted["initrd_paths"], ["/boot/hosted/initramfs.cpio.gz"])
+        self.assertEqual(
+            hosted["arguments"],
+            [
+                "console=ttyS0,115200n8",
+                "console=tty0",
+                "rdinit=/init",
+                "panic=0",
+                "loglevel=7",
+                "ignore_loglevel",
+            ],
+        )
+        self.assertFalse(any(entry["adapter"].startswith("qemu-") for entry in parsed["entries"]))
+        self.assertFalse(any(artifact["role"] == "ocore-kernel" for artifact in parsed["artifacts"]))
 
     def test_create_lock_is_deterministic_and_renders_real_qemu_entries(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -747,7 +777,7 @@ class CapacityIsoTests(unittest.TestCase):
         builder = ROOT / "ocore/kernel/build-x86_64-capacity-iso.sh"
         builder_source = builder.read_text(encoding="utf-8")
         self.assertIn("export CARGO_NET_OFFLINE=true", builder_source)
-        self.assertIn("ostadix-hosted-live-x86_64-uefi.iso", builder_source)
+        self.assertIn("ostadix-absorbed-capacity-x86_64-uefi.iso", builder_source)
         with tempfile.TemporaryDirectory() as directory:
             build_root = Path(directory) / "must-not-exist"
             environment = os.environ.copy()
@@ -766,6 +796,15 @@ class CapacityIsoTests(unittest.TestCase):
                 result.stderr,
             )
             self.assertFalse(build_root.exists())
+
+    def test_physical_builder_is_hosted_only_and_forces_grub2_name(self) -> None:
+        builder = ROOT / "ocore/kernel/build-x86_64-hosted-live-iso.sh"
+        source = builder.read_text(encoding="utf-8")
+        self.assertIn("hosted_live_physical_iso.toml", source)
+        self.assertIn("ostadix-hosted-live-x86_64-uefi_VTGRUB2.iso", source)
+        self.assertIn("boot/hosted/vmlinuz-lts", source)
+        self.assertNotIn("foreign_kernel_lab.py", source)
+        self.assertNotIn("OCORE_KERNEL", source)
 
     def test_ocore_builder_resolves_an_external_cargo_target_directory(self) -> None:
         source = (ROOT / "ocore/kernel/build.sh").read_text(encoding="utf-8")

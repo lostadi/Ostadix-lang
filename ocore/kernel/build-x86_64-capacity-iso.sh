@@ -6,7 +6,7 @@ set -euo pipefail
 ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 ISO_ROOT=${OSTADIX_CAPACITY_ISO_ROOT:-"$ROOT/target/ostadix-capacity-iso/x86_64"}
 KERNEL_BUILD_DIR=${OCORE_CAPACITY_ISO_KERNEL_BUILD_DIR:-"$ROOT/target/ocore-capacity-iso-kernel"}
-OUTPUT=${1:-"$ISO_ROOT/ostadix-hosted-live-x86_64-uefi.iso"}
+OUTPUT=${1:-"$ISO_ROOT/ostadix-absorbed-capacity-x86_64-uefi.iso"}
 PROFILE=${OSTADIX_CAPACITY_ISO_PROFILE:-"$ROOT/evidence/absorbed_capacity_iso.toml"}
 GUEST_ROOT=${OSTADIX_GUEST_ROOT:-"${XDG_DATA_HOME:-$HOME/.local/share}/ostadix/guests"}
 CAPACITY_HOST_INITRAMFS=${OSTADIX_CAPACITY_HOST_INITRAMFS:-"$ROOT/target/ostadix-capacity-host/x86_64/initramfs.cpio.gz"}

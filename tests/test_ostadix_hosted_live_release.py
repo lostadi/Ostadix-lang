@@ -36,6 +36,10 @@ SMOKE = _load(
     "ostadix_hosted_live_qemu_smoke",
     ROOT / "ocore/kernel/smoke-x86_64-hosted-live-qemu.py",
 )
+VGA_SMOKE = _load(
+    "ostadix_hosted_live_qemu_vga_smoke",
+    ROOT / "ocore/kernel/smoke-x86_64-hosted-live-vga-qemu.py",
+)
 
 
 class HostedLiveReleaseTests(unittest.TestCase):
@@ -76,25 +80,17 @@ class HostedLiveReleaseTests(unittest.TestCase):
             "volume_id": "OSTADIX_CAPACITY",
             "default_entry": "hosted",
             **identity,
-            "entries": [
-                {"id": value}
-                for value in (
-                    "hosted",
-                    "ostadix",
-                    "alpine",
-                    "guix",
-                    "openbsd",
-                    "plan9",
-                    "redox",
-                )
-            ],
+            "entries": [{"id": "hosted"}],
             "artifacts": [
                 {
-                    "iso_path": f"/artifact/{index}",
-                    "role": "fixture",
+                    "iso_path": path,
+                    "role": role,
                     **identity,
                 }
-                for index in range(10)
+                for path, role in (
+                    ("/boot/hosted/initramfs.cpio.gz", "linux-initrd"),
+                    ("/boot/hosted/vmlinuz-lts", "linux-kernel"),
+                )
             ],
             "capacity_lock_bytes": 7,
             "capacity_lock_sha256": "4" * 64,
@@ -117,7 +113,7 @@ class HostedLiveReleaseTests(unittest.TestCase):
             "mode": 0o755,
         }
         payload = {
-            "schema": "ostadix.hosted-live-release/v1",
+            "schema": "ostadix.hosted-live-release/v2",
             "source": {
                 "staged_tree": snapshot.tree,
                 "base_commit": snapshot.head,
@@ -134,7 +130,7 @@ class HostedLiveReleaseTests(unittest.TestCase):
                 "musl_dev_version": "1.2.6-r2",
                 "sysroot_package_lock": list(RELEASE.EXPECTED_SYSROOT_PACKAGE_LOCK),
                 "sysroot_manifest": dict(identity),
-                "capacity_host_package_lock": dict(identity),
+                "hosted_live_package_lock": dict(identity),
                 "apk_repository_boundary": {
                     "exact_versions": True,
                     "signed_index_and_packages": True,
@@ -142,16 +138,18 @@ class HostedLiveReleaseTests(unittest.TestCase):
                     "repository_availability_required": True,
                 },
                 "cache_inputs": {
-                    "guest_root": "/home/ubuntu/.local/share/ostadix/guests",
-                    "guest_verification": {
-                        "identity": dict(identity),
-                        "records": ["verified fixture"],
-                    },
-                    "capacity_host_minirootfs": {
+                    "alpine_minirootfs": {
                         "bytes": RELEASE.PINNED_MINIROOTFS_BYTES,
                         "sha256": RELEASE.PINNED_MINIROOTFS_SHA256,
                     },
-                    "capacity_host_modloop": dict(identity),
+                    "alpine_lts_kernel": {
+                        "bytes": RELEASE.PINNED_LTS_KERNEL_BYTES,
+                        "sha256": RELEASE.PINNED_LTS_KERNEL_SHA256,
+                    },
+                    "alpine_lts_initramfs": {
+                        "bytes": RELEASE.PINNED_LTS_INITRAMFS_BYTES,
+                        "sha256": RELEASE.PINNED_LTS_INITRAMFS_SHA256,
+                    },
                 },
             },
             "binaries": {
@@ -160,14 +158,51 @@ class HostedLiveReleaseTests(unittest.TestCase):
             "initramfs": dict(identity),
             "iso": inspection,
             "smoke": {
-                "schema": "ostadix.hosted-live-qemu-smoke/v1",
-                "markers": list(RELEASE.REQUIRED_SMOKE_MARKERS),
-                "transcript_bytes": 7,
-                "transcript_sha256": "4" * 64,
-                "exit_code": 0,
-                "acceleration": "tcg",
-                "firmware_path": "ovmf-through-capacity-runner",
-                "physical_hardware_proof": False,
+                "schema": "ostadix.hosted-live-boot-gates/v2",
+                "serial": {
+                    "schema": "ostadix.hosted-live-qemu-smoke/v1",
+                    "markers": list(RELEASE.REQUIRED_SMOKE_MARKERS),
+                    "transcript_bytes": 7,
+                    "transcript_sha256": "4" * 64,
+                    "exit_code": 0,
+                    "acceleration": "tcg",
+                    "firmware_path": "ovmf-through-capacity-runner",
+                    "physical_hardware_proof": False,
+                },
+                "graphical": {
+                    "schema": "ostadix.hosted-live-qemu-visual-smoke/v1",
+                    "markers": list(RELEASE.REQUIRED_SMOKE_MARKERS),
+                    "input_marker": "vga-input-pass",
+                    "serial": dict(identity),
+                    "frame_before": {
+                        **identity,
+                        "width": 640,
+                        "height": 480,
+                        "nonblack_pixels": 3000,
+                        "unique_colors": 2,
+                    },
+                    "frame_after": {
+                        **identity,
+                        "width": 640,
+                        "height": 480,
+                        "nonblack_pixels": 3200,
+                        "unique_colors": 2,
+                    },
+                    "changed_pixels": 300,
+                    "acceleration": "tcg",
+                    "firmware": dict(identity),
+                    "display_device": "VGA",
+                    "input_device": "usb-kbd",
+                    "network": "none",
+                    "physical_hardware_proof": False,
+                },
+            },
+            "boot_profile": {
+                "kind": "physical-hosted-live",
+                "kernel_flavor": "alpine-lts",
+                "preferred_console": "tty0",
+                "panic_timeout_seconds": 0,
+                "ventoy_mode": "grub2-filename-suffix",
             },
             "claim_boundary": {
                 "substrate": "fixture",
@@ -254,7 +289,7 @@ class HostedLiveReleaseTests(unittest.TestCase):
         output = RELEASE.default_output_for("a" * 40)
         self.assertEqual(
             output.name,
-            "ostadix-hosted-live-x86_64-uefi-aaaaaaaaaaaa.iso",
+            "ostadix-hosted-live-x86_64-uefi-aaaaaaaaaaaa_VTGRUB2.iso",
         )
         self.assertEqual(output.parent, RELEASE.DEFAULT_OUTPUT_DIRECTORY)
 
@@ -422,7 +457,7 @@ class HostedLiveReleaseTests(unittest.TestCase):
         )
         inspection = {"sha256": "4" * 64, "bytes": 7}
         payload = {
-            "schema": "ostadix.hosted-live-release/v1",
+            "schema": "ostadix.hosted-live-release/v2",
             "source": {
                 "staged_tree": snapshot.tree,
                 "base_commit": snapshot.head,
@@ -531,6 +566,107 @@ class HostedLiveReleaseTests(unittest.TestCase):
         self.assertIn("trap 'exit 130' INT", worker)
         self.assertIn("trap 'exit 143' TERM", worker)
         self.assertIn('find "$SOURCE_ROOT" -type l -print -quit', worker)
+        self.assertIn("ALPINE_LTS_KERNEL_SHA256=77007123", worker)
+        self.assertIn("OSTADIX_CAPACITY_HOST_KERNEL_FLAVOR=lts", worker)
+        self.assertIn("build-x86_64-hosted-live-iso.sh", worker)
+        self.assertIn("smoke-x86_64-hosted-live-vga-qemu.py", worker)
+        self.assertNotIn("foreign_kernel_lab.py", worker)
+
+    def test_vga_gate_rejects_black_and_unchanged_frames(self) -> None:
+        self.assertEqual(
+            RELEASE.MIN_GRAPHICAL_NONBLACK_PIXELS,
+            VGA_SMOKE.MIN_NONBLACK_PIXELS,
+        )
+        self.assertEqual(
+            RELEASE.MIN_GRAPHICAL_UNIQUE_COLORS,
+            VGA_SMOKE.MIN_UNIQUE_COLORS,
+        )
+        self.assertEqual(
+            RELEASE.MIN_GRAPHICAL_CHANGED_PIXELS,
+            VGA_SMOKE.MIN_CHANGED_PIXELS,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            width, height = 320, 200
+            black_path = root / "black.ppm"
+            black_path.write_bytes(b"P6\n320 200\n255\n" + bytes(width * height * 3))
+            black = VGA_SMOKE.read_frame(black_path)
+            with self.assertRaisesRegex(VGA_SMOKE.VisualSmokeError, "effectively black"):
+                VGA_SMOKE.validate_visible_frame(black)
+
+            pixels = bytearray(width * height * 3)
+            for pixel in range(3000):
+                start = pixel * 3
+                pixels[start : start + 3] = b"\xff\xff\xff"
+            before_path = root / "before.ppm"
+            before_path.write_bytes(b"P6\n320 200\n255\n" + pixels)
+            before = VGA_SMOKE.read_frame(before_path)
+            self.assertEqual(before.unique_colors, 2)
+            VGA_SMOKE.validate_visible_frame(before)
+            with self.assertRaisesRegex(VGA_SMOKE.VisualSmokeError, "did not visibly react"):
+                VGA_SMOKE.changed_pixel_count(before, before)
+
+            changed = bytearray(pixels)
+            for pixel in range(400, 700):
+                start = pixel * 3
+                changed[start : start + 3] = b"\x7f\x7f\x7f"
+            after_path = root / "after.ppm"
+            after_path.write_bytes(b"P6\n320 200\n255\n" + changed)
+            after = VGA_SMOKE.read_frame(after_path)
+            self.assertGreaterEqual(VGA_SMOKE.changed_pixel_count(before, after), 300)
+
+    def test_vga_input_command_is_fully_mappable_to_qemu_keys(self) -> None:
+        keys = [VGA_SMOKE._key_name(character) for character in VGA_SMOKE.INPUT_COMMAND]
+        self.assertIn("shift-s", keys)
+        self.assertIn("shift-dot", keys)
+        self.assertEqual(keys[-1], "ret")
+
+    def test_vga_monitor_socket_avoids_deep_evidence_paths(self) -> None:
+        directory, path = VGA_SMOKE._allocate_monitor_socket()
+        try:
+            self.assertLessEqual(
+                len(os.fsencode(path)), VGA_SMOKE.MAX_MONITOR_SOCKET_PATH_BYTES
+            )
+            self.assertEqual(path.name, "qemu.sock")
+        finally:
+            directory.cleanup()
+        self.assertFalse(path.parent.exists())
+
+    def test_vga_hmp_quit_does_not_wait_for_a_prompt(self) -> None:
+        monitor = VGA_SMOKE.Hmp.__new__(VGA_SMOKE.Hmp)
+        monitor.socket = mock.Mock()
+        monitor.quit()
+        monitor.socket.sendall.assert_called_once_with(b"quit\n")
+        monitor.socket.recv.assert_not_called()
+
+    def test_vga_monitor_wait_reports_an_early_qemu_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            qemu_log = root / "qemu.log"
+            qemu_log.write_text("qemu-system: bad device\n", encoding="utf-8")
+            process = mock.Mock()
+            process.poll.return_value = 1
+            process.returncode = 1
+            with self.assertRaisesRegex(
+                VGA_SMOKE.VisualSmokeError, "bad device"
+            ):
+                VGA_SMOKE._wait_for_monitor(
+                    root / "monitor.sock", process, qemu_log, time.monotonic() + 1
+                )
+
+    def test_vga_ppm_parser_preserves_whitespace_valued_first_pixel(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "frame.ppm"
+            first_pixel = b"\x0a\x20\x09"
+            path.write_bytes(
+                b"P6\n320 200\n255\n"
+                + first_pixel
+                + bytes(320 * 200 * 3 - len(first_pixel))
+            )
+            self.assertEqual(VGA_SMOKE.read_frame(path).pixels[:3], first_pixel)
+
+    def test_vga_fd_reference_uses_a_host_descriptor_filesystem(self) -> None:
+        self.assertRegex(VGA_SMOKE._fd_reference(7), r"^/(proc/self|dev)/fd/7$")
 
     def fake_program(self, root: Path, source: str) -> Path:
         path = root / "fake.py"

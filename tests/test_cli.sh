@@ -1046,7 +1046,7 @@ check_kernel_media_dispatch "kernel inspect-iso forwards the default ISO path" \
 check_kernel_media_dispatch "kernel inspect-iso forwards an explicit ISO path" \
     "$(printf 'script=iso-inspect\nargc=2\narg=inspect\narg=%s' "$KERNEL_ISO_OUTPUT")" \
     inspect-iso "$KERNEL_ISO_OUTPUT"
-KERNEL_CAPACITY_ISO_DEFAULT="$ROOT/target/ostadix-capacity-iso/x86_64/ostadix-hosted-live-x86_64-uefi.iso"
+KERNEL_CAPACITY_ISO_DEFAULT="$ROOT/target/ostadix-capacity-iso/x86_64/ostadix-absorbed-capacity-x86_64-uefi.iso"
 KERNEL_CAPACITY_ISO_OUTPUT="$ARTIFACT_DIR/custom-capacity.iso"
 check_kernel_media_dispatch "kernel capacity-iso accepts no output path" \
     $'script=capacity-iso-build\nargc=0' \
@@ -1063,7 +1063,7 @@ check_kernel_media_dispatch "kernel inspect-capacity-iso forwards the default IS
 check_kernel_media_dispatch "kernel inspect-capacity-iso forwards an explicit ISO path" \
     "$(printf 'script=capacity-iso-inspect\nargc=2\narg=inspect\narg=%s' "$KERNEL_CAPACITY_ISO_OUTPUT")" \
     inspect-capacity-iso "$KERNEL_CAPACITY_ISO_OUTPUT"
-KERNEL_HOSTED_LIVE_OUTPUT="$ARTIFACT_DIR/ostadix-hosted-live-x86_64-uefi-0123456789ab.iso"
+KERNEL_HOSTED_LIVE_OUTPUT="$ARTIFACT_DIR/ostadix-hosted-live-x86_64-uefi-0123456789ab_VTGRUB2.iso"
 check_kernel_media_dispatch "kernel hosted-live-release accepts the default workflow" \
     $'script=hosted-live-release\nargc=0' \
     hosted-live-release
@@ -1080,7 +1080,7 @@ check_kernel_media_rejection "kernel smoke-hosted-live rejects extra ISO paths" 
     'command accepts at most one path argument' \
     smoke-hosted-live "$KERNEL_HOSTED_LIVE_OUTPUT" unexpected.iso
 KERNEL_VENTOY_DEVICE=/dev/disk4
-KERNEL_VENTOY_NAME=OSTADIX-Hosted-Live-x86_64-UEFI.iso
+KERNEL_VENTOY_NAME=OSTADIX-Hosted-Live-x86_64-UEFI_VTGRUB2.iso
 check_kernel_media_dispatch "kernel prepare-ventoy forwards the complete preparation request" \
     "$(printf 'script=ventoy-installer\nargc=9\narg=prepare\narg=--iso\narg=%s\narg=--device\narg=%s\narg=--volume\narg=/Volumes/Ventoy\narg=--name\narg=%s' "$KERNEL_HOSTED_LIVE_OUTPUT" "$KERNEL_VENTOY_DEVICE" "$KERNEL_VENTOY_NAME")" \
     prepare-ventoy --iso "$KERNEL_HOSTED_LIVE_OUTPUT" \

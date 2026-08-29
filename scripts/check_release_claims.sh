@@ -500,7 +500,7 @@ require_fixed scripts/o-kernel.sh \
     'exec "$VENTOY_INSTALLER_SCRIPT" verify "$@"' \
     'the O-core operator CLI no longer exposes installed Ventoy ISO verification'
 require_fixed README.md \
-    'ostadix-hosted-live-x86_64-uefi-<tree12>.iso' \
+    'ostadix-hosted-live-x86_64-uefi-<tree12>_VTGRUB2.iso' \
     'the staged-tree-addressed hosted-live ISO pattern is missing from public documentation'
 require_fixed README.md \
     'hosted-live-output:' \
@@ -518,8 +518,11 @@ require_fixed README.md \
     'requires all seven in-guest markers in order:' \
     'the hosted-live QEMU claim is no longer bound to its complete marker set'
 require_fixed README.md \
-    '2919fdb774cd0e2d9dfdd59a10a4cd9ad36d5c1a6d776eaafef21d782b655661' \
-    'the documented hosted-live boot result is no longer bound to the verified ISO digest'
+    '247a51f296e8b07238df32870a44c2a582ff802daafab631be822ea0f4539c6e' \
+    'the documented black-screen failure record is no longer bound to its exact ISO digest'
+require_fixed README.md \
+    'rejects a black or unchanged framebuffer' \
+    'the hosted-live release documentation no longer requires graphical console evidence'
 require_fixed setup.sh \
     '"$PROJECT_ROOT/scripts/install-o-cli-wrapper.sh" "$CARGO_BIN_DIR/o"' \
     'the cargo-bin lowercase o wrapper no longer delegates to the repository installer'

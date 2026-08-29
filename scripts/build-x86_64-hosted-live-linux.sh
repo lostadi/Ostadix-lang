@@ -13,6 +13,12 @@ SOURCE_DATE_EPOCH=315532800
 ALPINE_MINIROOTFS_URL=https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/x86_64/alpine-minirootfs-3.24.1-x86_64.tar.gz
 ALPINE_MINIROOTFS_BYTES=3698422
 ALPINE_MINIROOTFS_SHA256=41f73e3cf5fa919b8aa5ca6b30dc48f0da2720776d7423e2a7748211456fe081
+ALPINE_LTS_KERNEL_URL=https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/x86_64/netboot-3.24.1/vmlinuz-lts
+ALPINE_LTS_KERNEL_BYTES=14468096
+ALPINE_LTS_KERNEL_SHA256=77007123c0591ab4b2a5434ffa1b6a3985b3037d534be78bccfb30f3c9536c54
+ALPINE_LTS_INITRAMFS_URL=https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/x86_64/netboot-3.24.1/initramfs-lts
+ALPINE_LTS_INITRAMFS_BYTES=27951899
+ALPINE_LTS_INITRAMFS_SHA256=e1649e94ef1b276bf22ea4ed2628dd17c7fa7505cd40b2c7aa7fd9ebb71fe5c9
 MUSL_DEV_VERSION=1.2.6-r2
 
 trap 'exit 130' INT
@@ -68,7 +74,6 @@ BASE_COMMIT=$5
 RUN_ROOT=$(dirname -- "$SOURCE_ROOT")
 ARCHIVE_SHA256=${OSTADIX_HOSTED_LIVE_ARCHIVE_SHA256:-}
 SHARED_CACHE=/home/ubuntu/.cache/ostadix/hosted-live-release/shared
-GUEST_ROOT=/home/ubuntu/.local/share/ostadix/guests
 CAPACITY_HOST_CACHE=/home/ubuntu/.cache/ostadix/capacity-host
 
 case "$SOURCE_ROOT" in
@@ -82,21 +87,23 @@ case "$RECEIPT" in "$RUN_ROOT"/*) ;; *) die "receipt escaped the private run roo
 [[ "$SOURCE_TREE" =~ ^[0-9a-f]{40}$ ]] || die "SOURCE_TREE must be a 40-character Git tree OID"
 [[ "$BASE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || die "BASE_COMMIT must be a 40-character Git commit OID"
 [[ "$ARCHIVE_SHA256" =~ ^[0-9a-f]{64}$ ]] || die "OSTADIX_HOSTED_LIVE_ARCHIVE_SHA256 is required"
-for cache in "$SHARED_CACHE" "$GUEST_ROOT" "$CAPACITY_HOST_CACHE"; do
+for cache in "$SHARED_CACHE" "$CAPACITY_HOST_CACHE"; do
   [[ ! -L "$cache" ]] || die "release cache must not be a symlink: $cache"
   case "$(realpath -m -- "$cache")" in
     /home/ubuntu/*) ;;
     *) die "release cache escaped the native guest home: $cache" ;;
   esac
 done
-mkdir -p -- "$SHARED_CACHE" "$GUEST_ROOT" "$CAPACITY_HOST_CACHE" "$RUN_ROOT/output"
+mkdir -p -- "$SHARED_CACHE" "$CAPACITY_HOST_CACHE" "$RUN_ROOT/output"
 
 for required in \
   Cargo.lock Cargo.toml rust-toolchain.toml backends examples \
-  evidence/absorbed_capacity_iso.toml evidence/hosted_live_apk_packages.txt \
-  scripts/foreign_kernel_lab.py scripts/prepare-x86_64-capacity-host.sh \
-  ocore/kernel/build-x86_64-capacity-iso.sh \
-  ocore/kernel/smoke-x86_64-hosted-live-qemu.py; do
+  evidence/hosted_live_physical_iso.toml evidence/hosted_live_physical_apk_packages.txt \
+  scripts/prepare-x86_64-capacity-host.sh \
+  ocore/kernel/build-x86_64-hosted-live-iso.sh \
+  ocore/kernel/resolve-x86_64-ovmf-code.sh \
+  ocore/kernel/smoke-x86_64-hosted-live-qemu.py \
+  ocore/kernel/smoke-x86_64-hosted-live-vga-qemu.py; do
   [[ -e "$SOURCE_ROOT/$required" && ! -L "$SOURCE_ROOT/$required" ]] \
     || die "staged source snapshot is missing required path: $required"
 done
@@ -130,6 +137,8 @@ DOWNLOAD_ROOT="$SHARED_CACHE/downloads"
 SYSROOT="$RUN_ROOT/sysroot-alpine-3.24.1-x86_64-musl-$MUSL_DEV_VERSION"
 mkdir -p -- "$DOWNLOAD_ROOT"
 MINIROOTFS="$DOWNLOAD_ROOT/alpine-minirootfs-3.24.1-x86_64.tar.gz"
+LTS_KERNEL="$DOWNLOAD_ROOT/vmlinuz-lts-3.24.1-x86_64"
+LTS_INITRAMFS="$DOWNLOAD_ROOT/initramfs-lts-3.24.1-x86_64"
 
 verify_file() {
   local path=$1 expected_bytes=$2 expected_sha=$3 actual_bytes actual_sha
@@ -139,16 +148,27 @@ verify_file() {
   [[ "$actual_bytes" == "$expected_bytes" && "$actual_sha" == "$expected_sha" ]]
 }
 
-if ! verify_file "$MINIROOTFS" "$ALPINE_MINIROOTFS_BYTES" "$ALPINE_MINIROOTFS_SHA256"; then
-  PARTIAL="$DOWNLOAD_ROOT/.alpine-minirootfs.$$.partial"
-  rm -f -- "$PARTIAL"
+fetch_pinned() {
+  local path=$1 url=$2 expected_bytes=$3 expected_sha=$4 label=$5 partial
+  if verify_file "$path" "$expected_bytes" "$expected_sha"; then
+    return
+  fi
+  partial="$DOWNLOAD_ROOT/.$label.$$.partial"
+  rm -f -- "$partial"
   curl --fail --location --proto '=https' --tlsv1.2 --retry 3 \
-    --output "$PARTIAL" "$ALPINE_MINIROOTFS_URL"
-  verify_file "$PARTIAL" "$ALPINE_MINIROOTFS_BYTES" "$ALPINE_MINIROOTFS_SHA256" \
-    || die "pinned Alpine minirootfs failed exact size/SHA-256 verification"
-  chmod 0444 "$PARTIAL"
-  mv -f -- "$PARTIAL" "$MINIROOTFS"
-fi
+    --output "$partial" "$url"
+  verify_file "$partial" "$expected_bytes" "$expected_sha" \
+    || die "pinned $label failed exact size/SHA-256 verification"
+  chmod 0444 "$partial"
+  mv -f -- "$partial" "$path"
+}
+
+fetch_pinned "$MINIROOTFS" "$ALPINE_MINIROOTFS_URL" \
+  "$ALPINE_MINIROOTFS_BYTES" "$ALPINE_MINIROOTFS_SHA256" alpine-minirootfs
+fetch_pinned "$LTS_KERNEL" "$ALPINE_LTS_KERNEL_URL" \
+  "$ALPINE_LTS_KERNEL_BYTES" "$ALPINE_LTS_KERNEL_SHA256" alpine-vmlinuz-lts
+fetch_pinned "$LTS_INITRAMFS" "$ALPINE_LTS_INITRAMFS_URL" \
+  "$ALPINE_LTS_INITRAMFS_BYTES" "$ALPINE_LTS_INITRAMFS_SHA256" alpine-initramfs-lts
 
 EXPECTED_SYSROOT_LOCK=$(printf '%s\n' "${SYSROOT_PACKAGE_SPECS[@]}" | LC_ALL=C sort)
 [[ ! -e "$SYSROOT" && ! -L "$SYSROOT" ]] \
@@ -287,19 +307,6 @@ for binary in O o-cli olangc o-link; do
   install -m 0555 "$source_binary" "$HOSTED_BIN_DIR/$binary"
 done
 
-GUEST_ARGUMENTS=(
-  --guest linux-alpine-3.24.1-x86_64
-  --guest guix-system-1.5.0-x86_64
-  --guest plan9-9front-11983-amd64
-  --guest redox-0.9.0-server-x86_64
-  --guest openbsd-7.9-amd64
-)
-python3 "$SOURCE_ROOT/scripts/foreign_kernel_lab.py" --guest-dir "$GUEST_ROOT" \
-  fetch "${GUEST_ARGUMENTS[@]}"
-GUEST_CACHE_VERIFICATION="$RUN_ROOT/output/guest-cache-verification.txt"
-python3 "$SOURCE_ROOT/scripts/foreign_kernel_lab.py" --guest-dir "$GUEST_ROOT" \
-  verify "${GUEST_ARGUMENTS[@]}" | tee "$GUEST_CACHE_VERIFICATION"
-
 sudo install -d -m 0755 "$CAPACITY_HOST_CACHE"
 if [[ ! -e "$CAPACITY_HOST_CACHE/alpine-minirootfs-3.24.1-x86_64.tar.gz" ]]; then
   sudo install -m 0444 "$MINIROOTFS" \
@@ -307,9 +314,10 @@ if [[ ! -e "$CAPACITY_HOST_CACHE/alpine-minirootfs-3.24.1-x86_64.tar.gz" ]]; the
 fi
 INITRAMFS="$RUN_ROOT/output/initramfs.cpio.gz"
 sudo env \
+  OSTADIX_CAPACITY_HOST_BASE_INITRAMFS="$LTS_INITRAMFS" \
   OSTADIX_CAPACITY_HOST_CACHE="$CAPACITY_HOST_CACHE" \
-  OSTADIX_CAPACITY_HOST_PACKAGE_LOCK="$SOURCE_ROOT/evidence/hosted_live_apk_packages.txt" \
-  OSTADIX_GUEST_ROOT="$GUEST_ROOT" \
+  OSTADIX_CAPACITY_HOST_KERNEL_FLAVOR=lts \
+  OSTADIX_CAPACITY_HOST_PACKAGE_LOCK="$SOURCE_ROOT/evidence/hosted_live_physical_apk_packages.txt" \
   OSTADIX_HOSTED_BIN_DIR="$HOSTED_BIN_DIR" \
   OSTADIX_HOSTED_REVISION="$SOURCE_TREE" \
   OSTADIX_HOSTED_SOURCE_ROOT="$SOURCE_ROOT" \
@@ -317,36 +325,40 @@ sudo env \
   "$SOURCE_ROOT/scripts/prepare-x86_64-capacity-host.sh" "$INITRAMFS"
 
 ISO_ROOT="$RUN_ROOT/iso-work"
-NATIVE_TARGET="$RUN_ROOT/cargo-native"
-mkdir -p -- "$ISO_ROOT" "$NATIVE_TARGET" "$(dirname -- "$OUTPUT")"
+mkdir -p -- "$ISO_ROOT" "$(dirname -- "$OUTPUT")"
 env \
-  CARGO_TARGET_DIR="$NATIVE_TARGET" \
-  OCORE_CAPACITY_ISO_KERNEL_BUILD_DIR="$RUN_ROOT/ocore-kernel" \
-  OCORE_LLD="$(command -v ld.lld)" \
-  OSTADIX_CAPACITY_HOST_INITRAMFS="$INITRAMFS" \
-  OSTADIX_CAPACITY_ISO_ROOT="$ISO_ROOT" \
+  OSTADIX_HOSTED_LIVE_INITRAMFS="$INITRAMFS" \
+  OSTADIX_HOSTED_LIVE_ISO_ROOT="$ISO_ROOT" \
+  OSTADIX_HOSTED_LIVE_KERNEL="$LTS_KERNEL" \
   OSTADIX_GRUB_MKRESCUE="$(command -v grub-mkrescue)" \
-  OSTADIX_GUEST_ROOT="$GUEST_ROOT" \
-  RUSTUP_TOOLCHAIN="$RUST_TOOLCHAIN" \
   SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
-  "$SOURCE_ROOT/ocore/kernel/build-x86_64-capacity-iso.sh" "$OUTPUT"
+  "$SOURCE_ROOT/ocore/kernel/build-x86_64-hosted-live-iso.sh" "$OUTPUT"
 
 INSPECTION="$RUN_ROOT/output/iso-inspection.json"
-SMOKE="$RUN_ROOT/output/qemu-smoke.json"
+SERIAL_SMOKE="$RUN_ROOT/output/qemu-serial-smoke.json"
+VISUAL_SMOKE="$RUN_ROOT/output/qemu-visual-smoke.json"
 python3 "$SOURCE_ROOT/scripts/ostadix_capacity_iso.py" inspect "$OUTPUT" >"$INSPECTION"
 python3 "$SOURCE_ROOT/ocore/kernel/smoke-x86_64-hosted-live-qemu.py" \
-  --timeout "${OSTADIX_HOSTED_LIVE_SMOKE_TIMEOUT:-180}" "$OUTPUT" >"$SMOKE"
+  --timeout "${OSTADIX_HOSTED_LIVE_SMOKE_TIMEOUT:-180}" "$OUTPUT" >"$SERIAL_SMOKE"
+# shellcheck source=../ocore/kernel/resolve-x86_64-ovmf-code.sh
+source "$SOURCE_ROOT/ocore/kernel/resolve-x86_64-ovmf-code.sh"
+OVMF_CODE=$(resolve_ostadix_x86_64_ovmf_code "$(command -v qemu-system-x86_64)")
+python3 "$SOURCE_ROOT/ocore/kernel/smoke-x86_64-hosted-live-vga-qemu.py" \
+  --firmware "$OVMF_CODE" \
+  --qemu "$(command -v qemu-system-x86_64)" \
+  --evidence-dir "$RUN_ROOT/output/qemu-vga-evidence" \
+  --timeout "${OSTADIX_HOSTED_LIVE_SMOKE_TIMEOUT:-180}" \
+  "$OUTPUT" >"$VISUAL_SMOKE"
 
 SYSROOT_LOCK_FILE="$RUN_ROOT/output/sysroot-packages.txt"
 printf '%s\n' "${SYSROOT_PACKAGE_SPECS[@]}" | LC_ALL=C sort >"$SYSROOT_LOCK_FILE"
 python3 - \
-  "$OUTPUT" "$RECEIPT" "$INSPECTION" "$SMOKE" "$INITRAMFS" \
-  "$HOSTED_BIN_DIR" "$SOURCE_ROOT/evidence/hosted_live_apk_packages.txt" \
+  "$OUTPUT" "$RECEIPT" "$INSPECTION" "$SERIAL_SMOKE" "$VISUAL_SMOKE" "$INITRAMFS" \
+  "$HOSTED_BIN_DIR" "$SOURCE_ROOT/evidence/hosted_live_physical_apk_packages.txt" \
   "$SYSROOT_LOCK_FILE" "$SOURCE_TREE" "$BASE_COMMIT" "$ARCHIVE_SHA256" \
   "$RUST_VERSION" "$HOST_ARCH" "$SYSROOT_MANIFEST" \
-  "$GUEST_ROOT" "$GUEST_CACHE_VERIFICATION" \
   "$CAPACITY_HOST_CACHE/alpine-minirootfs-3.24.1-x86_64.tar.gz" \
-  "$CAPACITY_HOST_CACHE/modloop-virt-3.24.1-x86_64" <<'PY'
+  "$LTS_KERNEL" "$LTS_INITRAMFS" <<'PY'
 from pathlib import Path
 import hashlib
 import json
@@ -357,7 +369,8 @@ import sys
     iso_text,
     receipt_text,
     inspection_text,
-    smoke_text,
+    serial_smoke_text,
+    visual_smoke_text,
     initramfs_text,
     binaries_text,
     package_lock_text,
@@ -368,10 +381,9 @@ import sys
     rust_version,
     host_arch,
     sysroot_manifest_text,
-    guest_root,
-    guest_verification_text,
-    capacity_minirootfs_text,
-    capacity_modloop_text,
+    alpine_minirootfs_text,
+    alpine_lts_kernel_text,
+    alpine_lts_initramfs_text,
 ) = sys.argv[1:]
 
 def identity(path: Path) -> dict[str, object]:
@@ -387,7 +399,7 @@ iso = Path(iso_text)
 receipt = Path(receipt_text)
 binaries = Path(binaries_text)
 payload = {
-    "schema": "ostadix.hosted-live-release/v1",
+    "schema": "ostadix.hosted-live-release/v2",
     "source": {
         "staged_tree": source_tree,
         "base_commit": base_commit,
@@ -404,7 +416,7 @@ payload = {
         "musl_dev_version": "1.2.6-r2",
         "sysroot_package_lock": Path(sysroot_lock_text).read_text(encoding="utf-8").splitlines(),
         "sysroot_manifest": identity(Path(sysroot_manifest_text)),
-        "capacity_host_package_lock": identity(Path(package_lock_text)),
+        "hosted_live_package_lock": identity(Path(package_lock_text)),
         "apk_repository_boundary": {
             "exact_versions": True,
             "signed_index_and_packages": True,
@@ -412,13 +424,9 @@ payload = {
             "repository_availability_required": True,
         },
         "cache_inputs": {
-            "guest_root": guest_root,
-            "guest_verification": {
-                "identity": identity(Path(guest_verification_text)),
-                "records": Path(guest_verification_text).read_text(encoding="utf-8").splitlines(),
-            },
-            "capacity_host_minirootfs": identity(Path(capacity_minirootfs_text)),
-            "capacity_host_modloop": identity(Path(capacity_modloop_text)),
+            "alpine_minirootfs": identity(Path(alpine_minirootfs_text)),
+            "alpine_lts_kernel": identity(Path(alpine_lts_kernel_text)),
+            "alpine_lts_initramfs": identity(Path(alpine_lts_initramfs_text)),
         },
     },
     "binaries": {
@@ -427,7 +435,18 @@ payload = {
     },
     "initramfs": identity(Path(initramfs_text)),
     "iso": json.loads(Path(inspection_text).read_text(encoding="utf-8")),
-    "smoke": json.loads(Path(smoke_text).read_text(encoding="utf-8")),
+    "smoke": {
+        "schema": "ostadix.hosted-live-boot-gates/v2",
+        "serial": json.loads(Path(serial_smoke_text).read_text(encoding="utf-8")),
+        "graphical": json.loads(Path(visual_smoke_text).read_text(encoding="utf-8")),
+    },
+    "boot_profile": {
+        "kind": "physical-hosted-live",
+        "kernel_flavor": "alpine-lts",
+        "preferred_console": "tty0",
+        "panic_timeout_seconds": 0,
+        "ventoy_mode": "grub2-filename-suffix",
+    },
     "claim_boundary": {
         "substrate": "aarch64-or-x86_64-linux-multipass-plus-x86_64-qemu-tcg-ovmf",
         "physical_hardware_proof": False,

@@ -1,20 +1,35 @@
 #!/usr/bin/env bash
-# Build the x86_64 Linux initramfs used to launch absorbed foreign systems.
-# This is an explicit networked preparation step. The capacity ISO build itself
-# consumes the resulting immutable file and performs no package downloads.
+# Build the x86_64 Linux initramfs used by hosted live and, in the default
+# virt-kernel mode, by the absorbed foreign-system laboratory.
 set -euo pipefail
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 OUTPUT=${1:-"$ROOT/target/ostadix-capacity-host/x86_64/initramfs.cpio.gz"}
 GUEST_ROOT=${OSTADIX_GUEST_ROOT:-"${XDG_DATA_HOME:-$HOME/.local/share}/ostadix/guests"}
-ALPINE_INITRAMFS=${OSTADIX_CAPACITY_HOST_BASE_INITRAMFS:-"$GUEST_ROOT/alpine-3.24.1-x86_64/initramfs-virt"}
+ALPINE_KERNEL_FLAVOR=${OSTADIX_CAPACITY_HOST_KERNEL_FLAVOR:-virt}
 ALPINE_MINIROOTFS_URL=https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/x86_64/alpine-minirootfs-3.24.1-x86_64.tar.gz
 ALPINE_MINIROOTFS_BYTES=3698422
 ALPINE_MINIROOTFS_SHA256=41f73e3cf5fa919b8aa5ca6b30dc48f0da2720776d7423e2a7748211456fe081
-ALPINE_KERNEL_RELEASE=6.18.35-0-virt
-ALPINE_MODLOOP_URL=https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/x86_64/netboot-3.24.1/modloop-virt
-ALPINE_MODLOOP_BYTES=22867968
-ALPINE_MODLOOP_SHA256=78907e7cc812d555f08d4e1133d090cf11fa197370882adfe67b0a5986ccb3f9
+case "$ALPINE_KERNEL_FLAVOR" in
+  virt)
+    ALPINE_INITRAMFS=${OSTADIX_CAPACITY_HOST_BASE_INITRAMFS:-"$GUEST_ROOT/alpine-3.24.1-x86_64/initramfs-virt"}
+    ALPINE_KERNEL_RELEASE=6.18.35-0-virt
+    ALPINE_MODLOOP_URL=https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/x86_64/netboot-3.24.1/modloop-virt
+    ALPINE_MODLOOP_BYTES=22867968
+    ALPINE_MODLOOP_SHA256=78907e7cc812d555f08d4e1133d090cf11fa197370882adfe67b0a5986ccb3f9
+    ;;
+  lts)
+    ALPINE_INITRAMFS=${OSTADIX_CAPACITY_HOST_BASE_INITRAMFS:-"$GUEST_ROOT/alpine-3.24.1-x86_64/initramfs-lts"}
+    ALPINE_KERNEL_RELEASE=6.18.35-0-lts
+    ALPINE_MODLOOP_URL=
+    ALPINE_MODLOOP_BYTES=
+    ALPINE_MODLOOP_SHA256=
+    ;;
+  *)
+    printf 'error: OSTADIX_CAPACITY_HOST_KERNEL_FLAVOR must be virt or lts\n' >&2
+    exit 1
+    ;;
+esac
 CACHE_ROOT=${OSTADIX_CAPACITY_HOST_CACHE:-"${XDG_CACHE_HOME:-$HOME/.cache}/ostadix/capacity-host"}
 HOSTED_BIN_DIR=${OSTADIX_HOSTED_BIN_DIR:-"$ROOT/target/ostadix-hosted/x86_64/bin"}
 HOSTED_SOURCE_ROOT=${OSTADIX_HOSTED_SOURCE_ROOT:-"$ROOT"}
@@ -28,10 +43,10 @@ usage() {
   cat <<'USAGE'
 Usage: prepare-x86_64-capacity-host.sh [OUTPUT]
 
-Build the Alpine-based x86_64 initramfs that launches Guix, OpenBSD, 9front,
-and Redox capacity images through local QEMU TCG and provides the hosted Ostadix
-live CLI. Run this script on Linux as root (or through sudo) after fetching the
-x86_64 Alpine foreign-lab guest and building the x86_64-musl hosted binaries.
+Build the Alpine-based x86_64 initramfs that provides the hosted Ostadix live
+CLI. The default virt flavor also launches Guix, OpenBSD, 9front, and Redox
+capacity images through local QEMU TCG. The lts flavor uses Alpine's upstream
+hardware-oriented initramfs and is the physical Hosted Live release substrate.
 
 This command accesses Alpine's HTTPS repositories. The later capacity ISO
 build forces Cargo offline, downloads no guest media, and binds the resulting
@@ -171,8 +186,10 @@ fetch_pinned() {
 
 fetch_pinned "$MINIROOTFS" "$ALPINE_MINIROOTFS_URL" \
   "$ALPINE_MINIROOTFS_BYTES" "$ALPINE_MINIROOTFS_SHA256" alpine-minirootfs
-fetch_pinned "$MODLOOP" "$ALPINE_MODLOOP_URL" \
-  "$ALPINE_MODLOOP_BYTES" "$ALPINE_MODLOOP_SHA256" alpine-modloop-virt
+if [[ "$ALPINE_KERNEL_FLAVOR" == virt ]]; then
+  fetch_pinned "$MODLOOP" "$ALPINE_MODLOOP_URL" \
+    "$ALPINE_MODLOOP_BYTES" "$ALPINE_MODLOOP_SHA256" alpine-modloop-virt
+fi
 
 WORK_DIR=$(mktemp -d "$(dirname -- "$OUTPUT")/.capacity-host.XXXXXX")
 STAGE="$WORK_DIR/root"
@@ -188,22 +205,37 @@ mkdir -p -- "$STAGE"
   gzip -dc "$ALPINE_INITRAMFS" | cpio --quiet -idmu --no-absolute-filenames
   tar -xzf "$MINIROOTFS"
 )
-# The netboot initramfs intentionally omits optical-media drivers. Import the
-# exact matching virt modloop so the standalone capacity host can mount the
-# same read-only ISO after GRUB hands control to Linux.
-unsquashfs -f -d "$STAGE/usr/lib" "$MODLOOP" \
-  "modules/$ALPINE_KERNEL_RELEASE" >/dev/null
-for module in \
-  "$STAGE/usr/lib/modules/$ALPINE_KERNEL_RELEASE/kernel/drivers/cdrom/cdrom.ko" \
-  "$STAGE/usr/lib/modules/$ALPINE_KERNEL_RELEASE/kernel/drivers/scsi/sr_mod.ko" \
-  "$STAGE/usr/lib/modules/$ALPINE_KERNEL_RELEASE/kernel/fs/isofs/isofs.ko"; do
-  [[ -f "$module" && ! -L "$module" ]] \
-    || die "pinned Alpine modloop omitted required optical-media module: $module"
-done
-if [[ -e "$STAGE/lib/modules" || -L "$STAGE/lib/modules" ]]; then
-  die "capacity-host stage unexpectedly already defines /lib/modules"
+if [[ "$ALPINE_KERNEL_FLAVOR" == virt ]]; then
+  # The virt netboot initramfs omits optical-media drivers. Import its exact
+  # matching modloop so the laboratory host can remount a directly attached ISO.
+  unsquashfs -f -d "$STAGE/usr/lib" "$MODLOOP" \
+    "modules/$ALPINE_KERNEL_RELEASE" >/dev/null
+  for module in \
+    "$STAGE/usr/lib/modules/$ALPINE_KERNEL_RELEASE/kernel/drivers/cdrom/cdrom.ko" \
+    "$STAGE/usr/lib/modules/$ALPINE_KERNEL_RELEASE/kernel/drivers/scsi/sr_mod.ko" \
+    "$STAGE/usr/lib/modules/$ALPINE_KERNEL_RELEASE/kernel/fs/isofs/isofs.ko"; do
+    [[ -f "$module" && ! -L "$module" ]] \
+      || die "pinned Alpine modloop omitted required optical-media module: $module"
+  done
+else
+  # Alpine's LTS netboot initramfs is already a bounded matching module set.
+  # Require the pieces needed for a USB keyboard and common xHCI controllers;
+  # the LTS kernel supplies simpledrm/framebuffer console support built in.
+  for module in \
+    "$STAGE/usr/lib/modules/$ALPINE_KERNEL_RELEASE/kernel/drivers/hid/hid.ko" \
+    "$STAGE/usr/lib/modules/$ALPINE_KERNEL_RELEASE/kernel/drivers/hid/hid-generic.ko" \
+    "$STAGE/usr/lib/modules/$ALPINE_KERNEL_RELEASE/kernel/drivers/hid/usbhid/usbhid.ko" \
+    "$STAGE/usr/lib/modules/$ALPINE_KERNEL_RELEASE/kernel/drivers/usb/host/xhci-hcd.ko" \
+    "$STAGE/usr/lib/modules/$ALPINE_KERNEL_RELEASE/kernel/drivers/usb/host/xhci-pci.ko"; do
+    [[ -f "$module" && ! -L "$module" ]] \
+      || die "pinned Alpine LTS initramfs omitted required physical-input module: $module"
+  done
+  [[ -f "$STAGE/usr/lib/modules/$ALPINE_KERNEL_RELEASE/modules.dep" ]] \
+    || die "pinned Alpine LTS initramfs omitted modules.dep"
 fi
-ln -s ../usr/lib/modules "$STAGE/lib/modules"
+if [[ ! -e "$STAGE/lib/modules" && ! -L "$STAGE/lib/modules" ]]; then
+  ln -s ../usr/lib/modules "$STAGE/lib/modules"
+fi
 printf '%s\n%s\n' \
   'https://dl-cdn.alpinelinux.org/alpine/v3.24/main' \
   'https://dl-cdn.alpinelinux.org/alpine/v3.24/community' \
@@ -296,6 +328,40 @@ mount -t devtmpfs devtmpfs /dev 2>/dev/null || {
 mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /run
 mount -t tmpfs -o mode=1777,nosuid,nodev tmpfs /tmp
 
+emit_line() {
+  for output in /dev/tty0 /dev/ttyS0; do
+    if [ -c "$output" ]; then
+      printf '%s\n' "$*" >"$output" 2>/dev/null || true
+    fi
+  done
+}
+
+emit_error() {
+  emit_line "$*"
+}
+
+hosted_shell() {
+  cat >/run/ostadix-live-shell <<'SHELL'
+#!/bin/sh
+cd /opt/ostadix
+export HOME=/root
+export O_BACKENDS_DIR=/opt/ostadix/backends
+export PATH=/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+export PS1='ostadix-live:\w# '
+exec /bin/sh -i
+SHELL
+  chmod 0755 /run/ostadix-live-shell
+  if command -v openvt >/dev/null 2>&1 && [ -c /dev/tty1 ]; then
+    while :; do
+      openvt -c 1 -s -w /run/ostadix-live-shell || true
+      emit_error 'OSTADIX HOSTED LIVE: visible shell exited; restarting tty1'
+      sleep 1
+    done
+  fi
+  emit_error 'OSTADIX HOSTED LIVE: openvt unavailable; using /dev/console fallback'
+  exec /run/ostadix-live-shell
+}
+
 for module in \
   ata_piix ahci nvme xhci_hcd xhci_pci usbhid hid_generic simpledrm \
   cdrom sr_mod isofs; do
@@ -314,56 +380,52 @@ if [ "$selected" = hosted ]; then
   smoke_output=
   if smoke_output=$(O /opt/ostadix/examples/hello.O "$O_BACKENDS_DIR" 2>&1) \
       && [ "$smoke_output" = '[number] 2' ]; then
-    echo 'OSTADIX HOSTED O SMOKE: PASS'
+    emit_line 'OSTADIX HOSTED O SMOKE: PASS'
   else
-    echo "OSTADIX HOSTED O SMOKE: FAIL: $smoke_output" >&2
-    exec sh
+    emit_error "OSTADIX HOSTED O SMOKE: FAIL: $smoke_output"
+    hosted_shell
   fi
   if [ "$(bash -lc 'printf ostadix-bash')" = ostadix-bash ]; then
-    echo 'OSTADIX HOSTED BASH: PASS'
+    emit_line 'OSTADIX HOSTED BASH: PASS'
   else
-    echo 'OSTADIX HOSTED BASH: FAIL' >&2
-    exec sh
+    emit_error 'OSTADIX HOSTED BASH: FAIL'
+    hosted_shell
   fi
   if [ "$(sqlite3 ':memory:' 'select 1 + 1;')" = 2 ]; then
-    echo 'OSTADIX HOSTED SQLITE: PASS'
+    emit_line 'OSTADIX HOSTED SQLITE: PASS'
   else
-    echo 'OSTADIX HOSTED SQLITE: FAIL' >&2
-    exec sh
+    emit_error 'OSTADIX HOSTED SQLITE: FAIL'
+    hosted_shell
   fi
   if olangc /opt/ostadix/examples/hello.O --target ir \
       --shim-dir "$O_BACKENDS_DIR" >/tmp/ostadix-hello.ir 2>/tmp/ostadix-olangc.err \
       && [ -s /tmp/ostadix-hello.ir ]; then
-    echo 'OSTADIX HOSTED OLANGC IR: PASS'
+    emit_line 'OSTADIX HOSTED OLANGC IR: PASS'
   else
-    echo 'OSTADIX HOSTED OLANGC IR: FAIL' >&2
+    emit_error 'OSTADIX HOSTED OLANGC IR: FAIL'
     cat /tmp/ostadix-olangc.err >&2 2>/dev/null || true
-    exec sh
+    hosted_shell
   fi
   if o-cli --help 2>&1 | grep -q '^Usage: o-cli'; then
-    echo 'OSTADIX HOSTED O-CLI: PASS'
+    emit_line 'OSTADIX HOSTED O-CLI: PASS'
   else
-    echo 'OSTADIX HOSTED O-CLI: FAIL' >&2
-    exec sh
+    emit_error 'OSTADIX HOSTED O-CLI: FAIL'
+    hosted_shell
   fi
   if o-link --literal /opt/ostadix/examples/hello.O \
       -o /tmp/ostadix-linked.O >/tmp/ostadix-olink.out 2>/tmp/ostadix-olink.err \
       && [ -s /tmp/ostadix-linked.O ]; then
-    echo 'OSTADIX HOSTED O-LINK: PASS'
+    emit_line 'OSTADIX HOSTED O-LINK: PASS'
   else
-    echo 'OSTADIX HOSTED O-LINK: FAIL' >&2
+    emit_error 'OSTADIX HOSTED O-LINK: FAIL'
     cat /tmp/ostadix-olink.err >&2 2>/dev/null || true
-    exec sh
+    hosted_shell
   fi
-  echo 'OSTADIX HOSTED LIVE READY'
-  echo 'Try: O /opt/ostadix/examples/hello.O "$O_BACKENDS_DIR"'
-  echo '     O --repl "$O_BACKENDS_DIR"'
-  echo '     olangc /opt/ostadix/examples/hello.O --target ir --shim-dir "$O_BACKENDS_DIR"'
-  export PS1='ostadix-live:\w# '
-  if command -v setsid >/dev/null 2>&1 && command -v cttyhack >/dev/null 2>&1; then
-    exec setsid cttyhack sh -l
-  fi
-  exec sh -l
+  emit_line 'OSTADIX HOSTED LIVE READY'
+  emit_line 'Try: O /opt/ostadix/examples/hello.O "$O_BACKENDS_DIR"'
+  emit_line '     O --repl "$O_BACKENDS_DIR"'
+  emit_line '     olangc /opt/ostadix/examples/hello.O --target ir --shim-dir "$O_BACKENDS_DIR"'
+  hosted_shell
 fi
 
 media=

@@ -1,0 +1,30 @@
+schema = "ostadix.capacity-iso-profile/v1"
+architecture = "x86_64"
+default_entry = "hosted"
+
+[[artifacts]]
+iso_path = "/boot/hosted/vmlinuz-lts"
+stage_path = "boot/hosted/vmlinuz-lts"
+role = "linux-kernel"
+
+[[artifacts]]
+iso_path = "/boot/hosted/initramfs.cpio.gz"
+stage_path = "boot/hosted/initramfs.cpio.gz"
+role = "linux-initrd"
+
+[[entries]]
+id = "hosted"
+title = "OSTADIX Hosted Live CLI [physical x86_64]"
+hotkey = "h"
+adapter = "linux-selection"
+arguments = [
+  "console=ttyS0,115200n8",
+  "console=tty0",
+  "rdinit=/init",
+  "panic=0",
+  "loglevel=7",
+  "ignore_loglevel",
+]
+kernel_path = "/boot/hosted/vmlinuz-lts"
+initrd_paths = ["/boot/hosted/initramfs.cpio.gz"]
+selection_id = "hosted"

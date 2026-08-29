@@ -394,6 +394,43 @@ def _inspect_capacity(descriptor: int, label: str) -> dict[str, Any]:
         raise CapacityValidationError(f"{label} inspection metadata is incomplete")
     if metadata["schema"] != "ostadix.capacity-iso/v1" or metadata["architecture"] != "x86_64":
         raise CapacityValidationError(f"{label} is not an x86_64 OSTADIX capacity ISO")
+    entries = metadata.get("entries")
+    artifacts = metadata.get("artifacts")
+    if (
+        not isinstance(entries, list)
+        or len(entries) != 1
+        or not isinstance(entries[0], dict)
+        or entries[0].get("id") != "hosted"
+    ):
+        raise CapacityValidationError(
+            f"{label} is not the single-entry physical Hosted Live ISO"
+        )
+    entry = entries[0]
+    if (
+        entry.get("adapter") != "linux-selection"
+        or entry.get("kernel_path") != "/boot/hosted/vmlinuz-lts"
+        or entry.get("initrd_paths") != ["/boot/hosted/initramfs.cpio.gz"]
+        or entry.get("selection_id") != "hosted"
+        or entry.get("arguments") != [
+            "console=ttyS0,115200n8",
+            "console=tty0",
+            "rdinit=/init",
+            "panic=0",
+            "loglevel=7",
+            "ignore_loglevel",
+        ]
+    ):
+        raise CapacityValidationError(f"{label} has the wrong physical Hosted Live boot profile")
+    artifact_closure = {
+        (artifact.get("iso_path"), artifact.get("role"))
+        for artifact in artifacts or []
+        if isinstance(artifact, dict)
+    }
+    if artifact_closure != {
+        ("/boot/hosted/vmlinuz-lts", "linux-kernel"),
+        ("/boot/hosted/initramfs.cpio.gz", "linux-initrd"),
+    }:
+        raise CapacityValidationError(f"{label} has the wrong physical Hosted Live artifact closure")
     return metadata
 
 
@@ -445,6 +482,8 @@ def _validate_name(name: str) -> str:
         raise VentoyError("destination name must be one bounded .iso basename")
     if name in {".", ".."} or "/" in name or "\\" in name:
         raise VentoyError("destination name must not contain path traversal")
+    if not name.endswith("_VTGRUB2.iso"):
+        raise VentoyError("destination name must end with _VTGRUB2.iso to force Ventoy GRUB2 mode")
     return name
 
 

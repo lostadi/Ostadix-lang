@@ -201,7 +201,7 @@ case "$command_name" in
     inspect-capacity-iso)
         require_at_most_one_arg "$@"
         require_executable "$CAPACITY_ISO_INSPECT_SCRIPT"
-        capacity_iso_path=${1:-"$ROOT/target/ostadix-capacity-iso/x86_64/ostadix-hosted-live-x86_64-uefi.iso"}
+        capacity_iso_path=${1:-"$ROOT/target/ostadix-capacity-iso/x86_64/ostadix-absorbed-capacity-x86_64-uefi.iso"}
         exec "$CAPACITY_ISO_INSPECT_SCRIPT" inspect "$capacity_iso_path"
         ;;
     hosted-live-release)
