@@ -275,7 +275,7 @@ footprint.
 The bundle is digest-bound to canonical lowered OIR, the validated plan, the
 solved analyzed graph, analyzer identity, the canonical backend-catalog
 specifications referenced by the plan, consumed legacy Python shim files, a
-V5 direct-executable manifest, the execution environment, and a descriptive
+direct-executable manifest V1, the execution environment, and a descriptive
 ambient `HostWorld` snapshot. For an execution snapshot, the manifest selects
 each plan-used shim backend's direct launchers once, preserves their absolute
 invocation paths, opens and hashes each canonical target once, records Unix
@@ -335,9 +335,9 @@ direct launchers only, not shebang interpreters, compiler-driver subtools,
 dynamic libraries, or descendants launched by hosted code. Consumed legacy
 Python support files and adapter-owned tools are bound without constraining
 subprocesses created by user code. Because `ExecutionPlan`
-omits WebAssembly body shape, V5 conservatively binds a complete text-converter
+omits WebAssembly body shape, Catalog V6 conservatively binds a complete text-converter
 plus runtime alternative (`wat2wasm` or `wasm-tools parse`) rather than
-under-admitting a later WAT conversion. V5 also
+under-admitting a later WAT conversion. The manifest also
 does not attest a frozen child environment, the opaque state or generation of
 an already-live actor, Request/project admission authority, or placement-lease
 freshness. The separate Request authority captures and shares a Nix command

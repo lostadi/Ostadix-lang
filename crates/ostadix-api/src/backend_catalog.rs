@@ -510,6 +510,7 @@ macro_rules! runtime_requirement_catalog {
 macro_rules! backend_catalog_metadata {
     (
         current_schema: $current_schema:literal,
+        legacy_schema_v5: $legacy_schema_v5:literal,
         legacy_schema_v4: $legacy_schema_v4:literal,
         legacy_schema_v3: $legacy_schema_v3:literal $(,)?
     ) => {
@@ -517,10 +518,12 @@ macro_rules! backend_catalog_metadata {
         pub const BACKEND_CATALOG_SCHEMA_V3: &str = $legacy_schema_v3;
         /// Archival V4 catalog domain retained byte-for-byte.
         pub const BACKEND_CATALOG_SCHEMA_V4: &str = $legacy_schema_v4;
+        /// Archival V5 catalog domain retained byte-for-byte.
+        pub const BACKEND_CATALOG_SCHEMA_V5: &str = $legacy_schema_v5;
         /// Current catalog domain. Only identities derived under this domain
         /// authorize new placement records.
-        pub const BACKEND_CATALOG_SCHEMA_V5: &str = $current_schema;
-        pub const BACKEND_CATALOG_CURRENT_SCHEMA: &str = BACKEND_CATALOG_SCHEMA_V5;
+        pub const BACKEND_CATALOG_SCHEMA_V6: &str = $current_schema;
+        pub const BACKEND_CATALOG_CURRENT_SCHEMA: &str = BACKEND_CATALOG_SCHEMA_V6;
         /// Compatibility name retained for evidence code that predates the
         /// explicit current-schema constant. It always names the current domain.
         pub const BACKEND_CATALOG_SCHEMA_V1: &str = BACKEND_CATALOG_CURRENT_SCHEMA;
@@ -684,6 +687,28 @@ macro_rules! backend_catalog {
 // olangc so emitted runtime projects compile from the identical catalog.
 include!("backend_catalog.inc.rs");
 
+// Catalog V3 through V5 published the original two WebAssembly alternatives.
+// The current declarative catalog may grow, but those archival identities must
+// continue hashing the exact runtime requirement they originally named.
+const ARCHIVAL_WEBASSEMBLY_ALTERNATIVES_V5: &[&[&str]] =
+    &[&["wat2wasm", "wasmtime"], &["wat2wasm", "wasmer"]];
+const ARCHIVAL_WEBASSEMBLY_REQUIREMENT_V5: RuntimeRequirementSpec = RuntimeRequirementSpec {
+    key: "webassembly",
+    builtin: false,
+    precision: RuntimeRequirementPrecision::ConservativeAllSources,
+    alternatives: ARCHIVAL_WEBASSEMBLY_ALTERNATIVES_V5,
+};
+
+fn archival_runtime_requirement_v5(
+    requirement: &'static RuntimeRequirementSpec,
+) -> &'static RuntimeRequirementSpec {
+    if requirement.key == "webassembly" {
+        &ARCHIVAL_WEBASSEMBLY_REQUIREMENT_V5
+    } else {
+        requirement
+    }
+}
+
 pub(crate) fn catalog_hash_field(hash: &mut Sha256, bytes: &[u8]) {
     hash.update((bytes.len() as u64).to_be_bytes());
     hash.update(bytes);
@@ -811,6 +836,17 @@ pub(crate) fn hash_backend_spec_v5(
     }
 }
 
+pub(crate) fn hash_backend_spec_v6(
+    hash: &mut Sha256,
+    spec: &BackendSpec,
+    requirement: &RuntimeRequirementSpec,
+    morphism_profile: Option<BackendMorphismProfileV1>,
+) {
+    // V6 retains the complete V5 projection shape. Its distinct schema domain
+    // authorizes the expanded runtime alternatives without rewriting V5.
+    hash_backend_spec_v5(hash, spec, requirement, morphism_profile);
+}
+
 pub(crate) fn finish_catalog_hash(hash: Sha256) -> String {
     hex::encode(hash.finalize())
 }
@@ -896,6 +932,10 @@ impl BackendRegistry {
             .unwrap_or(&UNKNOWN_RUNTIME_REQUIREMENT)
     }
 
+    fn runtime_requirements_for_v5(&self, lang: &str) -> &'static RuntimeRequirementSpec {
+        archival_runtime_requirement_v5(self.runtime_requirements_for(lang))
+    }
+
     /// Concrete adapter ownership for a canonical name or alias. Unknown tags
     /// remain conservative compatibility-shim backends.
     pub fn adapter_for(&self, lang: &str) -> BackendAdapterKind {
@@ -939,11 +979,14 @@ impl BackendRegistry {
                 catalog_hash_field(&mut hash, BACKEND_CATALOG_SCHEMA_V3.as_bytes());
                 catalog_hash_count(&mut hash, RUNTIME_REQUIREMENT_SPECS.len());
                 for requirement in RUNTIME_REQUIREMENT_SPECS {
-                    hash_runtime_requirement(&mut hash, requirement);
+                    hash_runtime_requirement(
+                        &mut hash,
+                        archival_runtime_requirement_v5(requirement),
+                    );
                 }
                 catalog_hash_count(&mut hash, self.specs.len());
                 for spec in self.specs {
-                    let requirement = self.runtime_requirements_for(spec.name);
+                    let requirement = self.runtime_requirements_for_v5(spec.name);
                     hash_backend_spec_v3(&mut hash, spec, requirement);
                 }
                 finish_catalog_hash(hash)
@@ -960,18 +1003,25 @@ impl BackendRegistry {
                 catalog_hash_field(&mut hash, BACKEND_CATALOG_SCHEMA_V4.as_bytes());
                 catalog_hash_count(&mut hash, RUNTIME_REQUIREMENT_SPECS.len());
                 for requirement in RUNTIME_REQUIREMENT_SPECS {
-                    hash_runtime_requirement(&mut hash, requirement);
+                    hash_runtime_requirement(
+                        &mut hash,
+                        archival_runtime_requirement_v5(requirement),
+                    );
                 }
                 catalog_hash_count(&mut hash, self.specs.len());
                 for spec in self.specs {
-                    hash_backend_spec_v4(&mut hash, spec, self.runtime_requirements_for(spec.name));
+                    hash_backend_spec_v4(
+                        &mut hash,
+                        spec,
+                        self.runtime_requirements_for_v5(spec.name),
+                    );
                 }
                 finish_catalog_hash(hash)
             })
             .clone()
     }
 
-    /// Deterministic SHA-256 of the complete ordered current V5 catalog.
+    /// Deterministic SHA-256 of the complete ordered archival V5 catalog.
     pub fn catalog_sha256_v5(&self) -> String {
         static V5_DIGEST: OnceLock<String> = OnceLock::new();
         V5_DIGEST
@@ -980,11 +1030,39 @@ impl BackendRegistry {
                 catalog_hash_field(&mut hash, BACKEND_CATALOG_SCHEMA_V5.as_bytes());
                 catalog_hash_count(&mut hash, RUNTIME_REQUIREMENT_SPECS.len());
                 for requirement in RUNTIME_REQUIREMENT_SPECS {
-                    hash_runtime_requirement(&mut hash, requirement);
+                    hash_runtime_requirement(
+                        &mut hash,
+                        archival_runtime_requirement_v5(requirement),
+                    );
                 }
                 catalog_hash_count(&mut hash, self.specs.len());
                 for spec in self.specs {
                     hash_backend_spec_v5(
+                        &mut hash,
+                        spec,
+                        self.runtime_requirements_for_v5(spec.name),
+                        self.morphism_profile_for(spec.name),
+                    );
+                }
+                finish_catalog_hash(hash)
+            })
+            .clone()
+    }
+
+    /// Deterministic SHA-256 of the complete ordered current V6 catalog.
+    pub fn catalog_sha256_v6(&self) -> String {
+        static V6_DIGEST: OnceLock<String> = OnceLock::new();
+        V6_DIGEST
+            .get_or_init(|| {
+                let mut hash = Sha256::new();
+                catalog_hash_field(&mut hash, BACKEND_CATALOG_SCHEMA_V6.as_bytes());
+                catalog_hash_count(&mut hash, RUNTIME_REQUIREMENT_SPECS.len());
+                for requirement in RUNTIME_REQUIREMENT_SPECS {
+                    hash_runtime_requirement(&mut hash, requirement);
+                }
+                catalog_hash_count(&mut hash, self.specs.len());
+                for spec in self.specs {
+                    hash_backend_spec_v6(
                         &mut hash,
                         spec,
                         self.runtime_requirements_for(spec.name),
@@ -997,9 +1075,9 @@ impl BackendRegistry {
     }
 
     /// Deterministic SHA-256 of the complete current ordered catalog.
-    /// Current behavior is an alias of the explicit V5 helper.
+    /// Current behavior is an alias of the explicit V6 helper.
     pub fn catalog_sha256(&self) -> String {
-        self.catalog_sha256_v5()
+        self.catalog_sha256_v6()
     }
 
     /// Deterministic SHA-256 of one canonical backend specification and its
@@ -1008,7 +1086,7 @@ impl BackendRegistry {
         let spec = self.get(lang)?;
         let mut hash = Sha256::new();
         catalog_hash_field(&mut hash, BACKEND_CATALOG_SCHEMA_V3.as_bytes());
-        hash_backend_spec_v3(&mut hash, spec, self.runtime_requirements_for(spec.name));
+        hash_backend_spec_v3(&mut hash, spec, self.runtime_requirements_for_v5(spec.name));
         Some(finish_catalog_hash(hash))
     }
 
@@ -1018,17 +1096,32 @@ impl BackendRegistry {
         let spec = self.get(lang)?;
         let mut hash = Sha256::new();
         catalog_hash_field(&mut hash, BACKEND_CATALOG_SCHEMA_V4.as_bytes());
-        hash_backend_spec_v4(&mut hash, spec, self.runtime_requirements_for(spec.name));
+        hash_backend_spec_v4(&mut hash, spec, self.runtime_requirements_for_v5(spec.name));
         Some(finish_catalog_hash(hash))
     }
 
-    /// Deterministic SHA-256 of one current V5 canonical backend
+    /// Deterministic SHA-256 of one archival V5 canonical backend
     /// specification. Aliases resolve to the same exact identity.
     pub fn specification_sha256_v5(&self, lang: &str) -> Option<String> {
         let spec = self.get(lang)?;
         let mut hash = Sha256::new();
         catalog_hash_field(&mut hash, BACKEND_CATALOG_SCHEMA_V5.as_bytes());
         hash_backend_spec_v5(
+            &mut hash,
+            spec,
+            self.runtime_requirements_for_v5(spec.name),
+            self.morphism_profile_for(spec.name),
+        );
+        Some(finish_catalog_hash(hash))
+    }
+
+    /// Deterministic SHA-256 of one current V6 canonical backend
+    /// specification. Aliases resolve to the same exact identity.
+    pub fn specification_sha256_v6(&self, lang: &str) -> Option<String> {
+        let spec = self.get(lang)?;
+        let mut hash = Sha256::new();
+        catalog_hash_field(&mut hash, BACKEND_CATALOG_SCHEMA_V6.as_bytes());
+        hash_backend_spec_v6(
             &mut hash,
             spec,
             self.runtime_requirements_for(spec.name),
@@ -1038,9 +1131,9 @@ impl BackendRegistry {
     }
 
     /// Deterministic SHA-256 of one current canonical backend specification.
-    /// Current behavior is an alias of the explicit V5 helper.
+    /// Current behavior is an alias of the explicit V6 helper.
     pub fn specification_sha256(&self, lang: &str) -> Option<String> {
-        self.specification_sha256_v5(lang)
+        self.specification_sha256_v6(lang)
     }
 
     /// Build the exact implementation identity shared by local publication
@@ -1269,6 +1362,11 @@ mod tests {
     const CATALOG_V5_SOURCE_SHA256: &str =
         "c5fd5baf4b282230f7be9be65af0728f2dfa722b85876865b8e7608a995df1bf";
     const CATALOG_V5_SOURCE_BYTES: usize = 15_630;
+    const CATALOG_V6_WHOLE_SHA256: &str =
+        "df3730ddf88eaea0e2e6e8973841d26718224062274dfbbf2ff1a227b0feb103";
+    const CATALOG_V6_SOURCE_SHA256: &str =
+        "6eddd348911053268d339c1e0888b7ab9bb8e4b05b7ecf6f98ec06fa432b37a7";
+    const CATALOG_V6_SOURCE_BYTES: usize = 15_959;
 
     const CATALOG_V3_SPEC_GOLDENS: &[(&str, &str)] = &[
         (
@@ -1639,6 +1737,129 @@ mod tests {
         ),
     ];
 
+    const CATALOG_V6_SPEC_GOLDENS: &[(&str, &str)] = &[
+        (
+            "O",
+            "227a4d1628315483efdcb91b6e38f952be392b4b4340b43fef5715fa1d434749",
+        ),
+        (
+            "quote",
+            "b762fa2acddd3324c6cbfa397b454c1c6ec47a9afee8087df7154be856e686c2",
+        ),
+        (
+            "nix",
+            "ff1a70056ad6d2bdf47e881885a41d1486222f1a71fbb1ad6d285cfde0d2e2c1",
+        ),
+        (
+            "nix_expr",
+            "c51aa2ff112b34b2605129ce6da079b12c7895e8c86486ba579fb5be7d638626",
+        ),
+        (
+            "nix_store",
+            "701958eac0969dea998735fb2c7df60e99ff38ad8be1f654486b326115bf2e78",
+        ),
+        (
+            "nixos_test",
+            "39ec104a945c55fc89f6cfdd4644594d89695c35a1f12bf2e37a93e26ad5d170",
+        ),
+        (
+            "html",
+            "6d042b09cce9968f3166517c3c0830449627b28a875880d2cfc46ba598dd29f0",
+        ),
+        (
+            "markdown",
+            "92e2bab0ea02c57f1c8eb9b39a710e0d33d902f574697469e69ee8e4029a38e3",
+        ),
+        (
+            "latex",
+            "e12d3c5e179601ca9a9fc9108c808defd8d0ade9f0d3c4da7ec39338a2378d2d",
+        ),
+        (
+            "text",
+            "f55342ed08820c51d894ff3b597f6064d42b39c02cd7289f49d6a01a19fefff7",
+        ),
+        (
+            "sql",
+            "39ce9c54a9624fa4e99644899339929e5cb0d756dd29486f100f80c7a2051e2a",
+        ),
+        (
+            "haskell",
+            "188548016654b5f0a23d3afc001fee0646243468cba599a43be14b15841e1fd8",
+        ),
+        (
+            "ocaml",
+            "af6b74f51a7b9c2485ab58ef7ae7c685052de07aba5a9e59d9b6d4a49a6924dc",
+        ),
+        (
+            "webassembly",
+            "28b2e9a07dd03c2ca1cad032d3753ab4c8d3652c0160680ccdfc4bdca02c1d3e",
+        ),
+        (
+            "python",
+            "e6111346a1d231844cc66eb1c9146aa7658e55c9fdb67f64f30491cab9121bcd",
+        ),
+        (
+            "ubuntu_vm",
+            "133be56de13eceef9b5613b33ddbe742513515a9f18b4af94d5be11838d496e5",
+        ),
+        (
+            "bash",
+            "8200dfb4d9618f68f71858b155b1302c3578d9c853b49f98fc393632b7685df4",
+        ),
+        (
+            "shell",
+            "b6a6c2e35f00e2f68edd092625c2fc08b0153cf083ec1f887c6756faf4dc8524",
+        ),
+        (
+            "rust",
+            "e936da6ec0878cfc8c60db386ba1e4d117d5afa1cdd61c4eb1453b725a13563c",
+        ),
+        (
+            "racket",
+            "da41cc733a04a65312934eb40cd42993ea099844cabd53f9b6a4624e3b35d8e6",
+        ),
+        (
+            "csharp",
+            "b37cfd1b87523c9208404dc96ec1f4c259b860ef8556b12de644b64f57eefaae",
+        ),
+        (
+            "c",
+            "ec8fbde941499da44f36c13ed474abf6ae6771edc105b076134e40c31d0f930d",
+        ),
+        (
+            "cpp",
+            "cad77fd041e2694a3904f353e9e70881b6e73a3ce1a914c55b348c2ffb24cd43",
+        ),
+        (
+            "lisp",
+            "14a79151290b298446fc713ae885aa3e5228f56990d419eaade86e61725b853e",
+        ),
+        (
+            "common_lisp",
+            "f0c0730bcf54edda1c09ada7abae9fc38cae0afee8ad5f62dea1a5b77cc8a77d",
+        ),
+        (
+            "ruby",
+            "7ea4ce9791e655b89a9b15cded5ea4ba3c53e90382bfba1bab21aabbf0a26a5e",
+        ),
+        (
+            "matlab",
+            "9dc68ae4c90a29dd298202a21ca6f043d356f3978eefd10f831ad73c180f3e21",
+        ),
+        (
+            "mathematica",
+            "ec10629c8c575af208fd5fbca20dadc71f9103e93b933d93b3c330cba020eaa0",
+        ),
+        (
+            "java",
+            "ce7a663d89c50a553982cd8fb420acafce45723296cb8c6c753fc373dea22daa",
+        ),
+        (
+            "javascript",
+            "cc4dd30821ca87daab896ddbc1e43f88b8399b79985fcad767400bb9085efa0a",
+        ),
+    ];
+
     fn artifact(byte: u8) -> ArtifactId {
         ArtifactId::from_sha256(format!("{byte:02x}").repeat(32)).unwrap()
     }
@@ -1660,7 +1881,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_v1_through_v5_archive_coordinates_are_explicit_and_v5_source_is_current() {
+    fn catalog_v1_through_v5_archive_coordinates_are_explicit_and_v6_source_is_current() {
         let coordinates = [
             (
                 "v1",
@@ -1711,23 +1932,26 @@ mod tests {
             assert!(whole.insert(whole_sha256));
             assert!(source.insert(source_sha256));
         }
+        assert!(whole.insert(CATALOG_V6_WHOLE_SHA256));
+        assert!(source.insert(CATALOG_V6_SOURCE_SHA256));
 
         let registry = BackendRegistry::global();
         assert_eq!(registry.catalog_sha256_v3(), coordinates[2].2);
         assert_eq!(registry.catalog_sha256_v4(), coordinates[3].2);
         assert_eq!(registry.catalog_sha256_v5(), coordinates[4].2);
-        assert_eq!(registry.catalog_sha256(), coordinates[4].2);
-        assert_ne!(registry.catalog_sha256(), coordinates[3].2);
+        assert_eq!(registry.catalog_sha256_v6(), CATALOG_V6_WHOLE_SHA256);
+        assert_eq!(registry.catalog_sha256(), CATALOG_V6_WHOLE_SHA256);
+        assert_ne!(registry.catalog_sha256(), coordinates[4].2);
         let current_source = include_bytes!("backend_catalog.inc.rs");
-        assert_eq!(current_source.len(), coordinates[4].4);
+        assert_eq!(current_source.len(), CATALOG_V6_SOURCE_BYTES);
         assert_eq!(
             hex::encode(Sha256::digest(current_source)),
-            coordinates[4].3
+            CATALOG_V6_SOURCE_SHA256
         );
     }
 
     #[test]
-    fn catalog_v3_through_v5_specification_goldens_cover_every_canonical_backend() {
+    fn catalog_v3_through_v6_specification_goldens_cover_every_canonical_backend() {
         let registry = BackendRegistry::global();
         assert_eq!(
             registry.canonical_specs().len(),
@@ -1741,14 +1965,22 @@ mod tests {
             registry.canonical_specs().len(),
             CATALOG_V5_SPEC_GOLDENS.len()
         );
-        for (((v3_name, v3_digest), (v4_name, v4_digest)), (v5_name, v5_digest)) in
-            CATALOG_V3_SPEC_GOLDENS
-                .iter()
-                .zip(CATALOG_V4_SPEC_GOLDENS)
-                .zip(CATALOG_V5_SPEC_GOLDENS)
+        assert_eq!(
+            registry.canonical_specs().len(),
+            CATALOG_V6_SPEC_GOLDENS.len()
+        );
+        for (
+            (((v3_name, v3_digest), (v4_name, v4_digest)), (v5_name, v5_digest)),
+            (v6_name, v6_digest),
+        ) in CATALOG_V3_SPEC_GOLDENS
+            .iter()
+            .zip(CATALOG_V4_SPEC_GOLDENS)
+            .zip(CATALOG_V5_SPEC_GOLDENS)
+            .zip(CATALOG_V6_SPEC_GOLDENS)
         {
             assert_eq!(v3_name, v4_name);
             assert_eq!(v4_name, v5_name);
+            assert_eq!(v5_name, v6_name);
             assert_eq!(
                 registry.specification_sha256_v3(v3_name).as_deref(),
                 Some(*v3_digest)
@@ -1762,14 +1994,20 @@ mod tests {
                 Some(*v5_digest)
             );
             assert_eq!(
-                registry.specification_sha256(v5_name),
-                registry.specification_sha256_v5(v5_name)
+                registry.specification_sha256_v6(v6_name).as_deref(),
+                Some(*v6_digest)
+            );
+            assert_eq!(
+                registry.specification_sha256(v6_name).as_deref(),
+                Some(*v6_digest)
             );
             assert_ne!(v3_digest, v4_digest);
             assert_ne!(v4_digest, v5_digest);
+            assert_ne!(v5_digest, v6_digest);
             assert!(!registry.contains_specification_sha256(v3_digest));
             assert!(!registry.contains_specification_sha256(v4_digest));
-            assert!(registry.contains_specification_sha256(v5_digest));
+            assert!(!registry.contains_specification_sha256(v5_digest));
+            assert!(registry.contains_specification_sha256(v6_digest));
         }
         assert_eq!(
             registry.specification_sha256_v4("py"),
@@ -1782,6 +2020,10 @@ mod tests {
         assert_eq!(
             registry.specification_sha256_v5("py"),
             registry.specification_sha256_v5("python")
+        );
+        assert_eq!(
+            registry.specification_sha256_v6("py"),
+            registry.specification_sha256_v6("python")
         );
     }
 
@@ -1886,12 +2128,12 @@ mod tests {
         );
         assert_eq!(
             canonical.realization_pipeline().as_sha256(),
-            "4aeb615bec8522275e4424e6a7738186be568c5637b48b6cd8a413f80e83f6c4"
+            "1878587a74314b4376b1ec44c92ecb9b7781fbda3fd7d567f81f2222179665da"
         );
 
         // The catalog coordinate is a transitive input to the realization
         // pipeline. Preserve the exact V4 implementation identity as an
-        // archival oracle while proving that the current V5 coordinate rolls
+        // archival oracle while proving that the current V6 coordinate rolls
         // the derived identity forward.
         let v4_backend_specification = registry.specification_sha256_v4("markdown").unwrap();
         assert_eq!(
@@ -1917,6 +2159,30 @@ mod tests {
         );
         assert_ne!(canonical.realization_pipeline(), &v4_realization_pipeline);
 
+        let v5_backend_specification = registry.specification_sha256_v5("markdown").unwrap();
+        assert_eq!(
+            v5_backend_specification,
+            "fcd939eb381234d3dfb3e8f2db761c9a7959a5ff39dd26ca9013a0693f17c2b0"
+        );
+        let v5_realization_material = serde_json::json!({
+            "schema": LOCAL_REALIZATION_SCHEMA_V2,
+            "backend_specification": v5_backend_specification,
+            "adapter_kind": "inline",
+            "adapter_artifact": "11".repeat(32),
+            "executable_set_schema": BACKEND_EXECUTABLE_SET_DIGEST_DOMAIN_V2,
+            "executable_set": "22".repeat(32),
+            "protocol": LOCAL_BACKEND_PROTOCOL_ABI_V1,
+        });
+        let v5_realization_pipeline = SemanticDigestV1::hash_bytes(
+            LOCAL_REALIZATION_DIGEST_DOMAIN_V2,
+            &serde_json::to_vec(&v5_realization_material).unwrap(),
+        );
+        assert_eq!(
+            v5_realization_pipeline.as_sha256(),
+            "4aeb615bec8522275e4424e6a7738186be568c5637b48b6cd8a413f80e83f6c4"
+        );
+        assert_ne!(canonical.realization_pipeline(), &v5_realization_pipeline);
+
         // Compatibility oracle for the formula formerly owned by
         // `o-registry::discover_backend_implementations`.
         let legacy_material = serde_json::json!({
@@ -1933,6 +2199,22 @@ mod tests {
         );
         assert_eq!(
             legacy_pipeline.as_sha256(),
+            "5794138c165548b9af8692d653baf760c4577a0bc61a7cedd1bbaa053f7a7a1a"
+        );
+        let v5_legacy_material = serde_json::json!({
+            "schema": "ostadix.local-realization/v1",
+            "backend_specification": v5_backend_specification,
+            "adapter_kind": "inline",
+            "adapter_artifact": "11".repeat(32),
+            "executable_set": "22".repeat(32),
+            "protocol": "o-backend-cbor-v1",
+        });
+        let v5_legacy_pipeline = SemanticDigestV1::hash_bytes(
+            LOCAL_REALIZATION_DIGEST_DOMAIN_V1,
+            &serde_json::to_vec(&v5_legacy_material).unwrap(),
+        );
+        assert_eq!(
+            v5_legacy_pipeline.as_sha256(),
             "2c8faf4c5fa06d272893378c627f7ee276ef3235f35c97f0efca85f82c1fef36"
         );
         let v4_legacy_material = serde_json::json!({
@@ -1952,6 +2234,7 @@ mod tests {
             "c98daed592288c5e4e80bd10be1c8f26786303d07d001d4250171616e4e41c90"
         );
         assert_ne!(legacy_pipeline, v4_legacy_pipeline);
+        assert_ne!(legacy_pipeline, v5_legacy_pipeline);
         assert_ne!(canonical.realization_pipeline(), &legacy_pipeline);
         let legacy = BackendImplementationIdV1::new(
             canonical.backend_specification().clone(),
@@ -2256,6 +2539,30 @@ mod tests {
     }
 
     #[test]
+    fn catalog_v6_expands_only_webassembly_runtime_alternatives_and_preserves_indices() {
+        let registry = BackendRegistry::global();
+        for current in registry.runtime_requirement_specs() {
+            let archival = archival_runtime_requirement_v5(current);
+            if current.key == "webassembly" {
+                assert_eq!(
+                    archival.alternatives,
+                    &[&["wat2wasm", "wasmtime"][..], &["wat2wasm", "wasmer"][..]]
+                );
+                assert_eq!(&current.alternatives[..2], archival.alternatives);
+                assert_eq!(
+                    &current.alternatives[2..],
+                    &[
+                        &["wasm-tools", "wasmtime"][..],
+                        &["wasm-tools", "wasmer"][..]
+                    ]
+                );
+            } else {
+                assert_eq!(current, archival);
+            }
+        }
+    }
+
+    #[test]
     fn catalog_adapter_projection_distinguishes_execution_implementations() {
         let registry = BackendRegistry::global();
         for lang in ["O", "quote", "html", "markdown", "latex", "text"] {
@@ -2295,17 +2602,18 @@ mod tests {
         assert_eq!(BACKEND_CATALOG_SCHEMA_V3, "ostadix.backend-catalog/v3");
         assert_eq!(BACKEND_CATALOG_SCHEMA_V4, "ostadix.backend-catalog/v4");
         assert_eq!(BACKEND_CATALOG_SCHEMA_V5, "ostadix.backend-catalog/v5");
-        assert_eq!(BACKEND_CATALOG_CURRENT_SCHEMA, BACKEND_CATALOG_SCHEMA_V5);
-        assert_eq!(BACKEND_CATALOG_SCHEMA_V1, BACKEND_CATALOG_SCHEMA_V5);
+        assert_eq!(BACKEND_CATALOG_SCHEMA_V6, "ostadix.backend-catalog/v6");
+        assert_eq!(BACKEND_CATALOG_CURRENT_SCHEMA, BACKEND_CATALOG_SCHEMA_V6);
+        assert_eq!(BACKEND_CATALOG_SCHEMA_V1, BACKEND_CATALOG_SCHEMA_V6);
         let catalog = registry.catalog_sha256();
         assert_eq!(catalog.len(), 64);
         assert!(catalog.bytes().all(|byte| byte.is_ascii_hexdigit()));
         assert_eq!(catalog, registry.catalog_sha256());
-        assert_eq!(catalog, registry.catalog_sha256_v5());
-        assert_ne!(catalog, registry.catalog_sha256_v4());
+        assert_eq!(catalog, registry.catalog_sha256_v6());
+        assert_ne!(catalog, registry.catalog_sha256_v5());
 
         let python = registry.specification_sha256("python").unwrap();
-        assert_eq!(python, registry.specification_sha256_v5("python").unwrap());
+        assert_eq!(python, registry.specification_sha256_v6("python").unwrap());
         assert_eq!(python, registry.specification_sha256("py").unwrap());
         assert_ne!(python, registry.specification_sha256("bash").unwrap());
         assert_eq!(python.len(), 64);
@@ -2325,6 +2633,10 @@ mod tests {
         assert_ne!(legacy_v4, python);
         assert_eq!(legacy_v4, registry.specification_sha256_v4("py").unwrap());
         assert!(!registry.contains_specification_sha256(&legacy_v4));
+        let legacy_v5 = registry.specification_sha256_v5("python").unwrap();
+        assert_ne!(legacy_v5, python);
+        assert_eq!(legacy_v5, registry.specification_sha256_v5("py").unwrap());
+        assert!(!registry.contains_specification_sha256(&legacy_v5));
     }
 
     #[test]
@@ -2687,7 +2999,7 @@ mod tests {
             hash_backend_spec_v3(
                 &mut hash,
                 &spec,
-                registry.runtime_requirements_for(spec.name),
+                registry.runtime_requirements_for_v5(spec.name),
             );
             finish_catalog_hash(hash)
         };

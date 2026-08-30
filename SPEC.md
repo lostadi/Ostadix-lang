@@ -247,7 +247,7 @@ wrapper. Inspection
 manifests remain explicitly non-probing and do not assert runtime readiness.
 The catalog projection binds specification identity only; it does not assert
 health, authorization, capacity, or readiness. This V6 binding uses the current
-Catalog V5 projection and does not claim
+Catalog V6 projection and does not claim
 the original source-byte digest when the entry point receives an already
 lowered `OIrProgram`, nor does it bind caller initial-scope shape/values. Before
 issuing evidence, analysis
@@ -508,7 +508,7 @@ assessment. Graph V1, Evidence/Admission V5, Schedule Explanation/Why V1, and
 Placement Fragment V1 are archival inspection coordinates. Package 0.3 and
 later MUST NOT convert, relabel, reconstruct, dispatch, or authorize them as
 current V2/V6 authority. `ExecutionIntentV1` remains deliberately bound to
-Graph V1 and the current Catalog V5 projection; matching intent still requires
+Graph V1 and the current Catalog V6 projection; matching intent still requires
 fresh V6 analysis and admission before dispatch.
 
 ---

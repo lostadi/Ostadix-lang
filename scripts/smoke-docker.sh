@@ -81,7 +81,7 @@ expected = {
     "admission_schema": "oexec.admission/v6",
     "evidence_analyzer": "ostadix-oir-evidence-compiler/v6",
     "execution_intent_schema": "oexec.execution-intent/v1",
-    "backend_catalog_schema": "ostadix.backend-catalog/v5",
+    "backend_catalog_schema": "ostadix.backend-catalog/v6",
 }
 for key, value in expected.items():
     if report.get(key) != value:

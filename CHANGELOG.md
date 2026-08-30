@@ -9,6 +9,13 @@ Package SemVer is only one of the independent coordinates documented in
 
 ### Added
 
+- Backend Catalog V6 admits `wasm-tools+wasmtime` and
+  `wasm-tools+wasmer` as complete WebAssembly alternatives while preserving
+  every published V3, V4, and V5 whole-catalog, source, and per-backend
+  identity. Current version, MCP, generated-runtime, evidence, and placement
+  surfaces bind V6; archival V5 records remain inspectable but cannot authorize
+  current execution.
+
 - `o kernel hosted-live-release` turns the exact staged Git index into a
   tree-addressed x86_64 hosted-live ISO from a run-owned native path inside
   `moral-gaur`, then requires strict inspection and bounded OVMF/QEMU readiness

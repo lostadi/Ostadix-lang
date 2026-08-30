@@ -60,18 +60,19 @@ admission. A generated executable embeds its runtime sources, including the
 current Graph V2/Evidence and Admission V6 execution path and its V2 placement
 fragment boundary.
 
-## Backend catalog V5 hard rollover
+## Backend catalog V6 hard rollover
 
 Execution-admission coordinates, the Hosted Placement V6 milestone, and
-backend-catalog V3/V4/V5 describe different things. An execution-admission
+backend-catalog V3/V4/V5/V6 describe different things. An execution-admission
 schema selects a local evidence contract; the placement milestone selects its
 own records and transports. The catalog schema selects the hash domain for
 backend metadata. The current authorizing catalog schema is
-`ostadix.backend-catalog/v5`. Archival V4 added the backend-state support tier
+`ostadix.backend-catalog/v6`. Archival V4 added the backend-state support tier
 and snapshot-compatibility identity. V5 preserves that exact hash prefix and
 appends one self-identifying optional BackendMorphism V1 profile:
 Python, JavaScript, and Rust have named profiles and the other 27 canonical
-backends explicitly have none.
+backends explicitly have none. V6 preserves that complete projection and adds
+`wasm-tools+wasmtime` and `wasm-tools+wasmer` after the frozen WABT alternatives.
 
 The profile label is catalog data, not direct crossing authority. The Catalog
 V5 rollover itself is not projected into `BackendInterface`, does not rewrite
@@ -79,10 +80,10 @@ production `BackendCrossing` fidelity, does not change solved-graph hashing or
 evidence/admission schemas, and does not alter dispatch. Separately, the
 explicit local Graph V2/Evidence V6 API binds the complete solver assessment;
 it does not enforce the catalog morphism profile. Both V5 and V6 evidence paths
-bind the existing current Catalog V5 projection.
+bind the process's current Catalog V6 projection.
 
 The schema string participates in the digest of the complete ordered catalog
-and in every canonical backend-specification digest. Moving from V4 to V5 thus
+and in every canonical backend-specification digest. Moving from V5 to V6 thus
 changes those identities even when a backend keeps the same display name. A
 name or alias is never substituted for that digest.
 
@@ -95,18 +96,18 @@ schemas:
 2. `NodeProfileV1::validate_at()` performs that check before freshness and
    detached-authentication checks. Candidate evaluation validates the profile
    before it attempts requirement or warrant discharge.
-3. A V4, V3, or otherwise unknown specification fails with
+3. A V5, V4, V3, or otherwise unknown specification fails with
    `PlacementValidationError::NonCurrentBackendCatalog`.
 
 The exact diagnostic is:
 
 ```text
-backend specification `<digest>` is not authorized by current catalog `ostadix.backend-catalog/v5`
+backend specification `<digest>` is not authorized by current catalog `ostadix.backend-catalog/v6`
 ```
 
 Consequently, a self-consistent set of old profile, footprint, implementation,
-warrant, and signature records cannot authorize V5 placement. Old warrants
-also cannot discharge requirements freshly derived from V5 identities. The
+warrant, and signature records cannot authorize V6 placement. Old warrants
+also cannot discharge requirements freshly derived from V6 identities. The
 runtime never edits, relabels, or silently uplifts an archival digest. A descriptor
 with no backend implementations may remain structurally valid, but it cannot
 satisfy a `BackendSpecification` or `BackendImplementation` requirement.
@@ -127,7 +128,7 @@ local preparation and authorization.
 
 ### Executable-set and local-realization V2 rollover
 
-Catalog V5 identity is necessary but not sufficient for a current backend
+Catalog V6 identity is necessary but not sufficient for a current backend
 implementation. The implementation also uses:
 
 - `ostadix/backend-executable-set/v2`, a path-independent digest over the
@@ -145,7 +146,7 @@ The runtime and `o-registry profile-local` use the same builder, so publication
 and evaluator preflight cannot silently apply different realization formulas.
 
 Local-realization V1 remains an archival digest domain. Even when paired with a
-current V5 backend specification, it fails current target validation with
+current V6 backend specification, it fails current target validation with
 `NonCurrentBackendImplementation`. The runtime never relabels V1 material as
 V2. Regenerate backend implementations, profiles, warrants, discharges, and
 leases whenever either the catalog or realization formula changes.
@@ -160,7 +161,7 @@ After a catalog rollover, rebuild components that compile or embed the catalog:
 
 Then restart long-running `O`, `o-node`, and MCP processes so they do not retain
 an older compiled snapshot. Confirm that a rebuilt MCP `o_runtimes` report says
-`runtime-catalog-schema=ostadix.backend-catalog/v5`.
+`runtime-catalog-schema=ostadix.backend-catalog/v6`.
 
 For placement, generate and publish a new short-lived profile with
 `o-registry profile-local` and `o-registry publish-profile`. Recompute the
@@ -174,17 +175,17 @@ example:
 olangc program.O -o program --shim-dir backends
 ```
 
-An installed V4 or V3 MCP snapshot reports its own compiled catalog, and a generated
+An installed V5, V4, or V3 MCP snapshot reports its own compiled catalog, and a generated
 executable retains its embedded build generation. Neither is a way to authorize
-V5 placement.
+V6 placement.
 
 The behavioral rollover seam is
 `tests/placement_v6.rs::noncurrent_catalog_profiles_remain_inspectable_but_cannot_authorize`:
-it round-trips a real archival V4 descriptor, then proves that current profile
+it round-trips a real archival V5 descriptor, then proves that current profile
 validation returns `NonCurrentBackendCatalog`. The catalog hash-domain check is
 covered by
 `crates/ostadix-api/src/backend_catalog.rs::catalog_digests_are_stable_canonical_projections`, and
-the MCP projection pins current V5 plus archival V4 and V3 in
+the MCP projection pins current V6 plus archival V5, V4, and V3 in
 `mcp/ostadix_lang_mcp_server/src/main.rs::runtime_inventory_is_a_complete_catalog_projection`.
 The companion regression
 `tests/placement_v6.rs::current_catalog_rejects_legacy_realization_with_a_current_specification`

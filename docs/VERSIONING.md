@@ -24,8 +24,8 @@ authorized, that an information projection is fresh, or that a World is live.
 | Admission | `oexec.admission/v6` | `crates/ostadix-api/src/evidence/fact.rs` `ADMISSION_SCHEMA_V6` | Current process-local admitted-execution contract accepted by coordinator/evaluator. |
 | Schedule explanation | `oexec.schedule-explanation/v2`; `oexec.admission-why/v2` | `SCHEDULE_EXPLANATION_SCHEMA_V2`; `SCHEDULE_WHY_SCHEMA_V2` | Current whole-admission and focused typed V6 inspection projections. V1 forms are archival. |
 | Placement admission | `ostadix/placement-admission/v2` | `crates/ostadix-api/src/evidence/admit.rs` `PLACEMENT_ADMISSION_DIGEST_DOMAIN_V2` | Current process-portable V6/Graph V2 semantic coordinate consumed by freshly prepared placement V2 authority. |
-| Backend catalog | `ostadix.backend-catalog/v5` | `crates/ostadix-api/src/backend_catalog.inc.rs` `current_schema` | Canonical backend specification and implementation-identity projection. V5 extends frozen V4 identity with one explicit optional bounded morphism-profile label per backend. |
-| Backend morphism | `ostadix.backend-morphism/v1` | `crates/ostadix-api/src/backend_morphism.rs` `BACKEND_MORPHISM_SCHEMA_V1` | Experimental shadow-only crossing kernel. Catalog V5 binds which profile applies, but does not enforce its assessment through evidence, admission, placement, or dispatch. |
+| Backend catalog | `ostadix.backend-catalog/v6` | `crates/ostadix-api/src/backend_catalog.inc.rs` `current_schema` | Canonical backend specification and implementation-identity projection. V6 retains frozen V5 fields and adds two ordered `wasm-tools` WebAssembly runtime alternatives. |
+| Backend morphism | `ostadix.backend-morphism/v1` | `crates/ostadix-api/src/backend_morphism.rs` `BACKEND_MORPHISM_SCHEMA_V1` | Experimental shadow-only crossing kernel. Catalog V5 introduced the profile assignment and Catalog V6 retains it, but does not enforce its assessment through evidence, admission, placement, or dispatch. |
 | Hosted transport | `ostadix.hosted-transport/v1`, `ostadix.hosted-transport/v2` | `crates/ostadix-api/src/hosted_remote/protocol.rs` `HOSTED_PROTOCOL_V1`; `crates/ostadix-api/src/hosted_remote/v2/protocol.rs` `HOSTED_PROTOCOL_V2`; `crates/ostadix-api/src/hosted_remote/v2/store.rs` `HOSTED_STATE_AUTHORITY_SCHEMA_V1` = `ostadix.hosted-state-authority/v1` | Frozen single-operation V1 and opt-in durable-session V2 wire contracts. Package 0.3 and later roots bind their durable state to current Graph V2/V6/placement V2 and reject older journals without migration. |
 | Pure execution records | `ostadix.oir-execution-capsule/v1`, `ostadix.oir-execution-candidate/v1` | `crates/ostadix-api/src/execution_fabric/protocol.rs` `EXECUTION_CAPSULE_SCHEMA_V1`, `EXECUTION_CANDIDATE_SCHEMA_V1` | Frozen M2 authority-free capsule and provisional-candidate records. M3 nests their exact canonical bytes and does not add node, transport, placement, TLS, or HGraph fields. |
 | Authenticated execution Fabric | ALPN `ostadix-execution-fabric/1`; request/response/submission/source-closure V1; placement lease V3; terminal receipt V1 | `crates/ostadix-api/src/hosted_remote/tls.rs` `EXECUTION_FABRIC_TLS_ALPN_V1`; `crates/ostadix-api/src/execution_fabric_authority/protocol.rs` `FABRIC_*` constants | Opt-in M3 transport and authority envelopes for the frozen pure profile. They authorize one exact provider attempt and return a provisional result; they confer no graph mutation, publication, or settlement authority. |
@@ -56,11 +56,11 @@ dispatch. Package `0.3.0` atomically makes these coordinates current:
 | Explicit coordinate | Source authority | Meaning |
 |---|---|---|
 | Graph V2 / `ostadix-solved-executable-hgraph/v2` | `crates/ostadix-api/src/evidence/analyze.rs` `graph_sha256_v2` | Frozen Graph V1 fields plus the complete canonical `FidelityAssessmentV2`; absent and present assessments are distinct. |
-| `oexec.evidence/v6` / `ostadix-evidence-bundle/v6` | `EVIDENCE_SCHEMA_V6`; `evidence_bundle_sha256_v6` | Typed per-operation fidelity assessment bound to Graph V2 and the current Catalog V5 projection. |
+| `oexec.evidence/v6` / `ostadix-evidence-bundle/v6` | `EVIDENCE_SCHEMA_V6`; `evidence_bundle_sha256_v6` | Typed per-operation fidelity assessment bound to Graph V2 and the current Catalog V6 projection. |
 | `oexec.admission/v6` / `ostadix-execution-admission/v6` | `ADMISSION_SCHEMA_V6`; `admit_execution_v6` | Revalidated local V6 admission accepted by the current coordinator and evaluator. |
 | `oexec.admission-why/v2` | `SCHEDULE_WHY_SCHEMA_V2` | Inspection-only V6 why-view retaining typed fidelity evidence. |
 | `oexec.schedule-explanation/v2` | `SCHEDULE_EXPLANATION_SCHEMA_V2` | Whole-admission JSON projection whose embedded admission is V6; V1 bytes remain archival. |
-| `ostadix/placement-admission/v2` | `PLACEMENT_ADMISSION_DIGEST_DOMAIN_V2` | Process-portable semantic digest over V6 schemas/analyzer, Graph V2 identities, current Catalog V5 projection, and policy. Fresh `PlacementFragmentBindingsV2` binds this digest. |
+| `ostadix/placement-admission/v2` | `PLACEMENT_ADMISSION_DIGEST_DOMAIN_V2` | Process-portable semantic digest over V6 schemas/analyzer, Graph V2 identities, current Catalog V6 projection, and policy. Fresh `PlacementFragmentBindingsV2` binds this digest. |
 
 The unversioned `analyze_execution` and `admit_execution`, `AdmittedExecution`,
 uppercase `O`, evaluator/coordinator, CLI JSON, version report, and MCP behavior
@@ -68,7 +68,7 @@ now mean V6/Graph V2. Current prepared execution uses
 `PlacementFragmentBindingsV2` and `PreparedPlacementFragmentV2`. The public V1
 fragment/binding vocabulary and `AdmittedExecutionV5` are inspection-only and
 cannot enter current execution or authorization. `ExecutionIntentV1` remains
-Graph V1 while binding the current Catalog V5 projection, and execution of a
+Graph V1 while binding the current Catalog V6 projection, and execution of a
 matching intent always performs fresh V6 analysis/admission. There is no
 V5-to-V6 conversion, relabel, prepared-fragment uplift, lease migration, or
 journal migration.
@@ -168,7 +168,7 @@ commits to them.
    contracts, and receipts. They do not version a storage engine and do not
    mint or replace evidence, admission, placement, or World authority.
 7. Backend-morphism V1 remains an inspection-only profile family. Catalog V5
-   binds the selected optional profile. The explicit Graph V2/Evidence V6 path
+   introduced the selected optional profile and Catalog V6 retains it. The explicit Graph V2/Evidence V6 path
    preserves typed solver assessments, but does not itself enforce morphism
    profiles or silently strengthen or narrow current V6 semantics.
 8. At v0.3.0, `ostadix-api` was the narrow stable embedding facade. In the
@@ -214,10 +214,10 @@ these exported coordinates:
 | `EXECUTION_FABRIC_TLS_ALPN_V1` | `ostadix-execution-fabric/1` | `crates/ostadix-api/src/hosted_remote/tls.rs` |
 
 Execution Intent V1 continues to bind the solved graph V1 identity and the
-process's current backend-catalog projection. The V5 catalog rollover therefore
+process's current backend-catalog projection. The V6 catalog rollover therefore
 changes that catalog binding without changing the graph algorithm or schema.
-Archival V4 whole/per-specification helpers remain available for inspection but
-never authorize a current Catalog V5-backed placement V2.
+Archival V5 and V4 whole/per-specification helpers remain available for inspection but
+never authorize a current Catalog V6-backed placement V2.
 
 ## Package 0.3 source breaks
 

@@ -197,20 +197,21 @@ establishes only `declared` and `located`; `invocable`, `compatible`,
 `authorized`, `healthy`, and per-operation `admitted` remain not-probed or
 deferred to their actual operation-scoped mechanisms.
 
-The current compiled catalog schema is `ostadix.backend-catalog/v5`.
+The current compiled catalog schema is `ostadix.backend-catalog/v6`.
 `o_runtimes` exposes it as
-`runtime-catalog-schema=ostadix.backend-catalog/v5`. The schema participates in
+`runtime-catalog-schema=ostadix.backend-catalog/v6`. The schema participates in
 both the complete catalog digest and every backend-specification digest, so a
-V4 MCP binary is an older descriptive snapshot rather than a source of V5
+V5 MCP binary is an older descriptive snapshot rather than a source of V6
 placement identity. Rebuild the root runtime and this dependency-isolated MCP
 crate together after a catalog change (the root `./setup.sh --minimal --yes`
 flow does so), then restart MCP clients. Never relabel a digest reported by an
-old binary. Archived V4 and V3 records may still be decoded and their original
+old binary. Archived V5, V4, and V3 records may still be decoded and their original
 signatures inspected, but that is not placement authorization; current
 `NodeProfileV1` validation accepts only backend specifications present in the
-V5 registry. V4 remains frozen with each backend's state-support tier and
+V6 registry. V4 remains frozen with each backend's state-support tier and
 snapshot-compatibility identity. V5 extends that exact projection with an
-explicit optional bounded backend-morphism profile.
+explicit optional bounded backend-morphism profile. V6 retains those fields and
+adds the two `wasm-tools` WebAssembly runtime alternatives after the frozen WABT pair.
 
 The same dependency-isolated catalog macro emits one `runtime-capability`
 record per backend with `integer-exactness`, `rich-numbers`, `state-support`,

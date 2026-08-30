@@ -262,8 +262,19 @@ def _read_serial(path: Path) -> bytes:
 def _raise_for_failure_markers(transcript: bytes) -> None:
     for marker in FAILURE_MARKERS:
         if marker in transcript:
+            failure_line = next(
+                (
+                    line.decode("utf-8", "replace").strip()
+                    for line in transcript.splitlines()
+                    if marker in line
+                ),
+                marker.decode("ascii", "replace"),
+            )
+            if len(failure_line) > 1024:
+                failure_line = failure_line[:1021] + "..."
             raise VisualSmokeError(
-                f"serial transcript contains failure marker {marker.decode('ascii', 'replace')!r}"
+                f"serial transcript contains failure marker "
+                f"{marker.decode('ascii', 'replace')!r}: {failure_line}"
             )
 
 
@@ -610,7 +621,11 @@ def validate_visible_frame(frame: Frame) -> None:
     if frame.chromatic_hue_buckets < MIN_CHROMATIC_HUE_BUCKETS:
         raise VisualSmokeError(
             "desktop lacks independent hue families: "
-            f"{frame.chromatic_hue_buckets} populated hue buckets"
+            f"{frame.chromatic_hue_buckets} populated hue buckets "
+            f"(nonblack_pixels={frame.nonblack_pixels} "
+            f"unique_colors={frame.unique_colors} "
+            f"chromatic_pixels={frame.chromatic_pixels} "
+            f"frame_sha256={frame.sha256})"
         )
 
 

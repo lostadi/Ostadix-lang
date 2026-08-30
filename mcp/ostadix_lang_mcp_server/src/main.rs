@@ -706,10 +706,12 @@ struct CatalogBackendRuntime {
 macro_rules! backend_catalog_metadata {
     (
         current_schema: $current_schema:literal,
+        legacy_schema_v5: $legacy_schema_v5:literal,
         legacy_schema_v4: $legacy_schema_v4:literal,
         legacy_schema_v3: $legacy_schema_v3:literal $(,)?
     ) => {
         const CATALOG_SCHEMA: &str = $current_schema;
+        const CATALOG_LEGACY_SCHEMA_V5: &str = $legacy_schema_v5;
         const CATALOG_LEGACY_SCHEMA_V4: &str = $legacy_schema_v4;
         const CATALOG_LEGACY_SCHEMA_V3: &str = $legacy_schema_v3;
     };
@@ -965,7 +967,7 @@ impl RuntimeDiscovery {
 
     fn to_text(&self) -> String {
         let mut out = format!(
-            "runtime-catalog-schema={CATALOG_SCHEMA}\nruntime-catalog-legacy-schema-v4={CATALOG_LEGACY_SCHEMA_V4}\nruntime-catalog-legacy-schema-v3={CATALOG_LEGACY_SCHEMA_V3}\nruntime-catalog-projection=compiled-mcp-snapshot\nruntime-search-mode={}\nruntime-search-path={}\n{}\n",
+            "runtime-catalog-schema={CATALOG_SCHEMA}\nruntime-catalog-legacy-schema-v5={CATALOG_LEGACY_SCHEMA_V5}\nruntime-catalog-legacy-schema-v4={CATALOG_LEGACY_SCHEMA_V4}\nruntime-catalog-legacy-schema-v3={CATALOG_LEGACY_SCHEMA_V3}\nruntime-catalog-projection=compiled-mcp-snapshot\nruntime-search-mode={}\nruntime-search-path={}\n{}\n",
             self.search.mode.name(),
             self.search.encoded.to_string_lossy(),
             self.summary()
@@ -2422,8 +2424,8 @@ mod tests {
         sanitize_information_head_output, validate_information_head_name, validate_intent_target,
         EmptyArgs, InformationInspectRunError, IntentLease, IntentReservation, IntentStore,
         OstadixMcp, RuntimePathMode, RuntimeSearchPath, CATALOG_BACKEND_RUNTIMES,
-        CATALOG_LEGACY_SCHEMA_V3, CATALOG_LEGACY_SCHEMA_V4, CATALOG_RUNTIME_REQUIREMENTS,
-        CATALOG_SCHEMA, INTENT_SCHEMA_V1, MAX_LIVE_INTENTS,
+        CATALOG_LEGACY_SCHEMA_V3, CATALOG_LEGACY_SCHEMA_V4, CATALOG_LEGACY_SCHEMA_V5,
+        CATALOG_RUNTIME_REQUIREMENTS, CATALOG_SCHEMA, INTENT_SCHEMA_V1, MAX_LIVE_INTENTS,
     };
     use std::collections::BTreeSet;
     use std::ffi::OsStr;
@@ -2577,7 +2579,8 @@ mod tests {
 
     #[test]
     fn runtime_inventory_is_a_complete_catalog_projection() {
-        assert_eq!(CATALOG_SCHEMA, "ostadix.backend-catalog/v5");
+        assert_eq!(CATALOG_SCHEMA, "ostadix.backend-catalog/v6");
+        assert_eq!(CATALOG_LEGACY_SCHEMA_V5, "ostadix.backend-catalog/v5");
         assert_eq!(CATALOG_LEGACY_SCHEMA_V4, "ostadix.backend-catalog/v4");
         assert_eq!(CATALOG_LEGACY_SCHEMA_V3, "ostadix.backend-catalog/v3");
         let requirement_keys = CATALOG_RUNTIME_REQUIREMENTS
@@ -2734,7 +2737,8 @@ mod tests {
         let search = RuntimeSearchPath::new(RuntimePathMode::InheritedOnly, Vec::new())
             .expect("empty inherited runtime search path");
         let output = discover_runtimes(&search, &fixture.0).to_text();
-        assert!(output.contains("runtime-catalog-schema=ostadix.backend-catalog/v5\n"));
+        assert!(output.contains("runtime-catalog-schema=ostadix.backend-catalog/v6\n"));
+        assert!(output.contains("runtime-catalog-legacy-schema-v5=ostadix.backend-catalog/v5\n"));
         assert!(output.contains("runtime-catalog-legacy-schema-v4=ostadix.backend-catalog/v4\n"));
         assert!(output.contains(
             "runtime-capability backend=python integer-exactness=arbitrary rich-numbers=preserved state-support=semantic-snapshot codec=ostadix.python-graph/v1 compatibility=exact-implementation morphism-profile=python-plain-data provenance=catalog"

@@ -8,6 +8,124 @@ emit_serial() {
   fi
 }
 
+notebook_page_ready() {
+  python3 - <<'PY'
+import time
+import urllib.request
+
+deadline = time.monotonic() + 30
+last_error = None
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+while time.monotonic() < deadline:
+    try:
+        with opener.open("http://127.0.0.1:8888/", timeout=0.5) as response:
+            page = response.read(1024 * 1024)
+        if b"<title>O \xc2\xb7 Notebook</title>" not in page:
+            raise RuntimeError("notebook title marker is absent")
+        raise SystemExit(0)
+    except Exception as error:
+        last_error = error
+        time.sleep(0.1)
+raise SystemExit(f"notebook root did not become ready: {last_error!r}")
+PY
+}
+
+focus_x11_window() {
+  python3 - "$1" <<'PY'
+import ctypes
+import re
+import sys
+
+Display = ctypes.c_void_p
+Window = ctypes.c_ulong
+Atom = ctypes.c_ulong
+
+
+class ClientMessageData(ctypes.Union):
+    _fields_ = [
+        ("b", ctypes.c_char * 20),
+        ("s", ctypes.c_short * 10),
+        ("l", ctypes.c_long * 5),
+    ]
+
+
+class XClientMessageEvent(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_int),
+        ("serial", ctypes.c_ulong),
+        ("send_event", ctypes.c_int),
+        ("display", Display),
+        ("window", Window),
+        ("message_type", Atom),
+        ("format", ctypes.c_int),
+        ("data", ClientMessageData),
+    ]
+
+
+class XEvent(ctypes.Union):
+    _fields_ = [
+        ("xclient", XClientMessageEvent),
+        ("pad", ctypes.c_long * 24),
+    ]
+
+
+x11 = ctypes.CDLL("libX11.so.6")
+x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+x11.XOpenDisplay.restype = Display
+x11.XDefaultRootWindow.argtypes = [Display]
+x11.XDefaultRootWindow.restype = Window
+x11.XInternAtom.argtypes = [Display, ctypes.c_char_p, ctypes.c_int]
+x11.XInternAtom.restype = Atom
+x11.XRaiseWindow.argtypes = [Display, Window]
+x11.XRaiseWindow.restype = ctypes.c_int
+x11.XSendEvent.argtypes = [
+    Display,
+    Window,
+    ctypes.c_int,
+    ctypes.c_long,
+    ctypes.POINTER(XEvent),
+]
+x11.XSendEvent.restype = ctypes.c_int
+x11.XSync.argtypes = [Display, ctypes.c_int]
+x11.XSync.restype = ctypes.c_int
+x11.XCloseDisplay.argtypes = [Display]
+x11.XCloseDisplay.restype = ctypes.c_int
+
+raw_window = sys.argv[1]
+if not re.fullmatch(r"0x[0-9A-Fa-f]+", raw_window):
+    raise SystemExit("invalid X11 window id")
+window = int(raw_window, 16)
+if not 0 < window <= (1 << (8 * ctypes.sizeof(Window))) - 1:
+    raise SystemExit("invalid X11 window id")
+display = x11.XOpenDisplay(None)
+if not display:
+    raise SystemExit("could not open the X11 display")
+try:
+    root = x11.XDefaultRootWindow(display)
+    active_window = x11.XInternAtom(display, b"_NET_ACTIVE_WINDOW", 0)
+    if not active_window:
+        raise SystemExit("could not intern _NET_ACTIVE_WINDOW")
+    event = XEvent()
+    event.xclient.type = 33  # ClientMessage
+    event.xclient.send_event = 1
+    event.xclient.display = display
+    event.xclient.window = window
+    event.xclient.message_type = active_window
+    event.xclient.format = 32
+    # This launcher is the local session controller, so the EWMH source is a
+    # pager/controller rather than an arbitrary application focus-steal.
+    event.xclient.data.l[0] = 2
+    event.xclient.data.l[1] = 0  # CurrentTime
+    x11.XRaiseWindow(display, window)
+    event_mask = (1 << 19) | (1 << 20)
+    if x11.XSendEvent(display, root, 0, event_mask, ctypes.byref(event)) == 0:
+        raise SystemExit("Openbox activation request was not sent")
+    x11.XSync(display, 0)
+finally:
+    x11.XCloseDisplay(display)
+PY
+}
+
 terminal_session() {
   cd /usr/src/ostadix
   export HOME=/root
@@ -33,7 +151,7 @@ terminal_session() {
   printf '\033[38;5;81m  o-lang   O examples/hello.O backends  run O from the exact staged source tree\033[0m\n'
   printf '\033[38;5;117m  wasm     O examples/webassembly_hello.O backends  run O through Wasmtime\033[0m\n'
   printf '\033[38;5;111m  source   pwd                          inspect /usr/src/ostadix\033[0m\n'
-  printf '\033[38;5;215m  systems  reboot, then choose a/g/b/p/r for Alpine/Guix/OpenBSD/9front/Redox\033[0m\n'
+  printf '\033[38;5;215m  systems  reboot; choose o/a/g/b/p/r     O-core/Alpine/Guix/OpenBSD/9front/Redox\033[0m\n'
   printf '\033[38;5;218m  desktop  openbox + xterm              active local GUI session\033[0m\n'
   printf '\033[38;5;183m  notebook o-notebook                    open the local O notebook GUI\033[0m\n\n'
   exec /bin/bash --noprofile --norc -i
@@ -46,6 +164,22 @@ x_session() {
   mkdir -p "$XDG_RUNTIME_DIR"
   chmod 0700 "$XDG_RUNTIME_DIR"
 
+  # Keep the Ostadix terminal visible and focused after Firefox finishes
+  # mapping the local notebook.  The visual gate must observe the actual
+  # workstation palette and deliver its input proof to this Xterm, not merely
+  # find three live client processes behind an uncovered root window.
+  mkdir -p "$HOME/.config/openbox"
+  cat >"$HOME/.config/openbox/rc.xml" <<'EOF'
+<openbox_config xmlns="http://openbox.org/3.4/rc">
+  <applications>
+    <application name="ostadix-workstation">
+      <focus>yes</focus>
+      <layer>above</layer>
+    </application>
+  </applications>
+</openbox_config>
+EOF
+
   if ! xsetroot -solid '#181825'; then
     emit_serial 'OSTADIX HOSTED DESKTOP: FAIL: xsetroot palette failed'
     return 1
@@ -57,6 +191,12 @@ x_session() {
     o-notebook >/tmp/ostadix-notebook-gui.out \
     2>/tmp/ostadix-notebook-gui.err &
   notebook=$!
+  if ! notebook_page_ready \
+      >/tmp/ostadix-notebook-page.out \
+      2>/tmp/ostadix-notebook-page.err; then
+    emit_serial 'OSTADIX HOSTED NOTEBOOK GUI: FAIL: embedded notebook page did not become ready'
+    return 1
+  fi
   notebook_window=
   for attempt in $(seq 1 60); do
     if ! kill -0 "$window_manager" 2>/dev/null \
@@ -83,16 +223,68 @@ x_session() {
     return 1
   fi
   emit_serial 'OSTADIX HOSTED NOTEBOOK GUI READY: PASS'
-  xterm -geometry 90x28+24+24 -title 'OSTADIX Workstation' \
+  xterm -name ostadix-workstation \
+    -geometry 90x28+24+24 -title 'OSTADIX Workstation' \
     -bg '#1e1e2e' -fg '#cdd6f4' -cr '#f5e0dc' \
     -e /usr/local/bin/ostadix-desktop terminal \
     >/tmp/ostadix-xterm.log 2>&1 &
   terminal=$!
-  sleep 2
-  if ! kill -0 "$window_manager" 2>/dev/null \
-      || ! kill -0 "$notebook" 2>/dev/null \
-      || ! kill -0 "$terminal" 2>/dev/null; then
-    emit_serial 'OSTADIX HOSTED DESKTOP: FAIL: window manager, notebook, or terminal exited'
+  terminal_window=
+  for attempt in $(seq 1 60); do
+    if ! kill -0 "$window_manager" 2>/dev/null \
+        || ! kill -0 "$notebook" 2>/dev/null \
+        || ! kill -0 "$terminal" 2>/dev/null; then
+      break
+    fi
+    for window in $(xprop -root _NET_CLIENT_LIST 2>/dev/null \
+        | sed 's/.*#//' | tr ',' ' '); do
+      case "$window" in
+        0x*)
+          if xprop -id "$window" WM_CLASS 2>/dev/null \
+              | grep -Fqi 'ostadix-workstation'; then
+            terminal_window=$window
+            break
+          fi
+          ;;
+      esac
+    done
+    [ -z "$terminal_window" ] || break
+    sleep 1
+  done
+  if [ -z "$terminal_window" ]; then
+    emit_serial 'OSTADIX HOSTED DESKTOP: FAIL: Ostadix Xterm did not become a mapped window'
+    return 1
+  fi
+  active_window=
+  active_confirmations=0
+  focus_status=1
+  for attempt in $(seq 1 60); do
+    if ! kill -0 "$window_manager" 2>/dev/null \
+        || ! kill -0 "$notebook" 2>/dev/null \
+        || ! kill -0 "$terminal" 2>/dev/null; then
+      break
+    fi
+    if focus_x11_window "$terminal_window" \
+        >>/tmp/ostadix-x11-focus.out \
+        2>>/tmp/ostadix-x11-focus.err; then
+      focus_status=0
+    else
+      focus_status=$?
+    fi
+    active_window=$(xprop -root _NET_ACTIVE_WINDOW 2>/dev/null \
+      | sed 's/.*# *//')
+    if [ "$terminal_window" = "$active_window" ]; then
+      active_confirmations=$((active_confirmations + 1))
+    else
+      active_confirmations=0
+    fi
+    # Three consecutive confirmations provide a two-second stable interval in
+    # which Xterm can paint the palette before the VGA capture follows READY.
+    [ "$active_confirmations" -lt 3 ] || break
+    sleep 1
+  done
+  if [ "$active_confirmations" -lt 3 ]; then
+    emit_serial "OSTADIX HOSTED DESKTOP: FAIL: Ostadix Xterm did not remain active terminal=$terminal_window active=${active_window:-none} confirmations=$active_confirmations focus_status=$focus_status"
     return 1
   fi
   emit_serial 'OSTADIX HOSTED DESKTOP READY: PASS'
@@ -103,7 +295,8 @@ x_session() {
       return 1
     fi
     if ! kill -0 "$terminal" 2>/dev/null; then
-      xterm -geometry 90x28+24+24 -title 'OSTADIX Workstation' \
+      xterm -name ostadix-workstation \
+        -geometry 90x28+24+24 -title 'OSTADIX Workstation' \
         -bg '#1e1e2e' -fg '#cdd6f4' -cr '#f5e0dc' \
         -e /usr/local/bin/ostadix-desktop terminal \
         >/tmp/ostadix-xterm.log 2>&1 &

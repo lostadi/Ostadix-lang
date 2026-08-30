@@ -67,7 +67,7 @@ execution handle.
 | `ParsedDocumentV1` plus exact source bytes | `ParsedDocumentInformationV1` | source SHA-256/length, immutable syntax/origin counts, origin-map digest |
 | caller-declared-public scalar `OValue` | `PublicValueInformationV1` | allowlisted scalar kind, canonical digest/length, caller-public flag |
 | unadmitted `HGraph` | `HGraphInformationV1` | structural counts and `metadata_projection_sha256` over exactly those counts |
-| Evidence V6 | `EvidenceInformationV1` | exact evidence schema/analyzer, Catalog V5 public projection digest, node count, metadata projection digest |
+| Evidence V6 | `EvidenceInformationV1` | exact evidence schema/analyzer, Catalog V6 public projection digest, node count, metadata projection digest |
 | verified registry profile | `RegistryProfileInformationV1` | canonical namespace, projected node identity, generation, event digest, validity range, stale flag |
 | verified World receipt | `WorldReceiptInformationV1` | receipt/semantic digests and `signature_validated=true` |
 | logical project HGraph | `ProjectGraphInformationV1` | logical/source-bundle digests and operation/root counts |

@@ -499,23 +499,25 @@ Admission version and backend-catalog generation are separate version axes.
 `O version --json` reports the independent coordinates compiled into the
 interpreter; [VERSIONING.md](docs/VERSIONING.md) defines their compatibility
 rules.
-The current authorizing catalog is `ostadix.backend-catalog/v5`; its schema is
+The current authorizing catalog is `ostadix.backend-catalog/v6`; its schema is
 part of both the whole-catalog digest and every backend-specification digest.
-A placement profile that advertises any V4 or older backend identity remains decodable
+A placement profile that advertises any V5 or older backend identity remains decodable
 and independently auditable, but fails current profile validation before it can
 authorize candidate selection or warrant discharge. There is no digest
-relabeling or silent V4-to-V5 uplift. V4 remains the archival generation that
+relabeling or silent V5-to-V6 uplift. V4 remains the archival generation that
 added each backend's state-support tier and snapshot-compatibility identity.
 V5 extends that frozen projection with one explicit optional bounded
 backend-morphism profile. Python, JavaScript, and Rust carry that profile; the
 field is absent for the other 27 canonical backends. The Catalog V5 rollover
 itself changed catalog identity without changing `BackendInterface` or
-execution behavior at that rollover. Package 0.3 separately makes Graph
+execution behavior at that rollover. V6 retains the V5 projection shape and
+adds ordered `wasm-tools+wasmtime` and `wasm-tools+wasmer` WebAssembly runtime
+alternatives after the two frozen WABT alternatives. Package 0.3 separately makes Graph
 V2/Evidence V6 current; morphism profiles remain shadow metadata on that path.
 Rebuild the runtime and MCP server, then regenerate
 short-lived profiles and all derived placement evidence after this rollover. The
 exact boundary and regeneration sequence are in [Hosted Placement
-V6](docs/HOSTED_PLACEMENT_V6.md#backend-catalog-v5-hard-rollover).
+V6](docs/HOSTED_PLACEMENT_V6.md#backend-catalog-v6-hard-rollover).
 
 Current implementation identity also uses the path-independent
 `ostadix/backend-executable-set/v2` projection and
@@ -3633,7 +3635,7 @@ live authenticated kernel session already binds it.
 
 ## Hosted backends
 
-Backend Catalog V5 registers 30 canonical backends and six aliases: `o`, `md`,
+Backend Catalog V6 registers 30 canonical backends and six aliases: `o`, `md`,
 `tex`, `plain`, `py`, and `ubuntu`. The Rust runtime executes the following
 canonical languages. Inline backends
 run inside the evaluator. Hosted backends run as Rust backend processes through
