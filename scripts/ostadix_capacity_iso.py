@@ -55,6 +55,7 @@ ADAPTERS = frozenset(
         "multiboot2",
         "linux",
         "linux-selection",
+        "linux-live-rootfs",
         "qemu-tcg-linux-direct",
         "qemu-tcg-qcow2",
         "qemu-tcg-raw-cd",
@@ -67,6 +68,8 @@ ARTIFACT_ROLES = frozenset(
         "ocore-kernel",
         "linux-kernel",
         "linux-initrd",
+        "linux-rootfs",
+        "linux-modloop",
         "guest-qcow2",
         "guest-raw-cd",
         "guest-rootfs",
@@ -197,6 +200,10 @@ def _arguments(value: Any, label: str) -> list[str]:
             raise CapacityIsoError(f"{label}[{index}] is not a safe single kernel argument")
         if argument.startswith("ostadix.capacity="):
             raise CapacityIsoError(f"{label}[{index}] attempts to override the capacity selection")
+        if argument.startswith("ostadix.rootfs="):
+            raise CapacityIsoError(f"{label}[{index}] attempts to override the live root filesystem")
+        if argument.startswith("modloop="):
+            raise CapacityIsoError(f"{label}[{index}] attempts to override the Linux modloop")
         result.append(argument)
     return result
 
@@ -291,6 +298,14 @@ def _entry(value: Any, label: str) -> dict[str, Any]:
         required = common | {"kernel_path", "initrd_paths"}
     elif adapter == "linux-selection":
         required = common | {"kernel_path", "initrd_paths", "selection_id"}
+    elif adapter == "linux-live-rootfs":
+        required = common | {
+            "kernel_path",
+            "initrd_paths",
+            "selection_id",
+            "rootfs_path",
+            "modloop_path",
+        }
     else:
         required = common | {
             "host_kernel_path",
@@ -308,15 +323,22 @@ def _entry(value: Any, label: str) -> dict[str, Any]:
     }
     if adapter == "multiboot2":
         normalized["kernel_path"] = _iso_path(entry["kernel_path"], f"{label}.kernel_path")
-    elif adapter in {"linux", "linux-selection"}:
+    elif adapter in {"linux", "linux-selection", "linux-live-rootfs"}:
         normalized["kernel_path"] = _iso_path(entry["kernel_path"], f"{label}.kernel_path")
         initrds = _path_list(entry["initrd_paths"], f"{label}.initrd_paths", 16)
         if not initrds:
             raise CapacityIsoError(f"{label}.initrd_paths must not be empty")
         normalized["initrd_paths"] = initrds
-        if adapter == "linux-selection":
+        if adapter in {"linux-selection", "linux-live-rootfs"}:
             normalized["selection_id"] = _identifier(
                 entry["selection_id"], f"{label}.selection_id"
+            )
+        if adapter == "linux-live-rootfs":
+            normalized["rootfs_path"] = _iso_path(
+                entry["rootfs_path"], f"{label}.rootfs_path"
+            )
+            normalized["modloop_path"] = _iso_path(
+                entry["modloop_path"], f"{label}.modloop_path"
             )
     else:
         if "[virtualized/TCG]" not in normalized["title"]:
@@ -375,11 +397,16 @@ def _validate_entries(
         adapter = entry["adapter"]
         if adapter == "multiboot2":
             require(entry["kernel_path"], {"ocore-kernel"}, f"{label}.kernel_path")
-        elif adapter in {"linux", "linux-selection"}:
+        elif adapter in {"linux", "linux-selection", "linux-live-rootfs"}:
             require(entry["kernel_path"], {"linux-kernel"}, f"{label}.kernel_path")
             for path in entry["initrd_paths"]:
                 require(path, {"linux-initrd"}, f"{label}.initrd_paths")
-            if adapter == "linux-selection":
+            if adapter == "linux-live-rootfs":
+                require(entry["rootfs_path"], {"linux-rootfs"}, f"{label}.rootfs_path")
+                require(
+                    entry["modloop_path"], {"linux-modloop"}, f"{label}.modloop_path"
+                )
+            if adapter in {"linux-selection", "linux-live-rootfs"}:
                 selection = entry["selection_id"]
                 if selection in selections:
                     raise CapacityIsoError(f"duplicate Linux capacity selection_id: {selection}")
@@ -442,11 +469,13 @@ def render_grub(entries: list[dict[str, Any]], default_entry: str) -> bytes:
         arguments = "" if not entry["arguments"] else " " + " ".join(entry["arguments"])
         if entry["adapter"] == "multiboot2":
             lines.append(f"    multiboot2 {entry['kernel_path']}{arguments}")
-        elif entry["adapter"] in {"linux", "linux-selection"}:
-            if entry["adapter"] == "linux-selection":
-                arguments = " " + " ".join(
-                    [f"ostadix.capacity={entry['selection_id']}", *entry["arguments"]]
-                )
+        elif entry["adapter"] in {"linux", "linux-selection", "linux-live-rootfs"}:
+            if entry["adapter"] in {"linux-selection", "linux-live-rootfs"}:
+                injected = [f"ostadix.capacity={entry['selection_id']}"]
+                if entry["adapter"] == "linux-live-rootfs":
+                    injected.append(f"ostadix.rootfs={entry['rootfs_path']}")
+                    injected.append(f"modloop={entry['modloop_path']}")
+                arguments = " " + " ".join([*injected, *entry["arguments"]])
             lines.append(f"    linux {entry['kernel_path']}{arguments}")
             lines.append("    initrd " + " ".join(entry["initrd_paths"]))
         else:

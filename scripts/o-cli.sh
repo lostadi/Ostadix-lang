@@ -17,7 +17,7 @@ REGISTRY_BIN=${O_LANG_REGISTRY_BIN:-"$ROOT/target/release/o-registry"}
 INFO_BIN=${O_LANG_INFO_BIN:-"$ROOT/target/release/o-info"}
 
 case "${1:-}" in
-    help|--help|-h|run|plan|explain|inspect)
+    help|--help|-h|run|plan|explain|inspect|object)
         if [[ ! -x "$OCLI_BIN" ]]; then
             printf 'error: compiled Ostadix front door is missing or not executable: %s\n' "$OCLI_BIN" >&2
             exit 1

@@ -9,6 +9,7 @@
 //   olangc <input.O>                              # binary target (default)
 //   olangc <input.O> -o myprogram                 # explicit output name
 //   olangc <input.O> --target wasm                # wasm32-wasip1
+//   olangc <input.O> --target wasm --materialize-only ./generated
 //   olangc <input.O> --target script              # run in-process
 //   olangc <input.O> --target ir                  # dump the lowered OIR
 //   olangc <input.O> --target ir --execution-intent-json
@@ -165,8 +166,10 @@ a wasm32-wasip1 module (--target wasm), executes in-process (--target script), \
 prints the lowered OIR/ExecutionPlan/HGraph or project plan/HGraph (--target ir), \
 or emits the execution hypergraph as Graphviz DOT (--target dot). Binary \
 outputs embed the program source, compatibility adapters, and the Ostadix-lang \
-runtime. Project IR/DOT planning constructs route operations without running \
-commands. In dot mode the HGraph is serialised as a digraph; pipe to \
+runtime. --materialize-only writes the exact generated Cargo project for an \
+ordinary .O binary or wasm target without invoking Cargo. Project IR/DOT \
+planning constructs route operations without running commands. In dot mode \
+the HGraph is serialised as a digraph; pipe to \
 `dot -Tpng` for a rendered image."
 )]
 struct Cli {
@@ -178,9 +181,16 @@ struct Cli {
     target: CompileTarget,
 
     /// Output binary path (default: input file stem in the current directory).
-    /// Ignored when --target is "script", "ir", or "dot".
+    /// With --materialize-only, its basename names the generated Cargo binary,
+    /// but no output artifact is created. Ignored for script, ir, and dot.
     #[arg(short, long)]
     output: Option<PathBuf>,
+
+    /// Write the exact generated Cargo project to a newly created directory
+    /// without invoking Cargo or creating the output artifact. This is
+    /// available only for ordinary .O binary and wasm targets.
+    #[arg(long, value_name = "DIR")]
+    materialize_only: Option<PathBuf>,
 
     /// Override or extend the bundled compatibility adapters with files from
     /// this directory. Files with names matching a bundled adapter replace it;
@@ -324,27 +334,56 @@ fn main() -> Result<()> {
 
             let shims = read_shims(cli.shim_dir.as_deref())?;
 
-            let build_dir = create_build_dir()?;
-            eprintln!("olangc: building in {}", build_dir.display());
-            eprintln!("olangc: embedding {} shim script(s)", shims.len());
-
-            let result = compile_to_binary(
-                &cli.input,
-                &source,
-                &shims,
-                &build_dir,
-                &output,
-                cli.target == CompileTarget::Wasm,
-                &cli.backend_grants,
-            );
-
-            if !cli.keep_build_dir {
-                let _ = fs::remove_dir_all(&build_dir);
+            if let Some(materialize_dir) = cli.materialize_only.as_deref() {
+                create_materialization_dir(materialize_dir)?;
+                eprintln!(
+                    "olangc: materializing generated Cargo project in {}",
+                    materialize_dir.display()
+                );
+                eprintln!("olangc: embedding {} shim script(s)", shims.len());
+                write_binary_cargo_project(
+                    &cli.input,
+                    &source,
+                    &shims,
+                    materialize_dir,
+                    &output,
+                    &cli.backend_grants,
+                )?;
+                let (materialized_target, rust_target) = match cli.target {
+                    CompileTarget::Binary => ("binary", "native"),
+                    CompileTarget::Wasm => ("wasm", "wasm32-wasip1"),
+                    _ => unreachable!("materialization target was validated"),
+                };
+                eprintln!(
+                    "olangc: materialize-only target={} rust-target={} cargo-invoked=false dir={}",
+                    materialized_target,
+                    rust_target,
+                    materialize_dir.display()
+                );
+                Ok(())
             } else {
-                eprintln!("olangc: keeping build directory: {}", build_dir.display());
-            }
+                let build_dir = create_build_dir()?;
+                eprintln!("olangc: building in {}", build_dir.display());
+                eprintln!("olangc: embedding {} shim script(s)", shims.len());
 
-            result
+                let result = compile_to_binary(
+                    &cli.input,
+                    &source,
+                    &shims,
+                    &build_dir,
+                    &output,
+                    cli.target == CompileTarget::Wasm,
+                    &cli.backend_grants,
+                );
+
+                if !cli.keep_build_dir {
+                    let _ = fs::remove_dir_all(&build_dir);
+                } else {
+                    eprintln!("olangc: keeping build directory: {}", build_dir.display());
+                }
+
+                result
+            }
         }
         CompileTarget::Script => {
             run_as_script(&source, cli.shim_dir.as_deref(), &cli.backend_grants)
@@ -372,6 +411,14 @@ fn main() -> Result<()> {
 }
 
 fn validate_admission_inspection(cli: &Cli) -> Result<()> {
+    if cli.materialize_only.is_some()
+        && !matches!(cli.target, CompileTarget::Binary | CompileTarget::Wasm)
+    {
+        bail!("--materialize-only is available only with --target binary or --target wasm");
+    }
+    if cli.materialize_only.is_some() && cli.keep_build_dir {
+        bail!("--keep-build-dir cannot be combined with --materialize-only; the materialized directory is always retained");
+    }
     if cli.explain_schedule && cli.target != CompileTarget::Ir {
         bail!("--explain-schedule is available only with --target ir");
     }
@@ -476,6 +523,9 @@ fn load_project_bundle(
 fn compile_or_run_project(cli: &Cli, input_is_dir: bool, source: &str) -> Result<()> {
     use o_lang::project::RoutePolicy;
 
+    if cli.materialize_only.is_some() {
+        bail!("--materialize-only currently supports ordinary .O inputs only");
+    }
     if cli.project_trace_out.is_some() && cli.target != CompileTarget::Script {
         bail!(
             "--project-trace-out requires hosted project execution with --target script; compiled project binaries accept this option at runtime"
@@ -920,15 +970,17 @@ fn main() -> anyhow::Result<()> {{
 // Target A — compile to a native binary on disk
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn compile_to_binary(
+/// Write the exact generated Cargo source/build contract shared by native and
+/// WASM compilation. This function deliberately performs no Cargo invocation
+/// and creates no output artifact.
+fn write_binary_cargo_project(
     input_path: &Path,
     source: &str,
     shims: &[(String, Vec<u8>)],
     build_dir: &Path,
     output: &Path,
-    is_wasm: bool,
     backend_grants: &[String],
-) -> Result<()> {
+) -> Result<String> {
     let bin_name = derive_bin_name(output);
     let src_dir = build_dir.join("src");
     let shim_dir = src_dir.join("shims");
@@ -968,6 +1020,20 @@ fn compile_to_binary(
 
     // ── Cargo build contract — manifest, exact lock, pinned toolchain ─────────
     write_generated_cargo_contract(build_dir, &bin_name, false)?;
+    Ok(bin_name)
+}
+
+fn compile_to_binary(
+    input_path: &Path,
+    source: &str,
+    shims: &[(String, Vec<u8>)],
+    build_dir: &Path,
+    output: &Path,
+    is_wasm: bool,
+    backend_grants: &[String],
+) -> Result<()> {
+    let bin_name =
+        write_binary_cargo_project(input_path, source, shims, build_dir, output, backend_grants)?;
 
     // ── Build ────────────────────────────────────────────────────────────────
     let mut cargo_args = vec!["build", "--release", "--locked"];
@@ -2036,8 +2102,20 @@ fn main() -> anyhow::Result<()> {{
     for grant in BACKEND_GRANTS {{
         evaluator.install_backend_grant(grant, &mut scope)?;
     }}
+
+    let program = {lib_name}::ir::OIrProgram::lower(&nodes);
+
+    // WASI Preview 1 does not provide std::thread worker creation. Keep the
+    // complete OIR/evidence/admission path, then use its serial reference
+    // executor for this target. Native generated binaries remain graph-first.
+    #[cfg(target_family = "wasm")]
     let result = evaluator
-        .eval_document_with_scope(nodes, &mut scope)
+        .eval_ir_program_serial_with_scope(&program, &mut scope)
+        .context("failed to evaluate program")?;
+
+    #[cfg(not(target_family = "wasm"))]
+    let result = evaluator
+        .eval_ir_program_with_scope(&program, &mut scope)
         .context("failed to evaluate program")?;
 
     match result {{
@@ -2415,6 +2493,26 @@ fn create_build_dir() -> Result<PathBuf> {
         }
     }
     bail!("could not allocate a unique olangc build directory")
+}
+
+/// Reserve the caller-selected materialization directory without ever reusing
+/// or overwriting an existing filesystem object.
+fn create_materialization_dir(path: &Path) -> Result<()> {
+    match fs::create_dir(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            bail!(
+                "--materialize-only directory already exists: {}",
+                path.display()
+            )
+        }
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to create --materialize-only directory {}",
+                path.display()
+            )
+        }),
+    }
 }
 
 /// Derive a Cargo-compatible binary name from the output path.
@@ -3062,6 +3160,138 @@ mod tests {
 
         assert_eq!(command.get_current_dir(), Some(build_dir.path()));
         assert_eq!(Path::new(target_dir), expected);
+    }
+
+    #[test]
+    fn generated_main_selects_serial_only_for_wasm_without_mutating_environment() {
+        let main = generate_main_rs("demo", "program.O", &[], &[]);
+
+        assert!(
+            main.contains("let program = ostadix_generated_demo::ir::OIrProgram::lower(&nodes);")
+        );
+        assert!(main.contains(
+            "#[cfg(target_family = \"wasm\")]\n    let result = evaluator\n        .eval_ir_program_serial_with_scope(&program, &mut scope)"
+        ));
+        assert!(main.contains(
+            "#[cfg(not(target_family = \"wasm\"))]\n    let result = evaluator\n        .eval_ir_program_with_scope(&program, &mut scope)"
+        ));
+        assert!(!main.contains("set_var(\"O_EXECUTOR\""));
+    }
+
+    #[test]
+    fn materialize_only_is_binary_or_wasm_only() {
+        for target in ["binary", "wasm"] {
+            let cli = Cli::try_parse_from([
+                "olangc",
+                "example.O",
+                "--target",
+                target,
+                "--materialize-only",
+                "generated",
+            ])
+            .unwrap();
+            validate_admission_inspection(&cli).unwrap();
+        }
+
+        for target in ["script", "ir", "dot"] {
+            let cli = Cli::try_parse_from([
+                "olangc",
+                "example.O",
+                "--target",
+                target,
+                "--materialize-only",
+                "generated",
+            ])
+            .unwrap();
+            assert!(validate_admission_inspection(&cli).is_err());
+        }
+
+        let keep = Cli::try_parse_from([
+            "olangc",
+            "example.O",
+            "--materialize-only",
+            "generated",
+            "--keep-build-dir",
+        ])
+        .unwrap();
+        assert!(validate_admission_inspection(&keep).is_err());
+
+        let project =
+            Cli::try_parse_from(["olangc", "project", "--materialize-only", "generated"]).unwrap();
+        let error = compile_or_run_project(&project, true, "").unwrap_err();
+        assert!(format!("{error:#}").contains("ordinary .O inputs only"));
+    }
+
+    #[test]
+    fn materialize_only_writes_a_deterministic_unbuilt_project() {
+        let root = tempfile::tempdir().unwrap();
+        let output = root.path().join("artifact.wasm");
+        fs::write(&output, b"existing-output-must-not-change").unwrap();
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        let source = "python^(40 + 2)_python\n";
+
+        for materialized in [&first, &second] {
+            create_materialization_dir(materialized).unwrap();
+            let bin_name = write_binary_cargo_project(
+                Path::new("example.O"),
+                source,
+                &[],
+                materialized,
+                &output,
+                &[],
+            )
+            .unwrap();
+
+            assert_eq!(bin_name, "artifact");
+            assert_eq!(
+                fs::read_to_string(materialized.join("src/program.O")).unwrap(),
+                source
+            );
+            for relative in [
+                "Cargo.toml",
+                "Cargo.lock",
+                "rust-toolchain.toml",
+                "src/lib.rs",
+                "src/main.rs",
+            ] {
+                assert!(materialized.join(relative).is_file(), "missing {relative}");
+            }
+            assert!(!materialized.join("target").exists());
+            assert_eq!(
+                fs::read(&output).unwrap(),
+                b"existing-output-must-not-change"
+            );
+        }
+
+        for relative in [
+            "Cargo.toml",
+            "Cargo.lock",
+            "rust-toolchain.toml",
+            "src/program.O",
+            "src/lib.rs",
+            "src/main.rs",
+        ] {
+            assert_eq!(
+                fs::read(first.join(relative)).unwrap(),
+                fs::read(second.join(relative)).unwrap(),
+                "materialized file differs: {relative}"
+            );
+        }
+    }
+
+    #[test]
+    fn materialize_only_refuses_to_reuse_an_existing_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let materialized = root.path().join("generated");
+        create_materialization_dir(&materialized).unwrap();
+        let existing_file = root.path().join("existing-file");
+        fs::write(&existing_file, b"sentinel").unwrap();
+
+        for existing in [&materialized, &existing_file] {
+            let error = create_materialization_dir(existing).unwrap_err();
+            assert!(format!("{error:#}").contains("directory already exists"));
+        }
     }
 
     #[test]

@@ -389,48 +389,165 @@ def _inspect_capacity(descriptor: int, label: str) -> dict[str, Any]:
         raise CapacityValidationError(f"{label} is not a valid OSTADIX capacity ISO: {error}") from error
     if not isinstance(metadata, dict):
         raise CapacityValidationError(f"{label} inspector returned invalid metadata")
-    required = {"schema", "architecture", "bytes", "sha256", "capacity_lock_sha256", "default_entry", "entries"}
+    required = {
+        "schema",
+        "architecture",
+        "bytes",
+        "sha256",
+        "capacity_lock_sha256",
+        "default_entry",
+        "entries",
+        "artifacts",
+    }
     if not required.issubset(metadata):
         raise CapacityValidationError(f"{label} inspection metadata is incomplete")
     if metadata["schema"] != "ostadix.capacity-iso/v1" or metadata["architecture"] != "x86_64":
         raise CapacityValidationError(f"{label} is not an x86_64 OSTADIX capacity ISO")
     entries = metadata.get("entries")
     artifacts = metadata.get("artifacts")
+    if metadata["default_entry"] != "hosted":
+        raise CapacityValidationError(
+            f"{label} does not default to the physical Hosted Workstation"
+        )
+    capacity_arguments = [
+        "console=tty0",
+        "console=ttyS0,115200n8",
+        "rdinit=/init",
+        "panic=0",
+        "loglevel=4",
+    ]
+    expected_entries = [
+        {
+            "id": "hosted",
+            "title": "OSTADIX Hosted Workstation [physical x86_64]",
+            "hotkey": "h",
+            "adapter": "linux-live-rootfs",
+            "arguments": [
+                "console=ttyS0,115200n8",
+                "console=tty0",
+                "rdinit=/init",
+                "panic=0",
+                "loglevel=7",
+                "ignore_loglevel",
+            ],
+            "kernel_path": "/boot/hosted/vmlinuz-lts",
+            "initrd_paths": ["/boot/hosted/initramfs.cpio.gz"],
+            "selection_id": "hosted",
+            "rootfs_path": "/boot/hosted/rootfs.squashfs",
+            "modloop_path": "/boot/modloop-lts",
+        },
+        {
+            "id": "ocore",
+            "title": "OSTADIX O-core [direct Multiboot2, serial console]",
+            "hotkey": "o",
+            "adapter": "multiboot2",
+            "arguments": [],
+            "kernel_path": "/boot/ocore/kernel.elf",
+        },
+        {
+            "id": "alpine",
+            "title": "Alpine Linux 3.24.1 [direct kernel/initramfs]",
+            "hotkey": "a",
+            "adapter": "linux",
+            "arguments": [
+                "console=tty0",
+                "console=ttyS0,115200n8",
+                "rdinit=/bin/sh",
+                "panic=0",
+                "loglevel=4",
+            ],
+            "kernel_path": "/boot/capacity-host/vmlinuz-virt",
+            "initrd_paths": ["/boot/entry/010-alpine/initramfs-virt"],
+        },
+        {
+            "id": "guix",
+            "title": "GNU Guix System 1.5.0 [virtualized/TCG]",
+            "hotkey": "g",
+            "adapter": "qemu-tcg-linux-direct",
+            "arguments": capacity_arguments,
+            "host_kernel_path": "/boot/capacity-host/vmlinuz-virt",
+            "host_initrd_path": "/boot/capacity-host/initramfs.cpio.gz",
+            "selection_id": "guix-system-1.5.0-x86_64",
+            "guest_artifact_paths": [
+                "/ostadix/guix/linux-libre-6.17.12-bzimage",
+                "/ostadix/guix/guix-1.5.0-initrd.cpio.gz",
+                "/ostadix/guix/guix-system-install-1.5.0.x86_64-linux.iso",
+            ],
+        },
+        {
+            "id": "openbsd",
+            "title": "OpenBSD 7.9 offline installer [virtualized/TCG]",
+            "hotkey": "b",
+            "adapter": "qemu-tcg-raw-cd-curses",
+            "arguments": capacity_arguments,
+            "host_kernel_path": "/boot/capacity-host/vmlinuz-virt",
+            "host_initrd_path": "/boot/capacity-host/initramfs.cpio.gz",
+            "selection_id": "openbsd-7.9-amd64",
+            "guest_artifact_paths": ["/ostadix/openbsd/install79.iso"],
+        },
+        {
+            "id": "plan9",
+            "title": "9front Plan 9 build 11983 [virtualized/TCG]",
+            "hotkey": "p",
+            "adapter": "qemu-tcg-qcow2",
+            "arguments": capacity_arguments,
+            "host_kernel_path": "/boot/capacity-host/vmlinuz-virt",
+            "host_initrd_path": "/boot/capacity-host/initramfs.cpio.gz",
+            "selection_id": "plan9-9front-11983-amd64",
+            "guest_artifact_paths": [
+                "/ostadix/9front/9front-11983.amd64.qcow2"
+            ],
+        },
+        {
+            "id": "redox",
+            "title": "Redox OS 0.9.0 [virtualized/TCG]",
+            "hotkey": "r",
+            "adapter": "qemu-tcg-raw-cd",
+            "arguments": capacity_arguments,
+            "host_kernel_path": "/boot/capacity-host/vmlinuz-virt",
+            "host_initrd_path": "/boot/capacity-host/initramfs.cpio.gz",
+            "selection_id": "redox-0.9.0-server-x86_64",
+            "guest_artifact_paths": [
+                "/ostadix/redox/redox-server-0.9.0-livedisk.iso"
+            ],
+        },
+    ]
+    if entries != expected_entries:
+        raise CapacityValidationError(
+            f"{label} does not have the exact ordered seven-entry Hosted capacity closure"
+        )
     if (
-        not isinstance(entries, list)
-        or len(entries) != 1
-        or not isinstance(entries[0], dict)
-        or entries[0].get("id") != "hosted"
+        not isinstance(artifacts, list)
+        or len(artifacts) != 14
+        or not all(isinstance(artifact, dict) for artifact in artifacts)
     ):
         raise CapacityValidationError(
-            f"{label} is not the single-entry physical Hosted Live ISO"
+            f"{label} does not have exactly 14 typed Hosted capacity artifacts"
         )
-    entry = entries[0]
-    if (
-        entry.get("adapter") != "linux-selection"
-        or entry.get("kernel_path") != "/boot/hosted/vmlinuz-lts"
-        or entry.get("initrd_paths") != ["/boot/hosted/initramfs.cpio.gz"]
-        or entry.get("selection_id") != "hosted"
-        or entry.get("arguments") != [
-            "console=ttyS0,115200n8",
-            "console=tty0",
-            "rdinit=/init",
-            "panic=0",
-            "loglevel=7",
-            "ignore_loglevel",
-        ]
-    ):
-        raise CapacityValidationError(f"{label} has the wrong physical Hosted Live boot profile")
     artifact_closure = {
         (artifact.get("iso_path"), artifact.get("role"))
-        for artifact in artifacts or []
-        if isinstance(artifact, dict)
+        for artifact in artifacts
     }
     if artifact_closure != {
         ("/boot/hosted/vmlinuz-lts", "linux-kernel"),
         ("/boot/hosted/initramfs.cpio.gz", "linux-initrd"),
+        ("/boot/hosted/rootfs.squashfs", "linux-rootfs"),
+        ("/boot/modloop-lts", "linux-modloop"),
+        ("/boot/ocore/kernel.elf", "ocore-kernel"),
+        ("/boot/capacity-host/vmlinuz-virt", "linux-kernel"),
+        ("/boot/capacity-host/initramfs.cpio.gz", "linux-initrd"),
+        ("/boot/entry/010-alpine/initramfs-virt", "linux-initrd"),
+        ("/ostadix/guix/linux-libre-6.17.12-bzimage", "linux-kernel"),
+        ("/ostadix/guix/guix-1.5.0-initrd.cpio.gz", "linux-initrd"),
+        (
+            "/ostadix/guix/guix-system-install-1.5.0.x86_64-linux.iso",
+            "guest-rootfs",
+        ),
+        ("/ostadix/openbsd/install79.iso", "guest-raw-cd"),
+        ("/ostadix/9front/9front-11983.amd64.qcow2", "guest-qcow2"),
+        ("/ostadix/redox/redox-server-0.9.0-livedisk.iso", "guest-raw-cd"),
     }:
-        raise CapacityValidationError(f"{label} has the wrong physical Hosted Live artifact closure")
+        raise CapacityValidationError(f"{label} has the wrong 14-artifact Hosted capacity closure")
     return metadata
 
 

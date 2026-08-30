@@ -142,11 +142,18 @@ runtime_requirement_catalog! {
     {
         key: "webassembly",
         builtin: false,
-        // `wat2wasm` is needed only for WAT-shaped bodies. The catalog's v1
+        // A text converter is needed only for WAT-shaped bodies. The catalog's
         // backend-wide view intentionally over-approximates that condition;
-        // operation-specific runtime evidence may refine it later.
+        // operation-specific runtime evidence may refine it later. Keep the
+        // original WABT alternatives first so their published indices remain
+        // stable, then admit the wasm-tools converter shipped by Alpine.
         precision: ConservativeAllSources,
-        alternatives: [["wat2wasm", "wasmtime"], ["wat2wasm", "wasmer"]],
+        alternatives: [
+            ["wat2wasm", "wasmtime"],
+            ["wat2wasm", "wasmer"],
+            ["wasm-tools", "wasmtime"],
+            ["wasm-tools", "wasmer"],
+        ],
     },
     {
         key: "ubuntu_vm",

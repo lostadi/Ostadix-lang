@@ -636,6 +636,32 @@
         "rust": {"patterns": ["42"]},
         "c17": {"patterns": ["42"]}
       }
+    },
+    {
+      "path": "wasm_hello.O",
+      "editions": ["rust"],
+      "classification": "unit",
+      "requirements": {
+        "backends": ["text"],
+        "programs": [],
+        "authorities": []
+      },
+      "expected": {
+        "rust": {"patterns": ["OSTADIX OLANGC WASM EXECUTION PASS"]}
+      }
+    },
+    {
+      "path": "webassembly_hello.O",
+      "editions": ["rust"],
+      "classification": "integration",
+      "requirements": {
+        "backends": ["webassembly"],
+        "programs": ["wasm-tools", "wasmtime"],
+        "authorities": ["process"]
+      },
+      "expected": {
+        "rust": {"patterns": ["OSTADIX WEBASSEMBLY BACKEND PASS"]}
+      }
     }
   ]
 }

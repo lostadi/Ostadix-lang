@@ -14,8 +14,40 @@ Package SemVer is only one of the independent coordinates documented in
   `moral-gaur`, then requires strict inspection and bounded OVMF/QEMU readiness
   markers before publication. It prints the exact artifact and receipt paths;
   the staged-tree suffix prevents a later default release from colliding with a
-  different tree. The seven-entry image boots the hosted Alpine O CLI by default
-  and retains direct O-core plus the pinned foreign-system entries.
+  different tree. The exact seven-entry image boots the hosted Alpine O
+  workstation by default, provides direct O-core and direct Alpine entries, and
+  provides explicitly labeled nested QEMU/TCG entries for Guix, OpenBSD,
+  9front, and Redox. Its 14 typed artifacts cover the four Hosted components,
+  direct O-core, the capacity-host kernel/initramfs, direct Alpine initramfs,
+  Guix kernel/initramfs/ISO, OpenBSD ISO, 9front qcow2, and Redox ISO.
+  Rootfs and modloop are hosted kernel arguments and never GRUB initrds. Stage
+  one verifies the SquashFS identity before a tmpfs-overlay `switch_root`,
+  avoiding multi-gigabyte initramfs expansion while retaining the 4 GiB QEMU
+  regression bound. Its Ventoy 1.1.17 Alpine hook contract supplies the exact
+  `ebegin`/`eend` insertion marker, a minimal `dm-mod.ko` SquashFS, a bounded
+  media retry, and full-token BusyBox `blkid "$device"` label parsing without
+  unsupported `-s`/`-o` options. Release receipt v6 and boot-gates v6 require
+  hosted serial v4, graphical v7, and direct O-core evidence to bind the exact
+  inspected ISO before publication or later same-tree adoption. Pinned foreign
+  guest bytes are fetched, verified, embedded, and receipt-bound, but those
+  three publication gates do not execute direct Alpine or the four nested guest
+  routes and do not prove guest GUI/package-manager execution, Ventoy routing,
+  or physical boot.
+- The workstation treats `examples/wasm_hello.O` as a source-bound rootfs
+  object.
+  Release construction uses the admitted `olangc` to materialize its exact
+  generated Cargo project, builds it once with the pinned native Rust
+  toolchain, and records the source tree, input, compiler, generated-project
+  closure, build profile, and module identity in a read-only descriptor. Every
+  hosted boot regenerates that project through MCP without invoking Cargo,
+  verifies the packaged descriptor and module, and separately compiles a small
+  `wasm32-wasip1` Rust probe. Exact Alpine `wasm-tools=1.236.0-r0` and
+  `wasmtime=44.0.1-r0` packages now convert and execute
+  `examples/webassembly_hello.O` through the installed `webassembly^` route,
+  and Wasmtime executes the packaged Olangc module before readiness. This replaces the
+  nested-TCG cold compile while preserving distinct evidence for Olangc, the
+  packaged module, MCP, the WebAssembly backend, the runtime, and the installed
+  Rust/WASI target. Aggregate re-smoke evidence is now v2.
 - `o kernel prepare-ventoy`, `install-ventoy`, and `verify-ventoy` provide a
   separate confirmation-bound ISO copy path for an explicitly identified
   Ventoy volume. They re-identify the removable USB target and verify the copied
@@ -37,6 +69,16 @@ Package SemVer is only one of the independent coordinates documented in
 
 ### Changed
 
+- Fresh automatic `o node start` PKI can explicitly use ECDSA P-256 while
+  retaining RSA-3072 as the default. The hosted-live cross-architecture gate
+  uses P-256 so it still proves fresh CA, node, client, and pairing identity
+  creation without conflating TCG prime-generation cost with node readiness.
+  Its one-time provisioning, complete Hosted boot, and post-provisioning
+  listener-readiness deadlines are separate bounded stages. The public Hosted
+  re-smoke now composes serial, graphical/input, and direct O-core results over
+  one private ISO snapshot, and graphical monitor operations share one absolute
+  deadline. Aggregate re-smoke v2 does not select or execute the remaining five
+  menu entries.
 - Project authorship metadata and new commit attribution now reject Claude and
   Codex identities; contribution credit remains assigned to the responsible
   human contributors.

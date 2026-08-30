@@ -1,7 +1,10 @@
 /// O ◦ Notebook — a Jupyter-style interactive notebook for Ostadix-lang.
 ///
 /// Launch:  cargo run --features notebook --bin o-notebook [backends_dir]
-/// Opens http://localhost:8888 in your default browser automatically.
+/// With no positional directory, `O_BACKENDS_DIR` is honored before the local
+/// `backends` fallback. The default browser opens http://localhost:8888;
+/// `OSTADIX_NOTEBOOK_BROWSER` selects an explicit opener and
+/// `OSTADIX_NOTEBOOK_NO_OPEN` suppresses it for bounded headless validation.
 ///
 /// Variable bindings introduced with `let` in one cell are visible in all
 /// subsequent cells (like Jupyter kernel state). Use "Restart Kernel" to
@@ -171,10 +174,12 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let shim_dir = std::env::args()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("backends"));
+    let shim_dir = select_shim_dir(
+        std::env::args().nth(1).map(PathBuf::from),
+        std::env::var_os("O_BACKENDS_DIR")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from),
+    );
 
     let backends = Arc::new(registered_backends());
     let shim_dir = Arc::new(shim_dir);
@@ -202,13 +207,14 @@ async fn main() -> Result<()> {
     eprintln!("  \x1b[2mListening on \x1b[0m\x1b[4m{url}\x1b[0m");
     eprintln!("  \x1b[2mShift+Enter to run a cell · Ctrl+C to stop\x1b[0m\n");
 
-    let _ = std::process::Command::new(if cfg!(target_os = "macos") {
-        "open"
-    } else {
-        "xdg-open"
-    })
-    .arg(&url)
-    .spawn();
+    if std::env::var_os("OSTADIX_NOTEBOOK_NO_OPEN").is_none() {
+        let opener = if cfg!(target_os = "macos") {
+            "open".into()
+        } else {
+            std::env::var_os("OSTADIX_NOTEBOOK_BROWSER").unwrap_or_else(|| "xdg-open".into())
+        };
+        let _ = std::process::Command::new(opener).arg(&url).spawn();
+    }
 
     axum::serve(listener, app).await?;
     Ok(())
@@ -218,6 +224,37 @@ fn registered_backends() -> HashSet<String> {
     // Single source of truth: the central BackendRegistry owns the set of
     // accepted parser tags (canonical names plus aliases).
     o_lang::ir::BackendRegistry::global().registered_backend_tags()
+}
+
+fn select_shim_dir(explicit: Option<PathBuf>, configured: Option<PathBuf>) -> PathBuf {
+    explicit
+        .or(configured)
+        .unwrap_or_else(|| PathBuf::from("backends"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::select_shim_dir;
+    use std::path::PathBuf;
+
+    #[test]
+    fn configured_backend_directory_is_the_zero_argument_default() {
+        assert_eq!(
+            select_shim_dir(None, Some(PathBuf::from("/opt/ostadix/backends"))),
+            PathBuf::from("/opt/ostadix/backends")
+        );
+    }
+
+    #[test]
+    fn explicit_backend_directory_overrides_environment_configuration() {
+        assert_eq!(
+            select_shim_dir(
+                Some(PathBuf::from("chosen-backends")),
+                Some(PathBuf::from("configured-backends")),
+            ),
+            PathBuf::from("chosen-backends")
+        );
+    }
 }
 
 // ─── Embedded notebook UI ────────────────────────────────────────────────────

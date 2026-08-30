@@ -2244,7 +2244,10 @@ mod tests {
         assert_eq!(rendered("java"), "javac+java");
         assert_eq!(rendered("haskell"), "runghc|ghc");
         assert_eq!(rendered("csharp"), "dotnet|mcs+mono");
-        assert_eq!(rendered("webassembly"), "wat2wasm+wasmtime|wat2wasm+wasmer");
+        assert_eq!(
+            rendered("webassembly"),
+            "wat2wasm+wasmtime|wat2wasm+wasmer|wasm-tools+wasmtime|wasm-tools+wasmer"
+        );
         assert_eq!(rendered("unregistered_backend"), "python3");
         assert_eq!(
             registry.runtime_requirements_for("webassembly").precision,

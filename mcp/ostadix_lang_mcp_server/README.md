@@ -10,21 +10,25 @@ resolve an **absolute** `O_BACKENDS_DIR`, so relative `backends` and bare
 |------|---------|
 | `o_env` | Print roots, `O` / `olangc` paths, shim presence, and the 30-backend runtime summary |
 | `o_runtimes` | Report executable discovery and catalog value capabilities for every canonical backend and supported alternative runtime set |
-| `o_doctor` | Existence checks + shim inventory + complete runtime report + a18re `search/o-run` |
+| `o_doctor` | Existence checks + shim inventory + complete runtime report + resolved external or bundled search corpus |
 | `o_smoke` | `O examples/hello.O <absolute-backends>` — expect `2` |
 | `o_analyze_intent` | Nonexecutingly compute a stable execution intent and return a bounded, expiring, one-use opaque handle |
 | `o_execute_intent` | Consume that handle and require `O` to recompute the same source and execution-intent digests before fresh Graph V2/Evidence and Admission V6 dispatch |
 | `o_run` | Direct, ungated compatibility execution of any `.O` with absolute backends; relative input resolves once against `cwd` or the repository root, while an absolute path with no `cwd` runs from its parent directory |
-| `o_olangc` | `olangc` with `--shim-dir`; relative input/output resolves against the repository root |
-| `o_search_run` | Run `~/a18re/search/<name>.O` with correct env |
+| `o_olangc` | `olangc` with `--shim-dir`; relative input/output resolves against the repository root. `materialize_only` admits ordinary binary/WASM inputs, requires a new contained destination below the server cwd, rejects traversal/existing targets, and invokes neither Cargo nor output publication. |
+| `o_search_run` | Run one strict leaf name from `<work>/search`, or bundled `examples/` when no external work tree exists; reject traversal and symlink escape |
 | `o_information_inspect` | Fixed, bounded `o-info head` inspection of one existing local Information V1 root; returns sanitized IDs/count, no state path or authority, and makes no logical/content/inode/mode/mtime change (atime untested) |
 
 ## Build / install
 
+Development builds on Lee's machine belong in a native path inside the
+`moral-gaur` Multipass VM, not in the mounted macOS checkout. With an exact
+source snapshot at `$OSTADIX_GUEST_SOURCE` inside that VM:
+
 ```bash
-cd ~/Ostadix-lang
+cd "$OSTADIX_GUEST_SOURCE"
 cargo build --release --locked --package o-lang --bin O --bin olangc --bin o-info
-cd ~/Ostadix-lang/mcp/ostadix_lang_mcp_server
+cd "$OSTADIX_GUEST_SOURCE/mcp/ostadix_lang_mcp_server"
 cargo build --release --locked
 cp -f target/release/ostadix-mcp ~/.local/bin/ostadix-mcp
 ```
@@ -42,22 +46,51 @@ The last command performs a real MCP initialize/list/call exchange and requires
 the root release `O`, `olangc`, and `o-info` binaries. Under a deliberately system-only
 `PATH`, it validates every tool's object schema, calls `o_runtimes`, `o_smoke`,
 both supported relative-path forms of `o_run`, relative-path `o_olangc`, and
-fixed local Information V1 head inspection with a no-mutation tree comparison.
+bundled `o_search_run`, rejects search-path escape, and performs fixed local
+Information V1 head inspection with a no-mutation tree comparison.
 The client drains stdout/stderr concurrently and retains out-of-order JSON-RPC
 replies by id.
 
 ## Read-only Information inspection
 
 `o_information_inspect` accepts only an existing, non-symlink Information V1
-state root, one bounded head token, and a timeout. It resolves only the fixed
-repository `target/release/o-info` binary and rejects a symlink at that final
-component. The dedicated runner clears the inherited environment, captures
+state root, one bounded head token, and a timeout. It resolves the fixed
+repository `target/release/o-info` binary by default. An installed image may set
+`OSTADIX_O_INFO_BIN` to an explicit absolute path such as
+`/usr/local/bin/o-info`; relative, missing, non-executable, and final-component
+symlink paths are rejected. The dedicated runner clears the inherited environment, captures
 stdout and stderr concurrently through hard byte limits, kills and reaps the
 process group on Unix (the direct child elsewhere) on overflow or timeout,
 rejects non-UTF-8/control/unexpected or duplicate output, and never returns raw
 stderr or the state path. It invokes
 only `o-info head --state ... --head ...`; no generic arguments, shell, cloud,
 or network surface is exposed.
+
+The installed-layout transport smoke is:
+
+```bash
+python3 scripts/smoke_ostadix_mcp.py \
+  --root /usr/src/ostadix \
+  --binary /usr/local/bin/ostadix-mcp \
+  --server-cwd /workspace \
+  --require-wasm-materialization \
+  --wasm-release-manifest /usr/share/ostadix/wasm/hello.release.json \
+  --wasm-release-artifact /usr/share/ostadix/wasm/hello.wasm \
+  --wasm-source-tree "$STAGED_TREE" \
+  --wasm-base-commit "$BASE_COMMIT" \
+  --wasm-source-archive-sha256 "$SOURCE_ARCHIVE_SHA256" \
+  --o-info /usr/local/bin/o-info \
+  --runtime-bin-dir /usr/local/bin
+```
+
+The smoke child pins `PYTHONDONTWRITEBYTECODE=1`, preserving the exact staged
+source tree while the Python backend is exercised. Materialization uses
+`examples/wasm_hello.O` and proves the MCP-exposed compiler can regenerate the
+descriptor-bound Cargo project without invoking Cargo or producing the output
+artifact. It is not runtime-execution evidence. Stage-two boot separately runs
+the admitted module and `examples/webassembly_hello.O` under Wasmtime;
+`--require-wasm` remains available as a slower focused cold-compilation test
+outside the normal boot path.
 
 The root runtime remains an independent child: the MCP crate does not link
 `o-lang` or write Information logical state. `o-info head` uses
@@ -119,7 +152,9 @@ be initialized with that marker.
 The checked-in `.mcp.json` contains no shell expressions. When explicit
 environment paths are absent, the server recognizes the repository from its
 working directory or an ancestor by checking the root Cargo package, Python
-shim, and hello example. It does not contain a developer-specific absolute
+shim, and hello example. Installed media also recognizes the validated
+`/usr/src/ostadix` source root, so launching from `/workspace` does not depend
+on current-directory accident. It does not contain a developer-specific
 fallback. The crate is distributed under `LGPL-2.1-only`, matching the root
 license shipped in the source release.
 

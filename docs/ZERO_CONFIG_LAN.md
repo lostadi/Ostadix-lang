@@ -22,6 +22,11 @@ Hosted V2 receipt identity, interface-aware discovery, and a detached server.
 It does **not** expose the historical plaintext bootstrap service. Closing the
 terminal or an ordinary remote-desktop terminal does not send the hosted server
 the terminal's hangup signal.
+Fresh automatic TLS material uses RSA-3072 by default. The explicit
+`--fresh-pki-key-algorithm ec-p256` profile provides comparable classical
+security with much faster key generation on cross-architecture emulators. It
+only selects the algorithm when material is absent; it never rotates an
+existing identity.
 
 On the first machine, create a foreground one-use pairing offer:
 

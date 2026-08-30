@@ -9,6 +9,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import tomllib
 import tracemalloc
 import unittest
 from unittest import mock
@@ -518,16 +519,26 @@ class CapacityIsoTests(unittest.TestCase):
             grub,
         )
 
-    def test_physical_hosted_profile_is_single_entry_lts_profile(self) -> None:
+    def test_physical_hosted_profile_has_exact_direct_and_nested_capacity_routes(self) -> None:
         parsed = ISO._load_profile(ROOT / "evidence" / "hosted_live_physical_iso.toml")
         self.assertEqual(parsed["default_entry"], "hosted")
-        self.assertEqual(len(parsed["artifacts"]), 2)
-        self.assertEqual(len(parsed["entries"]), 1)
+        self.assertEqual(len(parsed["artifacts"]), 14)
+        self.assertEqual(len(parsed["entries"]), 7)
+        self.assertEqual(
+            [entry["id"] for entry in parsed["entries"]],
+            ["hosted", "ocore", "alpine", "guix", "openbsd", "plan9", "redox"],
+        )
         hosted = parsed["entries"][0]
         self.assertEqual(hosted["id"], "hosted")
-        self.assertEqual(hosted["adapter"], "linux-selection")
+        self.assertEqual(
+            hosted["title"], "OSTADIX Hosted Workstation [physical x86_64]"
+        )
+        self.assertEqual(hosted["adapter"], "linux-live-rootfs")
         self.assertEqual(hosted["kernel_path"], "/boot/hosted/vmlinuz-lts")
         self.assertEqual(hosted["initrd_paths"], ["/boot/hosted/initramfs.cpio.gz"])
+        self.assertEqual(hosted["selection_id"], "hosted")
+        self.assertEqual(hosted["rootfs_path"], "/boot/hosted/rootfs.squashfs")
+        self.assertEqual(hosted["modloop_path"], "/boot/modloop-lts")
         self.assertEqual(
             hosted["arguments"],
             [
@@ -539,8 +550,163 @@ class CapacityIsoTests(unittest.TestCase):
                 "ignore_loglevel",
             ],
         )
-        self.assertFalse(any(entry["adapter"].startswith("qemu-") for entry in parsed["entries"]))
-        self.assertFalse(any(artifact["role"] == "ocore-kernel" for artifact in parsed["artifacts"]))
+        ocore = parsed["entries"][1]
+        self.assertEqual(
+            ocore,
+            {
+                "id": "ocore",
+                "title": "OSTADIX O-core [direct Multiboot2, serial console]",
+                "hotkey": "o",
+                "adapter": "multiboot2",
+                "arguments": [],
+                "kernel_path": "/boot/ocore/kernel.elf",
+            },
+        )
+        self.assertEqual(
+            {(artifact["iso_path"], artifact["role"]) for artifact in parsed["artifacts"]},
+            {
+                ("/boot/hosted/initramfs.cpio.gz", "linux-initrd"),
+                ("/boot/hosted/rootfs.squashfs", "linux-rootfs"),
+                ("/boot/modloop-lts", "linux-modloop"),
+                ("/boot/hosted/vmlinuz-lts", "linux-kernel"),
+                ("/boot/ocore/kernel.elf", "ocore-kernel"),
+                ("/boot/capacity-host/vmlinuz-virt", "linux-kernel"),
+                ("/boot/capacity-host/initramfs.cpio.gz", "linux-initrd"),
+                ("/boot/entry/010-alpine/initramfs-virt", "linux-initrd"),
+                ("/ostadix/guix/linux-libre-6.17.12-bzimage", "linux-kernel"),
+                ("/ostadix/guix/guix-1.5.0-initrd.cpio.gz", "linux-initrd"),
+                (
+                    "/ostadix/guix/guix-system-install-1.5.0.x86_64-linux.iso",
+                    "guest-rootfs",
+                ),
+                ("/ostadix/openbsd/install79.iso", "guest-raw-cd"),
+                ("/ostadix/9front/9front-11983.amd64.qcow2", "guest-qcow2"),
+                ("/ostadix/redox/redox-server-0.9.0-livedisk.iso", "guest-raw-cd"),
+            },
+        )
+        grub = ISO.render_grub(parsed["entries"], parsed["default_entry"]).decode("ascii")
+        self.assertIn("set default='hosted'", grub)
+        self.assertIn(
+            "linux /boot/hosted/vmlinuz-lts "
+            "ostadix.capacity=hosted "
+            "ostadix.rootfs=/boot/hosted/rootfs.squashfs "
+            "modloop=/boot/modloop-lts "
+            "console=ttyS0,115200n8 console=tty0 rdinit=/init panic=0 "
+            "loglevel=7 ignore_loglevel",
+            grub,
+        )
+        self.assertIn("initrd /boot/hosted/initramfs.cpio.gz", grub)
+        self.assertNotIn(
+            "initrd /boot/hosted/initramfs.cpio.gz /boot/hosted/rootfs.squashfs",
+            grub,
+        )
+        self.assertNotIn("initrd /boot/hosted/initramfs.cpio.gz /boot/modloop-lts", grub)
+        self.assertIn("multiboot2 /boot/ocore/kernel.elf", grub)
+        self.assertLess(
+            grub.index("--id=hosted --hotkey=h"),
+            grub.index("--id=ocore --hotkey=o"),
+        )
+        direct = parsed["entries"][:3]
+        nested = parsed["entries"][3:]
+        self.assertEqual(
+            [(entry["id"], entry["adapter"]) for entry in direct],
+            [
+                ("hosted", "linux-live-rootfs"),
+                ("ocore", "multiboot2"),
+                ("alpine", "linux"),
+            ],
+        )
+        self.assertEqual(
+            [(entry["id"], entry["adapter"]) for entry in nested],
+            [
+                ("guix", "qemu-tcg-linux-direct"),
+                ("openbsd", "qemu-tcg-raw-cd-curses"),
+                ("plan9", "qemu-tcg-qcow2"),
+                ("redox", "qemu-tcg-raw-cd"),
+            ],
+        )
+        self.assertTrue(all("[virtualized/TCG]" in entry["title"] for entry in nested))
+
+    def test_live_rootfs_is_exactly_referenced_and_cannot_be_overridden(self) -> None:
+        raw = tomllib.loads(
+            (ROOT / "evidence" / "hosted_live_physical_iso.toml").read_text(
+                encoding="utf-8"
+            )
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            wrong_role = copy.deepcopy(raw)
+            rootfs = next(
+                artifact
+                for artifact in wrong_role["artifacts"]
+                if artifact["iso_path"] == "/boot/hosted/rootfs.squashfs"
+            )
+            rootfs["role"] = "userspace"
+            path = root / "wrong-rootfs-role.json"
+            path.write_text(json.dumps(wrong_role), encoding="utf-8")
+            with self.assertRaisesRegex(ISO.CapacityIsoError, "expected one of.*linux-rootfs"):
+                ISO._load_profile(path)
+
+            wrong_modloop_role = copy.deepcopy(raw)
+            modloop = next(
+                artifact
+                for artifact in wrong_modloop_role["artifacts"]
+                if artifact["iso_path"] == "/boot/modloop-lts"
+            )
+            modloop["role"] = "userspace"
+            path = root / "wrong-modloop-role.json"
+            path.write_text(json.dumps(wrong_modloop_role), encoding="utf-8")
+            with self.assertRaisesRegex(ISO.CapacityIsoError, "expected one of.*linux-modloop"):
+                ISO._load_profile(path)
+
+            unreferenced = copy.deepcopy(raw)
+            unreferenced["artifacts"].append(
+                {
+                    "iso_path": "/boot/hosted/unreferenced.squashfs",
+                    "stage_path": "boot/hosted/unreferenced.squashfs",
+                    "role": "linux-rootfs",
+                }
+            )
+            path = root / "unreferenced-rootfs.json"
+            path.write_text(json.dumps(unreferenced), encoding="utf-8")
+            with self.assertRaisesRegex(
+                ISO.CapacityIsoError, "artifacts are outside the exact entry closure"
+            ):
+                ISO._load_profile(path)
+
+            unreferenced_modloop = copy.deepcopy(raw)
+            unreferenced_modloop["artifacts"].append(
+                {
+                    "iso_path": "/boot/unreferenced-modloop-lts",
+                    "stage_path": "boot/unreferenced-modloop-lts",
+                    "role": "linux-modloop",
+                }
+            )
+            path = root / "unreferenced-modloop.json"
+            path.write_text(json.dumps(unreferenced_modloop), encoding="utf-8")
+            with self.assertRaisesRegex(
+                ISO.CapacityIsoError, "artifacts are outside the exact entry closure"
+            ):
+                ISO._load_profile(path)
+
+            override = copy.deepcopy(raw)
+            override["entries"][0]["arguments"].append("ostadix.rootfs=/escape")
+            path = root / "rootfs-override.json"
+            path.write_text(json.dumps(override), encoding="utf-8")
+            with self.assertRaisesRegex(
+                ISO.CapacityIsoError, "attempts to override the live root filesystem"
+            ):
+                ISO._load_profile(path)
+
+            modloop_override = copy.deepcopy(raw)
+            modloop_override["entries"][0]["arguments"].append("modloop=/escape")
+            path = root / "modloop-override.json"
+            path.write_text(json.dumps(modloop_override), encoding="utf-8")
+            with self.assertRaisesRegex(
+                ISO.CapacityIsoError, "attempts to override the Linux modloop"
+            ):
+                ISO._load_profile(path)
 
     def test_create_lock_is_deterministic_and_renders_real_qemu_entries(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -797,20 +963,30 @@ class CapacityIsoTests(unittest.TestCase):
             )
             self.assertFalse(build_root.exists())
 
-    def test_physical_builder_is_hosted_only_and_forces_grub2_name(self) -> None:
+    def test_physical_builder_adds_exact_direct_and_nested_capacity_artifacts(self) -> None:
         builder = ROOT / "ocore/kernel/build-x86_64-hosted-live-iso.sh"
         source = builder.read_text(encoding="utf-8")
         self.assertIn("hosted_live_physical_iso.toml", source)
         self.assertIn("ostadix-hosted-live-x86_64-uefi_VTGRUB2.iso", source)
         self.assertIn("boot/hosted/vmlinuz-lts", source)
-        self.assertNotIn("foreign_kernel_lab.py", source)
-        self.assertNotIn("OCORE_KERNEL", source)
+        self.assertIn("OSTADIX_HOSTED_LIVE_OCORE_KERNEL", source)
+        self.assertIn("multiboot2.mod", source)
+        self.assertIn("boot/ocore/kernel.elf", source)
+        self.assertIn("foreign_kernel_lab.py", source)
+        self.assertIn("boot/capacity-host/initramfs.cpio.gz", source)
+        self.assertIn("ostadix/guix/guix-system-install-1.5.0.x86_64-linux.iso", source)
+        self.assertIn("ostadix/openbsd/install79.iso", source)
+        self.assertIn("ostadix/9front/9front-11983.amd64.qcow2", source)
+        self.assertIn("ostadix/redox/redox-server-0.9.0-livedisk.iso", source)
 
     def test_ocore_builder_resolves_an_external_cargo_target_directory(self) -> None:
         source = (ROOT / "ocore/kernel/build.sh").read_text(encoding="utf-8")
         self.assertIn('OCOREC_BIN="$CARGO_TARGET_DIR/debug/ocorec"', source)
         self.assertIn('OCOREC_BIN="$(pwd -P)/$CARGO_TARGET_DIR/debug/ocorec"', source)
         self.assertIn('"$OCOREC_BIN" \\', source)
+        self.assertIn(
+            'cargo build --locked --manifest-path "$ROOT/Cargo.toml"', source
+        )
 
     def test_interactive_runner_preserves_standard_input_through_qemu_exec(self) -> None:
         runner = ROOT / "ocore" / "kernel" / "run-x86_64-capacity-iso-qemu.sh"
@@ -825,13 +1001,22 @@ class CapacityIsoTests(unittest.TestCase):
             firmware.write_bytes(b"firmware")
             inspector.write_text(
                 """#!/usr/bin/env python3
+import hashlib
 import os
 
 def _open_pinned_regular(path, label, readonly=False):
     return os.open(path, os.O_RDONLY)
 
 def inspect_descriptor(descriptor, label):
-    return {"entries": [{"hotkey": "o", "title": "O-core", "adapter": "multiboot2"}]}
+    payload = os.pread(descriptor, os.fstat(descriptor).st_size, 0)
+    return {
+        "bytes": len(payload),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "entries": [
+            {"hotkey": "h", "title": "Hosted", "adapter": "linux-selection"},
+            {"hotkey": "o", "title": "O-core", "adapter": "multiboot2"},
+        ],
+    }
 """,
                 encoding="utf-8",
             )
@@ -864,6 +1049,14 @@ print("FAKE_QEMU_STDIN=" + sys.stdin.readline().rstrip("\\n"))
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("FAKE_QEMU_STDIN=preserved-terminal-input", result.stdout)
+            self.assertIn("OSTADIX x86_64 UEFI ISO", result.stderr)
+            self.assertIn("GRUB hotkeys h/o or arrow keys", result.stderr)
+            self.assertNotIn("h/o/a/g/b/p/r", result.stderr)
+            self.assertIn(
+                "OSTADIX ISO IDENTITY bytes=8 sha256="
+                + hashlib.sha256(b"capacity").hexdigest(),
+                result.stderr,
+            )
 
     def test_capacity_host_pins_optical_driver_modloop_and_module_namespace(self) -> None:
         source = (ROOT / "scripts" / "prepare-x86_64-capacity-host.sh").read_text(
@@ -876,6 +1069,16 @@ print("FAKE_QEMU_STDIN=" + sys.stdin.readline().rstrip("\\n"))
         )
         for module in ("cdrom.ko", "sr_mod.ko", "isofs.ko"):
             self.assertIn(module, source)
+        self.assertIn("ALPINE_MODLOOP_BYTES=303034368", source)
+        self.assertIn(
+            "ALPINE_MODLOOP_SHA256=871ef51ed6378283db9462947bb7fb84c1ec31376611eb1a2281b02b9404c0f6",
+            source,
+        )
+        self.assertIn("kernel/drivers/input/evdev.ko", source)
+        self.assertIn("kernel/drivers/char/hw_random/virtio-rng.ko", source)
+        self.assertIn("kernel/drivers/virtio/virtio_pci.ko", source)
+        self.assertIn("virtio_pci virtio_rng", source)
+        self.assertIn("hid_generic evdev simpledrm", source)
         self.assertIn('ln -s ../usr/lib/modules "$STAGE/lib/modules"', source)
 
     def test_capacity_host_embeds_and_self_tests_hosted_ostadix_before_media_mount(self) -> None:
@@ -902,7 +1105,11 @@ print("FAKE_QEMU_STDIN=" + sys.stdin.readline().rstrip("\\n"))
         self.assertIn("PACKAGE_SPECS", source)
         self.assertIn("resolved Alpine package closure differs", source)
         self.assertIn("nameserver 1.1.1.1", source)
-        self.assertIn("for binary in O o-cli olangc o-link; do", source)
+        self.assertIn("HOSTED_ROOT_BINARIES=(", source)
+        self.assertIn(
+            'HOSTED_BINARIES=("${HOSTED_ROOT_BINARIES[@]}" ostadix-mcp)', source
+        )
+        self.assertIn('for binary in "${HOSTED_IMAGE_BINARIES[@]}"; do', source)
         self.assertIn(
             'install -m 0555 "$HOSTED_BIN_DIR/$binary" "$STAGE/usr/local/bin/$binary"',
             source,

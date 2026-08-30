@@ -1182,21 +1182,70 @@ fn run_mathematica(tools: &BackendToolchain, code: &str) -> Result<OValue> {
     )
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WebAssemblyTextConverter {
+    Wat2Wasm,
+    WasmTools,
+}
+
+impl WebAssemblyTextConverter {
+    const fn logical_command(self) -> &'static str {
+        match self {
+            Self::Wat2Wasm => "wat2wasm",
+            Self::WasmTools => "wasm-tools",
+        }
+    }
+
+    const fn failure_label(self) -> &'static str {
+        match self {
+            Self::Wat2Wasm => "wat2wasm failed",
+            Self::WasmTools => "wasm-tools parse failed",
+        }
+    }
+
+    fn configure(self, command: &mut Command, wat: &Path, wasm: &Path) {
+        match self {
+            Self::Wat2Wasm => {
+                command.arg(wat).arg("-o").arg(wasm);
+            }
+            Self::WasmTools => {
+                command.arg("parse").arg(wat).arg("-o").arg(wasm);
+            }
+        }
+    }
+}
+
+fn select_webassembly_text_converter(
+    has_wat2wasm: bool,
+    has_wasm_tools: bool,
+) -> Result<WebAssemblyTextConverter> {
+    if has_wat2wasm {
+        Ok(WebAssemblyTextConverter::Wat2Wasm)
+    } else if has_wasm_tools {
+        Ok(WebAssemblyTextConverter::WasmTools)
+    } else {
+        bail!("admitted WebAssembly alternative contains no WAT text converter")
+    }
+}
+
 fn run_webassembly(tools: &BackendToolchain, code: &str) -> Result<OValue> {
     let temp = TempDir::new("o-backend-wasm")?;
     let wasm = temp.path().join("module.wasm");
     if code.trim_start().starts_with("(module") || code.trim_start().starts_with("(func") {
         let wat = temp.path().join("module.wat");
         fs::write(&wat, code)?;
-        let mut converter = tools.command("wat2wasm")?;
+        let converter_kind = select_webassembly_text_converter(
+            tools.contains("wat2wasm"),
+            tools.contains("wasm-tools"),
+        )?;
+        let converter_name = converter_kind.logical_command();
+        let mut converter = tools.command(converter_name)?;
+        converter_kind.configure(&mut converter, &wat, &wasm);
         expect_success(
-            "wat2wasm failed",
-            converter
-                .arg(&wat)
-                .arg("-o")
-                .arg(&wasm)
-                .output()
-                .context("failed to launch admitted wat2wasm executable")?,
+            converter_kind.failure_label(),
+            converter.output().with_context(|| {
+                format!("failed to launch admitted {converter_name} executable")
+            })?,
         )?;
     } else {
         fs::write(&wasm, code.as_bytes())?;
@@ -1564,7 +1613,50 @@ impl Drop for TempDir {
 
 #[cfg(test)]
 mod tests {
-    use super::{has_native_backend, sql_checkpoint_profile_accepts};
+    use std::path::Path;
+    use std::process::Command;
+
+    use super::{
+        has_native_backend, select_webassembly_text_converter, sql_checkpoint_profile_accepts,
+        WebAssemblyTextConverter,
+    };
+
+    #[test]
+    fn webassembly_text_converter_selection_and_argv_are_fail_closed() {
+        assert_eq!(
+            select_webassembly_text_converter(true, true).unwrap(),
+            WebAssemblyTextConverter::Wat2Wasm
+        );
+        assert_eq!(
+            select_webassembly_text_converter(false, true).unwrap(),
+            WebAssemblyTextConverter::WasmTools
+        );
+        assert!(select_webassembly_text_converter(false, false)
+            .unwrap_err()
+            .to_string()
+            .contains("no WAT text converter"));
+
+        let wat = Path::new("module.wat");
+        let wasm = Path::new("module.wasm");
+        let mut wabt = Command::new("wat2wasm");
+        WebAssemblyTextConverter::Wat2Wasm.configure(&mut wabt, wat, wasm);
+        assert_eq!(
+            wabt.get_args().collect::<Vec<_>>(),
+            [wat.as_os_str(), "-o".as_ref(), wasm.as_os_str()]
+        );
+
+        let mut wasm_tools = Command::new("wasm-tools");
+        WebAssemblyTextConverter::WasmTools.configure(&mut wasm_tools, wat, wasm);
+        assert_eq!(
+            wasm_tools.get_args().collect::<Vec<_>>(),
+            [
+                "parse".as_ref(),
+                wat.as_os_str(),
+                "-o".as_ref(),
+                wasm.as_os_str(),
+            ]
+        );
+    }
 
     #[test]
     fn sql_checkpoint_profile_is_portable_only_for_main_autocommit_state() {

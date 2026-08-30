@@ -7,6 +7,8 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import tomllib
+from typing import Any, Callable
 import unittest
 from unittest import mock
 
@@ -36,6 +38,11 @@ class FakeCapacityModule:
         if len(data) != size or data.startswith(b"invalid"):
             raise FakeCapacityError("invalid fixture")
         digest = hashlib.sha256(data).hexdigest()
+        profile = tomllib.loads(
+            (ROOT / "evidence/hosted_live_physical_iso.toml").read_text(
+                encoding="utf-8"
+            )
+        )
         return {
             "schema": "ostadix.capacity-iso/v1",
             "architecture": "x86_64",
@@ -43,32 +50,13 @@ class FakeCapacityModule:
             "sha256": digest,
             "capacity_lock_sha256": hashlib.sha256(b"lock" + data).hexdigest(),
             "default_entry": "hosted",
-            "entries": [
-                {
-                    "id": "hosted",
-                    "adapter": "linux-selection",
-                    "arguments": [
-                        "console=ttyS0,115200n8",
-                        "console=tty0",
-                        "rdinit=/init",
-                        "panic=0",
-                        "loglevel=7",
-                        "ignore_loglevel",
-                    ],
-                    "kernel_path": "/boot/hosted/vmlinuz-lts",
-                    "initrd_paths": ["/boot/hosted/initramfs.cpio.gz"],
-                    "selection_id": "hosted",
-                }
-            ],
+            "entries": profile["entries"],
             "artifacts": [
                 {
-                    "iso_path": "/boot/hosted/initramfs.cpio.gz",
-                    "role": "linux-initrd",
-                },
-                {
-                    "iso_path": "/boot/hosted/vmlinuz-lts",
-                    "role": "linux-kernel",
-                },
+                    "iso_path": artifact["iso_path"],
+                    "role": artifact["role"],
+                }
+                for artifact in profile["artifacts"]
             ],
         }
 
@@ -76,6 +64,37 @@ class FakeCapacityModule:
 class OstadixVentoyInstallerTests(unittest.TestCase):
     NAME = "OSTADIX-Hosted-Live-x86_64-UEFI_VTGRUB2.iso"
     SOURCE = b"OSTADIX fixture capacity ISO bytes\n" * 128
+
+    @staticmethod
+    def _capacity_module_with(
+        mutator: Callable[[dict[str, Any]], None],
+    ) -> type[FakeCapacityModule]:
+        class MutatedCapacityModule(FakeCapacityModule):
+            @staticmethod
+            def inspect_descriptor(descriptor: int, label: str) -> dict[str, object]:
+                metadata = FakeCapacityModule.inspect_descriptor(descriptor, label)
+                mutator(metadata)
+                return metadata
+
+        return MutatedCapacityModule
+
+    def _assert_contract_rejected_before_probe(
+        self, mutator: Callable[[dict[str, Any]], None], message: str
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "invalid-contract.iso"
+            source.write_bytes(self.SOURCE)
+            capacity_module = self._capacity_module_with(mutator)
+            with (
+                mock.patch.object(
+                    VENTOY, "_capacity_module", return_value=capacity_module
+                ),
+                mock.patch.object(VENTOY, "probe_ventoy") as probe,
+                self.assertRaisesRegex(VENTOY.CapacityValidationError, message),
+            ):
+                VENTOY.prepare(source, "/dev/disk9", root, self.NAME)
+            probe.assert_not_called()
 
     @staticmethod
     def _medium(volume: Path, *, free_bytes: int = 1024 * 1024 * 1024) -> object:
@@ -460,23 +479,12 @@ class OstadixVentoyInstallerTests(unittest.TestCase):
             VENTOY._validate_name("OSTADIX-Hosted-Live-x86_64-UEFI.iso")
         self.assertEqual(VENTOY._validate_name(self.NAME), self.NAME)
 
-    def test_seven_entry_capacity_lab_is_rejected_before_device_probe(self) -> None:
+    def test_legacy_ostadix_id_is_rejected_before_device_probe(self) -> None:
         class LabCapacityModule(FakeCapacityModule):
             @staticmethod
             def inspect_descriptor(descriptor: int, label: str) -> dict[str, object]:
                 metadata = FakeCapacityModule.inspect_descriptor(descriptor, label)
-                metadata["entries"] = [
-                    {"id": entry}
-                    for entry in (
-                        "hosted",
-                        "ostadix",
-                        "alpine",
-                        "guix",
-                        "openbsd",
-                        "plan9",
-                        "redox",
-                    )
-                ]
+                metadata["entries"][1]["id"] = "ostadix"
                 return metadata
 
         with tempfile.TemporaryDirectory() as directory:
@@ -486,10 +494,137 @@ class OstadixVentoyInstallerTests(unittest.TestCase):
             with (
                 mock.patch.object(VENTOY, "_capacity_module", return_value=LabCapacityModule),
                 mock.patch.object(VENTOY, "probe_ventoy") as probe,
-                self.assertRaisesRegex(VENTOY.CapacityValidationError, "single-entry physical"),
+                self.assertRaisesRegex(
+                    VENTOY.CapacityValidationError,
+                    "exact ordered seven-entry Hosted capacity closure",
+                ),
             ):
                 VENTOY.prepare(source, "/dev/disk9", root, self.NAME)
             probe.assert_not_called()
+
+    def test_missing_or_wrong_rootfs_entry_is_rejected_before_probe(self) -> None:
+        for label, rootfs_path in (
+            ("missing", None),
+            ("wrong", "/boot/hosted/not-the-admitted-rootfs.squashfs"),
+        ):
+            with self.subTest(label=label):
+                def mutate(metadata: dict[str, Any]) -> None:
+                    hosted = metadata["entries"][0]
+                    if rootfs_path is None:
+                        hosted.pop("rootfs_path")
+                    else:
+                        hosted["rootfs_path"] = rootfs_path
+
+                self._assert_contract_rejected_before_probe(
+                    mutate, "exact ordered seven-entry Hosted capacity closure"
+                )
+
+    def test_missing_or_wrong_rootfs_artifact_is_rejected_before_probe(self) -> None:
+        for label, wrong_role in (("missing", None), ("wrong-role", "guest-rootfs")):
+            with self.subTest(label=label):
+                def mutate(metadata: dict[str, Any]) -> None:
+                    artifacts = metadata["artifacts"]
+                    rootfs = next(
+                        artifact
+                        for artifact in artifacts
+                        if artifact["iso_path"] == "/boot/hosted/rootfs.squashfs"
+                    )
+                    if wrong_role is None:
+                        artifacts.remove(rootfs)
+                    else:
+                        rootfs["role"] = wrong_role
+
+                self._assert_contract_rejected_before_probe(
+                    mutate, "exactly 14|wrong 14-artifact Hosted capacity closure"
+                )
+
+    def test_missing_or_wrong_modloop_entry_is_rejected_before_probe(self) -> None:
+        for label, modloop_path in (
+            ("missing", None),
+            ("wrong", "/boot/not-the-admitted-modloop-lts"),
+        ):
+            with self.subTest(label=label):
+                def mutate(metadata: dict[str, Any]) -> None:
+                    hosted = metadata["entries"][0]
+                    if modloop_path is None:
+                        hosted.pop("modloop_path")
+                    else:
+                        hosted["modloop_path"] = modloop_path
+
+                self._assert_contract_rejected_before_probe(
+                    mutate, "exact ordered seven-entry Hosted capacity closure"
+                )
+
+    def test_missing_or_wrong_modloop_artifact_is_rejected_before_probe(self) -> None:
+        for label, wrong_role in (("missing", None), ("wrong-role", "linux-initrd")):
+            with self.subTest(label=label):
+                def mutate(metadata: dict[str, Any]) -> None:
+                    artifacts = metadata["artifacts"]
+                    modloop = next(
+                        artifact
+                        for artifact in artifacts
+                        if artifact["iso_path"] == "/boot/modloop-lts"
+                    )
+                    if wrong_role is None:
+                        artifacts.remove(modloop)
+                    else:
+                        modloop["role"] = wrong_role
+
+                self._assert_contract_rejected_before_probe(
+                    mutate, "exactly 14|wrong 14-artifact Hosted capacity closure"
+                )
+
+    def test_missing_or_wrong_ocore_entry_is_rejected_before_probe(self) -> None:
+        for label, wrong_kernel in (
+            ("missing", None),
+            ("wrong", "/boot/ocore/not-the-admitted-kernel.elf"),
+        ):
+            with self.subTest(label=label):
+                def mutate(metadata: dict[str, Any]) -> None:
+                    entries = metadata["entries"]
+                    if wrong_kernel is None:
+                        entries.pop(1)
+                    else:
+                        entries[1]["kernel_path"] = wrong_kernel
+
+                self._assert_contract_rejected_before_probe(
+                    mutate,
+                    "exact ordered seven-entry Hosted capacity closure",
+                )
+
+    def test_missing_or_wrong_ocore_artifact_is_rejected_before_probe(self) -> None:
+        for label, wrong_role in (("missing", None), ("wrong-role", "linux-kernel")):
+            with self.subTest(label=label):
+                def mutate(metadata: dict[str, Any]) -> None:
+                    artifacts = metadata["artifacts"]
+                    ocore = next(
+                        artifact
+                        for artifact in artifacts
+                        if artifact["iso_path"] == "/boot/ocore/kernel.elf"
+                    )
+                    if wrong_role is None:
+                        artifacts.remove(ocore)
+                    else:
+                        ocore["role"] = wrong_role
+
+                self._assert_contract_rejected_before_probe(
+                    mutate, "exactly 14|wrong 14-artifact Hosted capacity closure"
+                )
+
+    def test_wrong_default_or_entry_order_is_rejected_before_probe(self) -> None:
+        def wrong_default(metadata: dict[str, Any]) -> None:
+            metadata["default_entry"] = "ocore"
+
+        self._assert_contract_rejected_before_probe(
+            wrong_default, "does not default to the physical Hosted Workstation"
+        )
+
+        def wrong_order(metadata: dict[str, Any]) -> None:
+            metadata["entries"].reverse()
+
+        self._assert_contract_rejected_before_probe(
+            wrong_order, "exact ordered seven-entry Hosted capacity closure"
+        )
 
     def _diskutil_fixtures(self, volume: Path) -> tuple[dict[str, dict[str, object]], dict[str, object]]:
         volume_uuid = "11111111-1111-4111-8111-111111111111"

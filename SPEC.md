@@ -489,7 +489,8 @@ Python code. It excludes interpreters selected by shebangs, compiler-driver
 subtools, dynamic libraries, and descendants launched by hosted code. Because
 the current plan omits
 WebAssembly body shape, V6 conservatively requires and binds a complete
-`wat2wasm` plus runtime catalog alternative even for an already-binary body. It
+text-converter plus runtime catalog alternative (`wat2wasm` or `wasm-tools
+parse`) even for an already-binary body. It
 also excludes caller initial-scope shape/values, opaque live-actor
 state/generation, frozen child environment, Request/project admission authority,
 placement-lease freshness, and the final same-principal metadata-check-to-exec

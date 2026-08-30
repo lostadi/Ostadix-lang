@@ -77,12 +77,16 @@ if pid_file:
         stream.write(str(os.getpid()))
 
 
-def serve_qmp():
-    global paused
+def create_qmp_listener():
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(qmp_path)
+    listener.listen(1)
+    return listener
+
+
+def serve_qmp(listener):
+    global paused
     try:
-        listener.bind(qmp_path)
-        listener.listen(1)
         connection, _ = listener.accept()
         with connection:
             connection.sendall(
@@ -118,7 +122,8 @@ def serve_qmp():
 
 
 if scenario != "no-qmp-ignore-term":
-    threading.Thread(target=serve_qmp, daemon=True).start()
+    qmp_listener = create_qmp_listener()
+    threading.Thread(target=serve_qmp, args=(qmp_listener,), daemon=True).start()
 
 chunk_size = max(1, int(os.environ.get("FAKE_QEMU_CHUNK_SIZE", "7")))
 for offset in range(0, len(output), chunk_size):
@@ -162,6 +167,7 @@ class BootInfoQemuHarnessTests(unittest.TestCase):
         *,
         completion_timeout: float = 0.4,
         post_lifecycle: float = 0.08,
+        qmp_budget: float = 0.25,
     ) -> dict[str, object]:
         environment = {
             "FAKE_QEMU_SCENARIO": scenario,
@@ -182,7 +188,7 @@ class BootInfoQemuHarnessTests(unittest.TestCase):
                 transcript_path=self.transcript,
                 stderr_path=self.stderr,
                 diagnostic_path=self.diagnostic,
-                qmp_budget_seconds=0.25,
+                qmp_budget_seconds=qmp_budget,
                 cleanup_timeout_seconds=0.08,
             )
 
@@ -198,7 +204,10 @@ class BootInfoQemuHarnessTests(unittest.TestCase):
     def test_t_only_deadline_fails_and_captures_qmp_state(self) -> None:
         partial = valid_output().split("CPL3 native[0]: online\n", 1)[0]
         diagnostic = self.run_fake(
-            "t-only", partial, completion_timeout=0.18
+            "t-only",
+            partial,
+            completion_timeout=1.0,
+            qmp_budget=1.0,
         )
         self.assertFalse(diagnostic["passed"])
         self.assertEqual(

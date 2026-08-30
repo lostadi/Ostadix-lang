@@ -1,25 +1,33 @@
 # OSTADIX Alpha x86_64 UEFI boot media
 
-This guide covers the two implemented OSTADIX Alpha boot containers for the
-freestanding O-core kernel. Both paths are **x86_64 UEFI only**:
+This guide covers the implemented OSTADIX Alpha boot containers. Every path is
+**x86_64 UEFI only**:
 
-- a deterministic raw GPT disk image with one EFI System Partition; and
+- a deterministic raw GPT disk image with one EFI System Partition for the
+  freestanding O-core kernel;
 - a deterministic ISO9660 image with an El Torito UEFI no-emulation boot
-  image.
+  image for the freestanding O-core kernel; and
+- a staged-tree-addressed combined OSTADIX ISO with Hosted Linux as its
+  default, direct O-core and Alpine entries, and explicit nested QEMU/TCG
+  entries for Guix, OpenBSD, 9front, and Redox.
 
-Each path validates its own bounded structure and boots the exact admitted
-artifact through OVMF under QEMU/TCG. Only the raw GPT image participates in
+Each path validates its own bounded structure. The raw O-core and ordinary ISO
+paths boot their admitted artifact through OVMF/QEMU TCG. The combined ISO
+strictly admits all 14 artifacts, while its current automated gates execute
+Hosted and O-core only. Only the raw GPT image participates in
 the capacity-bound external-device writer on macOS or Linux. For a larger raw
 target, the planner relocates the backup GPT to the target's final LBA without
-enlarging or moving the admitted ESP. The ISO remains a read-only optical
-artifact and is not accepted by the removable-media writer.
+enlarging or moving the admitted ESP. Both ISO forms remain read-only optical
+artifacts and are not accepted by the raw removable-media writer. The combined
+ISO uses the separate guarded Ventoy file-copy workflow.
 
-The current automated evidence is virtual. Building an image, passing the
-OVMF/QEMU smoke, or writing the bytes to removable media does **not** establish
-that a physical machine booted OSTADIX Alpha. Mode 34 establishes one bounded
-four-vCPU SMP bring-up under QEMU/TCG; it does not make the general kernel SMP
-safe and does not establish physical SMP. Physical-machine boot remains
-unpassed until separately observed under the authority-free workflow below.
+The current automated evidence is virtual. Building an image, passing an
+OVMF/QEMU smoke, or writing/copying bytes to removable media does **not**
+establish that those exact bytes booted a physical machine. Mode 34 establishes
+one bounded four-vCPU SMP bring-up under QEMU/TCG; it does not make the general
+kernel SMP safe and does not establish physical SMP. One earlier CLI-only
+Hosted Live artifact has an operator-observed physical boot, but that result
+does not transfer to the newer workstation bytes.
 
 ## Implemented raw disk image
 
@@ -411,7 +419,272 @@ park after the barrier. It is not physical-machine evidence, arbitrary CPU
 topology, a general SMP scheduler, interrupt balancing, per-CPU allocation, or
 proof that existing process/IPC/syscall subsystems are SMP safe.
 
-## Prepare and write removable media
+## Combined staged-tree OSTADIX ISO
+
+The Hosted Workstation release is a separate staged-index product. Its default
+name is:
+
+```text
+target/ostadix-hosted-live/x86_64/ostadix-hosted-live-x86_64-uefi-<tree12>_VTGRUB2.iso
+```
+
+`<tree12>` identifies the first 12 hexadecimal characters of the exact staged
+Git tree. `_VTGRUB2.iso` selects Ventoy's GRUB2 handling path. The release is
+built in the Linux Multipass guest named `moral-gaur`, under a run-owned path,
+rather than compiling in the mounted macOS checkout.
+
+Review and stage only the intended source changes, then build and inspect the
+tree-addressed result:
+
+```bash
+git status --short
+git add -- <reviewed-source-paths>
+o kernel hosted-live-release
+
+HOSTED_LIVE_ISO='<exact hosted-live-output path>'
+o kernel smoke-hosted-live "$HOSTED_LIVE_ISO"
+```
+
+Staging is neither committing nor pushing. The release orchestrator snapshots
+the index with `git write-tree`, rejects source drift, and uses that snapshot as
+the common identity for three different roles:
+
+| Role | Boot representation | Authority boundary |
+|---|---|---|
+| Inspectable source | Complete staged tree at `/usr/src/ostadix` | Excludes `.git`, `target/`, caches, and untracked files; boot self-bind-remounts this tree read-only and proves a write fails. |
+| First-class objects | Read-only CAS at `/usr/share/ostadix/boot-objects/v1` | `o object root/list/stat/get/verify` inspect or materialize verified bytes; boot remounts the tree read-only and v1 does not execute objects. |
+| Runnable products | Admitted x86_64 executables at `/usr/local/bin` | Built separately from the same tree and individually receipt-bound by size and SHA-256. |
+| Derived O artifact | `/usr/share/ostadix/wasm/hello.wasm` plus `hello.release.json` | The descriptor binds the staged tree, O input, installed `olangc`, generated Cargo-project closure, fixed offline build profile, and module identity. |
+
+The 14 declared root products are `O`, `o-cli`, `olangc`, `ocorec`, `o-link`,
+`o-unlink`, `o-notebook`, `ogit`, `o-live-host`, `o-node`, `octl`,
+`o-registry`, `o-info`, and `ocore-kernel-world-record`. `ostadix-mcp` is a
+fifteenth executable built from its separately locked MCP crate. The hosted
+workstation also contains `apk`, Rust, Cargo, rustfmt, Clippy, `rust-wasm`, the
+`wasm32-wasip1` standard library and WASI libc, Git, OpenSSL, Firefox ESR,
+xdg-open, and the C/C++ build tools. The zero-argument
+`o-notebook` honors the installed `O_BACKENDS_DIR`; the boot gate evaluates a
+Python-backed cell, and the graphical gate requires a real Firefox notebook
+window before declaring the Openbox desktop ready. A fresh isolated
+`o node start` must provision its OpenSSL PKI, publish listener readiness,
+report running status, and stop cleanly. The cross-architecture gate selects
+the explicit `--fresh-pki-key-algorithm ec-p256` profile, which avoids RSA
+prime-generation latency under TCG while retaining comparable classical
+security. Ordinary `o node start` remains RSA-3072 by default.
+
+The cross-architecture release harness bounds that one-time fresh provisioning
+to 900 seconds while preserving the node CLI's separate 30-second
+post-provisioning listener-readiness deadline. The full Hosted serial and
+graphical gates each remain fail-closed under a 1,800-second deadline; direct
+O-core keeps its independent 900-second maximum. The Hosted deadline can be
+lowered, but not raised beyond that ceiling, with
+`OSTADIX_HOSTED_LIVE_SMOKE_TIMEOUT`. Direct O-core uses the separate
+`OSTADIX_HOSTED_LIVE_OCORE_SMOKE_TIMEOUT` override. The host release
+orchestrator validates finite values and forwards both assignments explicitly
+through the Multipass boundary; ambient guest values cannot silently select the
+release policy.
+
+Before those products are built, the worker runs `cargo vendor --locked
+--versioned-dirs` for the root manifest and synchronizes
+`mcp/ostadix_lang_mcp_server/Cargo.toml`. Its canonical
+`ostadix.cargo-vendor-manifest/v1` binds both staged `Cargo.lock` files and a
+sorted `{path,bytes,sha256}` record for every vendored file. The currently
+observed closure has 285 package directories, 17,593 files, and 376,759,069
+payload bytes. Root, MCP, and O-core release builds use that source replacement
+with Cargo network access forced offline.
+
+The verified vendor tree is available in the boot at
+`/usr/share/ostadix/cargo/vendor`; its manifest is
+`/usr/share/ostadix/cargo/cargo-vendor-manifest.json`. The installed
+`/root/.cargo/config.toml` replaces crates.io with that absolute directory and
+sets Cargo offline. These counts bind the current pair of lockfiles rather than
+establishing a permanent count for future releases.
+
+The strict ISO closure has 14 artifacts: the Hosted LTS kernel, bootstrap
+initramfs, digest-bound `/boot/hosted/rootfs.squashfs`, and exact
+`/boot/modloop-lts`; the direct O-core kernel; the shared capacity-host kernel
+and initramfs; the direct Alpine initramfs; the Guix kernel, initramfs, and ISO;
+the OpenBSD ISO; the 9front qcow2; and the Redox ISO. The hosted entry pins both
+`rootfs_path` and `modloop_path`; GRUB passes
+them as `ostadix.rootfs=` and `modloop=` kernel arguments. Neither artifact is
+on GRUB's `initrd` line, which contains only the bootstrap cpio. Stage one
+discovers media with the `OSTADIX_CAPACITY` volume label, checks the independently
+embedded SquashFS byte count and SHA-256, attaches it read-only through loop,
+mounts it as SquashFS, constructs a volatile tmpfs overlay, moves the retained
+mounts under the new root, and invokes `switch_root`. It cannot enter the hosted
+gate script before those steps succeed. The package database, Rust/Cargo
+toolchain, Firefox/Openbox GUI, complete staged source, offline Cargo vendor
+closure, boot-object CAS, and installed Ostadix executables are all first-class
+contents of that verified root.
+
+For the Ventoy 1.1.17 Alpine hook contract, bootstrap init exposes the exact
+`ebegin 'Mounting boot media'` / `eend 0` insertion marker. The separate minimal
+gzip SquashFS modloop contains the pinned LTS `dm-mod.ko`, and stage one requires
+`dm_mod` after the hook point. Media discovery is bounded to 30 one-second
+attempts. It invokes BusyBox-compatible `blkid "$device"` and parses the full
+output for an exact `LABEL="OSTADIX_CAPACITY"` token; it expressly avoids the
+unsupported `blkid -s` and `blkid -o` forms.
+
+The boot gate separately checks the exact Rust/Cargo package versions, runs
+rustfmt and Clippy with warnings denied, and compiles and executes a
+dependency-free Rust program with `cargo run --offline`. It then launches the
+installed MCP server from `/workspace` and requires `o_olangc` to regenerate
+the exact no-build `wasm32-wasip1` Cargo project. The project closure must match
+the release descriptor, and the descriptor must bind the packaged
+`/usr/share/ostadix/wasm/hello.wasm` to the staged source and installed
+compiler. A separate live `rustc --target wasm32-wasip1` probe validates the
+installed Rust/WASI target and the resulting core-WASM envelope. The gate then
+executes the packaged Olangc module with Wasmtime and runs the installed
+`webassembly^` route through `wasm-tools parse` and Wasmtime. The expensive
+Olangc-generated WASI entrypoint retains OIR projection, evidence analysis, V6
+admission, schedule validation, and executable-lease checks, then selects the
+serial reference executor because WASI Preview 1 cannot create native worker
+threads. Native generated binaries remain graph-first. The module is compiled
+once during native release construction with Cargo offline, LTO disabled, and
+16 codegen units; it is not cold-compiled under nested x86 TCG at every boot.
+The MCP exchange also proves installed-root
+discovery, bundled search execution, and search-path rejection. Alpine v3.24 currently ships these
+commands from Rust 1.96.1 packages, while the staged
+`rust-toolchain.toml` pins 1.97.1 for canonical repository development. The
+complete pinned source and dual-lock vendor closure remain available, but the
+in-image gate is not a second full root-plus-MCP rebuild and does not claim the
+packaged compiler is byte-identical to the pinned 1.97.1 toolchain.
+
+The object index binds staged-tree and base-commit identities, path modes, Git
+blob SHA-1 values, raw SHA-256 values, logical and deduplicated byte counts, and
+a domain-separated root. The convenient source view is checked against the same
+bindings. See [OSTADIX_BOOT_OBJECTS.md](OSTADIX_BOOT_OBJECTS.md) for the exact
+format and limits.
+
+### Combined ISO boot entries and gates
+
+The strict ISO profile has exactly seven entries:
+
+1. Hosted Linux is first and default. Its small Alpine LTS bootstrap initramfs
+   verifies and mounts the read-only SquashFS workstation root before launching
+   the Openbox/Xterm desktop and local Firefox O-notebook. The resulting system
+   exposes the staged source/object store, admitted Ostadix tools, Cargo, and
+   `apk`.
+2. O-core loads `/boot/ocore/kernel.elf` directly with GRUB Multiboot2. It is a
+   freestanding, serial-only kernel. It does not inherit Linux, X11, Cargo,
+   `apk`, or the hosted source filesystem.
+3. Alpine Linux 3.24.1 loads its virt kernel and initramfs directly.
+4. GNU Guix System 1.5.0 launches through the shared Alpine capacity host under
+   nested QEMU/TCG with its Linux-libre kernel, initramfs, and ISO.
+5. OpenBSD 7.9 launches its offline installer ISO through nested QEMU/TCG.
+6. 9front build 11983 launches its qcow2 through nested QEMU/TCG.
+7. Redox OS 0.9.0 launches its server livedisk through nested QEMU/TCG.
+
+The release keeps their evidence independent. The hosted serial gate verifies
+the digest-bound SquashFS/tmpfs-overlay handoff, read-only source/CAS mounts,
+APK presence, O execution, Bash, SQLite, OIR generation,
+CLI/link operations, Rust, Cargo, rustfmt, Clippy, an offline Cargo hello,
+MCP-mediated exact Olangc project materialization, the source-bound packaged
+Olangc WASM module, its execution under Wasmtime, the O `webassembly^` backend,
+a live Rust/WASI compile, a fresh `o-node` lifecycle, a Python-backed O-notebook
+cell, all declared binaries, the complete staged source view, the MCP
+executable, and the boot object closure before `OSTADIX HOSTED LIVE READY`. A
+second OVMF/QEMU TCG boot starts Openbox, Firefox,
+O-notebook, and Xterm; requires the Firefox notebook window; rejects a black,
+unchanged, or insufficiently chromatic framebuffer; injects USB-keyboard input;
+and verifies the typed command over serial. A third gate selects the O-core
+entry and requires its ordered serial liveness markers. Passing one route does
+not stand in for another. These gates bind the whole ISO identity but do not
+select direct Alpine or the four nested guest routes. Release receipt v6 and
+boot-gates v6 require the exact 14-artifact closure. Serial result v4 and VGA
+result v7 repeat the exact inspected ISO byte count and SHA-256; O-core remains
+independently bound to those same bytes.
+Serial obtains its identity from the same pinned descriptor passed to QEMU;
+graphical and O-core hash their own held descriptors. A stale or mixed gate
+record therefore cannot be adopted as evidence for another ISO.
+
+The public `o kernel smoke-hosted-live` command is the corresponding aggregate
+re-smoke. It copies the selected regular non-symlink ISO into one private,
+read-only snapshot, then runs the serial, graphical, and direct O-core gates in
+that order against those same bytes. It rejects a failed child, malformed or
+unexpected result schema, changed snapshot, or any ISO/firmware identity
+disagreement and emits one `ostadix.hosted-live-qemu-smoke-all/v2` result. Its
+graphical monitor connect, command, response, keyboard, capture, quit, and
+success-exit operations all consume one absolute Hosted deadline rather than
+receiving a fresh relative socket timeout per operation.
+
+These are QEMU gates, not physical or Secure Boot proof. The ISO is unsigned,
+and its intended development path has Secure Boot disabled. The live root is a
+read-only SquashFS with a volatile tmpfs overlay; the release does not claim an
+installer, durable home directory, or durable package installation.
+
+The hosted QEMU gates deliberately retain 4 GiB of guest RAM as a regression
+bound for the split-root design. The large immutable filesystem stays on
+SquashFS media and is paged on demand rather than expanded into the initial
+rootfs; only writable overlay and build state consume tmpfs memory. This does
+not establish a physical RAM minimum.
+
+Guix, OpenBSD, 9front, and Redox are embedded as exact, typed guest artifacts
+with explicit menu routes. The shared Alpine capacity host launches them under
+nested QEMU/TCG; they are not direct GRUB kernels or personalities running
+inside O-core. Current combined-release gates do not execute those menu routes
+and therefore do not prove their package managers, GUIs, or Ventoy routing.
+
+### Physical-artifact distinction
+
+The earlier CLI-only artifact remains a distinct operator-observed physical
+success:
+
+```text
+path:   target/ostadix-hosted-live/x86_64/ostadix-hosted-live-x86_64-uefi-12037d21a394_VTGRUB2.iso
+bytes:  80306176
+sha256: f25622d0e562ec5c95230653a1ab0e9edf65bb33b44750602b0d41237c44481b
+scope:  physical boot observed; CLI-only payload
+```
+
+That observation does not prove a later, larger workstation artifact. The
+workstation receipt remains `physical_hardware_proof:false` after its virtual
+gates and until the exact copied bytes are separately observed on the target
+machine.
+
+The previously retained 3,227,592,704-byte seven-entry attempt with SHA-256
+`247a51f296e8b07238df32870a44c2a582ff802daafab631be822ea0f4539c6e`
+passed an older serial gate but reproduced a black VGA screen. It remains a
+failure record, not boot evidence for the workstation or its individual menu
+entries.
+
+### Guarded Ventoy copy
+
+The combined OSTADIX ISO uses a guarded file copy, not the raw GPT writer.
+Resolve the currently connected external whole disk and mounted Ventoy data
+volume immediately before preparing the operation:
+
+```bash
+VENTOY_DEVICE=/dev/diskN       # example only; replace with the live external disk
+VENTOY_VOLUME=/Volumes/Ventoy
+VENTOY_NAME=OSTADIX-Hosted-Workstation-x86_64-UEFI_VTGRUB2.iso
+
+o kernel prepare-ventoy \
+  --iso "$HOSTED_LIVE_ISO" --device "$VENTOY_DEVICE" \
+  --volume "$VENTOY_VOLUME" --name "$VENTOY_NAME"
+
+TOKEN='<exact prepare-ventoy token>'
+o kernel install-ventoy \
+  --iso "$HOSTED_LIVE_ISO" --device "$VENTOY_DEVICE" \
+  --volume "$VENTOY_VOLUME" --name "$VENTOY_NAME" \
+  --confirm "$TOKEN"
+
+o kernel verify-ventoy \
+  --iso "$HOSTED_LIVE_ISO" --device "$VENTOY_DEVICE" \
+  --volume "$VENTOY_VOLUME" --name "$VENTOY_NAME"
+```
+
+Preparation is read-only. Installation re-identifies the same removable,
+writable target, copies through a private `.part` file or a guarded ExFAT
+fallback, synchronizes it, and verifies the complete ISO identity and structure.
+It never overwrites a divergent destination. Re-resolve the device after every
+disconnect; an old `/dev/diskN` value is not persistent device identity.
+Successful copy and digest verification, hook-compatible markers, and the
+minimal modloop do not prove that Ventoy or a physical firmware path can
+rediscover the ISO and mount its SquashFS root. That boot substrate remains
+unproven until the exact copied bytes are observed separately on hardware.
+
+## Prepare and write raw O-core removable media
 
 **Writing is destructive. It replaces the target's partition-table authority,
 writes the admitted image body, retires the source backup GPT, and writes a new
@@ -731,6 +1004,9 @@ execution, trusted firmware, a trusted source build, or a completed write.
 | `o kernel iso` succeeds | A mode-0 x86_64 kernel was packed into a strictly admitted ISO9660/El Torito UEFI no-emulation container and atomically published. | A second reproducible build, any boot, physical hardware, SMP, authenticity, or suitability for the raw-media writer. |
 | `o kernel inspect-iso` succeeds | The supplied bytes conform to `ostadix.boot-iso/v1`, including the admitted UEFI PE32+ application, x86_64 kernel ELF, exact GRUB configuration, and reported component hashes. | That the ISO was produced by a trusted party, that its payloads execute, or that it is signed, measured, or authenticated. |
 | `o kernel smoke-iso` succeeds | Two local ISO rebuilds are byte-identical and the descriptor-pinned first ISO boots as read-only CD media under x86_64 OVMF/QEMU TCG, emits the five required markers in order without fatal output, and remains live for the bounded post-heartbeat window without changing identity. | Physical boot, KVM, SMP, secure/measured boot, hardware driver support, PCI/DMA/IOMMU isolation, external-media writing, or a release qualification gate. |
+| `o kernel hosted-live-release` succeeds | One exact staged Git tree was embedded as both `/usr/src/ostadix` and a verified read-only boot-object CAS; the declared x86_64 root/MCP executables and Hosted package closure were admitted with exact direct Hosted/O-core/Alpine and nested Guix/OpenBSD/9front/Redox entries, 14 typed artifacts, and pinned foreign-media verification. | A commit, push, physical boot, persistence, Secure Boot, execution of every source file or backend runtime, selection of the other five menu routes, guest GUI/package-manager execution, or Ventoy foreign-route behavior. |
+| `o kernel smoke-hosted-live` succeeds | The exact combined ISO passes the Hosted serial/object/toolchain/node/notebook gate, Openbox/Firefox/Xterm framebuffer and USB-input gate, and separate direct-selection O-core serial gate under OVMF/QEMU TCG. | Physical hardware, Secure Boot, KVM/SVM, a persistent desktop, direct Alpine or nested guest execution, an O-core GUI or Linux userspace, the canonical Rust 1.97.1 toolchain, or guest package-manager/GUI execution. |
+| `install-ventoy` and `verify-ventoy` succeed | The same currently identified external Ventoy target contains a synchronized, hash-identical, structurally inspected copy under the requested new basename. | Firmware acceptance, a boot, persistence, authenticity, or a safe basis for reusing the device path after disconnection. |
 | `o kernel smoke-boot-info` succeeds | A bounded challenged Multiboot2 handoff derives the page allocator's admitted subwindow, closes its temporary mapping before W^X, and a challenged mode-0 boot reaches CPL3/timer/heartbeat while the shared transcript parser rejects a wrong challenge. | Physical execution, general firmware/ACPI support, initrd loading, KVM, secure/measured boot, or hardware trust. |
 | `o kernel smoke-smp` succeeds | One challenged four-vCPU QEMU/TCG image performs bounded ACPI/MADT admission, PIT-timed x2APIC INIT/SIPI, unique-stack AP entry, trampoline retirement, and one atomic barrier; the same image rejects under one vCPU. | Physical SMP, KVM, arbitrary topologies, a general SMP scheduler, interrupt balancing, per-CPU allocation, or SMP safety of other kernel subsystems. |
 | `prepare-write` succeeds | One privately snapshotted and validated source image, one stable external/removable device identity and capacity, and one canonical sparse target plan are bound by `target_plan_sha256` and a confirmation token. | A device write, the contents of `unwritten_ranges`, or a boot. |
@@ -749,7 +1025,15 @@ Additional current nonclaims:
   measured-boot, or TPM evidence chain.
 - The image is not an installer and does not authorize writing an internal
   disk.
-- It does not boot Linux, Plan 9, or another foreign kernel.
+- The O-core-only raw disk and ISO do not boot Linux, Plan 9, or another
+  foreign kernel. The combined ISO separately contains three direct and four
+  nested QEMU/TCG routes; this does not turn any guest into an O-core
+  personality.
+- The workstation's complete staged-tree/object closure does not install every
+  declared backend runtime. Foreign guest media bytes are included, but current
+  combined-release gates do not execute or qualify their package managers or
+  GUIs.
+- The workstation is RAM-backed and has no claimed persistence or installer.
 - QEMU/TCG observation cannot be promoted into physical-hardware evidence.
 - Physical intent and observation records are unkeyed, authority-free,
   operator-asserted records. They are neither attestations nor authenticators.

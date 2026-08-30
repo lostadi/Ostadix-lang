@@ -74,6 +74,23 @@ class LowercaseCliDispatchTests(unittest.TestCase):
             "node:7337",
         ])
         self.assert_dispatch(("node", "start"), ["start"])
+        self.assert_dispatch(
+            (
+                "node",
+                "start",
+                "--startup-timeout-seconds",
+                "30",
+                "--fresh-pki-key-algorithm",
+                "ec-p256",
+            ),
+            [
+                "start",
+                "--startup-timeout-seconds",
+                "30",
+                "--fresh-pki-key-algorithm",
+                "ec-p256",
+            ],
+        )
         self.assert_dispatch(("node", "status"), ["status"])
         self.assert_dispatch(("node-host", "serve", "--bind", "127.0.0.1:7337"), [
             "serve",

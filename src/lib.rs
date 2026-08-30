@@ -5,8 +5,8 @@
 //! module paths used by the root CLI and downstream `o_lang` embedders.
 
 pub use ostadix_api::{
-    api, backend, backend_morphism, backend_state, effects, environment, eval, evidence,
-    execution_contract, execution_fabric, execution_fabric_authority, executor, hgraph,
+    api, backend, backend_morphism, backend_state, boot_objects, effects, environment, eval,
+    evidence, execution_contract, execution_fabric, execution_fabric_authority, executor, hgraph,
     hosted_remote, information, information_bridge, information_provenance, intent, ir,
     kernel_world, live_system, nix_ops, nixos_ops, ocore, parser, placement, process, project,
     registry, resource_identity, runtime_exec, scheduler, shims, syntax_dialect, value, version,
