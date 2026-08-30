@@ -421,7 +421,7 @@ fn validate_evidence_information_v1(
         || !valid_sha256(&record.backend_catalog_projection_sha256)
     {
         return Err(invalid_record(
-            "Evidence projection is not the exact bounded V6/Catalog V5 coordinate",
+            "Evidence projection is not the exact bounded Evidence V6/Catalog V6 coordinate",
         ));
     }
     let projection = EvidenceDigestProjectionV1 {

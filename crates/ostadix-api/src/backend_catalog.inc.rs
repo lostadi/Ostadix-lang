@@ -10,7 +10,8 @@
 // `[["dotnet"], ["mcs", "mono"]]` means dotnet OR (mcs AND mono).
 
 backend_catalog_metadata! {
-    current_schema: "ostadix.backend-catalog/v5",
+    current_schema: "ostadix.backend-catalog/v6",
+    legacy_schema_v5: "ostadix.backend-catalog/v5",
     legacy_schema_v4: "ostadix.backend-catalog/v4",
     legacy_schema_v3: "ostadix.backend-catalog/v3",
 }

@@ -50,7 +50,7 @@ class ResponseReaderTests(unittest.TestCase):
     def test_catalog_schema_is_read_from_the_independent_engine(self) -> None:
         self.assertEqual(
             smoke._current_catalog_schema(ROOT),
-            "ostadix.backend-catalog/v5",
+            "ostadix.backend-catalog/v6",
         )
         source = SCRIPT.read_text(encoding="utf-8")
         self.assertIn('"crates" / "ostadix-api" / "src"', source)

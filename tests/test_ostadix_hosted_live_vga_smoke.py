@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import inspect
 from pathlib import Path
+import re
 import sys
 import tempfile
 import unittest
@@ -275,8 +276,20 @@ class HostedLiveDesktopSmokeTests(unittest.TestCase):
              SMOKE.INPUT_MARKER,
              b"OSTADIX HOSTED DESKTOP: FAIL: Xorg exited")
         )
-        with self.assertRaisesRegex(SMOKE.VisualSmokeError, "failure marker 'FAIL'"):
+        with self.assertRaisesRegex(
+            SMOKE.VisualSmokeError,
+            "OSTADIX HOSTED DESKTOP: FAIL: Xorg exited",
+        ):
             SMOKE._require_ordered_markers(transcript)
+
+    def test_failure_diagnostic_is_bounded_to_one_serial_line(self) -> None:
+        long_line = b"OSTADIX HOSTED DESKTOP: FAIL: " + b"x" * 2048
+        with self.assertRaises(SMOKE.VisualSmokeError) as raised:
+            SMOKE._raise_for_failure_markers(b"unrelated\n" + long_line + b"\nafter\n")
+        message = str(raised.exception)
+        self.assertIn("OSTADIX HOSTED DESKTOP: FAIL:", message)
+        self.assertNotIn("after", message)
+        self.assertLessEqual(len(message), 1100)
 
     def test_input_marker_must_follow_desktop_marker(self) -> None:
         self.assertFalse(
@@ -343,6 +356,36 @@ class HostedLiveDesktopSmokeTests(unittest.TestCase):
             SMOKE.changed_pixel_count(before, self._frame(bytes(enough_pixels))),
             SMOKE.MIN_CHANGED_PIXELS,
         )
+
+    def test_launcher_ansi_palette_satisfies_the_real_hue_gate(self) -> None:
+        source = (ROOT / "scripts/ostadix-hosted-live-desktop.sh").read_text()
+        indexes = [int(value) for value in re.findall(r"38;5;([0-9]+)m", source)]
+        self.assertGreaterEqual(len(set(indexes)), 8)
+
+        levels = (0, 95, 135, 175, 215, 255)
+        colors = []
+        for index in indexes:
+            self.assertIn(index, range(16, 232))
+            cube = index - 16
+            colors.append(
+                bytes(
+                    (
+                        levels[cube // 36],
+                        levels[(cube % 36) // 6],
+                        levels[cube % 6],
+                    )
+                )
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            frame_path = Path(temporary) / "launcher-palette.ppm"
+            self._write_ppm(frame_path, colors)
+            frame = SMOKE.read_frame(frame_path)
+            SMOKE.validate_visible_frame(frame)
+            self.assertGreaterEqual(
+                frame.chromatic_hue_buckets,
+                SMOKE.MIN_CHROMATIC_HUE_BUCKETS,
+            )
 
     def test_existing_input_command_is_sent_to_focused_xterm(self) -> None:
         class Monitor:
@@ -605,12 +648,34 @@ class HostedLiveDesktopSmokeTests(unittest.TestCase):
             "/usr/bin/startx",
             "-nolisten tcp",
             "openbox --sm-disable",
+            '<application name="ostadix-workstation">',
+            "<focus>yes</focus>",
+            "<layer>above</layer>",
             "xsetroot -solid '#181825'",
-            "xterm -geometry 90x28",
+            "xterm -name ostadix-workstation",
+            "-geometry 90x28",
+            "choose o/a/g/b/p/r",
+            "O-core/Alpine/Guix/OpenBSD/9front/Redox",
             "OSTADIX_NOTEBOOK_BROWSER=/usr/bin/firefox-esr",
             "o-notebook",
             "xprop -root _NET_CLIENT_LIST",
+            "notebook_page_ready",
+            'b"<title>O \\xc2\\xb7 Notebook</title>"',
+            "ProxyHandler({})",
+            "response.read(1024 * 1024)",
             "OSTADIX HOSTED NOTEBOOK GUI READY: PASS",
+            "xprop -root _NET_ACTIVE_WINDOW",
+            "focus_x11_window",
+            "XRaiseWindow",
+            "XSendEvent",
+            'b"_NET_ACTIVE_WINDOW"',
+            '("pad", ctypes.c_long * 24)',
+            "event_mask = (1 << 19) | (1 << 20)",
+            "event.xclient.data.l[0] = 2",
+            "active_confirmations=0",
+            'active_confirmations=$((active_confirmations + 1))',
+            '[ "$active_confirmations" -lt 3 ] || break',
+            "grep -Fqi 'ostadix-workstation'",
             "OSTADIX HOSTED X11 FONT: PASS",
             "os.openpty()",
             "OSTADIX HOSTED PTY: PASS",
@@ -624,6 +689,19 @@ class HostedLiveDesktopSmokeTests(unittest.TestCase):
             source.index('kill -0 "$window_manager"'),
             source.index("OSTADIX HOSTED DESKTOP READY: PASS"),
         )
+        self.assertLess(
+            source.index("notebook_page_ready"),
+            source.index("OSTADIX HOSTED NOTEBOOK GUI READY: PASS"),
+        )
+        self.assertLess(
+            source.index("focus_x11_window \"$terminal_window\""),
+            source.index("OSTADIX HOSTED DESKTOP READY: PASS"),
+        )
+        self.assertLess(
+            source.index("xprop -root _NET_ACTIVE_WINDOW"),
+            source.index("OSTADIX HOSTED DESKTOP READY: PASS"),
+        )
+        self.assertEqual(source.count("xterm -name ostadix-workstation"), 2)
         self.assertGreaterEqual(source.count("38;5;"), 6)
 
 

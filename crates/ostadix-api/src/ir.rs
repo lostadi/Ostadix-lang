@@ -31,7 +31,7 @@ pub use crate::backend_catalog::{
     BackendValueCapabilities, ExecutionMode, IntegerExactness, RichNumberPreservation,
     RuntimeRequirementPrecision, RuntimeRequirementSpec, SpliceRenderer,
     BACKEND_CATALOG_CURRENT_SCHEMA, BACKEND_CATALOG_SCHEMA_V1, BACKEND_CATALOG_SCHEMA_V3,
-    BACKEND_CATALOG_SCHEMA_V4, BACKEND_CATALOG_SCHEMA_V5,
+    BACKEND_CATALOG_SCHEMA_V4, BACKEND_CATALOG_SCHEMA_V5, BACKEND_CATALOG_SCHEMA_V6,
 };
 
 // ═════════════════════════════════════════════════════════════════════════════

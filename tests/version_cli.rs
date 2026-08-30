@@ -45,7 +45,7 @@ fn plain_and_machine_readable_version_surfaces_agree() {
     );
     assert_eq!(
         report["backend_catalog_schema"],
-        "ostadix.backend-catalog/v5"
+        "ostadix.backend-catalog/v6"
     );
 
     assert_eq!(

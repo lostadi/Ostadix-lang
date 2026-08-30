@@ -3509,13 +3509,13 @@ use ostadix_generated_serde::evidence::{
 use ostadix_generated_serde::ir::{OIr, OIrProgram};
 use ostadix_generated_serde::registry::bundle::{
     BackendMorphismProfileV1, BackendRegistry, IntegerExactness,
-    BACKEND_CATALOG_CURRENT_SCHEMA, BACKEND_CATALOG_SCHEMA_V4, BACKEND_CATALOG_SCHEMA_V5,
+    BACKEND_CATALOG_CURRENT_SCHEMA, BACKEND_CATALOG_SCHEMA_V4, BACKEND_CATALOG_SCHEMA_V6,
 };
 use ostadix_generated_serde::{resource_identity, world};
 
 #[test]
 fn catalog_placement_and_checkpoint_sources_are_live() {
-    assert_eq!(BACKEND_CATALOG_CURRENT_SCHEMA, BACKEND_CATALOG_SCHEMA_V5);
+    assert_eq!(BACKEND_CATALOG_CURRENT_SCHEMA, BACKEND_CATALOG_SCHEMA_V6);
     assert_eq!(BACKEND_CATALOG_SCHEMA_V4, "ostadix.backend-catalog/v4");
     let rust = BackendRegistry::global().interface_for("rust");
     assert!(matches!(

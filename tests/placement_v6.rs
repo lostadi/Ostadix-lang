@@ -16,7 +16,7 @@ use o_lang::placement::{
     WarrantTierV1,
 };
 use o_lang::registry::bundle::{
-    BACKEND_CATALOG_SCHEMA_V5, LOCAL_BACKEND_PROTOCOL_ABI_V1, LOCAL_REALIZATION_DIGEST_DOMAIN_V1,
+    BACKEND_CATALOG_SCHEMA_V6, LOCAL_BACKEND_PROTOCOL_ABI_V1, LOCAL_REALIZATION_DIGEST_DOMAIN_V1,
     LOCAL_REALIZATION_SCHEMA_V1,
 };
 use o_lang::world::ArtifactId;
@@ -190,13 +190,13 @@ fn noncurrent_catalog_profiles_remain_inspectable_but_cannot_authorize() {
     let registry = BackendRegistry::global();
     let obsolete_specification = SemanticDigestV1::from_sha256(
         registry
-            .specification_sha256_v4("python")
-            .expect("archival Python V4 specification"),
+            .specification_sha256_v5("python")
+            .expect("archival Python V5 specification"),
     )
     .unwrap();
     assert_eq!(
         obsolete_specification.as_sha256(),
-        "0802014cbcadb8e7302ccf4f542d0b08eb5ccb05d41caffdac359e392145dcbf"
+        "eaca98374a864d55ccb8ab464d4aa1ef34470cd6dc065e0de902e41fbf9d9655"
     );
     assert!(!registry.contains_specification_sha256(obsolete_specification.as_sha256()));
     let descriptor = target(
@@ -227,7 +227,7 @@ fn noncurrent_catalog_profiles_remain_inspectable_but_cannot_authorize() {
             specification,
             current_schema,
         }) if specification == obsolete_specification.as_sha256()
-            && current_schema == BACKEND_CATALOG_SCHEMA_V5
+            && current_schema == BACKEND_CATALOG_SCHEMA_V6
     ));
 }
 
@@ -313,7 +313,7 @@ fn current_catalog_rejects_legacy_realization_with_a_current_specification() {
             realization_pipeline,
             current_schema,
         }) if realization_pipeline == legacy_pipeline.as_sha256()
-            && current_schema == BACKEND_CATALOG_SCHEMA_V5
+            && current_schema == BACKEND_CATALOG_SCHEMA_V6
     ));
 }
 

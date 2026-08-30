@@ -64,11 +64,11 @@ from each projected scalar before it is compiled and run by the real shim.
 They also cover negative boundaries. Richer runtime values outside these
 profiles remain executable but acquire no V1 morphism claim.
 
-V1 is shadow-only. Catalog V5 hashes the explicit optional profile assignment
-and resolves it through canonical backend names and aliases; archival V4
+V1 is shadow-only. Catalog V5 introduced the hashed optional profile assignment,
+and Catalog V6 retains it and resolves it through canonical backend names and aliases; archival V4
 identity remains unchanged. The profile is not a `BackendInterface` field and
 does not itself authorize evidence, admission, placement, or dispatch. Existing
-current-catalog projections bind the Catalog V5 digest without adding a new
+current-catalog projections bind the Catalog V6 digest without adding a new
 evidence field. Package 0.3's current Graph V2/Evidence V6 path preserves the
 complete typed solver assessment in its hashes and Why V2 view and is accepted
 by the coordinator, but still does not enforce the catalog profile. Graph

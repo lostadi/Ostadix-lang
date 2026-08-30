@@ -232,16 +232,16 @@
   locally prepared fragment before accepting execution authority.
 - Local admission schema, Hosted Placement V6, and backend-catalog generation
   are independent version axes.
-  The current authorizing catalog is `ostadix.backend-catalog/v5`, and its
+  The current authorizing catalog is `ostadix.backend-catalog/v6`, and its
   schema string participates in the whole-catalog and per-specification hash
   domains. `NodeProfileV1::validate_at` invokes
   `TargetDescriptorV1::validate_current_backend_catalog` before candidate
-  authorization. A profile containing a V4, V3, or otherwise unknown backend
+  authorization. A profile containing a V5, V4, V3, or otherwise unknown backend
   specification therefore fails with `NonCurrentBackendCatalog`, even if its
   old digest, detached signature, requirements, and warrants agree with one
   another. Decoding or independently verifying an archived signed record is
   not current placement authorization, and no archival digest is relabeled as
-  V5. V4 remains frozen with the explicit backend-state support and snapshot-
+  V6. V4 remains frozen with the explicit backend-state support and snapshot-
   compatibility declaration used by persistent-session placement. V5 extends
   that exact prefix with an explicitly absent or named bounded
   backend-morphism profile.
@@ -615,8 +615,9 @@
   the backend can accept that value as input. Both legs carry explicit
   compositional fidelity and their exact boundary descriptions appear in each
   shadow assessment.
-- Catalog V5 binds the optional shadow profile assignment for all 30 canonical
-  backends; archival V4 digests stay unchanged. This makes profile selection
+- Catalog V5 introduced the optional shadow profile assignment for all 30
+  canonical backends, and Catalog V6 retains it while expanding only the
+  WebAssembly runtime alternatives; archival V4 and V5 digests stay unchanged. This makes profile selection
   part of the current catalog projection and placement identity, but does not
   add the profile to `BackendInterface`, change HGraph solver facts or graph
   hashing, add fields to evidence/admission protocols, or enforce a crossing

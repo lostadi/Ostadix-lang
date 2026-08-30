@@ -601,10 +601,10 @@ fn all_eight_native_projections_roundtrip_and_pin_t2_goldens() {
             "178c99cd772707d6cdaa83dc0af59223018720e652df1da895445f6774212fff",
             "44a1dec26c1f425305d777b52ae0df902a46f0ad22e1cd4db5f850eba074963c",
             "4898d60361492a7508b5befa5d17d92def15291b803336eeba636629feff4965",
-            "a1aedfc85d3a1c01e99fd9045b57beb69ecbe629aa02bf4820c007b7e307f4ce",
+            "aab562e52f0bef68e5e8f855d4a01bb1ee4b8ef29c5567434536860f53d26aba",
             "c19dd8e66807b2d927fc89a85a2c62cfdb187bd41dd3ac4f6a38015f896f8e55",
             "e2df6e5aee888f9d8d44737393bd9a1ccca221658e54f1fe683c9ff99fff2cf1",
-            "b291b1fbe84f7b2d7b802716996686d60f608db7572d4e3045bec1b2293ba0a7",
+            "b5b734e009431c1e1ad63db087a1ba0834aca2cc5af16215b84a73f45967c6fc",
             "32afbe8d94ab044fffbe38e5d2bb121b2b8ff9f0cebe8f34b908c80f3501c829",
         ],
         "canonical/T2 digest changes require a schema review and updated vectors"

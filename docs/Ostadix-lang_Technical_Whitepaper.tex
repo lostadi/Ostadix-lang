@@ -621,7 +621,7 @@ different graph coordinate.
 
 Evidence V6 binds that graph to the complete lowering and execution context.
 The bundle carries the OIR and plan identities, Graph V2 identity, analyzer
-coordinate, backend Catalog V5 projection, backend artifact bindings, runtime
+coordinate, backend Catalog V6 projection, backend artifact bindings, runtime
 binding, environment binding, ambient World binding, and one typed assessment
 for every executable operation. The analyzer first validates the caller graph
 against a freshly solved Graph V2 before emitting the bundle.
@@ -1715,7 +1715,8 @@ fixpoint and preserves the weakest accumulated guarantee.
 \texttt{BackendMorphismV1} defines bounded Python, JavaScript, and Rust
 crossing profiles with explicit input projection, output injection, rejection
 kinds, two fidelity legs, and a checked lossless round-trip law. Catalog V5
-binds each profile to its canonical backend entry. The HGraph solver exposes
+first bound each profile to its canonical backend entry, and Catalog V6 retains
+those assignments. The HGraph solver exposes
 the resulting assessment beside its compatibility fidelity result in shadow
 mode, making profile divergences inspectable while the established admission,
 rendering, and dispatch paths retain their current authority.
