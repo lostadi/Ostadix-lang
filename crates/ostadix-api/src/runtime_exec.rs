@@ -883,12 +883,32 @@ pub fn resolve_backend_launch_selection(backend: &str) -> Result<ResolvedBackend
 
 /// Capture one exact direct-launch alternative per plan-used shim backend.
 /// Missing direct entrypoints reject execution before evidence/admission and
-/// before any plan operation is dispatched.
+/// before any plan operation is dispatched. Inline-only plans have no process
+/// launch authority to capture, so they return an empty manifest without
+/// resolving the current executable. This keeps pure WASI evaluation usable
+/// while shim-backed WASI plans continue to fail closed.
 pub fn capture_execution_manifest(
     plan: &ExecutionPlan,
 ) -> Result<(ExecutableManifestV1, Arc<ExecutableLeaseSet>)> {
-    let current = std::env::current_exe().context("failed to locate current O executable")?;
-    capture_execution_manifest_with_current_executable(plan, &current)
+    capture_execution_manifest_with_current_executable_resolver(plan, || {
+        std::env::current_exe().context("failed to locate current O executable")
+    })
+}
+
+fn capture_execution_manifest_with_current_executable_resolver<F>(
+    plan: &ExecutionPlan,
+    resolve_current_executable: F,
+) -> Result<(ExecutableManifestV1, Arc<ExecutableLeaseSet>)>
+where
+    F: FnOnce() -> Result<PathBuf>,
+{
+    let shim_backends = shim_backends(plan);
+    let current_executable = if shim_backends.is_empty() {
+        None
+    } else {
+        Some(resolve_current_executable()?)
+    };
+    capture_execution_manifest_for_shim_backends(shim_backends, current_executable.as_deref())
 }
 
 /// Capture a manifest with an explicit O proxy entrypoint.
@@ -901,7 +921,13 @@ pub fn capture_execution_manifest_with_current_executable(
     plan: &ExecutionPlan,
     current_executable: &Path,
 ) -> Result<(ExecutableManifestV1, Arc<ExecutableLeaseSet>)> {
-    let shim_backends = shim_backends(plan);
+    capture_execution_manifest_for_shim_backends(shim_backends(plan), Some(current_executable))
+}
+
+fn capture_execution_manifest_for_shim_backends(
+    shim_backends: BTreeSet<String>,
+    current_executable: Option<&Path>,
+) -> Result<(ExecutableManifestV1, Arc<ExecutableLeaseSet>)> {
     let backends = shim_backends.clone();
     let mut artifacts = Vec::new();
     let mut retained = BTreeMap::new();
@@ -928,6 +954,8 @@ pub fn capture_execution_manifest_with_current_executable(
         }
 
         if shim_backends.contains(&backend) {
+            let current_executable =
+                current_executable.context("plan-used shim backend has no current O executable")?;
             artifacts.push(capture_artifact(
                 &backend,
                 ArtifactSelection {
@@ -2002,6 +2030,42 @@ mod tests {
         .plan()
     }
 
+    fn inline_plan() -> ExecutionPlan {
+        OIrProgram {
+            nodes: vec![OIr::Text("inline-only".into())],
+        }
+        .plan()
+    }
+
+    #[test]
+    fn inline_only_manifest_does_not_resolve_current_executable() {
+        let (manifest, leases) =
+            capture_execution_manifest_with_current_executable_resolver(&inline_plan(), || {
+                panic!("inline-only plan attempted to resolve the current executable")
+            })
+            .unwrap();
+
+        assert!(manifest.artifacts.is_empty());
+        assert_eq!(leases.manifest(), &manifest);
+        assert!(leases.retained.is_empty());
+        assert!(leases.backend_artifacts.is_empty());
+        assert!(leases.backend_digests.is_empty());
+    }
+
+    #[test]
+    fn shim_manifest_requires_current_executable_resolution() {
+        let error =
+            capture_execution_manifest_with_current_executable_resolver(&shell_plan(), || {
+                anyhow::bail!("distinctive current-executable resolution failure")
+            })
+            .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("distinctive current-executable resolution failure"),
+            "{error:#}"
+        );
+    }
+
     #[test]
     fn inspection_is_explicitly_non_probing() {
         let manifest = inspection_executable_manifest(&shell_plan());
@@ -2463,5 +2527,35 @@ mod tests {
         assert!(error.contains(
             "backend `webassembly` does not bind its complete selected catalog alternative"
         ));
+    }
+
+    #[test]
+    fn child_manifest_accepts_complete_wasm_tools_webassembly_alternative() {
+        let temp = tempfile::tempdir().unwrap();
+        let admitted = temp.path().join("tool");
+        fs::write(&admitted, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&admitted, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut retained = BTreeMap::new();
+        let artifacts = ["wasm-tools", "wasmtime"]
+            .into_iter()
+            .map(|logical_command| {
+                capture_artifact(
+                    "webassembly",
+                    ArtifactSelection {
+                        requirement_key: "webassembly",
+                        selected_alternative: Some(2),
+                        selection: ExecutableSelectionV1::CompleteCatalogAlternative,
+                    },
+                    logical_command,
+                    "direct-launcher",
+                    &admitted,
+                    &mut retained,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let manifest = ExecutableManifestV1::finish(artifacts);
+
+        validate_decoded_manifest(&manifest, Some("webassembly")).unwrap();
     }
 }

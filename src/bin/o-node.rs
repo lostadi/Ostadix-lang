@@ -25,7 +25,7 @@ use std::os::unix::io::AsRawFd;
 use std::os::unix::process::CommandExt;
 
 use anyhow::{bail, Context, Result};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
@@ -78,6 +78,8 @@ const DETACHED_STARTUP_LOG_EXCERPT_BYTES: usize = 16 * 1024;
 const DETACHED_STARTUP_LOG_POLL_BYTES: usize = 64 * 1024;
 const DETACHED_LISTENER_READY_LOG_PREFIX: &str = "o-node: listener ready token=";
 const DETACHED_LAUNCH_TOKEN_BYTES: usize = 16;
+const GENERATED_PKI_VERIFY_TIMEOUT: Duration = Duration::from_secs(3);
+const GENERATED_PKI_ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Parser)]
 #[command(
@@ -128,6 +130,46 @@ struct StartArgs {
         value_parser = clap::value_parser!(u64).range(1..=3600)
     )]
     startup_timeout_seconds: u64,
+    /// Key algorithm used only when fresh automatic TLS material is required.
+    #[arg(
+        long = "fresh-pki-key-algorithm",
+        value_enum,
+        default_value = "rsa-3072"
+    )]
+    fresh_pki_key_algorithm: PkiKeyAlgorithm,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
+enum PkiKeyAlgorithm {
+    /// RSA-3072, retained as the production-compatible default.
+    #[value(name = "rsa-3072")]
+    Rsa3072,
+    /// NIST P-256 ECDSA, with comparable classical security and fast key generation.
+    #[value(name = "ec-p256")]
+    EcP256,
+}
+
+impl PkiKeyAlgorithm {
+    fn openssl_new_key_args(self) -> &'static [&'static str] {
+        match self {
+            Self::Rsa3072 => &["rsa:3072"],
+            Self::EcP256 => &["ec", "-pkeyopt", "ec_paramgen_curve:prime256v1"],
+        }
+    }
+
+    fn tls_key_usage(self) -> &'static str {
+        match self {
+            Self::Rsa3072 => "digitalSignature,keyEncipherment",
+            Self::EcP256 => "digitalSignature",
+        }
+    }
+
+    fn cli_name(self) -> &'static str {
+        match self {
+            Self::Rsa3072 => "rsa-3072",
+            Self::EcP256 => "ec-p256",
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -359,7 +401,7 @@ fn main() -> Result<()> {
         Command::Restart(args) => restart_detached_node(args),
         Command::Pair(args) => pair_node(args),
         Command::Pki(args) => match args.command {
-            PkiCommand::Init(args) => init_development_pki(args),
+            PkiCommand::Init(args) => init_development_pki(args, PkiKeyAlgorithm::Rsa3072),
         },
         Command::Identity(args) => match args.command {
             IdentityCommand::Init(args) => init_v2_identity(args),
@@ -468,6 +510,12 @@ fn report_listener_ready(
 }
 
 fn ensure_lan_open_material() -> Result<LanOpenNodeMaterial> {
+    ensure_lan_open_material_with_pki_key_algorithm(PkiKeyAlgorithm::Rsa3072)
+}
+
+fn ensure_lan_open_material_with_pki_key_algorithm(
+    pki_key_algorithm: PkiKeyAlgorithm,
+) -> Result<LanOpenNodeMaterial> {
     let config_dir = lan_open_config_dir();
     ensure_private_directory(&config_dir)?;
     let server_name = automatic_server_name()?;
@@ -502,18 +550,21 @@ fn ensure_lan_open_material() -> Result<LanOpenNodeMaterial> {
                 backup.display()
             );
         }
-        init_development_pki(PkiInitArgs {
-            directory: Some(pki_dir.clone()),
-            server_name: server_name.clone(),
-            openssl: PathBuf::from("openssl"),
-        })?;
+        init_development_pki(
+            PkiInitArgs {
+                directory: Some(pki_dir.clone()),
+                server_name: server_name.clone(),
+                openssl: PathBuf::from("openssl"),
+            },
+            pki_key_algorithm,
+        )?;
         fs::write(&server_name_path, format!("{server_name}\n"))?;
     }
 
     // Pairing client authentication is intentionally separate from the
     // historical LAN-open CA. Generate it as an independent, stable migration
     // so adding these files can never rotate the existing node certificate.
-    let (pairing_ca, pairing_ca_key) = ensure_pairing_ca(&pki_dir)?;
+    let (pairing_ca, pairing_ca_key) = ensure_pairing_ca(&pki_dir, pki_key_algorithm)?;
     let client_ca_bundle = pki_dir.join("client-ca-bundle.pem");
     refresh_client_ca_bundle(&pairing_ca, &pki_dir.join("ca.pem"), &client_ca_bundle)?;
 
@@ -564,7 +615,10 @@ fn ensure_lan_open_material() -> Result<LanOpenNodeMaterial> {
     })
 }
 
-fn ensure_pairing_ca(pki_dir: &Path) -> Result<(PathBuf, PathBuf)> {
+fn ensure_pairing_ca(
+    pki_dir: &Path,
+    pki_key_algorithm: PkiKeyAlgorithm,
+) -> Result<(PathBuf, PathBuf)> {
     let certificate = pki_dir.join("pairing-ca.pem");
     let private_key = pki_dir.join("pairing-ca-key.pem");
     let certificate_exists = secure_regular_file_exists(&certificate)?;
@@ -590,26 +644,25 @@ fn ensure_pairing_ca(pki_dir: &Path) -> Result<(PathBuf, PathBuf)> {
         temporary.path().join("pairing-ca.cnf"),
         "[req]\nprompt=no\ndistinguished_name=dn\nx509_extensions=v3_ca\n[dn]\nCN=Ostadix Paired Client Authentication CA\n[v3_ca]\nbasicConstraints=critical,CA:TRUE,pathlen:0\nkeyUsage=critical,keyCertSign,cRLSign\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid:always,issuer\n",
     )?;
-    run_openssl(
-        Path::new("openssl"),
-        temporary.path(),
-        &[
-            "req",
-            "-x509",
-            "-newkey",
-            "rsa:3072",
-            "-sha256",
-            "-days",
-            "3650",
-            "-nodes",
-            "-keyout",
-            "pairing-ca-key.pem",
-            "-out",
-            "pairing-ca.pem",
-            "-config",
-            "pairing-ca.cnf",
-        ],
-    )?;
+    eprintln!(
+        "o-node: generating pairing CA key ({})",
+        pki_key_algorithm.cli_name()
+    );
+    let mut command = vec!["req", "-x509", "-newkey"];
+    command.extend_from_slice(pki_key_algorithm.openssl_new_key_args());
+    command.extend_from_slice(&[
+        "-sha256",
+        "-days",
+        "3650",
+        "-nodes",
+        "-keyout",
+        "pairing-ca-key.pem",
+        "-out",
+        "pairing-ca.pem",
+        "-config",
+        "pairing-ca.cnf",
+    ]);
+    run_openssl(Path::new("openssl"), temporary.path(), &command)?;
     secure_key(temporary.path().join("pairing-ca-key.pem"))?;
 
     let mut installed = Vec::new();
@@ -629,6 +682,7 @@ fn ensure_pairing_ca(pki_dir: &Path) -> Result<(PathBuf, PathBuf)> {
         installed.push(target);
     }
     verify_pairing_ca(pki_dir)?;
+    println!("pairing CA key algorithm: {}", pki_key_algorithm.cli_name());
     Ok((certificate, private_key))
 }
 
@@ -1563,7 +1617,11 @@ fn start_detached_node_locked(args: StartArgs, pid_path: PathBuf, log_path: Path
     }
     // Provision synchronously so configuration errors are shown in this
     // terminal instead of being buried in a detached log.
-    let material = ensure_lan_open_material()?;
+    let material = ensure_lan_open_material_with_pki_key_algorithm(args.fresh_pki_key_algorithm)?;
+    println!(
+        "fresh PKI key algorithm selection: {}",
+        args.fresh_pki_key_algorithm.cli_name()
+    );
     let mut log = OpenOptions::new()
         .create(true)
         .append(true)
@@ -2079,7 +2137,7 @@ fn gc_closed_session(args: AdminGcClosedArgs) -> Result<()> {
     Ok(())
 }
 
-fn init_development_pki(args: PkiInitArgs) -> Result<()> {
+fn init_development_pki(args: PkiInitArgs, pki_key_algorithm: PkiKeyAlgorithm) -> Result<()> {
     let san = certificate_san(&args.server_name)?;
     let destination = args.directory.unwrap_or_else(hosted_config_dir);
     ensure_private_directory(&destination)?;
@@ -2115,53 +2173,59 @@ fn init_development_pki(args: PkiInitArgs) -> Result<()> {
     fs::write(
         temporary.path().join("node.cnf"),
         format!(
-            "[req]\nprompt=no\ndistinguished_name=dn\nreq_extensions=node_ext\n[dn]\nCN={}\n[node_ext]\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName={}\n",
-            args.server_name, san
+            "[req]\nprompt=no\ndistinguished_name=dn\nreq_extensions=node_ext\n[dn]\nCN={}\n[node_ext]\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,{}\nextendedKeyUsage=serverAuth\nsubjectAltName={}\n",
+            args.server_name,
+            pki_key_algorithm.tls_key_usage(),
+            san
         ),
     )?;
     fs::write(
         temporary.path().join("client.cnf"),
-        "[req]\nprompt=no\ndistinguished_name=dn\nreq_extensions=client_ext\n[dn]\nCN=ostadix-development-client\n[client_ext]\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=clientAuth\n",
+        format!(
+            "[req]\nprompt=no\ndistinguished_name=dn\nreq_extensions=client_ext\n[dn]\nCN=ostadix-development-client\n[client_ext]\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,{}\nextendedKeyUsage=clientAuth\n",
+            pki_key_algorithm.tls_key_usage()
+        ),
     )?;
 
-    run_openssl(
-        &args.openssl,
-        temporary.path(),
-        &[
-            "req",
-            "-x509",
-            "-newkey",
-            "rsa:3072",
-            "-sha256",
-            "-days",
-            "3650",
-            "-nodes",
-            "-keyout",
-            "ca-key.pem",
-            "-out",
-            "ca.pem",
-            "-config",
-            "ca.cnf",
-        ],
-    )?;
-    run_openssl(
-        &args.openssl,
-        temporary.path(),
-        &[
-            "req",
-            "-new",
-            "-newkey",
-            "rsa:3072",
-            "-sha256",
-            "-nodes",
-            "-keyout",
-            "node-key.pem",
-            "-out",
-            "node.csr",
-            "-config",
-            "node.cnf",
-        ],
-    )?;
+    eprintln!(
+        "o-node: generating development CA key ({})",
+        pki_key_algorithm.cli_name()
+    );
+    let mut command = vec!["req", "-x509", "-newkey"];
+    command.extend_from_slice(pki_key_algorithm.openssl_new_key_args());
+    command.extend_from_slice(&[
+        "-sha256",
+        "-days",
+        "3650",
+        "-nodes",
+        "-keyout",
+        "ca-key.pem",
+        "-out",
+        "ca.pem",
+        "-config",
+        "ca.cnf",
+    ]);
+    run_openssl(&args.openssl, temporary.path(), &command)?;
+    eprintln!("o-node: generated development CA certificate");
+
+    eprintln!(
+        "o-node: generating development node key ({})",
+        pki_key_algorithm.cli_name()
+    );
+    let mut command = vec!["req", "-new", "-newkey"];
+    command.extend_from_slice(pki_key_algorithm.openssl_new_key_args());
+    command.extend_from_slice(&[
+        "-sha256",
+        "-nodes",
+        "-keyout",
+        "node-key.pem",
+        "-out",
+        "node.csr",
+        "-config",
+        "node.cnf",
+    ]);
+    run_openssl(&args.openssl, temporary.path(), &command)?;
+    eprintln!("o-node: generated development node CSR");
     run_openssl(
         &args.openssl,
         temporary.path(),
@@ -2186,24 +2250,25 @@ fn init_development_pki(args: PkiInitArgs) -> Result<()> {
             "node_ext",
         ],
     )?;
-    run_openssl(
-        &args.openssl,
-        temporary.path(),
-        &[
-            "req",
-            "-new",
-            "-newkey",
-            "rsa:3072",
-            "-sha256",
-            "-nodes",
-            "-keyout",
-            "client-key.pem",
-            "-out",
-            "client.csr",
-            "-config",
-            "client.cnf",
-        ],
-    )?;
+    eprintln!("o-node: generated development node certificate");
+    eprintln!(
+        "o-node: generating development client key ({})",
+        pki_key_algorithm.cli_name()
+    );
+    let mut command = vec!["req", "-new", "-newkey"];
+    command.extend_from_slice(pki_key_algorithm.openssl_new_key_args());
+    command.extend_from_slice(&[
+        "-sha256",
+        "-nodes",
+        "-keyout",
+        "client-key.pem",
+        "-out",
+        "client.csr",
+        "-config",
+        "client.cnf",
+    ]);
+    run_openssl(&args.openssl, temporary.path(), &command)?;
+    eprintln!("o-node: generated development client CSR");
     run_openssl(
         &args.openssl,
         temporary.path(),
@@ -2229,11 +2294,14 @@ fn init_development_pki(args: PkiInitArgs) -> Result<()> {
             "client_ext",
         ],
     )?;
+    eprintln!("o-node: generated development client certificate");
 
     secure_key(temporary.path().join("ca-key.pem"))?;
     secure_key(temporary.path().join("node-key.pem"))?;
     secure_key(temporary.path().join("client-key.pem"))?;
+    eprintln!("o-node: verifying generated development PKI over loopback mTLS");
     verify_generated_pki(temporary.path(), &args.server_name)?;
+    eprintln!("o-node: generated development PKI passed loopback mTLS verification");
 
     let mut installed = Vec::new();
     for name in installed_names {
@@ -2255,6 +2323,10 @@ fn init_development_pki(args: PkiInitArgs) -> Result<()> {
         installed.push(target);
     }
 
+    println!(
+        "development PKI key algorithm: {}",
+        pki_key_algorithm.cli_name()
+    );
     println!("development PKI initialized at {}", destination.display());
     println!("server name: {}", args.server_name);
     println!(
@@ -3090,6 +3162,17 @@ fn secure_key(path: PathBuf) -> Result<()> {
 }
 
 fn verify_generated_pki(directory: &std::path::Path, server_name: &str) -> Result<()> {
+    verify_generated_pki_with_timeout(directory, server_name, GENERATED_PKI_VERIFY_TIMEOUT)
+}
+
+fn verify_generated_pki_with_timeout(
+    directory: &std::path::Path,
+    server_name: &str,
+    timeout: Duration,
+) -> Result<()> {
+    if timeout.is_zero() {
+        bail!("generated-PKI verification timeout must be nonzero");
+    }
     let server_identity = ServerTlsIdentity {
         client_ca_path: directory.join("ca.pem"),
         cert_path: directory.join("node-cert.pem"),
@@ -3108,30 +3191,136 @@ fn verify_generated_pki(directory: &std::path::Path, server_name: &str) -> Resul
     let listener = TcpListener::bind("127.0.0.1:0")
         .context("failed to bind loopback socket for generated-PKI verification")?;
     let address = listener.local_addr()?;
-    let server = thread::spawn(move || -> Result<()> {
-        let (tcp, _) = listener
-            .accept()
-            .context("generated-PKI verification accept failed")?;
-        let _stream = accept_mutual_tls(
-            tcp,
-            server_config,
-            Duration::from_secs(3),
-            Duration::from_secs(3),
-        )?;
-        Ok(())
-    });
-    let client_result = connect_mutual_tls(
-        &address.to_string(),
-        &client_identity,
-        Duration::from_secs(3),
-        Duration::from_secs(3),
-    );
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .context("generated-PKI verification deadline overflowed")?;
+    let server = thread::Builder::new()
+        .name("ostadix-generated-pki-verifier".to_string())
+        .spawn(move || -> Result<()> {
+            let tcp = accept_generated_pki_tcp_until(&listener, deadline)?;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                bail!("generated-PKI verification deadline expired before server handshake");
+            }
+            let deadline_guard = GeneratedPkiDeadlineGuard::arm(&tcp, deadline)?;
+            let handshake_result = accept_mutual_tls(tcp, server_config, remaining, remaining);
+            if deadline_guard.expired() || Instant::now() >= deadline {
+                bail!("generated-PKI verification deadline expired during server handshake");
+            }
+            let _stream = handshake_result?;
+            Ok(())
+        })
+        .context("failed to create generated-PKI verification server thread")?;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let client_result = if remaining.is_zero() {
+        Err(anyhow::anyhow!(
+            "generated-PKI verification deadline expired before client handshake"
+        ))
+    } else {
+        connect_mutual_tls(&address.to_string(), &client_identity, remaining, remaining)
+    };
     let server_result = server
         .join()
         .map_err(|_| anyhow::anyhow!("generated-PKI verification thread panicked"))?;
-    client_result.context("generated PKI failed client-side loopback mTLS verification")?;
-    server_result.context("generated PKI failed server-side loopback mTLS verification")?;
-    Ok(())
+    match (client_result, server_result) {
+        (Ok(_client), Ok(())) if Instant::now() < deadline => Ok(()),
+        (Ok(_client), Ok(())) => {
+            bail!("generated-PKI verification completed after its absolute deadline")
+        }
+        (Err(client_error), Ok(())) => {
+            Err(client_error).context("generated PKI failed client-side loopback mTLS verification")
+        }
+        (Ok(_client), Err(server_error)) => {
+            Err(server_error).context("generated PKI failed server-side loopback mTLS verification")
+        }
+        (Err(client_error), Err(server_error)) => {
+            bail!(
+                "generated PKI failed loopback mTLS verification on both sides: client: {client_error:#}; server: {server_error:#}"
+            )
+        }
+    }
+}
+
+fn accept_generated_pki_tcp_until(listener: &TcpListener, deadline: Instant) -> Result<TcpStream> {
+    listener
+        .set_nonblocking(true)
+        .context("failed to configure expiring generated-PKI verification listener")?;
+    loop {
+        match listener.accept() {
+            Ok((tcp, _)) => {
+                if Instant::now() >= deadline {
+                    let _ = tcp.shutdown(std::net::Shutdown::Both);
+                    bail!("generated-PKI verification deadline expired as client connected");
+                }
+                tcp.set_nonblocking(false)
+                    .context("failed to restore blocking generated-PKI verification socket")?;
+                return Ok(tcp);
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) =>
+            {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    bail!("generated-PKI verification timed out waiting for loopback client");
+                }
+                thread::sleep(GENERATED_PKI_ACCEPT_POLL_INTERVAL.min(remaining));
+            }
+            Err(error) => return Err(error).context("generated-PKI verification accept failed"),
+        }
+    }
+}
+
+struct GeneratedPkiDeadlineGuard {
+    cancel: Option<std::sync::mpsc::SyncSender<()>>,
+    watchdog: Option<thread::JoinHandle<()>>,
+    expired: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl GeneratedPkiDeadlineGuard {
+    fn arm(socket: &TcpStream, deadline: Instant) -> Result<Self> {
+        let watched = socket
+            .try_clone()
+            .context("failed to clone generated-PKI socket for deadline enforcement")?;
+        let (cancel, cancelled) = std::sync::mpsc::sync_channel(1);
+        let expired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watchdog_expired = Arc::clone(&expired);
+        let watchdog = thread::Builder::new()
+            .name("ostadix-generated-pki-deadline".to_string())
+            .spawn(move || {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if matches!(
+                    cancelled.recv_timeout(remaining),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ) {
+                    watchdog_expired.store(true, std::sync::atomic::Ordering::SeqCst);
+                    let _ = watched.shutdown(std::net::Shutdown::Both);
+                }
+            })
+            .context("failed to create generated-PKI deadline watchdog")?;
+        Ok(Self {
+            cancel: Some(cancel),
+            watchdog: Some(watchdog),
+            expired,
+        })
+    }
+
+    fn expired(&self) -> bool {
+        self.expired.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Drop for GeneratedPkiDeadlineGuard {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.try_send(());
+        }
+        if let Some(watchdog) = self.watchdog.take() {
+            let _ = watchdog.join();
+        }
+    }
 }
 
 struct TemporaryPkiDirectory(PathBuf);
@@ -3710,6 +3899,59 @@ mod tests {
         assert!(certificate_san("-bad.example").is_err());
     }
 
+    #[test]
+    fn detached_start_pki_algorithm_is_explicit_and_defaults_to_rsa() {
+        let Cli {
+            command: Command::Start(defaults),
+        } = Cli::try_parse_from(["o-node", "start"]).unwrap()
+        else {
+            panic!("start command did not parse")
+        };
+        assert_eq!(defaults.fresh_pki_key_algorithm, PkiKeyAlgorithm::Rsa3072);
+
+        let Cli {
+            command: Command::Start(explicit),
+        } = Cli::try_parse_from(["o-node", "start", "--fresh-pki-key-algorithm", "ec-p256"])
+            .unwrap()
+        else {
+            panic!("start command did not parse")
+        };
+        assert_eq!(explicit.fresh_pki_key_algorithm, PkiKeyAlgorithm::EcP256);
+    }
+
+    #[test]
+    fn generated_pki_accept_expires_when_no_client_connects() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let started = Instant::now();
+        let deadline = started.checked_add(Duration::from_millis(100)).unwrap();
+        let error = accept_generated_pki_tcp_until(&listener, deadline).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("timed out waiting for loopback client"));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "generated-PKI listener did not honor its deadline"
+        );
+    }
+
+    #[test]
+    fn generated_pki_deadline_interrupts_a_stalled_accepted_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let _client = TcpStream::connect(address).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        let started = Instant::now();
+        let deadline = started.checked_add(Duration::from_millis(100)).unwrap();
+        let deadline_guard = GeneratedPkiDeadlineGuard::arm(&server, deadline).unwrap();
+        let mut byte = [0_u8; 1];
+        assert!(std::io::Read::read_exact(&mut server, &mut byte).is_err());
+        assert!(deadline_guard.expired());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "generated-PKI watchdog did not interrupt the stalled socket"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn first_termination_signal_drains_and_second_forces() {
@@ -3733,39 +3975,83 @@ mod tests {
             return;
         };
         let root = tempfile::tempdir().unwrap();
-        let destination = root.path().join("hosted");
-        init_development_pki(PkiInitArgs {
-            directory: Some(destination.clone()),
-            server_name: "localhost".to_string(),
-            openssl: openssl.clone(),
-        })
-        .unwrap();
-        for name in [
-            "ca.pem",
-            "ca-key.pem",
-            "node-cert.pem",
-            "node-key.pem",
-            "client-cert.pem",
-            "client-key.pem",
+        for (directory_name, pki_key_algorithm) in [
+            ("rsa-3072", PkiKeyAlgorithm::Rsa3072),
+            ("ec-p256", PkiKeyAlgorithm::EcP256),
         ] {
-            assert!(destination.join(name).is_file(), "missing {name}");
+            let destination = root.path().join(directory_name);
+            init_development_pki(
+                PkiInitArgs {
+                    directory: Some(destination.clone()),
+                    server_name: "localhost".to_string(),
+                    openssl: openssl.clone(),
+                },
+                pki_key_algorithm,
+            )
+            .unwrap();
+            for name in [
+                "ca.pem",
+                "ca-key.pem",
+                "node-cert.pem",
+                "node-key.pem",
+                "client-cert.pem",
+                "client-key.pem",
+            ] {
+                assert!(destination.join(name).is_file(), "missing {name}");
+            }
+            #[cfg(unix)]
+            for name in ["ca-key.pem", "node-key.pem", "client-key.pem"] {
+                let mode = fs::metadata(destination.join(name))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                assert_eq!(mode, 0o600, "wrong private-key mode for {name}");
+            }
+            if pki_key_algorithm == PkiKeyAlgorithm::EcP256 {
+                let started = Instant::now();
+                let error = verify_generated_pki_with_timeout(
+                    &destination,
+                    "not a valid server name",
+                    Duration::from_millis(250),
+                )
+                .unwrap_err();
+                assert!(
+                    format!("{error:#}").contains("invalid TLS server name"),
+                    "unexpected pre-connect verification error: {error:#}"
+                );
+                assert!(
+                    started.elapsed() < Duration::from_secs(2),
+                    "pre-connect client failure left the verifier thread blocked"
+                );
+            }
+            let error = init_development_pki(
+                PkiInitArgs {
+                    directory: Some(destination),
+                    server_name: "localhost".to_string(),
+                    openssl: openssl.clone(),
+                },
+                pki_key_algorithm,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("refusing to overwrite"));
         }
-        #[cfg(unix)]
-        for name in ["ca-key.pem", "node-key.pem", "client-key.pem"] {
-            let mode = fs::metadata(destination.join(name))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777;
-            assert_eq!(mode, 0o600, "wrong private-key mode for {name}");
-        }
-        let error = init_development_pki(PkiInitArgs {
-            directory: Some(destination),
-            server_name: "localhost".to_string(),
-            openssl,
-        })
-        .unwrap_err();
-        assert!(error.to_string().contains("refusing to overwrite"));
+
+        let pairing = root.path().join("pairing");
+        fs::create_dir(&pairing).unwrap();
+        let (_, pairing_key) = ensure_pairing_ca(&pairing, PkiKeyAlgorithm::EcP256).unwrap();
+        let ec_detail = run_openssl_capture(
+            &openssl,
+            &pairing,
+            &["pkey", "-in", "pairing-ca-key.pem", "-text", "-noout"],
+        )
+        .unwrap();
+        assert!(String::from_utf8(ec_detail)
+            .unwrap()
+            .contains("ASN1 OID: prime256v1"));
+        let original_key = fs::read(&pairing_key).unwrap();
+        ensure_pairing_ca(&pairing, PkiKeyAlgorithm::Rsa3072).unwrap();
+        assert_eq!(fs::read(pairing_key).unwrap(), original_key);
     }
 
     #[test]

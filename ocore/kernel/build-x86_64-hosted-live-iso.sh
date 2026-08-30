@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Build the hardware-oriented x86_64 UEFI Hosted Live ISO. The seven-entry
-# absorbed-capacity laboratory image remains a separate serial/QEMU artifact.
+# Build the hardware-oriented x86_64 UEFI Hosted Live plus capacity ISO.
+# Hosted, O-core, and Alpine boot directly; foreign media use nested QEMU TCG.
 set -euo pipefail
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -9,6 +9,14 @@ OUTPUT=${1:-"$ISO_ROOT/ostadix-hosted-live-x86_64-uefi_VTGRUB2.iso"}
 PROFILE=${OSTADIX_HOSTED_LIVE_ISO_PROFILE:-"$ROOT/evidence/hosted_live_physical_iso.toml"}
 KERNEL=${OSTADIX_HOSTED_LIVE_KERNEL:-"${XDG_DATA_HOME:-$HOME/.local/share}/ostadix/hosted-live/vmlinuz-lts"}
 INITRAMFS=${OSTADIX_HOSTED_LIVE_INITRAMFS:-"$ROOT/target/ostadix-hosted-live/x86_64/initramfs.cpio.gz"}
+ROOTFS=${OSTADIX_HOSTED_LIVE_ROOTFS:-"$ROOT/target/ostadix-hosted-live/x86_64/rootfs.squashfs"}
+VENTOY_MODLOOP=${OSTADIX_HOSTED_LIVE_VENTOY_MODLOOP:-"$ROOT/target/ostadix-hosted-live/x86_64/modloop-lts"}
+OCORE_KERNEL=${OSTADIX_HOSTED_LIVE_OCORE_KERNEL:-"$ROOT/target/ocore-kernel/kernel.elf"}
+GUEST_ROOT=${OSTADIX_GUEST_ROOT:-"${XDG_DATA_HOME:-$HOME/.local/share}/ostadix/guests"}
+CAPACITY_HOST_KERNEL=${OSTADIX_HOSTED_LIVE_CAPACITY_HOST_KERNEL:-"$GUEST_ROOT/alpine-3.24.1-x86_64/vmlinuz-virt"}
+CAPACITY_HOST_INITRAMFS=${OSTADIX_HOSTED_LIVE_CAPACITY_HOST_INITRAMFS:-"$ROOT/target/ostadix-capacity-host/x86_64/initramfs.cpio.gz"}
+ALPINE_INITRAMFS=${OSTADIX_HOSTED_LIVE_ALPINE_INITRAMFS:-"$GUEST_ROOT/alpine-3.24.1-x86_64/initramfs-virt"}
+FOREIGN_LAB=${OSTADIX_FOREIGN_KERNEL_LAB:-"$ROOT/scripts/foreign_kernel_lab.py"}
 ISO_TOOL=${OSTADIX_CAPACITY_ISO_TOOL:-"$ROOT/scripts/ostadix_capacity_iso.py"}
 XORRISO_WRAPPER=${OSTADIX_XORRISO_WRAPPER:-"$ROOT/scripts/ostadix_xorriso_reproducible.py"}
 GRUB_MKRESCUE=${OSTADIX_GRUB_MKRESCUE:-}
@@ -35,9 +43,12 @@ usage() {
   cat <<'USAGE'
 Usage: build-x86_64-hosted-live-iso.sh [OUTPUT]
 
-Build the single-entry hardware-oriented OSTADIX Hosted Live UEFI ISO from a
-pinned Alpine LTS kernel and a prepared hosted-live initramfs. This command
-downloads no inputs and never replaces an existing output.
+Build the seven-entry hardware-oriented OSTADIX Hosted Live UEFI ISO. Hosted,
+O-core, and Alpine are direct boot entries. Guix, OpenBSD, 9front, and Redox are
+explicitly labeled nested QEMU TCG entries using the on-disc capacity host.
+All 14 typed artifacts must already be fetched and verified. Hosted remains the
+first and default entry. This command downloads no inputs and never replaces an
+existing output.
 USAGE
 }
 
@@ -49,12 +60,15 @@ if [[ ! "$SOURCE_DATE_EPOCH" =~ ^[0-9]+$ ]] \
     || (( SOURCE_DATE_EPOCH < 315532800 || SOURCE_DATE_EPOCH > 2147483647 )); then
   die "SOURCE_DATE_EPOCH must be an integer from 315532800 through 2147483647"
 fi
-for source in "$PROFILE" "$KERNEL" "$INITRAMFS" "$ISO_TOOL" "$XORRISO_WRAPPER"; do
+for source in "$PROFILE" "$KERNEL" "$INITRAMFS" "$ROOTFS" "$VENTOY_MODLOOP" \
+  "$OCORE_KERNEL" "$CAPACITY_HOST_KERNEL" "$CAPACITY_HOST_INITRAMFS" \
+  "$ALPINE_INITRAMFS" "$FOREIGN_LAB" "$ISO_TOOL" \
+  "$XORRISO_WRAPPER"; do
   if [[ -L "$source" || ! -f "$source" ]]; then
     die "required hosted-live ISO input is missing or a symlink: $source"
   fi
 done
-for executable in "$ISO_TOOL" "$XORRISO_WRAPPER"; do
+for executable in "$FOREIGN_LAB" "$ISO_TOOL" "$XORRISO_WRAPPER"; do
   [[ -x "$executable" ]] || die "required hosted-live ISO script is not executable: $executable"
 done
 for tool in "$PYTHON" "$XORRISO"; do
@@ -85,7 +99,7 @@ if [[ -z "$GRUB_EFI_DIRECTORY" ]]; then
 fi
 [[ -n "$GRUB_EFI_DIRECTORY" && -d "$GRUB_EFI_DIRECTORY" && ! -L "$GRUB_EFI_DIRECTORY" ]] \
   || die "x86_64-efi GRUB platform directory is unavailable"
-for module in modinfo.sh normal.mod linux.mod part_gpt.mod fat.mod iso9660.mod; do
+for module in modinfo.sh normal.mod multiboot2.mod linux.mod part_gpt.mod fat.mod iso9660.mod; do
   if [[ -L "$GRUB_EFI_DIRECTORY/$module" || ! -f "$GRUB_EFI_DIRECTORY/$module" ]]; then
     die "required hosted-live ISO GRUB module is missing or a symlink: $GRUB_EFI_DIRECTORY/$module"
   fi
@@ -97,6 +111,14 @@ fi
 if [[ -e "$OUTPUT" ]]; then
   die "refusing to clobber existing hosted-live ISO output: $OUTPUT"
 fi
+
+"$PYTHON" "$FOREIGN_LAB" --guest-dir "$GUEST_ROOT" verify \
+  --guest linux-alpine-3.24.1-x86_64 \
+  --guest guix-system-1.5.0-x86_64 \
+  --guest plan9-9front-11983-amd64 \
+  --guest redox-0.9.0-server-x86_64 \
+  --guest openbsd-7.9-amd64 >/dev/null
+
 mkdir -p -- "$ISO_ROOT" "$(dirname -- "$OUTPUT")"
 WORK_DIR=$(mktemp -d "$ISO_ROOT/.hosted-live-iso-build.XXXXXX")
 chmod 0700 "$WORK_DIR"
@@ -114,6 +136,24 @@ install_artifact() {
 
 install_artifact "$KERNEL" boot/hosted/vmlinuz-lts
 install_artifact "$INITRAMFS" boot/hosted/initramfs.cpio.gz
+install_artifact "$ROOTFS" boot/hosted/rootfs.squashfs
+install_artifact "$VENTOY_MODLOOP" boot/modloop-lts
+install_artifact "$OCORE_KERNEL" boot/ocore/kernel.elf
+install_artifact "$CAPACITY_HOST_KERNEL" boot/capacity-host/vmlinuz-virt
+install_artifact "$CAPACITY_HOST_INITRAMFS" boot/capacity-host/initramfs.cpio.gz
+install_artifact "$ALPINE_INITRAMFS" boot/entry/010-alpine/initramfs-virt
+install_artifact "$GUEST_ROOT/guix-1.5.0-x86_64/linux-libre-6.17.12-bzImage" \
+  ostadix/guix/linux-libre-6.17.12-bzimage
+install_artifact "$GUEST_ROOT/guix-1.5.0-x86_64/guix-1.5.0-initrd.cpio.gz" \
+  ostadix/guix/guix-1.5.0-initrd.cpio.gz
+install_artifact "$GUEST_ROOT/guix-1.5.0-x86_64/guix-system-install-1.5.0.x86_64-linux.iso" \
+  ostadix/guix/guix-system-install-1.5.0.x86_64-linux.iso
+install_artifact "$GUEST_ROOT/openbsd-7.9-amd64/install79.iso" \
+  ostadix/openbsd/install79.iso
+install_artifact "$GUEST_ROOT/9front-11983-amd64/9front-11983.amd64.qcow2" \
+  ostadix/9front/9front-11983.amd64.qcow2
+install_artifact "$GUEST_ROOT/redox-0.9.0-server-x86_64/redox_server_x86_64_2024-09-07_1225_livedisk.iso" \
+  ostadix/redox/redox-server-0.9.0-livedisk.iso
 
 "$PYTHON" "$ISO_TOOL" create-lock --stage "$STAGE" --profile "$PROFILE" \
   >"$WORK_DIR/hosted-live-lock.json"

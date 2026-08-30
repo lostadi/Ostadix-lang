@@ -180,7 +180,23 @@ def _record_field(text: str, key: str) -> str:
     raise SmokeError(f"MCP result omitted nonempty {key}= record:\n{text}")
 
 
-def run_smoke(root: Path, binary: Path, timeout: float) -> None:
+def run_smoke(
+    root: Path,
+    binary: Path,
+    timeout: float,
+    *,
+    o_info: Path | None = None,
+    runtime_bin_dir: Path | None = None,
+    server_cwd: Path | None = None,
+    require_wasm: bool = False,
+    require_wasm_materialization: bool = False,
+    wasm_release_manifest: Path | None = None,
+    wasm_release_artifact: Path | None = None,
+    wasm_source_tree: str | None = None,
+    wasm_base_commit: str | None = None,
+    wasm_source_archive_sha256: str | None = None,
+    wasm_timeout: float = 900.0,
+) -> dict[str, Any] | None:
     catalog_schema = _current_catalog_schema(root)
     config = json.loads((root / ".mcp.json").read_text(encoding="utf-8"))
     registered = config.get("mcpServers", {}).get("ostadix", {})
@@ -198,26 +214,107 @@ def run_smoke(root: Path, binary: Path, timeout: float) -> None:
     environment.pop("O_BACKENDS_DIR", None)
     environment.pop("OLANG", None)
     environment.pop("OSTADIX_RUNTIME_PATH", None)
+    environment.pop("OSTADIX_O_INFO_BIN", None)
+    environment.pop("A18_WORK", None)
     environment["OSTADIX_RUNTIME_PATH_MODE"] = "discover-local"
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
     # Model the restricted environment used by GUI-launched MCP clients. The
     # server must restore local runtime locations without shell startup files.
-    environment["PATH"] = os.pathsep.join(
-        ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
-    )
+    restricted_path = ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+    if runtime_bin_dir is not None:
+        if (
+            not runtime_bin_dir.is_absolute()
+            or runtime_bin_dir.is_symlink()
+            or not runtime_bin_dir.is_dir()
+        ):
+            raise SmokeError(
+                "installed runtime bin directory is not an absolute "
+                f"non-symlink directory: {runtime_bin_dir}"
+            )
+        restricted_path.insert(0, os.fspath(runtime_bin_dir))
+    environment["PATH"] = os.pathsep.join(restricted_path)
     environment["RUST_LOG"] = "warn"
+    launch_cwd = server_cwd if server_cwd is not None else root
+    if not launch_cwd.is_absolute() or launch_cwd.is_symlink() or not launch_cwd.is_dir():
+        raise SmokeError(
+            "MCP launch directory is not an absolute non-symlink directory: "
+            f"{launch_cwd}"
+        )
+    if not (1.0 <= wasm_timeout <= 1800.0):
+        raise SmokeError("WASM timeout must be from 1 through 1800 seconds")
+    if require_wasm and require_wasm_materialization:
+        raise SmokeError("fresh WASM compilation and materialization are mutually exclusive")
+    if require_wasm_materialization:
+        if server_cwd is None:
+            raise SmokeError("WASM materialization requires an explicit MCP server cwd")
+        required_release_values = {
+            "manifest": wasm_release_manifest,
+            "artifact": wasm_release_artifact,
+            "source tree": wasm_source_tree,
+            "base commit": wasm_base_commit,
+            "source archive SHA-256": wasm_source_archive_sha256,
+        }
+        missing = [label for label, value in required_release_values.items() if value is None]
+        if missing:
+            raise SmokeError(
+                "WASM materialization omitted release bindings: " + ", ".join(missing)
+            )
+        for label, path in (
+            ("WASM release manifest", wasm_release_manifest),
+            ("WASM release artifact", wasm_release_artifact),
+        ):
+            assert path is not None
+            if not path.is_absolute() or path.is_symlink() or not path.is_file():
+                raise SmokeError(f"{label} is not an absolute regular non-symlink file: {path}")
+
     stderr_capture = tempfile.TemporaryFile()
-    intent_fixture = tempfile.TemporaryDirectory(
-        prefix=".mcp-intent-smoke-", dir=root
+    home_fixture = tempfile.TemporaryDirectory(prefix=".mcp-home-smoke-")
+    environment["HOME"] = home_fixture.name
+    intent_fixture = tempfile.TemporaryDirectory(prefix=".mcp-intent-smoke-")
+    information_fixture = tempfile.TemporaryDirectory(prefix=".mcp-information-smoke-")
+    wasm_fixture = (
+        tempfile.TemporaryDirectory(prefix=".mcp-wasm-smoke-")
+        if require_wasm
+        else None
     )
-    information_fixture = tempfile.TemporaryDirectory(
-        prefix=".mcp-information-smoke-", dir=root
+    wasm_output = (
+        Path(wasm_fixture.name) / "ostadix-mcp-hello.wasm"
+        if wasm_fixture is not None
+        else None
     )
+    materialize_fixture = (
+        tempfile.TemporaryDirectory(
+            prefix=".mcp-wasm-materialize-", dir=os.fspath(launch_cwd)
+        )
+        if require_wasm_materialization
+        else None
+    )
+    materialize_project = (
+        Path(materialize_fixture.name) / "generated"
+        if materialize_fixture is not None
+        else None
+    )
+    materialize_output = (
+        Path(materialize_fixture.name) / "hello.wasm"
+        if materialize_fixture is not None
+        else None
+    )
+    wasm_materialization_evidence: dict[str, Any] | None = None
     information_state = Path(information_fixture.name) / "state"
-    o_info = root / "target/release/o-info"
-    if not o_info.is_file():
-        raise SmokeError(f"fixed local o-info binary is missing: {o_info}")
+    information_binary = o_info if o_info is not None else root / "target/release/o-info"
+    if (
+        not information_binary.is_absolute()
+        or information_binary.is_symlink()
+        or not information_binary.is_file()
+    ):
+        raise SmokeError(
+            "fixed local o-info binary is not an absolute non-symlink file: "
+            f"{information_binary}"
+        )
+    if o_info is not None:
+        environment["OSTADIX_O_INFO_BIN"] = os.fspath(information_binary)
     initialized_information = subprocess.run(
-        [os.fspath(o_info), "init", "--state", os.fspath(information_state)],
+        [os.fspath(information_binary), "init", "--state", os.fspath(information_state)],
         cwd=root,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
@@ -246,7 +343,7 @@ def run_smoke(root: Path, binary: Path, timeout: float) -> None:
     write_intent_fixture("intent-original")
     process = subprocess.Popen(
         [os.fspath(binary)],
-        cwd=root,
+        cwd=launch_cwd,
         env=environment,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
@@ -317,6 +414,11 @@ def run_smoke(root: Path, binary: Path, timeout: float) -> None:
                     f"{tool.get('name', '<unnamed>')} has a non-object input schema: "
                     f"{schema!r}"
                 )
+        olangc_tools = [tool for tool in tools if tool.get("name") == "o_olangc"]
+        if len(olangc_tools) != 1 or "materialize_only" not in olangc_tools[0][
+            "inputSchema"
+        ]["properties"]:
+            raise SmokeError("o_olangc schema omitted materialize_only")
 
         _send(
             process,
@@ -358,7 +460,6 @@ def run_smoke(root: Path, binary: Path, timeout: float) -> None:
             "runtime-catalog-legacy-schema-v4=ostadix.backend-catalog/v4",
             "runtime-catalog-projection=compiled-mcp-snapshot",
             "runtime-search-mode=discover-local",
-            "runtime-search-entry index=0 source=inherited:0 path=/usr/bin",
             "runtime-summary backend-count=30",
             "runtime backends=python status=located",
             "runtime backends=java status=",
@@ -378,6 +479,10 @@ def run_smoke(root: Path, binary: Path, timeout: float) -> None:
             "morphism profiles are bounded shadow descriptions; they do not authorize "
             "execution or claim generic backend crossings",
         }
+        required_runtime_markers.update(
+            f"runtime-search-entry index={index} source=inherited:{index} path={path}"
+            for index, path in enumerate(restricted_path)
+        )
         if not all(marker in runtimes_text for marker in required_runtime_markers):
             raise SmokeError(
                 "o_runtimes omitted required backend discovery markers:\n"
@@ -708,6 +813,221 @@ def run_smoke(root: Path, binary: Path, timeout: float) -> None:
             raise SmokeError("o_information_inspect accepted a non-token head name")
         if _snapshot_tree(information_state) != information_before:
             raise SmokeError("rejected information inspection mutated the local store")
+
+        _send(
+            process,
+            {
+                "jsonrpc": "2.0",
+                "id": 20,
+                "method": "tools/call",
+                "params": {"name": "o_doctor", "arguments": {}},
+            },
+        )
+        doctor_result = responses.response(20, timeout)
+        doctor_text = _content_text(doctor_result)
+        required_doctor = {
+            f"O_LANG_ROOT={root} exists=true",
+            f"search-work={root}",
+            f"search-corpus={root / 'examples'} bundled=true",
+        }
+        if doctor_result.get("isError") is True or not all(
+            marker in doctor_text for marker in required_doctor
+        ):
+            raise SmokeError(f"o_doctor omitted installed-layout records:\n{doctor_text}")
+
+        _send(
+            process,
+            {
+                "jsonrpc": "2.0",
+                "id": 21,
+                "method": "tools/call",
+                "params": {
+                    "name": "o_search_run",
+                    "arguments": {"name": "hello", "timeout_secs": 45},
+                },
+            },
+        )
+        search_result = responses.response(21, timeout)
+        search_text = _content_text(search_result)
+        required_search = {
+            f"program={root / 'examples/hello.O'}",
+            f"corpus={root / 'examples'}",
+            "[number] 2",
+        }
+        if search_result.get("isError") is True or not all(
+            marker in search_text for marker in required_search
+        ):
+            raise SmokeError(f"o_search_run bundled corpus failed:\n{search_text}")
+
+        for request_id, rejected_name in (
+            (22, "../hello"),
+            (23, os.fspath(root / "examples/hello.O")),
+        ):
+            _send(
+                process,
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "o_search_run",
+                        "arguments": {"name": rejected_name},
+                    },
+                },
+            )
+            rejected_search = responses.response(request_id, timeout)
+            rejected_text = _content_text(rejected_search)
+            if (
+                rejected_search.get("isError") is not True
+                or "leaf token" not in rejected_text
+            ):
+                raise SmokeError(
+                    "o_search_run accepted a path outside its leaf-token contract:\n"
+                    f"{rejected_text}"
+                )
+
+        if require_wasm:
+            assert wasm_output is not None
+            _send(
+                process,
+                {
+                    "jsonrpc": "2.0",
+                    "id": 24,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "o_olangc",
+                        "arguments": {
+                            "path": "examples/wasm_hello.O",
+                            "target": "wasm",
+                            "output": os.fspath(wasm_output),
+                            "timeout_secs": int(wasm_timeout),
+                        },
+                    },
+                },
+            )
+            wasm_result = responses.response(24, wasm_timeout + 30.0)
+            wasm_text = _content_text(wasm_result)
+            if wasm_result.get("isError") is True or "exit=0" not in wasm_text:
+                raise SmokeError(f"o_olangc WASM compile failed:\n{wasm_text}")
+            if (
+                wasm_output.is_symlink()
+                or not wasm_output.is_file()
+                or wasm_output.read_bytes()[:4] != b"\x00asm"
+            ):
+                raise SmokeError(
+                    "o_olangc WASM compile omitted a regular WebAssembly artifact"
+                )
+        elif require_wasm_materialization:
+            assert materialize_project is not None
+            assert materialize_output is not None
+            _send(
+                process,
+                {
+                    "jsonrpc": "2.0",
+                    "id": 24,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "o_olangc",
+                        "arguments": {
+                            "path": "examples/wasm_hello.O",
+                            "target": "wasm",
+                            "output": os.fspath(materialize_output),
+                            "materialize_only": os.fspath(materialize_project),
+                            "timeout_secs": int(timeout),
+                        },
+                    },
+                },
+            )
+            materialize_result = responses.response(24, timeout + 30.0)
+            materialize_text = _content_text(materialize_result)
+            expected_record = (
+                "olangc: materialize-only target=wasm rust-target=wasm32-wasip1 "
+                f"cargo-invoked=false dir={materialize_project}"
+            )
+            if (
+                materialize_result.get("isError") is True
+                or "exit=0" not in materialize_text
+                or expected_record not in materialize_text
+            ):
+                raise SmokeError(
+                    f"o_olangc WASM materialization failed:\n{materialize_text}"
+                )
+            required_project_files = (
+                "Cargo.toml",
+                "Cargo.lock",
+                "rust-toolchain.toml",
+                "src/lib.rs",
+                "src/main.rs",
+                "src/program.O",
+            )
+            if (
+                materialize_project.is_symlink()
+                or not materialize_project.is_dir()
+                or any(
+                    not (materialize_project / relative).is_file()
+                    for relative in required_project_files
+                )
+                or (materialize_project / "target").exists()
+                or materialize_output.exists()
+                or (materialize_project / "src/program.O").read_bytes()
+                != (root / "examples/wasm_hello.O").read_bytes()
+            ):
+                raise SmokeError(
+                    "o_olangc materialization omitted or mutated its exact no-build project"
+                )
+            assert wasm_release_manifest is not None
+            assert wasm_release_artifact is not None
+            assert wasm_source_tree is not None
+            assert wasm_base_commit is not None
+            assert wasm_source_archive_sha256 is not None
+            generator = (
+                runtime_bin_dir / "olangc"
+                if runtime_bin_dir is not None
+                else root / "target/release/olangc"
+            )
+            verifier = root / "scripts/ostadix_wasm_release.py"
+            verified = subprocess.run(
+                [
+                    sys.executable,
+                    os.fspath(verifier),
+                    "verify",
+                    "--manifest",
+                    os.fspath(wasm_release_manifest),
+                    "--project",
+                    os.fspath(materialize_project),
+                    "--artifact",
+                    os.fspath(wasm_release_artifact),
+                    "--input",
+                    os.fspath(root / "examples/wasm_hello.O"),
+                    "--generator",
+                    os.fspath(generator),
+                    "--source-tree",
+                    wasm_source_tree,
+                    "--base-commit",
+                    wasm_base_commit,
+                    "--source-archive-sha256",
+                    wasm_source_archive_sha256,
+                ],
+                cwd=launch_cwd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=timeout,
+                check=False,
+            )
+            if verified.returncode != 0:
+                raise SmokeError(
+                    "MCP-materialized WASM project failed its release binding:\n"
+                    + verified.stderr.decode("utf-8", "replace")
+                )
+            try:
+                wasm_materialization_evidence = json.loads(
+                    verified.stdout.decode("utf-8")
+                )
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise SmokeError(
+                    "WASM release verifier returned malformed JSON"
+                ) from error
     finally:
         if process.stdin is not None:
             try:
@@ -726,16 +1046,34 @@ def run_smoke(root: Path, binary: Path, timeout: float) -> None:
         stderr_capture.close()
         intent_fixture.cleanup()
         information_fixture.cleanup()
+        if wasm_fixture is not None:
+            wasm_fixture.cleanup()
+        if materialize_fixture is not None:
+            materialize_fixture.cleanup()
+        home_fixture.cleanup()
         if process.returncode != 0:
             raise SmokeError(
                 f"ostadix-mcp exited {process.returncode}; stderr:\n{stderr}"
             )
+    return wasm_materialization_evidence
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--binary", type=Path)
+    parser.add_argument("--o-info", type=Path)
+    parser.add_argument("--runtime-bin-dir", type=Path)
+    parser.add_argument("--server-cwd", type=Path)
+    wasm_mode = parser.add_mutually_exclusive_group()
+    wasm_mode.add_argument("--require-wasm", action="store_true")
+    wasm_mode.add_argument("--require-wasm-materialization", action="store_true")
+    parser.add_argument("--wasm-release-manifest", type=Path)
+    parser.add_argument("--wasm-release-artifact", type=Path)
+    parser.add_argument("--wasm-source-tree")
+    parser.add_argument("--wasm-base-commit")
+    parser.add_argument("--wasm-source-archive-sha256")
+    parser.add_argument("--wasm-timeout", type=float, default=900.0)
     parser.add_argument("--timeout", type=float, default=120.0)
     arguments = parser.parse_args()
 
@@ -748,11 +1086,53 @@ def main() -> int:
     if not binary.is_file():
         print(f"error: MCP binary not found: {binary}", file=sys.stderr)
         return 2
+    o_info = arguments.o_info.expanduser() if arguments.o_info else None
+    runtime_bin_dir = (
+        arguments.runtime_bin_dir.expanduser()
+        if arguments.runtime_bin_dir
+        else None
+    )
+    server_cwd = (
+        arguments.server_cwd.expanduser().resolve()
+        if arguments.server_cwd
+        else None
+    )
     try:
-        run_smoke(root, binary, arguments.timeout)
+        wasm_evidence = run_smoke(
+            root,
+            binary,
+            arguments.timeout,
+            o_info=o_info,
+            runtime_bin_dir=runtime_bin_dir,
+            server_cwd=server_cwd,
+            require_wasm=arguments.require_wasm,
+            require_wasm_materialization=arguments.require_wasm_materialization,
+            wasm_release_manifest=arguments.wasm_release_manifest,
+            wasm_release_artifact=arguments.wasm_release_artifact,
+            wasm_source_tree=arguments.wasm_source_tree,
+            wasm_base_commit=arguments.wasm_base_commit,
+            wasm_source_archive_sha256=arguments.wasm_source_archive_sha256,
+            wasm_timeout=arguments.wasm_timeout,
+        )
     except (OSError, SmokeError, json.JSONDecodeError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
+    if arguments.require_wasm:
+        print("ostadix-mcp o_olangc wasm: PASS")
+    if arguments.require_wasm_materialization:
+        assert wasm_evidence is not None
+        project = wasm_evidence["project"]
+        source = wasm_evidence["source"]
+        artifact = wasm_evidence["artifact"]
+        print(
+            "ostadix-mcp o_olangc wasm materialization: PASS "
+            f"root_sha256={project['root_sha256']}"
+        )
+        print(
+            "ostadix-mcp o_olangc wasm artifact: PASS "
+            f"tree={source['staged_tree']} bytes={artifact['bytes']} "
+            f"sha256={artifact['sha256']}"
+        )
     print("ostadix-mcp stdio release smoke: PASS")
     return 0
 

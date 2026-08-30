@@ -9,6 +9,10 @@ use anyhow::{bail, Context, Result};
 #[cfg(test)]
 use clap::CommandFactory;
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use o_lang::boot_objects::{
+    portable_boot_object_ref, BootObjectIndex, BootObjectRecord, BootObjectStore, BootPathBinding,
+    BOOT_OBJECT_STORE_ENV, DEFAULT_BOOT_OBJECT_STORE,
+};
 use o_lang::hosted_remote::project_mesh::{
     MeshExecutionConfig, MeshExecutionError, MeshExecutionFailureClass, MeshLocalFallback,
     MeshRequirement, MeshTraceEventV1,
@@ -39,7 +43,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const OPERATIONAL_COMMANDS: &str = "Run highlights:\n  o run FILE.O --parallel auto          local HGraph workers only\n  o run PROJECT --parallel auto         mesh prefer with safe local fallback\n  o run PROJECT --mesh=required         authenticated remote placement required\n  Mesh controls include --mesh-retries, --mesh-local-fallback, and --closed-registry.\n\nOperational commands retained by the repository dispatcher:\n  node start|stop|status|restart|pair|list|use|profile|doctor|run|session ...\n  node-host <command> ...\n  registry <command> ...\n  info <command> ...\n  live <command> ...\n  receipt [ogit arguments]\n  kernel <command>\n  why FILE.O P<N> [olangc options]\n\nUnknown command forms retain historical evaluator behavior.";
+const OPERATIONAL_COMMANDS: &str = "Run highlights:\n  o run FILE.O --parallel auto          local HGraph workers only\n  o run PROJECT --parallel auto         mesh prefer with safe local fallback\n  o run PROJECT --mesh=required         authenticated remote placement required\n  Mesh controls include --mesh-retries, --mesh-local-fallback, and --closed-registry.\n\nBoot-object commands:\n  o object root|list|stat|get|verify     typed read-only boot CAS\n\nOperational commands retained by the repository dispatcher:\n  node start|stop|status|restart|pair|list|use|profile|doctor|run|session ...\n  node-host <command> ...\n  registry <command> ...\n  info <command> ...\n  live <command> ...\n  receipt [ogit arguments]\n  kernel <command>\n  why FILE.O P<N> [olangc options]\n\nUnknown command forms retain historical evaluator behavior.";
 #[derive(Debug, Parser)]
 #[command(
     name = "o",
@@ -65,6 +69,8 @@ enum IntentCommand {
     Explain(ExplainArgs),
     /// Inspect retained execution evidence and, optionally, its event trace.
     Inspect(InspectArgs),
+    /// Inspect and read the typed, authority-free boot-object store.
+    Object(ObjectArgs),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -345,6 +351,85 @@ struct InspectArgs {
     json: bool,
 }
 
+#[derive(Debug, Args)]
+struct ObjectArgs {
+    /// Override the immutable boot-object store root.
+    #[arg(long, global = true, value_name = "DIR")]
+    store: Option<PathBuf>,
+
+    #[command(subcommand)]
+    command: ObjectCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum ObjectCommand {
+    /// Print the source identities, set root, counts, and byte totals.
+    Root(ObjectRootArgs),
+    /// List canonical path bindings.
+    List(ObjectListArgs),
+    /// Describe one path, raw SHA-256, or Git blob SHA-1 selector.
+    Stat(ObjectStatArgs),
+    /// Read one fully verified blob without executing it.
+    Get(ObjectGetArgs),
+    /// Fully verify the canonical index and exact CAS object closure.
+    Verify(ObjectVerifyArgs),
+}
+
+#[derive(Debug, Args)]
+struct ObjectRootArgs {
+    /// Emit one stable JSON object.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct ObjectListArgs {
+    /// Restrict results to this exact path or its descendants.
+    #[arg(long, value_name = "PATH")]
+    prefix: Option<String>,
+
+    /// Emit one stable JSON array.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct ObjectStatArgs {
+    /// PATH, sha256:<64 lowercase hex>, or git-sha1:<40 lowercase hex>.
+    #[arg(value_name = "SELECTOR")]
+    selector: String,
+
+    /// Emit one stable JSON object.
+    #[arg(long, conflicts_with = "owvalue")]
+    json: bool,
+
+    /// Emit the canonical binary OWVALUE boot-object reference.
+    #[arg(long, conflicts_with = "json")]
+    owvalue: bool,
+}
+
+#[derive(Debug, Args)]
+struct ObjectGetArgs {
+    /// PATH, sha256:<64 lowercase hex>, or git-sha1:<40 lowercase hex>.
+    #[arg(value_name = "SELECTOR")]
+    selector: String,
+
+    /// New output path, or `-` for stdout. Existing paths are never overwritten.
+    #[arg(short, long, value_name = "FILE", default_value = "-")]
+    output: PathBuf,
+
+    /// Permit raw bytes on an interactive terminal.
+    #[arg(long)]
+    force: bool,
+}
+
+#[derive(Debug, Args)]
+struct ObjectVerifyArgs {
+    /// Emit one stable JSON object instead of the boot smoke marker.
+    #[arg(long)]
+    json: bool,
+}
+
 fn main() {
     // Hosted backend workers relaunch the exact admitted current executable.
     // The unified front door therefore owns the same hidden backend protocol
@@ -406,7 +491,275 @@ fn dispatch(command: IntentCommand) -> Result<i32> {
         IntentCommand::Plan(args) => plan_intent(&args),
         IntentCommand::Explain(args) => explain_pending(&args),
         IntentCommand::Inspect(args) => inspect_pending(&args),
+        IntentCommand::Object(args) => object_command(&args),
     }
+}
+
+struct ObjectSelection<'a> {
+    object: &'a BootObjectRecord,
+    selected_binding: Option<&'a BootPathBinding>,
+}
+
+fn object_command(args: &ObjectArgs) -> Result<i32> {
+    let root = args
+        .store
+        .clone()
+        .or_else(|| env::var_os(BOOT_OBJECT_STORE_ENV).map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_BOOT_OBJECT_STORE));
+    let store = BootObjectStore::open(&root)
+        .with_context(|| format!("failed to open boot-object store {}", root.display()))?;
+    match &args.command {
+        ObjectCommand::Root(command) => object_root(store.index(), command),
+        ObjectCommand::List(command) => object_list(store.index(), command),
+        ObjectCommand::Stat(command) => object_stat(store.index(), command),
+        ObjectCommand::Get(command) => object_get(&store, command),
+        ObjectCommand::Verify(command) => object_verify(&store, command),
+    }
+}
+
+fn object_root(index: &BootObjectIndex, args: &ObjectRootArgs) -> Result<i32> {
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema": "ostadix.boot-object-set/v1",
+                "source_commit_sha1": hex::encode(index.source_commit()),
+                "source_tree_sha1": hex::encode(index.source_tree()),
+                "root_sha256": hex::encode(index.root_sha256()),
+                "objects": index.objects().len(),
+                "bindings": index.bindings().len(),
+                "logical_bytes": index.logical_bytes(),
+                "stored_bytes": index.stored_bytes(),
+            }))?
+        );
+    } else {
+        println!("schema=ostadix.boot-object-set/v1");
+        println!("source_commit_sha1={}", hex::encode(index.source_commit()));
+        println!("source_tree_sha1={}", hex::encode(index.source_tree()));
+        println!("root_sha256={}", hex::encode(index.root_sha256()));
+        println!("objects={}", index.objects().len());
+        println!("bindings={}", index.bindings().len());
+        println!("logical_bytes={}", index.logical_bytes());
+        println!("stored_bytes={}", index.stored_bytes());
+    }
+    Ok(0)
+}
+
+fn object_list(index: &BootObjectIndex, args: &ObjectListArgs) -> Result<i32> {
+    let bindings = index
+        .bindings()
+        .iter()
+        .filter(|binding| {
+            args.prefix
+                .as_ref()
+                .is_none_or(|prefix| path_matches_prefix(binding.path(), prefix))
+        })
+        .collect::<Vec<_>>();
+    if args.json {
+        let values = bindings
+            .iter()
+            .map(|binding| {
+                serde_json::json!({
+                    "path": binding.path(),
+                    "mode": binding.mode().as_octal(),
+                    "executable": binding.mode().is_executable(),
+                    "sha256": hex::encode(binding.object_sha256()),
+                })
+            })
+            .collect::<Vec<_>>();
+        println!("{}", serde_json::to_string_pretty(&values)?);
+    } else {
+        for binding in bindings {
+            println!(
+                "{}\t{}\tsha256:{}",
+                binding.mode().as_octal(),
+                binding.path(),
+                hex::encode(binding.object_sha256())
+            );
+        }
+    }
+    Ok(0)
+}
+
+fn object_stat(index: &BootObjectIndex, args: &ObjectStatArgs) -> Result<i32> {
+    let selection = resolve_object(index, &args.selector)?;
+    if args.owvalue {
+        let record = portable_boot_object_ref(*index.root_sha256(), selection.object)?;
+        let encoded = record.encode()?;
+        let mut output = io::stdout().lock();
+        output.write_all(&encoded)?;
+        output.flush()?;
+        return Ok(0);
+    }
+
+    let paths = index
+        .bindings_for_object(selection.object.sha256())
+        .map(|binding| {
+            serde_json::json!({
+                "path": binding.path(),
+                "mode": binding.mode().as_octal(),
+                "executable": binding.mode().is_executable(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let identity = selection.object.identity()?;
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema": "ostadix.boot-object-ref/v1",
+                "identity": {
+                    "world": identity.world().as_str(),
+                    "object": identity.object().as_str(),
+                    "version": identity.version().get(),
+                },
+                "kind": "git-blob",
+                "sha256": selection.object.sha256_hex(),
+                "git_sha1": selection.object.git_sha1_hex(),
+                "bytes": selection.object.bytes(),
+                "set_sha256": hex::encode(index.root_sha256()),
+                "selected_path": selection.selected_binding.map(BootPathBinding::path),
+                "paths": paths,
+            }))?
+        );
+    } else {
+        println!("schema=ostadix.boot-object-ref/v1");
+        println!("identity={identity}");
+        println!("kind=git-blob");
+        println!("sha256={}", selection.object.sha256_hex());
+        println!("git_sha1={}", selection.object.git_sha1_hex());
+        println!("bytes={}", selection.object.bytes());
+        println!("set_sha256={}", hex::encode(index.root_sha256()));
+        if let Some(binding) = selection.selected_binding {
+            println!("selected_path={}", binding.path());
+        }
+        for path in paths {
+            println!(
+                "path={}\tmode={}",
+                path["path"].as_str().expect("path projection is text"),
+                path["mode"].as_str().expect("mode projection is text")
+            );
+        }
+    }
+    Ok(0)
+}
+
+fn object_get(store: &BootObjectStore, args: &ObjectGetArgs) -> Result<i32> {
+    let selection = resolve_object(store.index(), &args.selector)?;
+    let bytes = store
+        .read_object(selection.object.sha256())
+        .with_context(|| format!("failed to verify boot object `{}`", args.selector))?;
+    if args.output.as_os_str() == "-" {
+        if io::stdout().is_terminal() && !args.force {
+            bail!("refusing to write raw boot-object bytes to a terminal; use --force or --output FILE");
+        }
+        let mut output = io::stdout().lock();
+        output.write_all(&bytes)?;
+        output.flush()?;
+        return Ok(0);
+    }
+
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut output = options
+        .open(&args.output)
+        .with_context(|| format!("refusing to overwrite output {}", args.output.display()))?;
+    output
+        .write_all(&bytes)
+        .with_context(|| format!("failed to write {}", args.output.display()))?;
+    output
+        .sync_all()
+        .with_context(|| format!("failed to synchronize {}", args.output.display()))?;
+    Ok(0)
+}
+
+fn object_verify(store: &BootObjectStore, args: &ObjectVerifyArgs) -> Result<i32> {
+    let report = store
+        .verify()
+        .context("full boot-object index/CAS verification failed")?;
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema": "ostadix.boot-object-verification/v1",
+                "status": "pass",
+                "root_sha256": hex::encode(report.root_sha256),
+                "objects": report.object_count,
+                "bindings": report.binding_count,
+                "logical_bytes": report.logical_bytes,
+                "stored_bytes": report.stored_bytes,
+            }))?
+        );
+    } else {
+        println!("OSTADIX BOOT OBJECTS: PASS");
+        println!("root_sha256={}", hex::encode(report.root_sha256));
+        println!("objects={}", report.object_count);
+        println!("bindings={}", report.binding_count);
+        println!("logical_bytes={}", report.logical_bytes);
+        println!("stored_bytes={}", report.stored_bytes);
+    }
+    Ok(0)
+}
+
+fn resolve_object<'a>(index: &'a BootObjectIndex, selector: &str) -> Result<ObjectSelection<'a>> {
+    if let Some(value) = selector.strip_prefix("sha256:") {
+        let digest = decode_lower_hex::<32>(value, "SHA-256")?;
+        let object = index
+            .object_by_sha256(&digest)
+            .ok_or_else(|| anyhow::anyhow!("boot object `{selector}` is absent from the index"))?;
+        return Ok(ObjectSelection {
+            object,
+            selected_binding: None,
+        });
+    }
+    if let Some(value) = selector.strip_prefix("git-sha1:") {
+        let oid = decode_lower_hex::<20>(value, "Git SHA-1")?;
+        let object = index
+            .object_by_git_sha1(&oid)
+            .ok_or_else(|| anyhow::anyhow!("Git blob `{selector}` is absent from the index"))?;
+        return Ok(ObjectSelection {
+            object,
+            selected_binding: None,
+        });
+    }
+    let binding = index
+        .binding_by_path(selector)
+        .ok_or_else(|| anyhow::anyhow!("boot-object path `{selector}` is absent from the index"))?;
+    let object = index
+        .object_by_sha256(binding.object_sha256())
+        .ok_or_else(|| anyhow::anyhow!("boot-object index contains a dangling path binding"))?;
+    Ok(ObjectSelection {
+        object,
+        selected_binding: Some(binding),
+    })
+}
+
+fn decode_lower_hex<const N: usize>(value: &str, label: &str) -> Result<[u8; N]> {
+    if value.len() != N * 2
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!(
+            "{label} must be exactly {} lowercase hexadecimal characters",
+            N * 2
+        );
+    }
+    let decoded = hex::decode(value).expect("validated hexadecimal input");
+    decoded
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("{label} decoded to the wrong length"))
+}
+
+fn path_matches_prefix(path: &str, prefix: &str) -> bool {
+    let prefix = prefix.trim_end_matches('/');
+    prefix.is_empty()
+        || path == prefix
+        || path
+            .strip_prefix(prefix)
+            .is_some_and(|remainder| remainder.starts_with('/'))
 }
 
 fn resolve_shim_dir(explicit: Option<&Path>, positional: Option<&Path>) -> Result<PathBuf> {
@@ -1728,6 +2081,45 @@ mod tests {
         plan
     }
 
+    fn parse_object(arguments: &[&str]) -> ObjectArgs {
+        let cli = Cli::try_parse_from(arguments).unwrap();
+        let IntentCommand::Object(object) = cli.command else {
+            panic!("expected object command")
+        };
+        object
+    }
+
+    #[test]
+    fn boot_object_commands_are_read_only_and_accept_a_global_store() {
+        let object = parse_object(&[
+            "o",
+            "object",
+            "verify",
+            "--store",
+            "/usr/share/ostadix/boot-objects/v1",
+        ]);
+        assert_eq!(
+            object.store.as_deref(),
+            Some(Path::new("/usr/share/ostadix/boot-objects/v1"))
+        );
+        assert!(matches!(object.command, ObjectCommand::Verify(_)));
+
+        for command in ["root", "list", "stat", "get", "verify"] {
+            let help = Cli::try_parse_from(["o", "object", command, "--help"]).unwrap_err();
+            assert_eq!(help.kind(), ErrorKind::DisplayHelp);
+        }
+    }
+
+    #[test]
+    fn boot_object_list_prefix_respects_path_component_boundaries() {
+        assert!(path_matches_prefix("src", "src"));
+        assert!(path_matches_prefix("src/bin/o-cli.rs", "src"));
+        assert!(path_matches_prefix("src/bin/o-cli.rs", "src/"));
+        assert!(!path_matches_prefix("src2/main.rs", "src"));
+        assert!(!path_matches_prefix("source/main.rs", "src"));
+        assert!(path_matches_prefix("anything", ""));
+    }
+
     #[test]
     fn run_options_are_accepted_before_and_after_the_target() {
         let before = parse_run(&[
@@ -1882,6 +2274,8 @@ mod tests {
             "plan",
             "explain",
             "inspect",
+            "object",
+            "root|list|stat|get|verify",
             "closed-registry",
             "node start|stop|status|restart",
             "Unknown command forms retain historical evaluator behavior",

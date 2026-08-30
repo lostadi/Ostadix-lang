@@ -38,7 +38,7 @@ if (( PROBE_MODE == 33 || PROBE_MODE == 34 )) && (( BOOT_INFO_ENABLED != 1 )); t
 fi
 mkdir -p "$BUILD_DIR"
 
-cargo build --manifest-path "$ROOT/Cargo.toml" --package o-lang --bin ocorec
+cargo build --locked --manifest-path "$ROOT/Cargo.toml" --package o-lang --bin ocorec
 if [[ -L "$OCOREC_BIN" || ! -f "$OCOREC_BIN" || ! -x "$OCOREC_BIN" ]]; then
   echo "error: Cargo did not produce the expected ocorec binary: $OCOREC_BIN" >&2
   exit 1

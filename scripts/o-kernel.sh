@@ -25,7 +25,7 @@ CAPACITY_ISO_BUILD_SCRIPT=${O_KERNEL_CAPACITY_ISO_BUILD_SCRIPT:-"$ROOT/ocore/ker
 CAPACITY_ISO_BOOT_SCRIPT=${O_KERNEL_CAPACITY_ISO_BOOT_SCRIPT:-"$ROOT/ocore/kernel/run-x86_64-capacity-iso-qemu.sh"}
 CAPACITY_ISO_INSPECT_SCRIPT=${O_KERNEL_CAPACITY_ISO_INSPECT_SCRIPT:-"$ROOT/scripts/ostadix_capacity_iso.py"}
 HOSTED_LIVE_RELEASE_SCRIPT=${O_KERNEL_HOSTED_LIVE_RELEASE_SCRIPT:-"$ROOT/scripts/ostadix_hosted_live_release.py"}
-HOSTED_LIVE_SMOKE_SCRIPT=${O_KERNEL_HOSTED_LIVE_SMOKE_SCRIPT:-"$ROOT/ocore/kernel/smoke-x86_64-hosted-live-qemu.py"}
+HOSTED_LIVE_SMOKE_SCRIPT=${O_KERNEL_HOSTED_LIVE_SMOKE_SCRIPT:-"$ROOT/ocore/kernel/smoke-x86_64-hosted-live-all.py"}
 VENTOY_INSTALLER_SCRIPT=${O_KERNEL_VENTOY_INSTALLER_SCRIPT:-"$ROOT/scripts/ostadix_ventoy_installer.py"}
 MEDIA_WRITER_SCRIPT=${O_KERNEL_MEDIA_WRITER_SCRIPT:-"$ROOT/scripts/ostadix_media_writer.py"}
 PHYSICAL_EVIDENCE_SCRIPT=${O_KERNEL_PHYSICAL_EVIDENCE_SCRIPT:-"$ROOT/scripts/ostadix_physical_evidence.py"}
@@ -48,7 +48,7 @@ Commands:
   capacity-iso  Build the opt-in O-core plus foreign-systems x86_64 ISO
   inspect-capacity-iso  Strictly inspect an absorbed-capacity ISO
   hosted-live-release  Build and verify the staged-index x86_64 hosted-live ISO
-  smoke-hosted-live  Boot and assert the hosted-live O and olangc readiness markers
+  smoke-hosted-live  Boot and assert serial, graphical, and direct O-core readiness
   prepare-ventoy  Inspect a Ventoy volume and derive a bound install token
   install-ventoy  Copy and verify the hosted-live ISO using that exact token
   verify-ventoy  Re-identify and rehash an installed hosted-live Ventoy ISO

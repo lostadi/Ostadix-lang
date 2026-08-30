@@ -32,18 +32,6 @@ fi
 source "$ROOT/ocore/kernel/resolve-x86_64-ovmf-code.sh"
 OSTADIX_OVMF_CODE=$(resolve_ostadix_x86_64_ovmf_code "$QEMU_BIN")
 
-cat >&2 <<EOF
-
-OSTADIX absorbed-capacity x86_64 UEFI ISO
-  firmware: $OSTADIX_OVMF_CODE
-  iso:      $ISO
-  media:    descriptor-pinned, read-only El Torito CD-ROM
-  network:  disabled for the outer capacity host and every embedded adapter
-  select:   GRUB hotkeys h/o/a/g/b/p/r or arrow keys
-  exit:     Ctrl-A X
-
-EOF
-
 exec "$PYTHON" -c '
 import importlib.util
 import os
@@ -66,6 +54,23 @@ try:
     metadata = inspector.inspect_descriptor(media_descriptor, media_text)
     firmware = Path(firmware_text).resolve(strict=True)
     firmware_descriptor = inspector._open_pinned_regular(firmware, "OVMF code")
+    hotkeys = "/".join(entry["hotkey"] for entry in metadata["entries"])
+    print("", file=sys.stderr)
+    print("OSTADIX x86_64 UEFI ISO", file=sys.stderr)
+    print(f"  firmware: {firmware}", file=sys.stderr)
+    print(f"  iso:      {media_text}", file=sys.stderr)
+    print("  media:    descriptor-pinned, read-only El Torito CD-ROM", file=sys.stderr)
+    print("  network:  disabled for the outer QEMU machine", file=sys.stderr)
+    print(f"  select:   GRUB hotkeys {hotkeys} or arrow keys", file=sys.stderr)
+    print("  exit:     Ctrl-A X", file=sys.stderr)
+    print("", file=sys.stderr)
+    print(
+        "OSTADIX ISO IDENTITY bytes={} sha256={}".format(
+            metadata["bytes"], metadata["sha256"]
+        ),
+        file=sys.stderr,
+        flush=True,
+    )
     for entry in metadata["entries"]:
         print(
             "  [{}] {} adapter={}".format(
@@ -84,11 +89,15 @@ try:
         "-machine", "q35",
         "-cpu", "max",
         "-smp", "2",
-        "-m", "2048M",
+        "-m", "4096M",
         "-drive", f"if=pflash,unit=0,format=raw,readonly=on,file={firmware_fd_path}",
         "-drive", f"if=ide,index=2,media=cdrom,format=raw,readonly=on,file={media_fd_path}",
         "-boot", "order=d,strict=on",
         "-nodefaults",
+        # Model the hardware entropy that first-boot key provisioning requires;
+        # the outer guest still has no network device.
+        "-object", "rng-random,filename=/dev/urandom,id=ostadix_rng",
+        "-device", "virtio-rng-pci,rng=ostadix_rng",
         "-nic", "none",
         "-display", "none",
         "-serial", "mon:stdio",

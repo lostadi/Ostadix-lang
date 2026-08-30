@@ -335,8 +335,9 @@ direct launchers only, not shebang interpreters, compiler-driver subtools,
 dynamic libraries, or descendants launched by hosted code. Consumed legacy
 Python support files and adapter-owned tools are bound without constraining
 subprocesses created by user code. Because `ExecutionPlan`
-omits WebAssembly body shape, V5 conservatively binds the complete `wat2wasm`
-plus runtime alternative rather than under-admitting a later WAT conversion. V5 also
+omits WebAssembly body shape, V5 conservatively binds a complete text-converter
+plus runtime alternative (`wat2wasm` or `wasm-tools parse`) rather than
+under-admitting a later WAT conversion. V5 also
 does not attest a frozen child environment, the opaque state or generation of
 an already-live actor, Request/project admission authority, or placement-lease
 freshness. The separate Request authority captures and shares a Nix command

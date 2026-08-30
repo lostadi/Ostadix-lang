@@ -12,11 +12,71 @@ iso_path = "/boot/hosted/initramfs.cpio.gz"
 stage_path = "boot/hosted/initramfs.cpio.gz"
 role = "linux-initrd"
 
+[[artifacts]]
+iso_path = "/boot/hosted/rootfs.squashfs"
+stage_path = "boot/hosted/rootfs.squashfs"
+role = "linux-rootfs"
+
+[[artifacts]]
+iso_path = "/boot/modloop-lts"
+stage_path = "boot/modloop-lts"
+role = "linux-modloop"
+
+[[artifacts]]
+iso_path = "/boot/ocore/kernel.elf"
+stage_path = "boot/ocore/kernel.elf"
+role = "ocore-kernel"
+
+[[artifacts]]
+iso_path = "/boot/capacity-host/vmlinuz-virt"
+stage_path = "boot/capacity-host/vmlinuz-virt"
+role = "linux-kernel"
+
+[[artifacts]]
+iso_path = "/boot/capacity-host/initramfs.cpio.gz"
+stage_path = "boot/capacity-host/initramfs.cpio.gz"
+role = "linux-initrd"
+
+[[artifacts]]
+iso_path = "/boot/entry/010-alpine/initramfs-virt"
+stage_path = "boot/entry/010-alpine/initramfs-virt"
+role = "linux-initrd"
+
+[[artifacts]]
+iso_path = "/ostadix/guix/linux-libre-6.17.12-bzimage"
+stage_path = "ostadix/guix/linux-libre-6.17.12-bzimage"
+role = "linux-kernel"
+
+[[artifacts]]
+iso_path = "/ostadix/guix/guix-1.5.0-initrd.cpio.gz"
+stage_path = "ostadix/guix/guix-1.5.0-initrd.cpio.gz"
+role = "linux-initrd"
+
+[[artifacts]]
+iso_path = "/ostadix/guix/guix-system-install-1.5.0.x86_64-linux.iso"
+stage_path = "ostadix/guix/guix-system-install-1.5.0.x86_64-linux.iso"
+role = "guest-rootfs"
+
+[[artifacts]]
+iso_path = "/ostadix/openbsd/install79.iso"
+stage_path = "ostadix/openbsd/install79.iso"
+role = "guest-raw-cd"
+
+[[artifacts]]
+iso_path = "/ostadix/9front/9front-11983.amd64.qcow2"
+stage_path = "ostadix/9front/9front-11983.amd64.qcow2"
+role = "guest-qcow2"
+
+[[artifacts]]
+iso_path = "/ostadix/redox/redox-server-0.9.0-livedisk.iso"
+stage_path = "ostadix/redox/redox-server-0.9.0-livedisk.iso"
+role = "guest-raw-cd"
+
 [[entries]]
 id = "hosted"
-title = "OSTADIX Hosted Live CLI [physical x86_64]"
+title = "OSTADIX Hosted Workstation [physical x86_64]"
 hotkey = "h"
-adapter = "linux-selection"
+adapter = "linux-live-rootfs"
 arguments = [
   "console=ttyS0,115200n8",
   "console=tty0",
@@ -28,3 +88,100 @@ arguments = [
 kernel_path = "/boot/hosted/vmlinuz-lts"
 initrd_paths = ["/boot/hosted/initramfs.cpio.gz"]
 selection_id = "hosted"
+rootfs_path = "/boot/hosted/rootfs.squashfs"
+modloop_path = "/boot/modloop-lts"
+
+[[entries]]
+id = "ocore"
+title = "OSTADIX O-core [direct Multiboot2, serial console]"
+hotkey = "o"
+adapter = "multiboot2"
+arguments = []
+kernel_path = "/boot/ocore/kernel.elf"
+
+[[entries]]
+id = "alpine"
+title = "Alpine Linux 3.24.1 [direct kernel/initramfs]"
+hotkey = "a"
+adapter = "linux"
+arguments = [
+  "console=tty0",
+  "console=ttyS0,115200n8",
+  "rdinit=/bin/sh",
+  "panic=0",
+  "loglevel=4",
+]
+kernel_path = "/boot/capacity-host/vmlinuz-virt"
+initrd_paths = ["/boot/entry/010-alpine/initramfs-virt"]
+
+[[entries]]
+id = "guix"
+title = "GNU Guix System 1.5.0 [virtualized/TCG]"
+hotkey = "g"
+adapter = "qemu-tcg-linux-direct"
+arguments = [
+  "console=tty0",
+  "console=ttyS0,115200n8",
+  "rdinit=/init",
+  "panic=0",
+  "loglevel=4",
+]
+host_kernel_path = "/boot/capacity-host/vmlinuz-virt"
+host_initrd_path = "/boot/capacity-host/initramfs.cpio.gz"
+selection_id = "guix-system-1.5.0-x86_64"
+guest_artifact_paths = [
+  "/ostadix/guix/linux-libre-6.17.12-bzimage",
+  "/ostadix/guix/guix-1.5.0-initrd.cpio.gz",
+  "/ostadix/guix/guix-system-install-1.5.0.x86_64-linux.iso",
+]
+
+[[entries]]
+id = "openbsd"
+title = "OpenBSD 7.9 offline installer [virtualized/TCG]"
+hotkey = "b"
+adapter = "qemu-tcg-raw-cd-curses"
+arguments = [
+  "console=tty0",
+  "console=ttyS0,115200n8",
+  "rdinit=/init",
+  "panic=0",
+  "loglevel=4",
+]
+host_kernel_path = "/boot/capacity-host/vmlinuz-virt"
+host_initrd_path = "/boot/capacity-host/initramfs.cpio.gz"
+selection_id = "openbsd-7.9-amd64"
+guest_artifact_paths = ["/ostadix/openbsd/install79.iso"]
+
+[[entries]]
+id = "plan9"
+title = "9front Plan 9 build 11983 [virtualized/TCG]"
+hotkey = "p"
+adapter = "qemu-tcg-qcow2"
+arguments = [
+  "console=tty0",
+  "console=ttyS0,115200n8",
+  "rdinit=/init",
+  "panic=0",
+  "loglevel=4",
+]
+host_kernel_path = "/boot/capacity-host/vmlinuz-virt"
+host_initrd_path = "/boot/capacity-host/initramfs.cpio.gz"
+selection_id = "plan9-9front-11983-amd64"
+guest_artifact_paths = ["/ostadix/9front/9front-11983.amd64.qcow2"]
+
+[[entries]]
+id = "redox"
+title = "Redox OS 0.9.0 [virtualized/TCG]"
+hotkey = "r"
+adapter = "qemu-tcg-raw-cd"
+arguments = [
+  "console=tty0",
+  "console=ttyS0,115200n8",
+  "rdinit=/init",
+  "panic=0",
+  "loglevel=4",
+]
+host_kernel_path = "/boot/capacity-host/vmlinuz-virt"
+host_initrd_path = "/boot/capacity-host/initramfs.cpio.gz"
+selection_id = "redox-0.9.0-server-x86_64"
+guest_artifact_paths = ["/ostadix/redox/redox-server-0.9.0-livedisk.iso"]

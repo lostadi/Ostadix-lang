@@ -32,11 +32,13 @@ const MAX_INTENT_TTL_SECS: u64 = 900;
 const MAX_INTENT_OPERATION_TIMEOUT_SECS: u64 = 900;
 const MAX_LIVE_INTENTS: usize = 64;
 const MAX_INFORMATION_STATE_PATH_BYTES: usize = 4096;
+const MAX_OLANGC_MATERIALIZE_PATH_BYTES: usize = 4096;
 const MAX_INFORMATION_HEAD_NAME_BYTES: usize = 128;
 const MAX_INFORMATION_INSPECTION_STDOUT_BYTES: usize = 256 * 1024;
 const MAX_INFORMATION_INSPECTION_STDERR_BYTES: usize = 16 * 1024;
 const DEFAULT_INFORMATION_INSPECTION_TIMEOUT_SECS: u64 = 10;
 const MAX_INFORMATION_INSPECTION_TIMEOUT_SECS: u64 = 30;
+const O_INFO_BIN_ENV: &str = "OSTADIX_O_INFO_BIN";
 const INFORMATION_NON_AUTHORITY_NOTICE: &str =
     "information presence and signatures grant no execution authority";
 
@@ -294,7 +296,11 @@ fn resolve_lang_root() -> PathBuf {
         }
     }
 
-    for candidate in [home_dir().join("Ostadix-lang"), home_dir().join("O-lang")] {
+    for candidate in [
+        PathBuf::from("/usr/src/ostadix"),
+        home_dir().join("Ostadix-lang"),
+        home_dir().join("O-lang"),
+    ] {
         if is_lang_root(&candidate) {
             return canonical_directory(&candidate).unwrap_or(candidate);
         }
@@ -336,26 +342,53 @@ fn resolve_olangc(root: &Path) -> PathBuf {
     which::which("olangc").unwrap_or_else(|_| PathBuf::from("olangc"))
 }
 
-fn resolve_o_info(root: &Path) -> Result<PathBuf, String> {
-    let candidate = root.join("target/release/o-info");
+fn resolve_o_info_with_override(
+    root: &Path,
+    configured: Option<&OsStr>,
+) -> Result<PathBuf, String> {
+    let candidate = match configured {
+        Some(value) => {
+            if value.is_empty() {
+                return Err(format!("{O_INFO_BIN_ENV} must not be empty"));
+            }
+            let path = PathBuf::from(value);
+            if !path.is_absolute() {
+                return Err(format!("{O_INFO_BIN_ENV} must be an absolute path"));
+            }
+            path
+        }
+        None => root.join("target/release/o-info"),
+    };
     let metadata = std::fs::symlink_metadata(&candidate).map_err(|_| {
         format!(
-            "local o-info is not built at the fixed repository path {}",
+            "local o-info is unavailable at the fixed path {}",
             candidate.display()
         )
     })?;
     if metadata.file_type().is_symlink() {
-        return Err("fixed repository o-info path must not be a symlink".to_string());
+        return Err("fixed o-info path must not be a symlink".to_string());
     }
     if !metadata.is_file() {
         return Err(format!(
-            "local o-info is not built at the fixed repository path {}",
+            "local o-info is unavailable at the fixed path {}",
             candidate.display()
         ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return Err("fixed o-info path must be executable".to_string());
+        }
     }
     candidate
         .canonicalize()
         .map_err(|error| format!("resolve local o-info {}: {error}", candidate.display()))
+}
+
+fn resolve_o_info(root: &Path) -> Result<PathBuf, String> {
+    let configured = std::env::var_os(O_INFO_BIN_ENV);
+    resolve_o_info_with_override(root, configured.as_deref())
 }
 
 const RUNTIME_PATH_MODE_ENV: &str = "OSTADIX_RUNTIME_PATH_MODE";
@@ -1398,6 +1431,134 @@ fn resolve_file(base: &Path, requested: &str, label: &str) -> Result<PathBuf, St
         .map_err(|error| format!("resolve {label} {}: {error}", candidate.display()))
 }
 
+fn resolve_new_directory_under(base: &Path, requested: &str) -> Result<PathBuf, String> {
+    if requested.is_empty()
+        || requested.len() > MAX_OLANGC_MATERIALIZE_PATH_BYTES
+        || requested.chars().any(char::is_control)
+    {
+        return Err(
+            "materialize_only must be a nonempty path of at most 4096 UTF-8 bytes without control characters"
+                .to_string(),
+        );
+    }
+    let requested_path = PathBuf::from(requested);
+    if requested_path
+        .components()
+        .any(|component| component == std::path::Component::ParentDir)
+    {
+        return Err("materialize_only must not contain parent traversal".to_string());
+    }
+    let canonical_base = base
+        .canonicalize()
+        .map_err(|error| format!("resolve MCP server cwd {}: {error}", base.display()))?;
+    let candidate = if requested_path.is_absolute() {
+        requested_path
+    } else {
+        canonical_base.join(requested_path)
+    };
+    let name = candidate
+        .file_name()
+        .ok_or_else(|| "materialize_only must name a new child directory".to_string())?;
+    let parent = candidate
+        .parent()
+        .ok_or_else(|| "materialize_only has no parent directory".to_string())?;
+    let canonical_parent = parent.canonicalize().map_err(|error| {
+        format!(
+            "materialize_only parent must be an existing directory: {}: {error}",
+            parent.display()
+        )
+    })?;
+    if !canonical_parent.starts_with(&canonical_base) {
+        return Err(format!(
+            "materialize_only escaped the MCP server cwd: {}",
+            canonical_base.display()
+        ));
+    }
+    let resolved = canonical_parent.join(name);
+    match std::fs::symlink_metadata(&resolved) {
+        Ok(_) => Err(format!(
+            "materialize_only destination already exists: {}",
+            resolved.display()
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(resolved),
+        Err(error) => Err(format!(
+            "inspect materialize_only destination {}: {error}",
+            resolved.display()
+        )),
+    }
+}
+
+fn resolve_search_corpus(
+    root: &Path,
+    requested: Option<&str>,
+) -> Result<(PathBuf, PathBuf, bool), String> {
+    if let Some(requested) = requested {
+        let work = resolve_directory(root, Some(requested), "work")?;
+        let corpus = resolve_directory(&work, Some("search"), "search corpus")?;
+        require_contained_search_corpus(&work, &corpus)?;
+        return Ok((work, corpus, false));
+    }
+    if let Some(requested) = std::env::var_os("A18_WORK") {
+        let work = resolve_directory(root, Some(&requested.to_string_lossy()), "A18_WORK")?;
+        let corpus = resolve_directory(&work, Some("search"), "search corpus")?;
+        require_contained_search_corpus(&work, &corpus)?;
+        return Ok((work, corpus, false));
+    }
+    let conventional = home_dir().join("a18re");
+    if conventional.is_dir() {
+        let work = conventional
+            .canonicalize()
+            .map_err(|error| format!("resolve work {}: {error}", conventional.display()))?;
+        let corpus = resolve_directory(&work, Some("search"), "search corpus")?;
+        require_contained_search_corpus(&work, &corpus)?;
+        return Ok((work, corpus, false));
+    }
+    let work = resolve_directory(root, None, "bundled work")?;
+    let corpus = resolve_directory(&work, Some("examples"), "bundled corpus")?;
+    require_contained_search_corpus(&work, &corpus)?;
+    Ok((work, corpus, true))
+}
+
+fn require_contained_search_corpus(work: &Path, corpus: &Path) -> Result<(), String> {
+    if corpus.starts_with(work) {
+        Ok(())
+    } else {
+        Err(format!(
+            "search corpus escapes selected work root {}: {}",
+            work.display(),
+            corpus.display()
+        ))
+    }
+}
+
+fn resolve_search_program(corpus: &Path, requested: &str) -> Result<PathBuf, String> {
+    let corpus = corpus
+        .canonicalize()
+        .map_err(|error| format!("resolve search corpus {}: {error}", corpus.display()))?;
+    let requested = requested.trim();
+    let stem = requested.strip_suffix(".O").unwrap_or(requested);
+    if stem.is_empty()
+        || stem.len() > 128
+        || !stem
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
+        return Err(
+            "search program name must be a 1..128 byte ASCII letter/digit/_/- leaf token"
+                .to_string(),
+        );
+    }
+    let program = resolve_file(&corpus, &format!("{stem}.O"), "search program")?;
+    if !program.starts_with(&corpus) {
+        return Err(format!(
+            "search program escapes selected corpus {}: {}",
+            corpus.display(),
+            program.display()
+        ));
+    }
+    Ok(program)
+}
+
 fn resolve_run_target(
     root: &Path,
     requested_path: &str,
@@ -1526,6 +1687,11 @@ struct OlangcArgs {
     #[schemars(description = "Optional -o output path (relative paths use O_LANG_ROOT)")]
     output: Option<String>,
     #[serde(default)]
+    #[schemars(
+        description = "Materialize the exact binary/WASM Cargo project into a new directory beneath the MCP server cwd without invoking Cargo"
+    )]
+    materialize_only: Option<String>,
+    #[serde(default)]
     #[schemars(description = "Timeout seconds (default 180)")]
     timeout_secs: Option<u64>,
 }
@@ -1533,11 +1699,13 @@ struct OlangcArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct SearchRunArgs {
     #[schemars(
-        description = "Search tool name without .O, e.g. sptm_retype_catalog, nscramble_mine, lab_pipeline"
+        description = "Leaf O program name, with optional .O suffix; bundled names resolve under examples/, external work names under search/"
     )]
     name: String,
     #[serde(default)]
-    #[schemars(description = "a18re work root (default A18_WORK or ~/a18re)")]
+    #[schemars(
+        description = "Optional a18re/work root; default A18_WORK, existing ~/a18re, or the bundled O_LANG_ROOT"
+    )]
     work: Option<String>,
     #[serde(default)]
     #[schemars(description = "Timeout seconds (default 300)")]
@@ -2015,7 +2183,9 @@ impl OstadixMcp {
         }
     }
 
-    #[tool(description = "Run olangc on a .O file (targets: ir, dot, script, wasm, or omit)")]
+    #[tool(
+        description = "Run olangc on a .O file, or materialize an exact binary/WASM Cargo project without invoking Cargo"
+    )]
     async fn o_olangc(
         &self,
         Parameters(args): Parameters<OlangcArgs>,
@@ -2044,6 +2214,24 @@ impl OstadixMcp {
                 .display()
                 .to_string(),
             );
+        }
+        if let Some(requested) = &args.materialize_only {
+            let target = args.target.as_deref().unwrap_or("binary");
+            if !matches!(target, "binary" | "wasm") {
+                return text_err(
+                    "materialize_only is available only for binary or wasm targets".to_string(),
+                );
+            }
+            let server_cwd = match std::env::current_dir() {
+                Ok(path) => path,
+                Err(error) => return text_err(format!("resolve MCP server cwd: {error}")),
+            };
+            let destination = match resolve_new_directory_under(&server_cwd, requested) {
+                Ok(path) => path,
+                Err(error) => return text_err(error),
+            };
+            argv.push("--materialize-only".into());
+            argv.push(destination.display().to_string());
         }
         argv.push("--shim-dir".into());
         argv.push(backends.display().to_string());
@@ -2105,12 +2293,14 @@ impl OstadixMcp {
             shims.sort();
             lines.push(format!("shims({}): {}", shims.len(), shims.join(", ")));
         }
-        let a18 = home_dir().join("a18re");
-        lines.push(format!(
-            "a18re={} o-run={}",
-            a18.is_dir(),
-            a18.join("search/o-run").is_file()
-        ));
+        match resolve_search_corpus(&root, None) {
+            Ok((work, corpus, bundled)) => lines.push(format!(
+                "search-work={} search-corpus={} bundled={bundled}",
+                work.display(),
+                corpus.display()
+            )),
+            Err(error) => lines.push(format!("search-work-error={error}")),
+        }
         lines.push(
             discover_runtimes(&self.runtime_search, &root)
                 .to_text()
@@ -2121,7 +2311,7 @@ impl OstadixMcp {
     }
 
     #[tool(
-        description = "Run an a18re search tool by name (e.g. sptm_retype_catalog, nscramble_mine, lab_pipeline) with correct backends"
+        description = "Run a bundled O work program or an explicitly selected a18re search program with correct absolute backends"
     )]
     async fn o_search_run(
         &self,
@@ -2130,45 +2320,17 @@ impl OstadixMcp {
         let root = resolve_lang_root();
         let backends = resolve_backends(&root);
         let o_bin = resolve_o_bin(&root);
-        let requested_work = args
-            .work
-            .as_ref()
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("A18_WORK").map(PathBuf::from))
-            .unwrap_or_else(|| home_dir().join("a18re"));
-        let requested_work_text = requested_work.to_string_lossy();
-        let work = match resolve_directory(&root, Some(&requested_work_text), "work") {
-            Ok(path) => path,
+        let (work, corpus, _) = match resolve_search_corpus(&root, args.work.as_deref()) {
+            Ok(paths) => paths,
             Err(error) => return text_err(error),
         };
-        let requested_name = args.name.trim();
-        let direct = PathBuf::from(requested_name);
-        let direct = if direct.is_absolute() {
-            direct
-        } else {
-            work.join(direct)
-        };
-        let tool_name = requested_name.trim_end_matches(".O");
-        let candidate = if direct.is_file() {
-            direct
-        } else {
-            work.join("search").join(format!("{tool_name}.O"))
-        };
-        let path = match resolve_file(
-            candidate.parent().unwrap_or(&work),
-            candidate
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or(""),
-            "search program",
-        ) {
+        let path = match resolve_search_program(&corpus, &args.name) {
             Ok(path) => path,
-            Err(_) => {
+            Err(error) => {
                 return text_err(format!(
-                    "not found: {} (tried search/{}.O under {})",
+                    "not found: {} under {}: {error}",
                     args.name,
-                    tool_name,
-                    work.display()
+                    corpus.display()
                 ))
             }
         };
@@ -2189,10 +2351,11 @@ impl OstadixMcp {
         {
             Ok((code, stdout, stderr)) => {
                 let body = format!(
-                    "program={}\nbackends={}\nwork={}\n{}",
+                    "program={}\nbackends={}\nwork={}\ncorpus={}\n{}",
                     path.display(),
                     backends.display(),
                     work.display(),
+                    corpus.display(),
                     format_run(code, &stdout, &stderr)
                 );
                 if code == 0 {
@@ -2253,7 +2416,8 @@ mod tests {
     use super::{
         catalog_backends_for, discover_runtimes, is_lang_root, parse_execution_intent,
         random_intent_handle, resolve_directory, resolve_file, resolve_information_state,
-        resolve_o_info, resolve_run_target, run_cmd, run_information_inspect_bounded,
+        resolve_new_directory_under, resolve_o_info_with_override, resolve_run_target,
+        resolve_search_corpus, resolve_search_program, run_cmd, run_information_inspect_bounded,
         runtime_search_path_with_mode, runtime_search_path_with_mode_and_manager_environment,
         sanitize_information_head_output, validate_information_head_name, validate_intent_target,
         EmptyArgs, InformationInspectRunError, IntentLease, IntentReservation, IntentStore,
@@ -2320,6 +2484,62 @@ mod tests {
                 .canonicalize()
                 .expect("canonical fixture program")
         );
+    }
+
+    #[test]
+    fn search_programs_fall_back_to_search_and_cannot_escape_work() {
+        let fixture = Fixture::new();
+        let work = fixture.0.canonicalize().expect("canonical work root");
+        let corpus = work.join("search");
+        fs::create_dir_all(&corpus).expect("create search corpus");
+        fs::write(corpus.join("catalog.O"), "text^(ok)_text\n").expect("write search fixture");
+        assert_eq!(
+            resolve_search_program(&corpus, "catalog").expect("resolve named search program"),
+            corpus.join("catalog.O")
+        );
+        assert_eq!(
+            resolve_search_program(&work.join("examples"), "hello.O")
+                .expect("resolve bundled named program"),
+            work.join("examples/hello.O")
+        );
+        for rejected in ["../catalog", "/tmp/catalog", "nested/catalog", ".", ""] {
+            let error = resolve_search_program(&corpus, rejected)
+                .expect_err("search program name must be a bounded leaf token");
+            assert!(error.contains("leaf token"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn search_program_symlink_cannot_escape_selected_corpus() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new();
+        let work = fixture.0.canonicalize().expect("canonical work root");
+        let corpus = work.join("search");
+        fs::create_dir_all(&corpus).expect("create search corpus");
+        let outside = work.join("outside.O");
+        fs::write(&outside, "text^(outside)_text\n").expect("write outside fixture");
+        symlink(&outside, corpus.join("escape.O")).expect("create escape symlink");
+        let error = resolve_search_program(&corpus, "escape")
+            .expect_err("canonical search program must remain inside its corpus");
+        assert!(error.contains("escapes selected corpus"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn search_corpus_symlink_cannot_escape_selected_work_root() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new();
+        let work = fixture.0.join("external-work");
+        let outside = fixture.0.join("outside-search");
+        fs::create_dir_all(&work).expect("create selected work root");
+        fs::create_dir_all(&outside).expect("create outside search corpus");
+        symlink(&outside, work.join("search")).expect("create escaping corpus symlink");
+        let error = resolve_search_corpus(&fixture.0, Some("external-work"))
+            .expect_err("canonical search corpus must remain inside selected work root");
+        assert!(error.contains("escapes selected work root"));
     }
 
     #[test]
@@ -2834,8 +3054,27 @@ mod tests {
         let release = fixture.0.join("target/release");
         fs::create_dir_all(&release).unwrap();
         symlink("/bin/sh", release.join("o-info")).unwrap();
-        let error = resolve_o_info(&fixture.0).unwrap_err();
+        let error = resolve_o_info_with_override(&fixture.0, None).unwrap_err();
         assert!(error.contains("must not be a symlink"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fixed_information_inspector_accepts_explicit_absolute_installed_binary() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = Fixture::new();
+        let installed = fixture.0.join("usr/local/bin/o-info");
+        fs::create_dir_all(installed.parent().unwrap()).unwrap();
+        fs::write(&installed, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&installed, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let resolved =
+            resolve_o_info_with_override(&fixture.0, Some(installed.as_os_str())).unwrap();
+        assert_eq!(resolved, installed.canonicalize().unwrap());
+        let relative =
+            resolve_o_info_with_override(&fixture.0, Some(OsStr::new("o-info"))).unwrap_err();
+        assert!(relative.contains("must be an absolute path"));
     }
 
     #[cfg(unix)]
@@ -3015,6 +3254,37 @@ mod tests {
         assert_eq!(first.len(), 64);
         assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn materialize_destination_is_new_and_contained_under_server_cwd() {
+        let fixture = Fixture::new();
+        let workspace = fixture.0.join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let resolved = resolve_new_directory_under(&workspace, "release/generated")
+            .expect_err("missing parent must be rejected");
+        assert!(resolved.contains("parent must be an existing directory"));
+
+        let release = workspace.join("release");
+        std::fs::create_dir(&release).expect("release parent");
+        let resolved = resolve_new_directory_under(&workspace, "release/generated")
+            .expect("fresh contained destination");
+        assert_eq!(resolved, release.canonicalize().unwrap().join("generated"));
+
+        std::fs::write(&resolved, b"occupied").expect("occupied destination");
+        let error = resolve_new_directory_under(&workspace, "release/generated")
+            .expect_err("existing destination must be rejected");
+        assert!(error.contains("already exists"));
+
+        let error = resolve_new_directory_under(&workspace, "../escaped")
+            .expect_err("parent traversal must be rejected");
+        assert!(error.contains("parent traversal"));
+        let outside = fixture.0.join("outside");
+        std::fs::create_dir(&outside).expect("outside parent");
+        let error =
+            resolve_new_directory_under(&workspace, &outside.join("new").display().to_string())
+                .expect_err("absolute escape must be rejected");
+        assert!(error.contains("escaped the MCP server cwd"));
     }
 
     #[cfg(unix)]

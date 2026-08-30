@@ -1297,7 +1297,7 @@ check_capabilities() {
       check_any_tool "Mono runtime" mono
     fi
     check_any_tool "GNU Octave" octave
-    check_any_tool "WebAssembly assembler" wat2wasm
+    check_any_tool "WebAssembly assembler" wat2wasm wasm-tools
     check_any_tool "WebAssembly runtime" wasmtime wasmer
     echo "  [excluded] Java backend (local no-JRE policy)"
     echo "  [excluded] MATLAB/Wolfram licensed runtimes (Octave covers MATLAB-compatible code)"

@@ -221,6 +221,13 @@ launch and retains the complete private log path. Durable recovery is allowed
 120 seconds by default; use `--startup-timeout-seconds N` for an unusually
 large state root. If a managed PID already exists, `start` reports it without
 re-probing listener readiness.
+Fresh automatic TLS material remains RSA-3072 by default. The explicit
+`--fresh-pki-key-algorithm ec-p256` profile is available when key-generation
+latency under cross-architecture emulation matters; it still creates and
+verifies fresh CA, node, client, and pairing identities. The hosted-live
+release gives that one-time nested-TCG provisioning a bounded 900-second budget
+while retaining the separate 30-second post-provisioning listener-readiness
+deadline.
 
 On the first machine, open a one-use five-minute pairing offer:
 
@@ -949,7 +956,7 @@ reconstructing executable and backend paths by hand.
 | `o_execute_intent` | Consumes that handle, requires O to recompute the same Intent V1, then performs a fresh V6 admission before dispatch. |
 | `o_run` | Runs one local `.O` file directly with an explicit working directory and timeout. |
 | `o_olangc` | Runs `olangc` with the resolved shim directory; supports `ir`, `dot`, `script`, and `wasm`, or the default target. |
-| `o_search_run` | Runs a named search program from an external `a18re` work tree when that optional tree is present. |
+| `o_search_run` | Runs one strictly named `.O` search program from `<work>/search` when an external `a18re` tree exists, otherwise from the installed bundled `examples/` corpus; path traversal and symlink escape are rejected. |
 | `o_information_inspect` | Runs fixed local `o-info head` against one existing non-symlink state root with bounded input, output, and timeout. It returns sanitized object IDs and counts while preserving entries, content, inode, mode, and mtime. |
 
 ```mermaid
@@ -1000,7 +1007,8 @@ own lockfile, rejects Clippy warnings, and exercises initialization, exact tool
 and object-schema discovery, `o_env`, `o_runtimes`, and `o_smoke` over the real
 stdio transport with `scripts/smoke_ostadix_mcp.py`. The smoke launches the
 server with a system-only `PATH`, then calls `o_run` with both forms of relative
-path, calls `o_olangc`, and inspects a temporary local Information V1 head
+path, executes the bundled `o_search_run`, rejects search-path escape, calls
+`o_olangc`, and inspects a temporary local Information V1 head
 without mutating its entries/content/inode/mode/mtime; transport discovery
 alone therefore cannot mask a broken runtime-path recovery, execution tool, or
 inspection boundary. Use `./setup.sh --no-mcp` when
@@ -1017,10 +1025,10 @@ The checked-in `.mcp.json` registers the server as `ostadix` using the
 configuration can load that file after `~/.local/bin` is visible in the
 client's `PATH`. It deliberately contains no shell-expanded environment values:
 the server discovers a valid Ostadix root from its working directory (or its
-ancestors), then checks `O_LANG_ROOT` and conventional home-directory checkouts
-when needed. For clients that launch outside the repository or need an explicit
-configuration, use absolute paths rather than relying on shell expansion inside
-JSON:
+ancestors), then checks `O_LANG_ROOT`, the installed `/usr/src/ostadix` source
+root, and conventional home-directory checkouts when needed. For clients that
+launch outside the repository or need an explicit configuration, use absolute
+paths rather than relying on shell expansion inside JSON:
 
 ```json
 {
@@ -1506,7 +1514,7 @@ and initramfs inputs needed for boot. See
 [`docs/ABSORBED_CAPACITY.md`](docs/ABSORBED_CAPACITY.md) for the package,
 transaction, rollback, and non-destructive garbage-collection contracts.
 
-#### Build the physical Hosted Live x86_64 UEFI ISO
+#### Build the combined staged-tree OSTADIX x86_64 UEFI ISO
 
 The default publication name is staged-tree-addressed:
 `target/ostadix-hosted-live/x86_64/ostadix-hosted-live-x86_64-uefi-<tree12>_VTGRUB2.iso`,
@@ -1518,9 +1526,10 @@ tree beneath a run-owned native guest path under
 `/home/ubuntu/.cache/ostadix/hosted-live-release/runs` in the Multipass VM named
 `moral-gaur`. The VM may expose unrelated host mounts; this is a build-path
 ownership boundary, not a claim of hermetic or security isolation. The release
-source, Cargo work, x86_64-musl sysroot, Alpine initramfs construction, GRUB
-assembly, and nested QEMU output must remain below the guest-owned run path and
-never use the mounted macOS checkout as their build root.
+source, Cargo work, x86_64-musl sysroot, Alpine bootstrap-initramfs and
+SquashFS construction, GRUB assembly, and nested QEMU output must remain below
+the guest-owned run path and never use the mounted macOS checkout as their
+build root.
 
 Review and stage only the intended source changes, then run one release command:
 
@@ -1536,47 +1545,177 @@ HOSTED_LIVE_ISO='<exact hosted-live-output path>'
 o kernel smoke-hosted-live "$HOSTED_LIVE_ISO"
 ```
 
-Staging does not commit or push. The orchestrator binds the build to the staged
-index, builds static x86_64 `O`, `o-cli`, `olangc`, and `o-link` binaries, embeds
-the pinned Alpine package closure from
-[`evidence/hosted_live_physical_apk_packages.txt`](evidence/hosted_live_physical_apk_packages.txt),
-uses the pinned Alpine LTS kernel and initramfs, builds the ISO, and strictly
-inspects the published bytes. It requires all seven in-guest markers in order:
-first on serial, then during a second boot with VGA and a USB keyboard. That
-second gate rejects a black or unchanged framebuffer, types into the visible
-`tty1` shell, and requires the typed command to report back over serial:
+That re-smoke command snapshots the exact ISO bytes once and requires the
+hosted serial/toolchain/node/notebook gate, the Openbox/Firefox/Xterm
+framebuffer and USB-input gate, and the separately selected direct O-core gate.
+All three child results must report the snapshot's byte count and SHA-256 before
+one aggregate v2 result is emitted. It does not select the direct Alpine entry
+or the four nested foreign-system entries. Hosted and O-core timeout overrides
+are finite and bounded, validated on the host, and passed explicitly into the
+Multipass release worker.
 
-```text
-OSTADIX HOSTED O SMOKE: PASS
-OSTADIX HOSTED BASH: PASS
-OSTADIX HOSTED SQLITE: PASS
-OSTADIX HOSTED OLANGC IR: PASS
-OSTADIX HOSTED O-CLI: PASS
-OSTADIX HOSTED O-LINK: PASS
-OSTADIX HOSTED LIVE READY
-```
+Staging does not commit or push. The orchestrator binds the build to the staged
+index returned by `git write-tree`. It puts that complete staged Git tree at
+`/usr/src/ostadix` and admits the same regular blobs into the read-only boot
+object store at `/usr/share/ostadix/boot-objects/v1`. `.git`, `target/`, caches,
+and untracked files are outside this boundary. The `o object root`, `list`,
+`stat`, `get`, and `verify` commands expose typed, hash-checked object
+operations; the v1 store grants no execution authority. See
+[`docs/OSTADIX_BOOT_OBJECTS.md`](docs/OSTADIX_BOOT_OBJECTS.md) for the exact
+index, CAS, path-mode, and non-authority contract.
+
+The ISO binds exactly 14 typed artifacts: the Hosted LTS kernel, bootstrap
+initramfs, SquashFS root, and `linux-modloop`; the direct O-core kernel; the
+shared capacity-host kernel and initramfs; the direct Alpine initramfs; the Guix
+kernel, initramfs, and installer ISO; the OpenBSD installer ISO; the 9front
+qcow2; and the Redox livedisk ISO. The hosted profile pins both `rootfs_path`
+and `modloop_path`; the renderer supplies them as `ostadix.rootfs=` and
+`modloop=` kernel arguments. Neither the rootfs nor the modloop is placed on
+GRUB's `initrd` line, which contains only the bootstrap cpio. Stage one
+rediscovers the `OSTADIX_CAPACITY` ISO, verifies the
+independently embedded SquashFS byte count and SHA-256, mounts it through a
+read-only loop device, adds a volatile tmpfs overlay, and only then enters the
+workstation root. The full package closure, GUI, source tree, Cargo vendor
+closure, boot-object CAS, and installed Ostadix binaries are first-class
+contents of that digest-bound SquashFS rather than a multi-gigabyte initramfs
+expansion.
+
+The Ventoy 1.1.17 Alpine hook contract is explicit. The bootstrap contains the
+`ebegin 'Mounting boot media'` / `eend 0` insertion marker and the separate
+minimal gzip SquashFS modloop contains the pinned LTS kernel's `dm-mod.ko`.
+After the hook point, stage one requires `dm_mod`, then allows at most 30
+one-second media-discovery attempts. Device labels are parsed from the complete
+BusyBox-compatible `blkid "$device"` token stream and must contain the exact
+`LABEL="OSTADIX_CAPACITY"` token; the bootstrap deliberately does not use the
+unsupported `blkid -s` or `blkid -o` forms.
+
+After that handoff, both installed source/object trees are self-bind-mounted
+and remounted read-only before any Ostadix readiness marker. The gate checks
+the resulting mount flags and proves a write attempt fails. Builds, generated
+WASM, notebook state, and user work go to `/workspace`, volatile `/tmp`, or the
+tmpfs overlay; this is an enforced initial live-system posture, not a claim
+that privileged root could never deliberately change mounts.
+
+The workstation separately builds and installs all 14 declared root binaries:
+`O`, `o-cli`, `olangc`, `ocorec`, `o-link`, `o-unlink`, `o-notebook`, `ogit`,
+`o-live-host`, `o-node`, `octl`, `o-registry`, `o-info`, and
+`ocore-kernel-world-record`. `ostadix-mcp` is built from its separately locked
+MCP crate and installed alongside them. Their sizes and SHA-256 identities are
+receipt-bound. Source inclusion and runnable-product admission remain separate,
+so an arbitrary tracked file does not become executable merely by appearing in
+the source tree or object store.
+
+The hosted environment uses the pinned Alpine LTS kernel and package closure in
+[`evidence/hosted_live_workstation_apk_packages.txt`](evidence/hosted_live_workstation_apk_packages.txt).
+It includes `apk`, Rust, Cargo, rustfmt, Clippy, `rust-wasm`, the
+`wasm32-wasip1` standard library and WASI libc, `wasm-tools`, Wasmtime, Git,
+OpenSSL, the C/C++ build toolchain, and a Firefox ESR/xdg-open desktop route for
+`o-notebook`.
+
+Before compiling, the release worker runs deterministic `cargo vendor --locked
+--versioned-dirs` against the root manifest and synchronizes the separately
+locked MCP manifest. The resulting `ostadix.cargo-vendor-manifest/v1` record
+binds both `Cargo.lock` files plus every sorted vendored file identity. The
+currently observed dual-lock closure has 285 package directories, 17,593 files,
+and 376,759,069 payload bytes. The root, MCP, and O-core release builds consume
+that closure with Cargo network access forced offline. The verified SquashFS
+root carries the closure at `/usr/share/ostadix/cargo/vendor`, its canonical
+manifest at `/usr/share/ostadix/cargo/cargo-vendor-manifest.json`, and an offline
+`/root/.cargo/config.toml` that replaces crates.io with that absolute directory.
+These counts describe the current staged lockfiles; a later lock change must
+produce and bind a new manifest.
+
+The boot gate checks exact Rust/Cargo package versions, runs rustfmt and Clippy
+with warnings denied, performs a dependency-free `cargo run --offline` compile
+and execution, and launches the installed MCP server from `/workspace` to make
+`o_olangc` regenerate the exact no-build `wasm32-wasip1` Cargo project. Its
+domain-separated closure must match the read-only release descriptor, which
+also binds the staged tree, O input, installed compiler, fixed offline build
+profile, and packaged `/usr/share/ostadix/wasm/hello.wasm`. A separate live
+`rustc --target wasm32-wasip1` probe proves the installed Rust/WASI target and
+validates the resulting core-WASM envelope. The gate then executes the packaged
+Olangc module with Wasmtime and runs `examples/webassembly_hello.O` through the
+ordinary O dispatcher, `wasm-tools parse`, and Wasmtime. The Olangc-generated
+WASI entrypoint retains the same OIR, evidence, admission, and lease checks but
+selects the serial reference executor because WASI Preview 1 cannot create the
+native graph executor's worker threads. Native generated binaries remain
+graph-first. The module is compiled once during native release construction
+with Cargo offline, release LTO disabled, and 16 codegen units, avoiding a
+nested-TCG cold build on every boot. The same MCP exchange proves installed
+root discovery, bundled search execution, and search-path rejection. It also
+proves a fresh OpenSSL-backed
+`o node start --fresh-pki-key-algorithm ec-p256`, status, and stop sequence plus a
+Python-backed O-notebook cell. Alpine v3.24 ships the in-image Rust commands at
+1.96.1; the staged repository still pins 1.97.1 as its canonical development
+toolchain, so this is not a second full root-plus-MCP rebuild. The graphical
+gate starts O-notebook in Firefox ESR,
+requires the real Firefox X11 window, then starts the Xterm workstation shell,
+rejects a black, unchanged, or insufficiently chromatic framebuffer, injects
+USB-keyboard input, and requires the command result over serial.
+
+The hosted QEMU gates deliberately retain a 4 GiB guest-RAM bound. This is a
+regression gate proving that the complete workstation can boot without
+expanding its multi-gigabyte root into initramfs memory; SquashFS pages are read
+on demand and writable state remains volatile. It is not a tested physical RAM
+minimum.
+
+The ISO has seven independently typed boot entries. Hosted Linux remains first
+and default; O-core loads directly through GRUB Multiboot2; and Alpine loads its
+kernel and initramfs directly. Guix, OpenBSD, 9front, and Redox are explicit
+nested QEMU/TCG routes through the shared Alpine capacity host. O-core is
+serial-only and does not inherit the hosted desktop, `apk`, Cargo, or Linux
+userspace. The release runs a hosted serial gate, the Openbox/Firefox/Xterm
+graphical and input gate, and a separate direct-selection O-core serial gate
+under OVMF/QEMU TCG. Passing one route does not substitute for passing another,
+and those three gates do not execute the other five menu selections. Release
+receipt v6 and boot-gates v6 bind all 14 ISO artifacts. Serial result v4
+and VGA result v7 each record the exact ISO byte count and SHA-256; the direct
+O-core result remains independently bound to those same inspected bytes. The
+serial runner derives its identity from the same pinned media descriptor passed
+to QEMU; the graphical and O-core gates likewise hash their held descriptors.
 
 The tree-addressed default prevents one staged tree from colliding with another.
-A repeated release of the same tree still resolves to the same name and fails
-closed if either its ISO or receipt already exists. Move the retained evidence
-aside or provide a new explicit output path; the release route never silently
+A repeated release of the same tree still resolves to the same name. Under the
+publication lock, a complete existing ISO/receipt pair is strictly re-inspected,
+rebound to the exact staged tree, and adopted only when every receipt field and
+digest remains coherent. A one-sided publication-crash state is resumed through
+the same binding checks; a symlink, mismatch, or divergent file fails closed.
+Adoption revalidates retained evidence but does not rerun the build or QEMU
+gates. Move both retained files aside or provide a new explicit output path when
+a fresh qualification run is required; the release route never silently
 replaces either file.
 
-The command fails closed before publication if the staged snapshot changes, a
-pinned download or package closure drifts, a cross-compiled binary is not static
-x86_64 ELF, strict ISO inspection fails, or either bounded OVMF/QEMU boot gate
-does not pass. Network access is confined to explicit build dependencies and
-pinned Alpine downloads. The built live image requires no network to boot.
+The command fails closed before publication if the staged snapshot changes, the
+source view and object-store closure differ, a pinned download or package
+closure drifts, a required x86_64 binary is missing or malformed, strict ISO
+inspection fails, any smoke record names different ISO bytes, or any bounded
+OVMF/QEMU boot gate does not pass. Network
+access is confined to explicit build dependencies and pinned Alpine downloads.
+The built live image requires no network for the admitted boot gates.
 
-The physical image deliberately has one menu entry: `OSTADIX Hosted Live CLI`.
-The O-core and foreign-kernel seven-entry image remains a separate QEMU/serial
-laboratory artifact at
-`target/ostadix-capacity-iso/x86_64/ostadix-absorbed-capacity-x86_64-uefi.iso`.
-O-core currently has no framebuffer console, and the foreign adapters do not
-yet rediscover Ventoy's device-mapper ISO path, so they are not advertised as
-working physical menu options.
+Guix, OpenBSD, 9front, and Redox are exact, hash-verified guest artifacts in the
+combined ISO with explicit nested QEMU/TCG menu entries. They are not direct
+GRUB kernels or O-core personalities. The current combined-release smoke does
+not execute those four routes and therefore does not qualify their package
+managers, GUIs, or Ventoy behavior.
 
-The previously copied seven-entry artifact is retained only as a failure record:
+The earlier 80 MiB CLI-only artifact remains a distinct, immutable physical
+observation record:
+
+```text
+path:   target/ostadix-hosted-live/x86_64/ostadix-hosted-live-x86_64-uefi-12037d21a394_VTGRUB2.iso
+bytes:  80306176
+sha256: f25622d0e562ec5c95230653a1ab0e9edf65bb33b44750602b0d41237c44481b
+result: operator-observed physical boot; CLI-only payload
+```
+
+That observation does not transfer to the larger workstation bytes. The new
+tree-addressed ISO remains physically unproven until its exact copied bytes are
+booted and separately recorded. Its release receipt therefore retains
+`physical_hardware_proof: false` after QEMU success.
+
+The previously copied seven-entry artifact is retained only as an older,
+digest-distinct failure record:
 
 ```text
 path:   /Users/ustad/Ostadix-lang/target/ostadix-capacity-iso/x86_64/ostadix-hosted-live-x86_64-uefi-07bd1c7727b0.iso
@@ -1586,10 +1725,8 @@ entries: 7
 ```
 
 Those bytes passed the old serial marker gate but reproduced a black VGA screen;
-they are not physical-boot success evidence. The new release receipt still says
-`physical_hardware_proof: false` until the exact copied bytes boot on the target
-machine. This unsigned development chain is intended for Secure Boot **off**;
-Secure Boot is not claimed or tested.
+they are not physical-boot success evidence. This unsigned development chain is
+intended for Secure Boot **off**; Secure Boot is not claimed or tested.
 
 #### Install the hosted-live ISO on Ventoy
 
@@ -1636,17 +1773,29 @@ o kernel verify-ventoy \
   --volume "$VENTOY_VOLUME" --name "$VENTOY_NAME"
 ```
 
+Copy, full combined-ISO structural verification, the Ventoy 1.1.17
+hook-compatible marker, and the minimal modloop do not prove that Ventoy can
+rediscover and mount the SquashFS-bearing ISO or launch any direct or nested
+route at boot. The exact bytes remain Ventoy/physical-boot unproven until that
+substrate is separately observed on hardware and recorded.
+
 The older `prepare-write` and `write-media` commands remain exclusive to the raw
 GPT/ESP `.img` format. They intentionally do not admit this ISO.
 
-The hosted-live image is x86_64 UEFI, unsigned, RAM-backed, and non-persistent.
+The workstation image is x86_64 UEFI, unsigned, SquashFS-backed with a volatile
+tmpfs overlay, and non-persistent.
 Secure Boot may need to be disabled. It is not an installer and does not boot
-natively on Apple Silicon. The included hosted tools and selected Python, Bash,
-and SQLite shims are a useful live subset, not proof that every one of the 30
-backend runtimes is installed. OVMF/QEMU TCG proves the named virtual substrate,
-not physical-machine, KVM/SVM, Secure Boot, measured-boot, device-isolation,
-World G7, or O-core-governance qualification. Foreign systems remain upstream
-guests, not personalities executing inside O-core. See
+natively on Apple Silicon. It exposes the complete staged Ostadix source/object
+closure and the admitted root binaries, but only the runtimes actually present
+in the Alpine package closure can execute; inclusion of all shims is not proof
+that every one of the 30 backend runtimes is installed. Its proven graphical
+claim is specifically the hosted Openbox/Firefox/Xterm session. O-core remains
+serial-only. The foreign guest media bytes are included and menu-routable, but
+the current combined-release gates do not execute or qualify their package
+managers or GUIs. OVMF/QEMU TCG proves the named virtual substrate, not
+physical-machine, KVM/SVM, Secure Boot, measured-boot, device-isolation, World
+G7, or O-core-governance qualification. Foreign systems remain upstream guests,
+not personalities executing inside O-core. See
 [`docs/FOREIGN_KERNEL_LAB.md`](docs/FOREIGN_KERNEL_LAB.md) for their independent
 host-launched boot contracts and exact nonclaims.
 
@@ -5232,9 +5381,15 @@ confuse with the implemented mechanisms described above.
 - Hosted Live-World status reconstructs from the active-set record, CAS, and
   policy rather than an operation journal. Rollback can swap to the one retained
   healthy root. The current CLI has no rebuild command.
-- The current WASI target compiles `wasm32-wasip1` modules. On the audited host,
-  Wasmtime execution of the produced program fails while locating `O`, so the
-  compile result is the established WASI result for this snapshot.
+- The current WASI target compiles `wasm32-wasip1` modules. Inline-only plans
+  carry no process-launch authority, so they do not resolve a host `O`
+  executable and can run through the target-specific serial executor under
+  WASI. This changes only final execution after the same OIR, HGraph, evidence,
+  V6 admission, schedule, and lease validation; native generated binaries stay
+  graph-first. Any plan that actually uses a shim backend still requires an
+  admitted `O` proxy and fails closed when that executable authority cannot be
+  captured. Hosted-live publication separately requires Wasmtime to execute the
+  exact source-bound Olangc module.
 - The World-alpha registry's checked-in G0 source-digest lineage is not
   continuous in accepted repository history. G0 and dependent G2 therefore do
   not validate through `scripts/world_alpha_evidence.py` at this snapshot. This

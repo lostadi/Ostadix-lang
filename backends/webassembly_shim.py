@@ -5,7 +5,7 @@ Executes WebAssembly text format (.wat) or binary (.wasm) via Wasmtime
 or Wasmer and captures stdout as the result.
 
 If the code is WAT (WebAssembly Text Format), it is first compiled to
-.wasm using wat2wasm (from WABT) before execution.
+.wasm using wat2wasm (from WABT) or `wasm-tools parse`.
 """
 import sys
 import json
@@ -46,20 +46,28 @@ def handle_exec(cmd):
                     f.write(code)
 
                 # Convert WAT to WASM
-                if not shutil.which("wat2wasm"):
+                if shutil.which("wat2wasm"):
+                    conversion_command = ["wat2wasm", wat_path, "-o", wasm_path]
+                    converter_name = "wat2wasm"
+                elif shutil.which("wasm-tools"):
+                    conversion_command = [
+                        "wasm-tools", "parse", wat_path, "-o", wasm_path
+                    ]
+                    converter_name = "wasm-tools parse"
+                else:
                     send_err(
-                        "wat2wasm (from WABT toolkit) is not installed. "
-                        "Install WABT (https://github.com/WebAssembly/wabt)."
+                        "No WAT converter found. Install wat2wasm (WABT) or "
+                        "wasm-tools."
                     )
                     return
 
                 conv = subprocess.run(
-                    ["wat2wasm", wat_path, "-o", wasm_path],
+                    conversion_command,
                     capture_output=True, text=True, timeout=30,
                 )
                 if conv.returncode != 0:
                     stderr = conv.stderr.strip()
-                    send_err(f"wat2wasm failed\n{stderr}")
+                    send_err(f"{converter_name} failed\n{stderr}")
                     return
             else:
                 # Assume raw WASM binary

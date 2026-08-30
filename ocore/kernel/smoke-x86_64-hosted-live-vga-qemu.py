@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Boot the exact Hosted Live ISO and prove visible, keyboard-driven VT use."""
+"""Boot the exact Hosted Live ISO and prove an interactive Openbox desktop."""
 
 from __future__ import annotations
 
@@ -26,29 +26,94 @@ DEFAULT_ISO = (
     ROOT
     / "target/ostadix-hosted-live/x86_64/ostadix-hosted-live-x86_64-uefi_VTGRUB2.iso"
 )
-DEFAULT_TIMEOUT_SECONDS = 180.0
+DEFAULT_TIMEOUT_SECONDS = 1800.0
+MAX_TIMEOUT_SECONDS = 1800.0
 MAX_SERIAL_BYTES = 8 * 1024 * 1024
-MIN_NONBLACK_PIXELS = 2_000
-# A Linux text VT may intentionally be monochrome: background plus glyph color.
-MIN_UNIQUE_COLORS = 2
+MIN_NONBLACK_PIXELS = 20_000
+# Eight raw colors plus three populated chromatic hue families distinguish the
+# Openbox/Xterm palette from a monochrome, anti-aliased Linux text VT.
+MIN_UNIQUE_COLORS = 8
+MIN_CHROMATIC_PIXELS = 500
+MIN_CHROMATIC_HUE_BUCKETS = 3
+MIN_PIXELS_PER_HUE_BUCKET = 20
+MIN_CHROMATIC_MAX_CHANNEL = 48
+MIN_CHROMATIC_CHANNEL_SPREAD = 32
 MIN_CHANGED_PIXELS = 200
 MAX_MONITOR_SOCKET_PATH_BYTES = 96
 INPUT_COMMAND = "echo vga-input-pass >/dev/ttyS0\n"
 INPUT_MARKER = b"vga-input-pass"
+DESKTOP_READY_MARKER = b"OSTADIX HOSTED DESKTOP READY: PASS"
+FONT_READY_MARKER = b"OSTADIX HOSTED X11 FONT: PASS"
+PTY_READY_MARKER = b"OSTADIX HOSTED PTY: PASS"
+EVDEV_READY_MARKER = b"OSTADIX HOSTED EVDEV: PASS"
+NOTEBOOK_GUI_READY_MARKER = b"OSTADIX HOSTED NOTEBOOK GUI READY: PASS"
+VISUAL_SMOKE_SCHEMA = "ostadix.hosted-live-qemu-visual-smoke/v7"
+DESKTOP_SESSION = "openbox-xterm"
+ROOTFS_IDENTITY_PREFIX = b"OSTADIX HOSTED ROOTFS: PASS "
+ROOTFS_IDENTITY_RE = re.compile(
+    rb"OSTADIX HOSTED ROOTFS: PASS bytes=([1-9][0-9]*) sha256=([0-9a-f]{64})"
+)
+ENTROPY_IDENTITY_PREFIX = b"OSTADIX HOSTED ENTROPY: PASS "
+ENTROPY_IDENTITY_RE = re.compile(
+    rb"OSTADIX HOSTED ENTROPY: PASS device=virtio-rng-pci "
+    rb"crng_bytes=32 available=([1-9][0-9]*)"
+)
+ENTROPY_ORDERED_MARKER = b"OSTADIX HOSTED ENTROPY: PASS"
+WASM_MATERIALIZATION_PREFIX = b"OSTADIX HOSTED OLANGC MATERIALIZATION: PASS "
+WASM_MATERIALIZATION_RE = re.compile(
+    rb"OSTADIX HOSTED OLANGC MATERIALIZATION: PASS root_sha256=([0-9a-f]{64})"
+)
+WASM_ARTIFACT_PREFIX = b"OSTADIX HOSTED OLANGC WASM ARTIFACT: PASS "
+WASM_ARTIFACT_RE = re.compile(
+    rb"OSTADIX HOSTED OLANGC WASM ARTIFACT: PASS "
+    rb"tree=([0-9a-f]{40}) bytes=([1-9][0-9]*) sha256=([0-9a-f]{64})"
+)
+MIN_ENTROPY_BITS = 128
 REQUIRED_MARKERS = (
+    b"OSTADIX HOSTED ROOTFS: PASS bytes=",
+    b"OSTADIX HOSTED ROOTFS OVERLAY: PASS",
+    b"OSTADIX HOSTED READ-ONLY TREES: PASS",
+    b"OSTADIX HOSTED LOOPBACK: PASS",
     b"OSTADIX HOSTED O SMOKE: PASS",
     b"OSTADIX HOSTED BASH: PASS",
+    b"OSTADIX HOSTED APK: PASS",
     b"OSTADIX HOSTED SQLITE: PASS",
     b"OSTADIX HOSTED OLANGC IR: PASS",
     b"OSTADIX HOSTED O-CLI: PASS",
     b"OSTADIX HOSTED O-LINK: PASS",
+    b"OSTADIX HOSTED RUSTC: PASS",
+    b"OSTADIX HOSTED CARGO: PASS",
+    b"OSTADIX HOSTED RUSTFMT: PASS",
+    b"OSTADIX HOSTED CLIPPY: PASS",
+    b"OSTADIX HOSTED CARGO HELLO: PASS",
+    ENTROPY_ORDERED_MARKER,
+    b"OSTADIX HOSTED O-NODE: PASS",
+    b"OSTADIX HOSTED NOTEBOOK: PASS",
+    b"OSTADIX HOSTED STANDARD BINARIES: PASS",
+    b"OSTADIX HOSTED DECLARED ROOT BINARIES: PASS",
+    b"OSTADIX HOSTED UNIFIED ROUTES: PASS",
+    b"OSTADIX HOSTED SOURCE SNAPSHOT: PASS",
+    WASM_MATERIALIZATION_PREFIX.rstrip(),
+    WASM_ARTIFACT_PREFIX.rstrip(),
+    b"OSTADIX HOSTED RUST WASM: PASS",
+    b"OSTADIX HOSTED WASM RUNTIME: PASS",
+    b"OSTADIX HOSTED OLANGC WASM EXECUTION: PASS",
+    b"OSTADIX HOSTED WEBASSEMBLY BACKEND: PASS",
+    b"OSTADIX HOSTED MCP: PASS",
+    b"OSTADIX BOOT OBJECTS: PASS",
+    b"OSTADIX HOSTED SOURCE OBJECT CLOSURE: PASS",
     b"OSTADIX HOSTED LIVE READY",
+    FONT_READY_MARKER,
+    PTY_READY_MARKER,
+    EVDEV_READY_MARKER,
+    NOTEBOOK_GUI_READY_MARKER,
+    DESKTOP_READY_MARKER,
 )
 FAILURE_MARKERS = (b"FAIL", b"Kernel panic", b"OSTADIX CAPACITY HOST ERROR")
 
 
 class VisualSmokeError(RuntimeError):
-    """The exact ISO did not establish visible, interactive VT readiness."""
+    """The exact ISO did not establish visible, interactive desktop readiness."""
 
 
 @dataclass(frozen=True)
@@ -60,6 +125,8 @@ class Frame:
     sha256: str
     nonblack_pixels: int
     unique_colors: int
+    chromatic_pixels: int
+    chromatic_hue_buckets: int
 
     def public(self) -> dict[str, object]:
         return {
@@ -69,6 +136,8 @@ class Frame:
             "height": self.height,
             "nonblack_pixels": self.nonblack_pixels,
             "unique_colors": self.unique_colors,
+            "chromatic_pixels": self.chromatic_pixels,
+            "chromatic_hue_buckets": self.chromatic_hue_buckets,
         }
 
 
@@ -97,11 +166,33 @@ def _open_regular(path: Path, label: str) -> tuple[int, os.stat_result]:
     return descriptor, state
 
 
+def _descriptor_identity(descriptor: int, expected: os.stat_result, label: str) -> dict[str, object]:
+    digest = hashlib.sha256()
+    size = 0
+    while chunk := os.pread(descriptor, 1024 * 1024, size):
+        digest.update(chunk)
+        size += len(chunk)
+    if size != expected.st_size:
+        raise VisualSmokeError(f"{label} size changed while hashing the pinned descriptor")
+    return {"bytes": size, "sha256": digest.hexdigest()}
+
+
 def _same_file(descriptor: int, expected: os.stat_result, label: str) -> None:
     current = os.fstat(descriptor)
     identity = lambda value: (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns)
     if identity(current) != identity(expected):
         raise VisualSmokeError(f"{label} changed during the visual smoke")
+
+
+def _require_unchanged_descriptor(
+    descriptor: int,
+    expected_state: os.stat_result,
+    expected_identity: dict[str, object],
+    label: str,
+) -> None:
+    _same_file(descriptor, expected_state, label)
+    if _descriptor_identity(descriptor, expected_state, label) != expected_identity:
+        raise VisualSmokeError(f"{label} content changed during the visual smoke")
 
 
 def _wait_for_path(path: Path, deadline: float, label: str) -> None:
@@ -168,13 +259,7 @@ def _read_serial(path: Path) -> bytes:
     return path.read_bytes()
 
 
-def _require_ordered_markers(transcript: bytes) -> None:
-    offset = 0
-    for marker in REQUIRED_MARKERS:
-        position = transcript.find(marker, offset)
-        if position < 0:
-            raise VisualSmokeError(f"serial transcript omitted marker {marker.decode()!r}")
-        offset = position + len(marker)
+def _raise_for_failure_markers(transcript: bytes) -> None:
     for marker in FAILURE_MARKERS:
         if marker in transcript:
             raise VisualSmokeError(
@@ -182,20 +267,158 @@ def _require_ordered_markers(transcript: bytes) -> None:
             )
 
 
+def _require_ordered_markers(transcript: bytes) -> None:
+    _raise_for_failure_markers(transcript)
+    offset = 0
+    positions = []
+    for marker in REQUIRED_MARKERS:
+        position = transcript.find(marker, offset)
+        if position < 0:
+            raise VisualSmokeError(f"serial transcript omitted marker {marker.decode()!r}")
+        positions.append(position)
+        offset = position + len(marker)
+    _, entropy_position = _validated_entropy_identity(transcript)
+    entropy_slot = REQUIRED_MARKERS.index(ENTROPY_ORDERED_MARKER)
+    if positions[entropy_slot] != entropy_position:
+        raise VisualSmokeError(
+            "full Hosted entropy marker did not occupy its ordered position"
+        )
+    _, _, wasm_materialization_position, wasm_artifact_position = (
+        _parse_wasm_identity(transcript)
+    )
+    if positions[REQUIRED_MARKERS.index(WASM_MATERIALIZATION_PREFIX.rstrip())] \
+            != wasm_materialization_position:
+        raise VisualSmokeError(
+            "full Olangc materialization marker did not occupy its ordered position"
+        )
+    if positions[REQUIRED_MARKERS.index(WASM_ARTIFACT_PREFIX.rstrip())] \
+            != wasm_artifact_position:
+        raise VisualSmokeError(
+            "full Olangc WASM artifact marker did not occupy its ordered position"
+        )
+
+
+def _parse_rootfs_identity(transcript: bytes) -> dict[str, object]:
+    candidates = [
+        line
+        for line in transcript.splitlines()
+        if line.startswith(ROOTFS_IDENTITY_PREFIX)
+    ]
+    if len(candidates) != 1:
+        raise VisualSmokeError(
+            "completed transcript must contain exactly one full Hosted rootfs identity marker"
+        )
+    match = ROOTFS_IDENTITY_RE.fullmatch(candidates[0])
+    if match is None:
+        raise VisualSmokeError(
+            "completed transcript must contain exactly one full Hosted rootfs identity marker"
+        )
+    return {
+        "bytes": int(match.group(1)),
+        "sha256": match.group(2).decode("ascii"),
+    }
+
+
+def _validated_entropy_identity(
+    transcript: bytes,
+) -> tuple[dict[str, object], int]:
+    candidates: list[tuple[int, bytes]] = []
+    offset = 0
+    for raw_line in transcript.splitlines(keepends=True):
+        line = raw_line.rstrip(b"\r\n")
+        if line.startswith(ENTROPY_IDENTITY_PREFIX):
+            candidates.append((offset, line))
+        offset += len(raw_line)
+    if len(candidates) != 1:
+        raise VisualSmokeError(
+            "completed transcript must contain exactly one full Hosted entropy marker"
+        )
+    position, line = candidates[0]
+    match = ENTROPY_IDENTITY_RE.fullmatch(line)
+    if match is None:
+        raise VisualSmokeError(
+            "completed transcript must contain exactly one full Hosted entropy marker"
+        )
+    available = int(match.group(1))
+    if available < MIN_ENTROPY_BITS:
+        raise VisualSmokeError(
+            f"Hosted entropy marker reported only {available} available bits"
+        )
+    return (
+        {
+            "device": "virtio-rng-pci",
+            "crng_bytes": 32,
+            "available": available,
+        },
+        position,
+    )
+
+
+def _parse_entropy_identity(transcript: bytes) -> dict[str, object]:
+    return _validated_entropy_identity(transcript)[0]
+
+
+def _parse_wasm_identity(
+    transcript: bytes,
+) -> tuple[dict[str, object], dict[str, object], int, int]:
+    materializations: list[tuple[int, bytes]] = []
+    artifacts: list[tuple[int, bytes]] = []
+    offset = 0
+    for raw_line in transcript.splitlines(keepends=True):
+        line = raw_line.rstrip(b"\r\n")
+        if line.startswith(WASM_MATERIALIZATION_PREFIX):
+            materializations.append((offset, line))
+        if line.startswith(WASM_ARTIFACT_PREFIX):
+            artifacts.append((offset, line))
+        offset += len(raw_line)
+    if len(materializations) != 1 or len(artifacts) != 1:
+        raise VisualSmokeError(
+            "completed transcript must contain exactly one full Olangc WASM identity chain"
+        )
+    materialization_position, materialization_line = materializations[0]
+    artifact_position, artifact_line = artifacts[0]
+    materialization_match = WASM_MATERIALIZATION_RE.fullmatch(materialization_line)
+    artifact_match = WASM_ARTIFACT_RE.fullmatch(artifact_line)
+    if materialization_match is None or artifact_match is None:
+        raise VisualSmokeError(
+            "completed transcript contains a malformed Olangc WASM identity chain"
+        )
+    return (
+        {
+            "root_sha256": materialization_match.group(1).decode("ascii"),
+        },
+        {
+            "staged_tree": artifact_match.group(1).decode("ascii"),
+            "bytes": int(artifact_match.group(2)),
+            "sha256": artifact_match.group(3).decode("ascii"),
+            "materialized_project_sha256": materialization_match.group(1).decode(
+                "ascii"
+            ),
+        },
+        materialization_position,
+        artifact_position,
+    )
+
+
+def _input_marker_after_desktop(transcript: bytes) -> bool:
+    desktop = transcript.find(DESKTOP_READY_MARKER)
+    return desktop >= 0 and transcript.find(INPUT_MARKER, desktop + len(DESKTOP_READY_MARKER)) >= 0
+
+
+def _remaining_before_deadline(deadline: float, action: str) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise VisualSmokeError(f"timed out {action}")
+    return remaining
+
+
 class Hmp:
     def __init__(self, path: Path, deadline: float) -> None:
+        self.deadline = deadline
         self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
-            while True:
-                try:
-                    self.socket.connect(str(path))
-                    break
-                except (FileNotFoundError, ConnectionRefusedError):
-                    if time.monotonic() >= deadline:
-                        raise VisualSmokeError("timed out connecting to QEMU monitor")
-                    time.sleep(0.02)
-            self.socket.settimeout(max(0.05, deadline - time.monotonic()))
-            self._until_prompt()
+            self._connect(path)
+            self._until_prompt("waiting for QEMU monitor prompt")
         except BaseException:
             self.socket.close()
             raise
@@ -203,10 +426,51 @@ class Hmp:
     def close(self) -> None:
         self.socket.close()
 
-    def _until_prompt(self) -> bytes:
+    def _remaining(self, action: str) -> float:
+        return _remaining_before_deadline(self.deadline, action)
+
+    def _arm(self, action: str) -> None:
+        self.socket.settimeout(self._remaining(action))
+
+    def _sleep(self, seconds: float, action: str) -> None:
+        time.sleep(min(seconds, self._remaining(action)))
+        self._remaining(action)
+
+    def _connect(self, path: Path) -> None:
+        action = "connecting to QEMU monitor"
+        while True:
+            try:
+                self._arm(action)
+                self.socket.connect(str(path))
+            except socket.timeout as error:
+                raise VisualSmokeError(f"timed out {action}") from error
+            except (FileNotFoundError, ConnectionRefusedError):
+                self._sleep(0.02, action)
+                continue
+            self._remaining(action)
+            return
+
+    def _send(self, payload: bytes, action: str) -> None:
+        try:
+            self._arm(action)
+            self.socket.sendall(payload)
+        except socket.timeout as error:
+            raise VisualSmokeError(f"timed out {action}") from error
+        self._remaining(action)
+
+    def _recv(self, action: str) -> bytes:
+        try:
+            self._arm(action)
+            chunk = self.socket.recv(4096)
+        except socket.timeout as error:
+            raise VisualSmokeError(f"timed out {action}") from error
+        self._remaining(action)
+        return chunk
+
+    def _until_prompt(self, action: str) -> bytes:
         response = bytearray()
         while b"(qemu)" not in response:
-            chunk = self.socket.recv(4096)
+            chunk = self._recv(action)
             if not chunk:
                 raise VisualSmokeError("QEMU monitor closed before its prompt")
             response.extend(chunk)
@@ -215,8 +479,11 @@ class Hmp:
         return bytes(response)
 
     def command(self, value: str) -> bytes:
-        self.socket.sendall(value.encode("ascii") + b"\n")
-        response = self._until_prompt()
+        self._send(
+            value.encode("ascii") + b"\n",
+            "sending a QEMU monitor command",
+        )
+        response = self._until_prompt("waiting for a QEMU monitor command response")
         if b"unknown command" in response.lower() or b"error" in response.lower():
             raise VisualSmokeError(
                 f"QEMU monitor rejected {value!r}: {response.decode('utf-8', 'replace')[-1024:]}"
@@ -225,7 +492,7 @@ class Hmp:
 
     def quit(self) -> None:
         """Ask QEMU to exit without waiting for the prompt it will never send."""
-        self.socket.sendall(b"quit\n")
+        self._send(b"quit\n", "sending QEMU monitor quit")
 
 
 def _key_name(character: str) -> str:
@@ -249,7 +516,7 @@ def _key_name(character: str) -> str:
 def _type_command(monitor: Hmp, command: str) -> None:
     for character in command:
         monitor.command(f"sendkey {_key_name(character)} 35")
-        time.sleep(0.045)
+        monitor._sleep(0.045, "typing the graphical input command")
 
 
 def _ppm_tokens(raw: bytes) -> tuple[list[bytes], int]:
@@ -290,6 +557,29 @@ def read_frame(path: Path) -> Frame:
     nonblack = sum(
         1 for index in range(0, len(pixels), 3) if max(pixels[index : index + 3]) > 8
     )
+    chromatic = 0
+    hue_counts = [0] * 6
+    for index in range(0, len(pixels), 3):
+        red, green, blue = pixels[index : index + 3]
+        maximum = max(red, green, blue)
+        minimum = min(red, green, blue)
+        chroma = maximum - minimum
+        if (
+            maximum < MIN_CHROMATIC_MAX_CHANNEL
+            or chroma < MIN_CHROMATIC_CHANNEL_SPREAD
+        ):
+            continue
+        chromatic += 1
+        if maximum == minimum:
+            continue
+        if maximum == red:
+            hue = (green - blue) / chroma
+        elif maximum == green:
+            hue = 2.0 + (blue - red) / chroma
+        else:
+            hue = 4.0 + (red - green) / chroma
+        hue_counts[int((hue % 6.0))] += 1
+    populated_hues = sum(count >= MIN_PIXELS_PER_HUE_BUCKET for count in hue_counts)
     return Frame(
         path=path,
         width=width,
@@ -298,6 +588,8 @@ def read_frame(path: Path) -> Frame:
         sha256=hashlib.sha256(raw).hexdigest(),
         nonblack_pixels=nonblack,
         unique_colors=len(colors),
+        chromatic_pixels=chromatic,
+        chromatic_hue_buckets=populated_hues,
     )
 
 
@@ -308,7 +600,17 @@ def validate_visible_frame(frame: Frame) -> None:
         )
     if frame.unique_colors < MIN_UNIQUE_COLORS:
         raise VisualSmokeError(
-            f"graphical console lacks text/color diversity: {frame.unique_colors} colors"
+            f"desktop lacks raw color diversity: {frame.unique_colors} colors"
+        )
+    if frame.chromatic_pixels < MIN_CHROMATIC_PIXELS:
+        raise VisualSmokeError(
+            "desktop lacks chromatic area: "
+            f"{frame.chromatic_pixels} chromatic pixels"
+        )
+    if frame.chromatic_hue_buckets < MIN_CHROMATIC_HUE_BUCKETS:
+        raise VisualSmokeError(
+            "desktop lacks independent hue families: "
+            f"{frame.chromatic_hue_buckets} populated hue buckets"
         )
 
 
@@ -352,6 +654,13 @@ def _terminate(process: subprocess.Popen[bytes]) -> None:
             process.wait(timeout=2)
 
 
+def _validate_timeout_seconds(timeout_seconds: float) -> None:
+    if not (1 <= timeout_seconds <= MAX_TIMEOUT_SECONDS):
+        raise VisualSmokeError(
+            f"timeout must be from 1 through {MAX_TIMEOUT_SECONDS:g} seconds"
+        )
+
+
 def run_visual_gate(
     iso: Path,
     firmware: Path,
@@ -360,8 +669,7 @@ def run_visual_gate(
     evidence_dir: Path,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
 ) -> dict[str, object]:
-    if not (1 <= timeout_seconds <= 900):
-        raise VisualSmokeError("timeout must be from 1 through 900 seconds")
+    _validate_timeout_seconds(timeout_seconds)
     evidence_dir.mkdir(parents=True, exist_ok=False)
     resources = contextlib.ExitStack()
     process: subprocess.Popen[bytes] | None = None
@@ -369,6 +677,7 @@ def run_visual_gate(
     try:
         iso_fd, iso_state = _open_regular(iso, "Hosted Live ISO")
         resources.callback(os.close, iso_fd)
+        iso_identity = _descriptor_identity(iso_fd, iso_state, "Hosted Live ISO")
         firmware_fd, firmware_state = _open_regular(firmware, "OVMF code")
         resources.callback(os.close, firmware_fd)
         serial = evidence_dir / "serial.log"
@@ -385,11 +694,14 @@ def run_visual_gate(
                 "-machine", "q35",
                 "-cpu", "max",
                 "-smp", "2",
-                "-m", "2048M",
+                "-m", "4096M",
                 "-drive", f"if=pflash,unit=0,format=raw,readonly=on,file={_fd_reference(firmware_fd)}",
                 "-drive", f"if=ide,index=2,media=cdrom,format=raw,readonly=on,file={_fd_reference(iso_fd)}",
                 "-boot", "order=d,strict=on",
                 "-nodefaults",
+                # Model physical entropy without relaxing the no-network gate.
+                "-object", "rng-random,filename=/dev/urandom,id=ostadix_rng",
+                "-device", "virtio-rng-pci,rng=ostadix_rng",
                 "-device", "VGA",
                 "-device", "qemu-xhci,id=xhci",
                 "-device", "usb-kbd,bus=xhci.0",
@@ -413,6 +725,7 @@ def run_visual_gate(
             transcript = b""
             while time.monotonic() < deadline:
                 transcript = _read_serial(serial)
+                _raise_for_failure_markers(transcript)
                 if REQUIRED_MARKERS[-1] in transcript:
                     break
                 if process.poll() is not None:
@@ -427,38 +740,82 @@ def run_visual_gate(
             _type_command(monitor, INPUT_COMMAND)
             while time.monotonic() < deadline:
                 transcript = _read_serial(serial)
-                if INPUT_MARKER in transcript:
+                _raise_for_failure_markers(transcript)
+                if _input_marker_after_desktop(transcript):
                     break
                 if process.poll() is not None:
                     raise VisualSmokeError("QEMU exited before graphical keyboard proof")
                 time.sleep(0.05)
             else:
-                raise VisualSmokeError("visible VT shell did not accept the emulated USB keyboard")
+                raise VisualSmokeError("focused desktop Xterm did not accept the emulated USB keyboard")
             after = _capture(monitor, after_path, deadline)
             changed_pixels = changed_pixel_count(before, after)
             _same_file(iso_fd, iso_state, "Hosted Live ISO")
             _same_file(firmware_fd, firmware_state, "OVMF code")
             monitor.quit()
+            exit_action = "waiting for QEMU to exit after successful visual proof"
+            exit_wait_seconds = _remaining_before_deadline(deadline, exit_action)
             try:
-                exit_code = process.wait(timeout=5)
+                exit_code = process.wait(timeout=min(5.0, exit_wait_seconds))
             except subprocess.TimeoutExpired as error:
                 raise VisualSmokeError("QEMU did not exit after successful visual proof") from error
+            _remaining_before_deadline(deadline, exit_action)
             if exit_code != 0:
                 raise VisualSmokeError(f"QEMU returned status {exit_code} after visual proof")
+            # Read once more after QEMU has exited and flushed the serial file.
+            # A desktop failure emitted after LIVE READY or even after the input
+            # marker remains fatal to the exact-session proof.
+            transcript = _read_serial(serial)
+            _require_ordered_markers(transcript)
+            rootfs_identity = _parse_rootfs_identity(transcript)
+            entropy_identity = _parse_entropy_identity(transcript)
+            _, wasm_identity, _, _ = _parse_wasm_identity(transcript)
+            if not _input_marker_after_desktop(transcript):
+                raise VisualSmokeError("serial input marker did not follow desktop readiness")
+            _require_unchanged_descriptor(
+                iso_fd,
+                iso_state,
+                iso_identity,
+                "Hosted Live ISO",
+            )
+            _same_file(firmware_fd, firmware_state, "OVMF code")
+            firmware_identity = _descriptor_identity(
+                firmware_fd, firmware_state, "OVMF code"
+            )
             serial_identity = _identity(serial)
             return {
-                "schema": "ostadix.hosted-live-qemu-visual-smoke/v1",
+                "schema": VISUAL_SMOKE_SCHEMA,
                 "markers": [marker.decode("ascii") for marker in REQUIRED_MARKERS],
+                "font_marker": FONT_READY_MARKER.decode("ascii"),
+                "pty_marker": PTY_READY_MARKER.decode("ascii"),
+                "evdev_marker": EVDEV_READY_MARKER.decode("ascii"),
+                "notebook_gui_marker": NOTEBOOK_GUI_READY_MARKER.decode("ascii"),
+                "desktop_marker": DESKTOP_READY_MARKER.decode("ascii"),
                 "input_marker": INPUT_MARKER.decode("ascii"),
+                "session": DESKTOP_SESSION,
+                "iso": iso_identity,
+                "rootfs": rootfs_identity,
                 "serial": serial_identity,
                 "frame_before": before.public(),
                 "frame_after": after.public(),
                 "changed_pixels": changed_pixels,
                 "acceleration": "tcg",
-                "firmware": _identity(firmware),
+                "firmware": firmware_identity,
                 "display_device": "VGA",
                 "input_device": "usb-kbd",
+                "entropy": entropy_identity,
+                "olangc_wasm": wasm_identity,
                 "network": "none",
+                "visual_thresholds": {
+                    "minimum_nonblack_pixels": MIN_NONBLACK_PIXELS,
+                    "minimum_unique_colors": MIN_UNIQUE_COLORS,
+                    "minimum_chromatic_pixels": MIN_CHROMATIC_PIXELS,
+                    "minimum_chromatic_hue_buckets": MIN_CHROMATIC_HUE_BUCKETS,
+                    "minimum_pixels_per_hue_bucket": MIN_PIXELS_PER_HUE_BUCKET,
+                    "minimum_chromatic_max_channel": MIN_CHROMATIC_MAX_CHANNEL,
+                    "minimum_chromatic_channel_spread": MIN_CHROMATIC_CHANNEL_SPREAD,
+                    "minimum_changed_pixels": MIN_CHANGED_PIXELS,
+                },
                 "physical_hardware_proof": False,
             }
     finally:
