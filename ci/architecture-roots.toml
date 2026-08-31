@@ -13,7 +13,7 @@ excluded_directories = []
 
 # This token fragment is compiled into backend_catalog.rs with include!(). It
 # is scanned under that owning root but is not counted as a standalone module
-# file in the 164-file production-module inventory.
+# file in the 184-file production-module inventory.
 [[compiled_fragment]]
 path = "crates/ostadix-api/src/backend_catalog.inc.rs"
 owner = "backend_catalog"
@@ -102,6 +102,16 @@ allowed_dependencies = []
 name = "capability"
 layer = 1
 allowed_dependencies = ["value"]
+
+[[root]]
+name = "computation_core"
+layer = 1
+allowed_dependencies = ["canonical_cbor", "resource_identity"]
+
+[[root]]
+name = "computation"
+layer = 15
+allowed_dependencies = ["computation_core", "evidence", "execution_contract", "hgraph", "ir", "parser", "project", "resource_identity"]
 
 [[root]]
 name = "dispatch_model"

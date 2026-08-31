@@ -4048,9 +4048,15 @@ bash scripts/semantic_custody_demo.sh
 ```
 
 The ignored `target/semantic-custody/` directory contains the execution-intent
-JSON, schedule explanation, HGraph DOT, observed result, and a manifest hashing
-all four. The run performs fresh local V6 admission and records an observed
-value; it does not manufacture a signed Hosted V2 or World receipt.
+JSON, inspection-only schedule explanation, rendered HGraph DOT, observed
+result, canonical `computation.cbor`, its matching `computation.json`
+projection, and a V2 publication manifest hashing all six files. The
+computation revision also binds the exact `O` and `olangc` executable byte
+identities. The run performs fresh local V6 admission and records an observed
+value. Its derivation edges are unsigned, workflow-attested provenance;
+canonical decoding checks content identities and graph structure, not
+historical process execution. Neither computation representation manufactures
+admission authority or a signed Hosted V2 or World receipt.
 
 ```text
 Hosted orchestration

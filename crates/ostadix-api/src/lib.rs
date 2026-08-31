@@ -14,6 +14,8 @@ pub mod backend_state;
 pub mod boot_objects;
 mod canonical_cbor;
 mod capability;
+pub mod computation;
+pub mod computation_core;
 mod dispatch_model;
 pub mod effects;
 pub mod environment;

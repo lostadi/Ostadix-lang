@@ -195,6 +195,8 @@ OSTADIX_API_ROOT_MODULE_PATHS = {
     "boot_objects": f"{OSTADIX_API_SOURCE_ROOT}/boot_objects.rs",
     "canonical_cbor": f"{OSTADIX_API_SOURCE_ROOT}/canonical_cbor.rs",
     "capability": f"{OSTADIX_API_SOURCE_ROOT}/capability.rs",
+    "computation": f"{OSTADIX_API_SOURCE_ROOT}/computation/mod.rs",
+    "computation_core": f"{OSTADIX_API_SOURCE_ROOT}/computation_core.rs",
     "dispatch_model": f"{OSTADIX_API_SOURCE_ROOT}/dispatch_model.rs",
     "effects": f"{OSTADIX_API_SOURCE_ROOT}/effects.rs",
     "environment": f"{OSTADIX_API_SOURCE_ROOT}/environment.rs",
@@ -513,6 +515,11 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "crates/ostadix-api/src/backend_catalog.inc.rs",
         "crates/ostadix-api/src/backend_state.rs",
         "crates/ostadix-api/src/canonical_cbor.rs",
+        "crates/ostadix-api/src/computation/build_oir.rs",
+        "crates/ostadix-api/src/computation/build_project.rs",
+        "crates/ostadix-api/src/computation/mod.rs",
+        "crates/ostadix-api/src/computation/verify.rs",
+        "crates/ostadix-api/src/computation_core.rs",
         "crates/ostadix-api/src/dispatch_model.rs",
         "crates/ostadix-api/src/evidence/admit.rs",
         "crates/ostadix-api/src/evidence/analyze.rs",
@@ -2054,6 +2061,7 @@ def _validate_workspace_facade_release_surface(files: dict[str, bytes]) -> None:
     engine_tests = _utf8_text(files[engine_tests_path], engine_tests_path)
     for marker in (
         "complete_ovalue_payload_vocabulary_is_nameable_from_the_engine_root",
+        "ocomputation_identity_spine_is_nameable_from_the_engine_root",
         "runtime_owns_success_parse_failure_and_evaluate_failure_stages",
         "engine_owns_the_full_runtime_without_a_compatibility_dependency",
     ):
