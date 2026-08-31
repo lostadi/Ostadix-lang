@@ -108,8 +108,8 @@ runtime implementation outside its CLI entrypoints.
 Facades bind an unconditionally public owner and exact public alias or glob
 projection. The checker then rejects undeclared roots and edges, retains
 the narrow semantic rules above, and runs Tarjan's algorithm over the observed
-root graph. The frozen baseline contains 178 production engine module files,
-44 roots, 211 cross-root edges, and zero multi-root strongly connected
+root graph. The frozen baseline contains 184 production engine module files,
+47 roots, 223 cross-root edges, and zero multi-root strongly connected
 components. The separately scanned include fragment has no cross-root edge.
 
 That is a root-level acyclicity claim only. Dependencies and bounded strongly

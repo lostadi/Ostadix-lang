@@ -185,6 +185,8 @@ FIXTURE_API_TEST = """\
 #[test]
 fn complete_ovalue_payload_vocabulary_is_nameable_from_the_engine_root() {}
 #[test]
+fn ocomputation_identity_spine_is_nameable_from_the_engine_root() {}
+#[test]
 fn runtime_owns_success_parse_failure_and_evaluate_failure_stages() {}
 #[test]
 fn engine_owns_the_full_runtime_without_a_compatibility_dependency() {}
@@ -1050,6 +1052,11 @@ class SourceReleaseTests(unittest.TestCase):
             "crates/ostadix-api/src/backend_morphism.rs": "// fixture shadow backend morphism kernel\n",
             "crates/ostadix-api/src/backend_state.rs": "// fixture versioned backend state protocol\n",
             "crates/ostadix-api/src/canonical_cbor.rs": "// fixture canonical CBOR codec\n",
+            "crates/ostadix-api/src/computation/build_oir.rs": "// fixture ordinary-O computation projection\n",
+            "crates/ostadix-api/src/computation/build_project.rs": "// fixture project computation projection\n",
+            "crates/ostadix-api/src/computation/mod.rs": "pub mod verify;\n",
+            "crates/ostadix-api/src/computation/verify.rs": "// fixture computation artifact verification\n",
+            "crates/ostadix-api/src/computation_core.rs": "// fixture authority-free computation identity\n",
             "crates/ostadix-api/src/dispatch_model.rs": "// fixture pure dispatch contract\n",
             "crates/ostadix-api/src/evidence/admit.rs": "// fixture evidence admission compiler\n",
             "crates/ostadix-api/src/evidence/analyze.rs": "// fixture pre-execution evidence analyzer\n",
@@ -1683,6 +1690,11 @@ class SourceReleaseTests(unittest.TestCase):
                 "crates/ostadix-api/src/backend_catalog.inc.rs",
                 "crates/ostadix-api/src/backend_state.rs",
                 "crates/ostadix-api/src/canonical_cbor.rs",
+                "crates/ostadix-api/src/computation/build_oir.rs",
+                "crates/ostadix-api/src/computation/build_project.rs",
+                "crates/ostadix-api/src/computation/mod.rs",
+                "crates/ostadix-api/src/computation/verify.rs",
+                "crates/ostadix-api/src/computation_core.rs",
                 "crates/ostadix-api/src/dispatch_model.rs",
                 "crates/ostadix-api/src/evidence/admit.rs",
                 "crates/ostadix-api/src/evidence/analyze.rs",
@@ -2952,6 +2964,23 @@ class SourceReleaseTests(unittest.TestCase):
 
         self._assert_missing_required_paths(
             "missing-execution-fabric-profile.zip",
+            required,
+        )
+
+    def test_ocomputation_identity_spine_is_required(self) -> None:
+        required = (
+            "crates/ostadix-api/src/computation_core.rs",
+            "crates/ostadix-api/src/computation/mod.rs",
+            "crates/ostadix-api/src/computation/build_oir.rs",
+            "crates/ostadix-api/src/computation/build_project.rs",
+            "crates/ostadix-api/src/computation/verify.rs",
+        )
+        self._commit()
+        self._git("rm", *required)
+        self._git("commit", "-q", "-m", "remove OComputation identity spine")
+
+        self._assert_missing_required_paths(
+            "missing-ocomputation-identity-spine.zip",
             required,
         )
 

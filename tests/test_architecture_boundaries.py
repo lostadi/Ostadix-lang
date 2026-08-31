@@ -177,7 +177,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         self.assertEqual(
             result.stdout,
             "architecture dependency boundaries: PASS "
-            "(179 production files, 45 roots, 213 cross-root edges)\n",
+            "(184 production files, 47 roots, 223 cross-root edges)\n",
         )
 
     def test_manifest_inventories_every_current_root_edge_override_and_facade(self) -> None:
@@ -198,9 +198,9 @@ class ArchitectureBoundaryTests(unittest.TestCase):
                 }
             ],
         )
-        self.assertEqual(len(roots), 45)
+        self.assertEqual(len(roots), 47)
         self.assertEqual(
-            sum(len(root["allowed_dependencies"]) for root in roots), 213
+            sum(len(root["allowed_dependencies"]) for root in roots), 223
         )
         api_root = next(root for root in roots if root["name"] == "api")
         self.assertIn("ir", api_root["allowed_dependencies"])
@@ -307,6 +307,53 @@ class ArchitectureBoundaryTests(unittest.TestCase):
                 ("world::identity", "alias"),
             },
         )
+
+    def test_computation_core_is_frozen_to_neutral_identity_seams(self) -> None:
+        manifest = tomllib.loads(MANIFEST.read_text(encoding="utf-8"))
+        computation_core = next(
+            root for root in manifest["root"] if root["name"] == "computation_core"
+        )
+        self.assertEqual(computation_core["layer"], 1)
+        self.assertEqual(
+            computation_core["allowed_dependencies"],
+            ["canonical_cbor", "resource_identity"],
+        )
+
+    def test_computation_core_accepts_only_its_frozen_lower_seams(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_tree(root)
+            (root / "crates/ostadix-api/src/computation_core.rs").write_text(
+                "use crate::canonical_cbor::Boundary;\n"
+                "use crate::resource_identity::Boundary;\n",
+                encoding="utf-8",
+            )
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        for module in (
+            "computation",
+            "evidence",
+            "executor",
+            "hgraph",
+            "intent",
+            "parser",
+            "project",
+            "world",
+        ):
+            with self.subTest(module=module):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    write_minimal_tree(root)
+                    (root / "crates/ostadix-api/src/computation_core.rs").write_text(
+                        f"use crate::{module}::Boundary;\n", encoding="utf-8"
+                    )
+                    result = run_checker(root)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(
+                    f"root edge `computation_core -> {module}` is not declared",
+                    result.stderr,
+                )
 
     def test_physical_overrides_must_map_one_crate_root(self) -> None:
         replacements = (

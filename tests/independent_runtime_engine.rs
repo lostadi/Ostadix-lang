@@ -22,6 +22,10 @@ fn compatibility_modules_preserve_the_engine_type_identities() {
     );
     assert_same!(o_lang::hgraph::HGraph, ostadix_api::hgraph::HGraph);
     assert_same!(
+        o_lang::computation_core::VerifiedOComputationV1,
+        ostadix_api::computation_core::VerifiedOComputationV1
+    );
+    assert_same!(
         o_lang::evidence::EvidenceBundleV5,
         ostadix_api::evidence::EvidenceBundleV5
     );

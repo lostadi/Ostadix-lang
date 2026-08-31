@@ -13,6 +13,15 @@ use o_lang::boot_objects::{
     portable_boot_object_ref, BootObjectIndex, BootObjectRecord, BootObjectStore, BootPathBinding,
     BOOT_OBJECT_STORE_ENV, DEFAULT_BOOT_OBJECT_STORE,
 };
+use o_lang::computation::OComputationBuilderV1;
+use o_lang::computation_core::{
+    artifact_id_for_bytes, ComputationLineageId, ComputationTokenV1, DerivationInputV1,
+    DerivationRefV1, DerivationRelationV1, FacetIdV1, FacetKindV1, FacetRefV1, TransformIdentityV1,
+};
+use o_lang::evidence::{
+    source_sha256, ExecutionIntentV1, ADMISSION_SCHEMA_V6, SCHEDULE_EXPLANATION_SCHEMA_V2,
+    SCHEDULE_PREDICTION_SCHEMA_V1, SCHEDULE_REALIZABILITY_SCHEMA_V1,
+};
 use o_lang::hosted_remote::project_mesh::{
     MeshExecutionConfig, MeshExecutionError, MeshExecutionFailureClass, MeshLocalFallback,
     MeshRequirement, MeshTraceEventV1,
@@ -31,6 +40,7 @@ use o_lang::project::executor::{ProjectExecutionError, ProjectExecutionFailureCl
 use o_lang::project::model::OutputCapture;
 use o_lang::project::runtime::public_route_execution_diagnostic;
 use o_lang::project::{OExecutionResult, RoutePolicy};
+use o_lang::resource_identity::ArtifactId;
 use sha2::{Digest, Sha256};
 use std::env;
 use std::ffi::OsString;
@@ -39,7 +49,7 @@ use std::io::{self, IsTerminal, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd};
 #[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -69,6 +79,8 @@ enum IntentCommand {
     Explain(ExplainArgs),
     /// Inspect retained execution evidence and, optionally, its event trace.
     Inspect(InspectArgs),
+    /// Bind exact semantic-custody artifacts into one canonical computation record.
+    Computation(ComputationArgs),
     /// Inspect and read the typed, authority-free boot-object store.
     Object(ObjectArgs),
 }
@@ -430,6 +442,49 @@ struct ObjectVerifyArgs {
     json: bool,
 }
 
+#[derive(Debug, Args)]
+struct ComputationArgs {
+    /// Exact .O source bytes described by the execution intent.
+    #[arg(long, value_name = "PATH")]
+    source: PathBuf,
+
+    /// Stable execution-intent JSON emitted for the source.
+    #[arg(long, value_name = "PATH")]
+    execution_intent: PathBuf,
+
+    /// Inspection-only schedule explanation text emitted for the source.
+    #[arg(long, value_name = "PATH")]
+    schedule: PathBuf,
+
+    /// Graphviz rendering of the solved HGraph.
+    #[arg(long, value_name = "PATH")]
+    hgraph_dot: PathBuf,
+
+    /// Observed JSON result of the same-intent-gated execution.
+    #[arg(long, value_name = "PATH")]
+    result: PathBuf,
+
+    /// Exact O runtime executable used for the observed result.
+    #[arg(long, value_name = "PATH")]
+    o_bin: PathBuf,
+
+    /// Exact olangc executable used for the inspection artifacts.
+    #[arg(long, value_name = "PATH")]
+    olangc_bin: PathBuf,
+
+    /// Refuse-overwrite output path for the canonical CBOR body.
+    #[arg(long, value_name = "PATH")]
+    cbor_out: PathBuf,
+
+    /// Refuse-overwrite output path for the matching JSON projection.
+    #[arg(long, value_name = "PATH")]
+    json_out: PathBuf,
+
+    /// Enduring computation lineage named by this revision.
+    #[arg(long, default_value = "examples/semantic-custody")]
+    lineage: String,
+}
+
 fn main() {
     // Hosted backend workers relaunch the exact admitted current executable.
     // The unified front door therefore owns the same hidden backend protocol
@@ -491,8 +546,319 @@ fn dispatch(command: IntentCommand) -> Result<i32> {
         IntentCommand::Plan(args) => plan_intent(&args),
         IntentCommand::Explain(args) => explain_pending(&args),
         IntentCommand::Inspect(args) => inspect_pending(&args),
+        IntentCommand::Computation(args) => computation_artifact(&args),
         IntentCommand::Object(args) => object_command(&args),
     }
+}
+
+fn computation_artifact(args: &ComputationArgs) -> Result<i32> {
+    if args.cbor_out == args.json_out {
+        bail!("canonical CBOR and JSON outputs must use distinct paths");
+    }
+
+    let source = read_computation_input(&args.source, "source")?;
+    let intent_bytes = read_computation_input(&args.execution_intent, "execution intent")?;
+    let schedule_bytes = read_computation_input(&args.schedule, "schedule explanation")?;
+    let hgraph_dot = read_computation_input(&args.hgraph_dot, "HGraph DOT rendering")?;
+    let result_bytes = read_computation_input(&args.result, "observed result")?;
+
+    let intent: ExecutionIntentV1 = serde_json::from_slice(&intent_bytes).with_context(|| {
+        format!(
+            "invalid execution-intent JSON {}",
+            args.execution_intent.display()
+        )
+    })?;
+    intent
+        .validate()
+        .context("execution-intent JSON failed canonical semantic validation")?;
+    let actual_source_sha256 = source_sha256(&source);
+    if intent.source_sha256 != actual_source_sha256 {
+        bail!(
+            "execution intent names source SHA-256 {}, but {} hashes to {}",
+            intent.source_sha256,
+            args.source.display(),
+            actual_source_sha256
+        );
+    }
+
+    validate_schedule_explanation(&schedule_bytes, &intent, &args.schedule)?;
+    validate_hgraph_rendering(&hgraph_dot, &args.hgraph_dot)?;
+    validate_observed_result(&result_bytes, &args.result)?;
+
+    let o_identity = executable_identity(&args.o_bin, "O runtime")?;
+    let olangc_identity = executable_identity(&args.olangc_bin, "olangc compiler")?;
+
+    let source_id = computation_id("source")?;
+    let o_binary_id = computation_id("tool/o-binary")?;
+    let olangc_binary_id = computation_id("tool/olangc-binary")?;
+    let intent_id = computation_id("execution-intent")?;
+    let schedule_id = computation_id("schedule-explanation")?;
+    let hgraph_id = computation_id("hgraph-rendering")?;
+    let result_id = computation_id("terminal-observation")?;
+
+    let native_executable_schema = computation_token("ostadix/native-executable/unversioned")?;
+    let mut builder = OComputationBuilderV1::new(ComputationLineageId::new(args.lineage.clone())?);
+    builder
+        .add_root_facet(FacetRefV1::new(
+            source_id.clone(),
+            FacetKindV1::Source,
+            computation_token("ostadix.source/o/v1")?,
+            artifact_id_for_bytes(&source),
+        ))
+        .add_root_facet(FacetRefV1::new(
+            o_binary_id.clone(),
+            FacetKindV1::NativePackage,
+            native_executable_schema.clone(),
+            o_identity.clone(),
+        ))
+        .add_root_facet(FacetRefV1::new(
+            olangc_binary_id.clone(),
+            FacetKindV1::NativePackage,
+            native_executable_schema,
+            olangc_identity.clone(),
+        ))
+        .add_facet_bytes(
+            intent_id.clone(),
+            FacetKindV1::ExecutionIntent,
+            computation_token(&intent.schema)?,
+            &intent_bytes,
+        )
+        .add_facet_bytes(
+            schedule_id.clone(),
+            FacetKindV1::ScheduleExplanation,
+            computation_token(SCHEDULE_EXPLANATION_SCHEMA_V2)?,
+            &schedule_bytes,
+        )
+        .add_facet_bytes(
+            hgraph_id.clone(),
+            FacetKindV1::HgraphRendering,
+            computation_token("ostadix.hgraph-rendering/dot-v1")?,
+            &hgraph_dot,
+        )
+        .add_facet_bytes(
+            result_id.clone(),
+            FacetKindV1::TerminalObservation,
+            computation_token("ostadix.o-json-result/unversioned")?,
+            &result_bytes,
+        )
+        .add_derivation(DerivationRefV1::new(
+            DerivationRelationV1::AnalyzedFrom,
+            vec![
+                computation_input("source", source_id.clone())?,
+                computation_input("compiler_binary", olangc_binary_id.clone())?,
+            ],
+            intent_id.clone(),
+            exact_transform(
+                "ostadix/workflow-attested/olangc-execution-intent-json/v1",
+                &olangc_identity,
+            )?,
+        ))
+        .add_derivation(DerivationRefV1::new(
+            DerivationRelationV1::AnalyzedFrom,
+            vec![
+                computation_input("source", source_id.clone())?,
+                computation_input("compiler_binary", olangc_binary_id.clone())?,
+            ],
+            schedule_id,
+            exact_transform(
+                "ostadix/workflow-attested/olangc-schedule-explanation/v2",
+                &olangc_identity,
+            )?,
+        ))
+        .add_derivation(DerivationRefV1::new(
+            DerivationRelationV1::ProjectedFrom,
+            vec![
+                computation_input("source", source_id.clone())?,
+                computation_input("compiler_binary", olangc_binary_id)?,
+            ],
+            hgraph_id,
+            exact_transform(
+                "ostadix/workflow-attested/olangc-hgraph-dot/v1",
+                &olangc_identity,
+            )?,
+        ))
+        .add_derivation(DerivationRefV1::new(
+            DerivationRelationV1::ObservedFrom,
+            vec![
+                computation_input("source", source_id)?,
+                computation_input("required_execution_intent", intent_id)?,
+                computation_input("runtime_binary", o_binary_id)?,
+            ],
+            result_id,
+            exact_transform(
+                "ostadix/workflow-attested/o-same-intent-graph-execution/v1",
+                &o_identity,
+            )?,
+        ));
+
+    let computation = builder
+        .finish()
+        .context("semantic-custody facets do not form a valid computation")?;
+    let canonical_cbor = computation
+        .canonical_bytes()
+        .context("failed to encode canonical computation CBOR")?;
+    let canonical_json = computation
+        .canonical_json_pretty()
+        .context("failed to encode computation JSON projection")?;
+    write_new_private(
+        &args.cbor_out,
+        &canonical_cbor,
+        "canonical computation CBOR",
+    )?;
+    write_new_private(
+        &args.json_out,
+        &canonical_json,
+        "computation JSON projection",
+    )?;
+    println!("{}", computation.revision().as_sha256());
+    Ok(0)
+}
+
+fn read_computation_input(path: &Path, label: &str) -> Result<Vec<u8>> {
+    fs::read(path).with_context(|| format!("failed to read {label} {}", path.display()))
+}
+
+fn validate_schedule_explanation(
+    bytes: &[u8],
+    intent: &ExecutionIntentV1,
+    path: &Path,
+) -> Result<()> {
+    let text = std::str::from_utf8(bytes)
+        .with_context(|| format!("schedule explanation {} is not UTF-8", path.display()))?;
+    // The V6 schedule's analyzed-graph digest is evidence-domain identity, not
+    // ExecutionIntentV1's stable analyzed-graph digest. OIR, plan, and catalog
+    // projection are the coordinates the two inspection views actually share.
+    for required in [
+        format!("; ExecutionAdmission {ADMISSION_SCHEMA_V6}"),
+        format!("lowered-oir-sha256={}", intent.oir_sha256),
+        format!("plan-sha256={}", intent.plan_sha256),
+        format!(
+            "backend-catalog-projection-sha256={}",
+            intent.backend_catalog_projection_sha256
+        ),
+        "runtime-snapshot kind=inspection dispatch-context=inspection-only".to_string(),
+        format!("; ScheduleRealizability {SCHEDULE_REALIZABILITY_SCHEMA_V1}"),
+        "execution-realizable=unknown dispatch=not-run".to_string(),
+        format!("; SchedulePrediction {SCHEDULE_PREDICTION_SCHEMA_V1}"),
+    ] {
+        if !text.contains(&required) {
+            bail!(
+                "schedule explanation {} is missing required binding `{required}`",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_hgraph_rendering(bytes: &[u8], path: &Path) -> Result<()> {
+    let text = std::str::from_utf8(bytes)
+        .with_context(|| format!("HGraph DOT rendering {} is not UTF-8", path.display()))?;
+    let rendered = text.trim();
+    if !rendered.starts_with("digraph hgraph {") || !rendered.ends_with('}') {
+        bail!(
+            "HGraph DOT rendering {} is not a complete `digraph hgraph` view",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn validate_observed_result(bytes: &[u8], path: &Path) -> Result<()> {
+    let result: serde_json::Value = serde_json::from_slice(bytes)
+        .with_context(|| format!("observed result {} is not JSON", path.display()))?;
+    let object = result
+        .as_object()
+        .with_context(|| format!("observed result {} is not a JSON object", path.display()))?;
+    if object.get("ok") != Some(&serde_json::Value::Bool(true)) {
+        bail!("observed result {} is not successful", path.display());
+    }
+    if !object
+        .get("value")
+        .is_some_and(serde_json::Value::is_object)
+    {
+        bail!(
+            "observed result {} has no structured O value",
+            path.display()
+        );
+    }
+    if !object.get("type").is_some_and(serde_json::Value::is_string) {
+        bail!("observed result {} has no value type", path.display());
+    }
+    if !object
+        .get("elapsed_ms")
+        .is_some_and(serde_json::Value::is_u64)
+    {
+        bail!(
+            "observed result {} has no elapsed_ms observation",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn executable_identity(path: &Path, label: &str) -> Result<ArtifactId> {
+    let mut executable =
+        File::open(path).with_context(|| format!("failed to open {label} {}", path.display()))?;
+    let metadata = executable
+        .metadata()
+        .with_context(|| format!("failed to inspect {label} {}", path.display()))?;
+    if !metadata.is_file() || metadata.len() == 0 {
+        bail!("{label} {} is not a non-empty regular file", path.display());
+    }
+    #[cfg(unix)]
+    if metadata.permissions().mode() & 0o111 == 0 {
+        bail!("{label} {} is not executable", path.display());
+    }
+
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = executable
+            .read(&mut buffer)
+            .with_context(|| format!("failed to hash {label} {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(ArtifactId::from_sha256(hex::encode(hasher.finalize()))?)
+}
+
+fn computation_id(value: &str) -> Result<FacetIdV1> {
+    Ok(FacetIdV1::new(value)?)
+}
+
+fn computation_token(value: &str) -> Result<ComputationTokenV1> {
+    Ok(ComputationTokenV1::new(value)?)
+}
+
+fn computation_input(role: &str, facet: FacetIdV1) -> Result<DerivationInputV1> {
+    Ok(DerivationInputV1::new(computation_token(role)?, facet))
+}
+
+fn exact_transform(name: &str, implementation: &ArtifactId) -> Result<TransformIdentityV1> {
+    Ok(TransformIdentityV1::new(
+        computation_token(name)?,
+        implementation.clone(),
+    ))
+}
+
+fn write_new_private(path: &Path, bytes: &[u8], label: &str) -> Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut output = options
+        .open(path)
+        .with_context(|| format!("refusing to overwrite {label} {}", path.display()))?;
+    output
+        .write_all(bytes)
+        .with_context(|| format!("failed to write {label} {}", path.display()))?;
+    output
+        .sync_all()
+        .with_context(|| format!("failed to synchronize {label} {}", path.display()))?;
+    Ok(())
 }
 
 struct ObjectSelection<'a> {
@@ -2087,6 +2453,46 @@ mod tests {
             panic!("expected object command")
         };
         object
+    }
+
+    fn parse_computation(arguments: &[&str]) -> ComputationArgs {
+        let cli = Cli::try_parse_from(arguments).unwrap();
+        let IntentCommand::Computation(computation) = cli.command else {
+            panic!("expected computation command")
+        };
+        computation
+    }
+
+    #[test]
+    fn computation_command_requires_explicit_artifact_and_binary_paths() {
+        let computation = parse_computation(&[
+            "o",
+            "computation",
+            "--source",
+            "program.O",
+            "--execution-intent",
+            "execution-intent.json",
+            "--schedule",
+            "schedule.txt",
+            "--hgraph-dot",
+            "hgraph.dot",
+            "--result",
+            "result.json",
+            "--o-bin",
+            "O",
+            "--olangc-bin",
+            "olangc",
+            "--cbor-out",
+            "computation.cbor",
+            "--json-out",
+            "computation.json",
+        ]);
+        assert_eq!(computation.source, Path::new("program.O"));
+        assert_eq!(
+            computation.execution_intent,
+            Path::new("execution-intent.json")
+        );
+        assert_eq!(computation.lineage, "examples/semantic-custody");
     }
 
     #[test]

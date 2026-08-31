@@ -89,14 +89,36 @@ bash scripts/semantic_custody_demo.sh
 The ignored output directory `target/semantic-custody/` contains:
 
 - `execution-intent.json` — stable, authority-free semantic identity;
-- `schedule.txt` — fresh admission and static schedule explanation;
-- `hgraph.dot` — graph inspection view;
+- `schedule.txt` — inspection-only admission and static schedule explanation;
+- `hgraph.dot` — rendered graph inspection view, not the solved HGraph record;
 - `result.json` — observed result from a newly admitted same-intent-gated run;
-- `manifest.json` — hashes, bounded claims, and explicit nonclaims.
+- `computation.cbor` — canonical `ostadix.ocomputation-manifest/v1` body;
+- `computation.json` — the same computation manifest projected as JSON;
+- `manifest.json` — V2 publication envelope with hashes, the computation
+  revision, bounded claims, and explicit nonclaims.
+
+The computation manifest hashes the exact source and four generated artifacts.
+It also records the exact `O` and `olangc` executable byte identities as root
+facets and workflow-attested transformer identities; the executables themselves
+are not copied into the output directory. The schedule and DOT facets remain
+explanatory and rendered views. In particular, the observed result edge names
+the source, required execution intent, and exact `O` binary identity, never the
+schedule explanation.
+
+The derivation edges attest what one locked staged shell workflow invoked. They
+are unsigned provenance claims, not cryptographic proof that those historical
+processes executed. Canonical decoding verifies the named content identities
+and derivation-graph structure. The schedule bytes bind their V6 shim, runtime,
+environment, and ambient-world digests, but those inputs, the Python runtime,
+and historical process identity are not separate rooted facets. The per-output
+lock prevents cooperating demo invocations from interleaving publication. The
+shell publishes all six hashed artifacts before it publishes the outer
+`manifest.json` last.
 
 The demonstration intentionally does not manufacture a signed Hosted V2 or
-World receipt. Those require their own authority, transport, and lifecycle
-contracts.
+World receipt. Decoding either computation representation also reconstructs no
+admission, placement, dispatch, or reusable runtime authority. Those require
+their own authority, transport, and lifecycle contracts.
 
 ## Explicit nonclaims
 

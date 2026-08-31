@@ -1,8 +1,13 @@
 use std::path::PathBuf;
 
+use ostadix_api::computation::OComputationBuilderV1;
+use ostadix_api::computation_core::{
+    ComputationLineageId, OComputationManifestV1, VerifiedOComputationV1,
+    OCOMPUTATION_MANIFEST_SCHEMA_V1,
+};
 use ostadix_api::execution_fabric::{
-    ExecutionCandidateV1, ExecutionCapsuleV1, ExecutionIdV1,
-    EXECUTION_CANDIDATE_SCHEMA_V1, EXECUTION_CAPSULE_SCHEMA_V1,
+    ExecutionCandidateV1, ExecutionCapsuleV1, ExecutionIdV1, EXECUTION_CANDIDATE_SCHEMA_V1,
+    EXECUTION_CAPSULE_SCHEMA_V1,
 };
 use ostadix_api::execution_fabric_authority::{
     FabricRequestV1, FabricResponseV1, FabricSigningKeyV1, FabricSubmissionV1,
@@ -36,6 +41,18 @@ fn independent_package_carries_its_license_and_notice() {
     assert!(notice
         .windows(b"Ostadix".len())
         .any(|window| window == b"Ostadix"));
+}
+
+#[test]
+fn ocomputation_identity_spine_is_nameable_from_the_engine_root() {
+    assert_public::<ComputationLineageId>();
+    assert_public::<OComputationManifestV1>();
+    assert_public::<VerifiedOComputationV1>();
+    assert_public::<OComputationBuilderV1>();
+    assert_eq!(
+        OCOMPUTATION_MANIFEST_SCHEMA_V1,
+        "ostadix.ocomputation-manifest/v1"
+    );
 }
 
 #[test]
