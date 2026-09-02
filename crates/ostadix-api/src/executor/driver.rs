@@ -23,6 +23,13 @@ pub(crate) trait AttemptDriver {
     fn submit(&mut self, submission: TaskSubmission) -> Result<()>;
     fn try_recv_event(&mut self) -> Result<Option<WorkerEvent>>;
     fn recv_event(&mut self) -> Result<WorkerEvent>;
+
+    /// Return a locally owned worker pool after the coordinator has finished.
+    /// Remote drivers keep the default so their transport state can never enter
+    /// the evaluator's process-local reuse slot.
+    fn into_local_worker_pool(self: Box<Self>) -> Option<WorkerPool> {
+        None
+    }
 }
 
 /// One protocol-neutral physical attempt prepared from admitted graph state.
@@ -48,7 +55,7 @@ impl PreparedPhysicalAttemptV1 {
 }
 
 /// High-layer policy injection for an explicitly selected physical-attempt
-/// realization. The executor owns graph scheduling and the five-method driver
+/// realization. The executor owns graph scheduling and the attempt-driver
 /// seam; a concrete adapter owns protocol authorization, preparation, and
 /// candidate validation without introducing an upward dependency.
 pub(crate) trait PhysicalAttemptAdapterV1: Send + Sync {
@@ -70,10 +77,13 @@ pub(crate) struct LocalWorkerDriver {
 }
 
 impl LocalWorkerDriver {
+    #[cfg(test)]
     pub(crate) fn new(capacity: usize) -> Result<Self> {
-        Ok(Self {
-            pool: WorkerPool::new(capacity)?,
-        })
+        Ok(Self::from_pool(WorkerPool::new(capacity)?))
+    }
+
+    pub(crate) fn from_pool(pool: WorkerPool) -> Self {
+        Self { pool }
     }
 }
 
@@ -99,5 +109,10 @@ impl AttemptDriver for LocalWorkerDriver {
 
     fn recv_event(&mut self) -> Result<WorkerEvent> {
         self.pool.recv_event()
+    }
+
+    fn into_local_worker_pool(self: Box<Self>) -> Option<WorkerPool> {
+        let Self { pool } = *self;
+        Some(pool)
     }
 }

@@ -426,11 +426,17 @@ class SetupScriptTests(unittest.TestCase):
                 "octl",
                 "o-registry",
                 "o-info",
+                "ostadix-device",
             ):
                 with self.subTest(binary=binary):
                     self.assertIn(f"--bin {binary}", output)
                     installed = home / "cargo" / "bin" / binary
                     self.assertIn(f"replace {installed}", output)
+            native_device = home / ".local" / "bin" / "ostadix-device"
+            self.assertIn(
+                f"replace {native_device} from {PROJECT_ROOT / 'target' / 'release' / 'ostadix-device'}",
+                output,
+            )
             evaluator_alias = home / "cargo" / "bin" / "ostadix-evaluator"
             self.assertIn(
                 f"replace {evaluator_alias} from {PROJECT_ROOT / 'target' / 'release' / 'O'}",

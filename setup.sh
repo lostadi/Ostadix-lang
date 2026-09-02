@@ -49,9 +49,9 @@ ENV_FILE="${OSTADIX_ENV_FILE:-$HOME/.config/ostadix/env.sh}"
 GUESTS_DIR="${OSTADIX_GUESTS_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/ostadix/guests}"
 
 EVALUATOR_ALIAS=ostadix-evaluator
-RUST_BIN_TARGETS=(O o-cli olangc ocorec o-link o-unlink ogit o-live-host o-node octl o-registry o-info)
-RUST_STALE_BINARIES=(O o o-cli olangc ocorec o-link olink o-unlink ogit o-live-host o-node octl o-registry o-info o-notebook "$EVALUATOR_ALIAS")
-WRAPPER_TARGETS=(O o olangc o-c olangc-c o-notebook)
+RUST_BIN_TARGETS=(O o-cli olangc ocorec o-link o-unlink ogit o-live-host o-node octl o-registry o-info ostadix-device)
+RUST_STALE_BINARIES=(O o o-cli olangc ocorec o-link olink o-unlink ogit o-live-host o-node octl o-registry o-info ostadix-device o-notebook "$EVALUATOR_ALIAS")
+WRAPPER_TARGETS=(O o olangc o-c olangc-c o-notebook ostadix-device)
 CARGO_BIN_DIR="${CARGO_HOME:-$HOME/.cargo}/bin"
 
 # --- Arg parsing ---
@@ -949,6 +949,8 @@ create_wrappers() {
       remove_managed_file "$BIN_DIR/$wrapper"
       if [[ "$wrapper" == "o-notebook" ]]; then
         echo "[DRY] recreate wrapper $BIN_DIR/$wrapper if target/release/o-notebook is built"
+      elif [[ "$wrapper" == "ostadix-device" ]]; then
+        echo "[DRY] replace $BIN_DIR/$wrapper from $PROJECT_ROOT/target/release/$wrapper"
       else
         echo "[DRY] recreate wrapper $BIN_DIR/$wrapper"
       fi
@@ -968,6 +970,11 @@ create_wrappers() {
   # cannot collide with the O/o dispatcher on case-insensitive filesystems.
   cp "$PROJECT_ROOT/target/release/O" "$BIN_DIR/$EVALUATOR_ALIAS"
   chmod +x "$BIN_DIR/$EVALUATOR_ALIAS"
+
+  # Keep the native Android controller ahead of Cargo's bin directory without
+  # leaving an older shell helper shadowing the compiled executable.
+  cp "$PROJECT_ROOT/target/release/ostadix-device" "$BIN_DIR/ostadix-device"
+  chmod +x "$BIN_DIR/ostadix-device"
 
   # Rust evaluator (prefers release).
   cat > "$BIN_DIR/O" <<WRAP

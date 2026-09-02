@@ -2566,9 +2566,45 @@ substrate gate did not run, not that the image passed or failed semantically.
 The O-core QEMU proof is intended to run directly on the host because it
 needs QEMU and the local Rust linker toolchain.
 
+### Native Android device control
+
+`ostadix-device` is a compiled ARM64 host controller for Termux. It reads the
+live Android cpuset and scheduler affinity, runs O with the Termux loader scoped
+to that child, manages wake locks, builds the Rust and C17 editions, and reports
+toolchain/cache health:
+
+```bash
+ostadix-device status
+ostadix-device doctor
+o doctor --json
+ostadix-device run -- examples/hello.O
+ostadix-device build rust
+ostadix-device root status
+ostadix-device root run -- /system/bin/id
+```
+
+On asymmetric Android SoCs, `run --prime` and `build --prime` explicitly ask
+Android for its temporary `CPUSET_SP_TOP_APP` task profile. `run --prime`
+then pins evaluator execution to the highest-numbered prime CPU (CPU 7 on the
+Tensor G5); parallel builds retain the full top-app mask instead of collapsing
+onto one core. An unprivileged invocation elevates only that fixed,
+PID/UID-validated operation through `su`; the evaluator and compilers remain
+under the Termux app UID. `prime release PID` returns the target to
+`CPUSET_SP_FOREGROUND`; it does not reconstruct an arbitrary original Android
+task profile. Status and doctor never probe `su`, and the CLI does
+not alter thermal controls, governors, SELinux, boot files, modules, or
+root-hiding policy. `root shell` and `root run -- COMMAND` expose the authority
+already granted by the installed Android root manager; the CLI does not
+install a setuid binary, grant itself authority, or replace the kernel.
+
+The standalone app lives under `apps/android-terminal`. Its default APK build
+uses a portable ARMv8-A CPU baseline; set
+`OSTADIX_ANDROID_CPU_PROFILE=native` only for a distinctly named,
+device-local APK tuned to the current SoC.
+
 ### What gets built
 
-The root Cargo package declares 14 binaries. The table also shows the installed
+The root Cargo package declares 15 binaries. The table also shows the installed
 lowercase wrapper, the independently locked MCP executable, and the two C17
 products so every public command surface has an explicit home.
 
@@ -2576,7 +2612,7 @@ products so every public command surface has an explicit home.
 |--------|----------|--------------|
 | `O` | `target/release/O` | Runs `.O` documents and provides the interactive REPL. |
 | `o-cli` | `target/release/o-cli` | Compiled intent orchestrator for validated `run`, static/live `plan`, verified `explain`, and strict JSON `inspect`. |
-| `o` | `scripts/o-cli.sh` through an installed wrapper | Routes the stateful intent commands to `o-cli`, preserves `why`, node, registry, information, live, receipt, and kernel tools, and retains evaluator compatibility for unknown command forms. |
+| `o` | `scripts/o-cli.sh` through an installed wrapper | Routes the stateful intent commands to `o-cli`, preserves device/doctor, `why`, node, registry, information, live, receipt, and kernel tools, and retains evaluator compatibility for unknown command forms. |
 | `olangc` | `target/release/olangc` | Produces native hosted binaries, WASI modules, script execution, OIR dumps, or Graphviz DOT hypergraph export. |
 | `ocorec` | `target/release/ocorec` | Compiles `.oc` modules through AST, typed HIR, and SSA MIR to freestanding ELF64 objects for the primary x86_64 and bounded AArch64 targets. |
 | `o-link` | `target/release/o-link` | Recursively literal-links and runs a bare single directory; `--project` creates an inert route-preserving bundle. |
@@ -2587,6 +2623,7 @@ products so every public command surface has an explicit home.
 | `octl` | `target/release/octl` | Uses discovery as a routing hint, reuses reciprocally paired identities, remembers peers, and invokes nodes automatically; retains the exact manual Hosted V1/V2 controls. |
 | `o-registry` | `target/release/o-registry` | Generates local placement profiles and creates, signs, verifies, lists, exports, and imports local registry snapshots. |
 | `o-info` | `target/release/o-info` | Maintains a local authority-free information head and exchanges signed canonical offline delta packs. |
+| `ostadix-device` | `target/release/ostadix-device` | Diagnoses, builds, runs, and temporarily applies Android top-app/foreground task profiles for Ostadix on Termux. |
 | `ocore-kernel-world-record` | `target/release/ocore-kernel-world-record` | Encodes a verified package and payload as the deterministic native KernelWorld admission record. |
 | `o-notebook` | feature-gated Cargo binary | Runs the local notebook server when built with `--features notebook`. |
 | `ostadix-mcp` | `mcp/ostadix_lang_mcp_server/target/release/ostadix-mcp` | Exposes the local agent tools above through MCP stdio; normal setup also installs `~/.local/bin/ostadix-mcp`. |
@@ -3737,7 +3774,10 @@ shim files before packaging. `--keep-build-dir` retains the generated Cargo
 project for inspection. `--backend-grant` may be repeated for script mode and
 native hosted binaries as a compatibility hook. Compiled binaries mint fresh
 process-local default backend authority at startup instead of embedding
-serialized authority.
+serialized authority. Generated Cargo builds disable disposable incremental
+state. They honor an explicitly configured `RUSTC_WRAPPER` such as an absolute
+`sccache` path, so equivalent AOT work can be reused without silently selecting
+another executable or sharing generated target directories.
 
 #### Public output forms
 

@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Ostadix Terminal</string>
+
+    <string name="settings_title">Terminal customization</string>
+    <string name="settings_subtitle">Tune every session without changing Android-wide settings.</string>
+    <string name="settings_apply">Apply</string>
+    <string name="settings_cancel">Cancel</string>
+    <string name="settings_reset">Defaults</string>
+    <string name="settings_preview_title">Live preview</string>
+    <string name="settings_appearance_section">Appearance</string>
+    <string name="settings_behavior_section">Session behavior</string>
+
+    <string name="setting_theme">Color theme</string>
+    <string name="setting_font_size">Terminal font</string>
+    <string name="setting_font_size_value">%1$d sp</string>
+    <string name="setting_scrollback">Scrollback</string>
+    <string name="setting_scrollback_value">%1$d lines</string>
+    <string name="setting_cursor">Cursor</string>
+    <string name="setting_cpu_mode">O session CPU policy</string>
+    <string name="setting_keep_awake">Keep screen awake</string>
+    <string name="setting_keep_awake_summary">Prevent sleep while a terminal session is visible</string>
+    <string name="setting_haptics">Key haptics</string>
+    <string name="setting_haptics_summary">Give light feedback for the terminal extra-key row</string>
+    <string name="setting_startup">New-session command</string>
+
+    <string name="terminal_preview">Ostadix Terminal\n$ O --repl\nO&gt; 2 + 2\n[number] 4 %1$s</string>
+
+    <string-array name="theme_labels">
+        <item>Obsidian</item>
+        <item>Solarized</item>
+        <item>Graphite</item>
+        <item>Light</item>
+    </string-array>
+
+    <string-array name="cursor_labels">
+        <item>Block</item>
+        <item>Bar</item>
+        <item>Underline</item>
+    </string-array>
+
+    <string-array name="cpu_mode_labels">
+        <item>Balanced (graph workloads)</item>
+        <item>Prime CPU7 (serial workloads)</item>
+    </string-array>
+
+    <string-array name="startup_mode_labels">
+        <item>Shell</item>
+        <item>O REPL</item>
+    </string-array>
+</resources>

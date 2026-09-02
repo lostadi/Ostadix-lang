@@ -121,6 +121,18 @@ pub(crate) trait GraphEvaluationHost {
 
     fn local_worker_parallelism_override(&self) -> Option<usize>;
 
+    /// Borrow a process-local worker pool for one graph evaluation. An
+    /// embedding with stable thread authority may explicitly retain idle pools
+    /// so short O programs do not repeatedly create and join the same workers.
+    fn take_local_worker_pool(
+        &mut self,
+        capacity: usize,
+    ) -> Result<crate::executor::pool::WorkerPool>;
+
+    /// Return a pool after a graph evaluation. Implementations may discard a
+    /// pool that is not idle or no longer matches their configured capacity.
+    fn return_local_worker_pool(&mut self, pool: crate::executor::pool::WorkerPool);
+
     fn shim_path(&self, language: &str) -> PathBuf;
 
     fn authorize_autonomous_ephemeral_shim(

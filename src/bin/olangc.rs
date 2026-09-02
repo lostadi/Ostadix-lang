@@ -2569,7 +2569,12 @@ fn generated_cargo_command(build_dir: &Path) -> Command {
         // `built_binary_path` cannot safely identify and can also make
         // independent AOT builds collide. Keep every generated build inside
         // its disposable project, then copy only the verified result out.
-        .env("CARGO_TARGET_DIR", build_dir.join("target"));
+        .env("CARGO_TARGET_DIR", build_dir.join("target"))
+        // Incremental state is tied to one disposable generated project and
+        // cannot help a later AOT build. Disabling it also makes rustc output
+        // eligible for a shared compiler cache.
+        .env("CARGO_INCREMENTAL", "0");
+
     command
 }
 
@@ -3160,6 +3165,14 @@ mod tests {
 
         assert_eq!(command.get_current_dir(), Some(build_dir.path()));
         assert_eq!(Path::new(target_dir), expected);
+        assert_eq!(
+            command
+                .get_envs()
+                .find(|(key, _)| *key == "CARGO_INCREMENTAL")
+                .and_then(|(_, value)| value),
+            Some(std::ffi::OsStr::new("0")),
+            "disposable generated builds must not retain incremental state"
+        );
     }
 
     #[test]
