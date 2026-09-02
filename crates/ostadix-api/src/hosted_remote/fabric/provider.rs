@@ -457,6 +457,9 @@ impl FabricAttemptProviderV1 {
 }
 
 #[derive(Debug)]
+// Ordinary provider responses are hot-path values; boxing them would allocate
+// on every request and would not change the bounded protocol representation.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum FabricProviderReplyV1 {
     Response(FabricResponseV1),
     ExactTerminal {

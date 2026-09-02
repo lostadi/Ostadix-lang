@@ -1,4 +1,4 @@
-//! Crash-durable, private storage for [`RunRecordV1`](super::record::RunRecordV1).
+//! Crash-durable, private storage for [`RunRecordV1`].
 //!
 //! Global locking is limited to allocation, publication, reconciliation, and
 //! retention.  The returned [`RunLeaseV1`] holds a per-run advisory lock while

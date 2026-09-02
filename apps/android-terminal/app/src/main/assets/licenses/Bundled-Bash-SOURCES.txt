@@ -1,0 +1,76 @@
+Bundled Bash runtime: source, license, and modification notice
+================================================================
+
+Ostadix Terminal 0.1.6 derives its standalone Bash runtime from these Termux
+aarch64 package payloads:
+
+  GNU Bash 5.3.15                    GPL-3.0-or-later
+  GNU Readline 8.3.3                 GPL-3.0-or-later
+  GNU libiconv 1.18-1                LGPL-2.1-or-later
+  Termux libandroid-support 29-1     Apache-2.0 and MIT-family licenses
+  ncurses 6.6.20260307+really6.5.20250830
+                                      ncurses permissive license
+
+The APK build makes only Android packaging metadata changes on 2026-09-01:
+it replaces Termux-private DT_RUNPATH entries with the literal ${ORIGIN},
+renames the Bash executable for PackageManager extraction, renames two
+version-suffixed shared-library files to names ending in .so, and updates the
+matching DT_NEEDED and DT_SONAME strings from libreadline.so.8 to
+libreadline_8.so and from libncursesw.so.6 to libncursesw_6.so. No program
+source is changed. The complete transformation is implemented by
+apps/android-terminal/tools/scrub_elf_runpath.py and
+apps/android-terminal/build.sh in the Ostadix-lang source tree:
+
+  https://github.com/lostadi/Ostadix-lang
+
+Android supports ${ORIGIN} beginning at API 24. Testing on the build device
+also found a linker namespace that did not search the main executable's valid
+RUNPATH, so the app supplies a sanitized LD_LIBRARY_PATH containing only its
+PackageManager-owned nativeLibraryDir to the non-root Bash child. That
+variable is never placed in the app process, system-shell fallback, or
+explicit /system/bin/su environment.
+
+The programs are provided without warranty. You may copy, modify, and convey
+them under their respective licenses. Full license texts are stored beside
+this notice in the APK's assets/licenses directory.
+
+Exact Termux build recipes, Android patches, and upstream source coordinates
+for the binaries in this APK:
+
+  Bash:
+    https://github.com/termux/termux-packages/tree/b6f56c35f83f9e1e11e0a505a655a5d4386cb145/packages/bash
+    Base source: https://mirrors.kernel.org/gnu/bash/bash-5.3.tar.gz
+    Base SHA-256: 0d5cd86965f869a26cf64f4b71be7b96f90a3ba8b3d74e27e8e9d9d5550f31ba
+    The recipe applies the official bash53 patches 001 through 015 plus the
+    Android/Termux patches in that exact recipe directory.
+
+  Readline:
+    https://github.com/termux/termux-packages/tree/d9ca062a205d01a14727d98fa5920fe61c84fa0c/packages/readline
+    Base source: https://mirrors.kernel.org/gnu/readline/readline-8.3.tar.gz
+    Base SHA-256: fe5383204467828cd495ee8d1d3c037a7eba1389c22bc6a041f627976f9061cc
+    The recipe applies official Readline patches 001 through 003 and its
+    Android/Termux patches.
+
+  libiconv:
+    https://github.com/termux/termux-packages/tree/679e73de6017a62db4f6c8705e5c72fcb5d58750/packages/libiconv
+    Source: https://mirrors.kernel.org/gnu/libiconv/libiconv-1.18.tar.gz
+    Source SHA-256: 3b08f5f4f9b4eb82f151a7040bfd6fe6c6fb922efe4b1659c66ea933276965e8
+
+  ncurses and the bundled terminfo database:
+    https://github.com/termux/termux-packages/tree/d29b295df936a1867fde79a45be5b236cefb0d55/packages/ncurses
+
+  libandroid-support:
+    https://github.com/termux/termux-packages/tree/91fad586ce5408b89711f478cc5e16598403e653/packages/libandroid-support
+    Upstream source: https://github.com/termux/libandroid-support/releases/tag/v29
+
+The complete Termux packaging/build framework is available at:
+
+  https://github.com/termux/termux-packages
+
+Original input ELF SHA-256 values used for this build:
+
+  bash                 0179c7b15fb3df857608ef745daa17077523ffc42b7755ccc725ad7a712698a2
+  libandroid-support   739cf829511d71dafd6c67fdbb70f3f0c6048642ea2e1967790ee961fde14430
+  libiconv             53349c7a84ad06da53c3976754c742d6a79f3297562f0fbe61b7ee620f783667
+  libreadline          aab81ed5d196100e7b2c2a7606b2cba2cffef2395c3ef3e602dca804f9c6acba
+  libncursesw          795f855f5a988d9e89116847b2c9aa03720cedbc02026259ca735be25398c4c5

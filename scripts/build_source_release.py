@@ -125,6 +125,13 @@ HOSTED_HGRAPH_BENCHMARK_RELEASE_PATHS = HOSTED_HGRAPH_BENCHMARK_PATHS | frozense
         "tests/test_benchmark_hgraph_hosted.py",
     }
 )
+CPU_RUNTIME_BENCHMARK_PATHS = frozenset(
+    {
+        "benchmarks/cpu_runtime/README.md",
+        "benchmarks/cpu_runtime/run.py",
+        "tests/test_benchmark_cpu_runtime.py",
+    }
+)
 OSTADIX_API_RUNTIME_ASSET_PATHS = frozenset(
     {
         f"{OSTADIX_API_ROOT}/backends/{name}"
@@ -240,11 +247,12 @@ ALLOWED_EXACT_PATHS = frozenset(
         "okernel-multikernel/boot-and-test.sh",
         "okernel-multikernel/MULTIKERNEL_PERSONALITY_PROPOSAL.md",
     }
-) | HOSTED_HGRAPH_BENCHMARK_PATHS | OSTADIX_API_RELEASE_PATHS
+) | HOSTED_HGRAPH_BENCHMARK_PATHS | CPU_RUNTIME_BENCHMARK_PATHS | OSTADIX_API_RELEASE_PATHS
 
 ALLOWED_TOP_LEVEL_DIRECTORIES = frozenset(
     {
         ".github",
+        "apps",
         "assets",
         "backends",
         "c_cpp",
@@ -609,6 +617,7 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "src/bin/o-cli.rs",
         "src/bin/o-node.rs",
         "src/bin/o-info.rs",
+        "src/bin/ostadix-device.rs",
         "src/bin/o-registry.rs",
         "src/bin/octl.rs",
         "src/bin/olink.rs",
@@ -699,6 +708,10 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "tests/hosted_remote_v2.rs",
         "tests/support/mod.rs",
         "tests/o_info_cli.rs",
+        "tests/ostadix_device_cli.rs",
+        "benchmarks/cpu_runtime/README.md",
+        "benchmarks/cpu_runtime/run.py",
+        "tests/test_benchmark_cpu_runtime.py",
         "tests/information_bridge_v1.rs",
         "tests/placement_v6.rs",
         "tests/registry_v1.rs",

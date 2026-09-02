@@ -101,6 +101,7 @@ fuzz/corpus/
 *.wasm
 *.elf
 patcheck.tmp
+/ostadix_pty.plist
 test.html
 cvelist
 cvelist-html

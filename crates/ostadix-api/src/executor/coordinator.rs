@@ -31,6 +31,7 @@ use crate::value::OValue;
 
 use super::driver::{AttemptDriver, LocalWorkerDriver, PhysicalAttemptAdapterV1};
 use super::parallel;
+use super::pool::WorkerPool;
 use super::task::{
     TaskCallbackFailure, TaskCompletion, TaskEvalRequest, TaskOutcome, TaskSubmission, TaskToken,
     WorkerEvent,
@@ -69,6 +70,17 @@ struct WorkerFailure {
 struct WorkerPublication {
     output_type: String,
     fingerprint: Option<String>,
+}
+
+/// Executor-owned extension of the evaluator-independent host contract.
+///
+/// Keeping the concrete pool vocabulary here preserves the lower `eval_core`
+/// boundary while allowing an embedding with stable thread authority to retain
+/// idle local workers between evaluations.
+pub(crate) trait GraphExecutorHost: GraphEvaluationHost {
+    fn take_local_worker_pool(&mut self, capacity: usize) -> Result<WorkerPool>;
+
+    fn return_local_worker_pool(&mut self, pool: WorkerPool);
 }
 
 /// One committed-or-pending operation the coordinator tracks.
@@ -202,7 +214,7 @@ impl<'a> Coordinator<'a> {
     /// non-whitespace root value (the document value).
     pub(crate) fn run_host(
         mut self,
-        evaluator: &mut dyn GraphEvaluationHost,
+        evaluator: &mut dyn GraphExecutorHost,
         scope: &mut std::collections::HashMap<String, OValue>,
         physical_attempt_adapter: Option<&dyn PhysicalAttemptAdapterV1>,
     ) -> Result<OValue> {
@@ -212,7 +224,54 @@ impl<'a> Coordinator<'a> {
 
         self.materialize_literals()?;
 
-        if let Err(err) = self.drive(evaluator, physical_attempt_adapter) {
+        let worker_operations = self
+            .ops
+            .iter()
+            .filter(|op| op.dispatch_lane == DispatchLaneV1::LocalWorker)
+            .count();
+        let worker_capacity = self
+            .admitted
+            .admission()
+            .resolved_worker_count(evaluator.local_worker_parallelism_override());
+        #[cfg(test)]
+        let worker_capacity = parallel::worker_count_hint()
+            .unwrap_or(worker_capacity)
+            .max(1);
+
+        if physical_attempt_adapter.is_some() {
+            if let Err(error) = self.validate_remote_selection() {
+                evaluator.install_execution_trace(std::mem::take(&mut self.trace).into_trace());
+                return Err(error);
+            }
+        }
+
+        let mut driver: Option<Box<dyn AttemptDriver>> = if worker_operations == 0 {
+            None
+        } else if let Some(adapter) = physical_attempt_adapter {
+            match adapter.create_driver() {
+                Ok(driver) => Some(driver),
+                Err(error) => {
+                    evaluator.install_execution_trace(std::mem::take(&mut self.trace).into_trace());
+                    return Err(error);
+                }
+            }
+        } else {
+            match evaluator.take_local_worker_pool(worker_capacity) {
+                Ok(pool) => Some(Box::new(LocalWorkerDriver::from_pool(pool))),
+                Err(error) => {
+                    evaluator.install_execution_trace(std::mem::take(&mut self.trace).into_trace());
+                    return Err(error);
+                }
+            }
+        };
+
+        let execution = self.drive(evaluator, &mut driver, physical_attempt_adapter);
+        if let Some(driver) = driver.take() {
+            if let Some(pool) = driver.into_local_worker_pool() {
+                evaluator.return_local_worker_pool(pool);
+            }
+        }
+        if let Err(err) = execution {
             evaluator.install_execution_trace(std::mem::take(&mut self.trace).into_trace());
             return Err(err);
         }
@@ -257,32 +316,9 @@ impl<'a> Coordinator<'a> {
     fn drive(
         &mut self,
         evaluator: &mut dyn GraphEvaluationHost,
+        driver: &mut Option<Box<dyn AttemptDriver>>,
         physical_attempt_adapter: Option<&dyn PhysicalAttemptAdapterV1>,
     ) -> Result<()> {
-        let worker_operations = self
-            .ops
-            .iter()
-            .filter(|op| op.dispatch_lane == DispatchLaneV1::LocalWorker)
-            .count();
-        let worker_capacity = self
-            .admitted
-            .admission()
-            .resolved_worker_count(evaluator.local_worker_parallelism_override());
-        #[cfg(test)]
-        let worker_capacity = parallel::worker_count_hint()
-            .unwrap_or(worker_capacity)
-            .max(1);
-        if physical_attempt_adapter.is_some() {
-            self.validate_remote_selection()?;
-        }
-        let mut driver: Option<Box<dyn AttemptDriver>> = if worker_operations == 0 {
-            None
-        } else if let Some(adapter) = physical_attempt_adapter {
-            Some(adapter.create_driver()?)
-        } else {
-            Some(Box::new(LocalWorkerDriver::new(worker_capacity)?))
-        };
-
         loop {
             if let Some(driver) = driver.as_mut() {
                 loop {
@@ -412,11 +448,12 @@ impl<'a> Coordinator<'a> {
                 .count();
             let stall_reason =
                 "scheduler stalled before a started local-worker result could settle";
-            if let Some(mut stalled_driver) = driver.take() {
-                self.discard_started_workers(Some(stalled_driver.as_mut()), stall_reason);
-            } else {
-                self.discard_started_workers(None, stall_reason);
-            }
+            self.discard_started_workers(
+                driver
+                    .as_mut()
+                    .map(|driver| &mut **driver as &mut (dyn AttemptDriver + '_)),
+                stall_reason,
+            );
             bail!(
                 "graph executor stalled: {remaining} of {} operations never became ready \
                  (dependency cycle, failed input, or unsatisfiable constraint; \

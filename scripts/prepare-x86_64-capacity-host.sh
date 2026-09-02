@@ -56,11 +56,11 @@ HOSTED_LEGACY_BINARIES=(
 )
 HOSTED_STANDARD_BINARIES=(
   O o-cli olangc ocorec o-link o-unlink ogit o-live-host o-node octl
-  o-registry o-info
+  o-registry o-info ostadix-device
 )
 HOSTED_ROOT_BINARIES=(
   O o-cli olangc ocorec o-link o-unlink o-notebook ogit o-live-host o-node
-  octl o-registry o-info ocore-kernel-world-record
+  octl o-registry o-info ostadix-device ocore-kernel-world-record
 )
 HOSTED_BINARIES=("${HOSTED_ROOT_BINARIES[@]}" ostadix-mcp)
 if [[ "$ALPINE_KERNEL_FLAVOR" == lts ]]; then
@@ -1255,7 +1255,7 @@ PY
   missing_standard=
   for binary in \
     O o-cli olangc ocorec o-link o-unlink ogit o-live-host o-node octl \
-    o-registry o-info; do
+    o-registry o-info ostadix-device; do
     command -v "$binary" >/dev/null 2>&1 \
       || missing_standard="$missing_standard $binary"
   done
@@ -1268,7 +1268,7 @@ PY
   missing_declared=
   for binary in \
     O o-cli olangc ocorec o-link o-unlink o-notebook ogit o-live-host o-node \
-    octl o-registry o-info ocore-kernel-world-record; do
+    octl o-registry o-info ostadix-device ocore-kernel-world-record; do
     command -v "$binary" >/dev/null 2>&1 \
       || missing_declared="$missing_declared $binary"
   done

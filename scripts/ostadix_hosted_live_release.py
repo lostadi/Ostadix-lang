@@ -132,6 +132,7 @@ REQUIRED_HOSTED_BINARIES = frozenset(
         "octl",
         "o-registry",
         "o-info",
+        "ostadix-device",
         "ocore-kernel-world-record",
         "ostadix-mcp",
     }

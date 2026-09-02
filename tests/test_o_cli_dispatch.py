@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -28,7 +29,9 @@ class LowercaseCliDispatchTests(unittest.TestCase):
         self.environment = os.environ.copy()
         for variable in (
             "O_LANG_OCLI_BIN",
+            "O_LANG_OLANGC_BIN",
             "O_LANG_EVALUATOR_BIN",
+            "O_LANG_DEVICE_BIN",
             "O_LANG_CAPACITY_BIN",
             "O_LANG_LIVE_BIN",
             "O_LANG_OGIT_BIN",
@@ -39,19 +42,28 @@ class LowercaseCliDispatchTests(unittest.TestCase):
         ):
             self.environment[variable] = str(self.fake)
 
-    def run_cli(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+    def run_cli(
+        self,
+        *arguments: str,
+        environment: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            ["/bin/bash", str(O_CLI), *arguments],
+            [str(O_CLI), *arguments],
             cwd=PROJECT_ROOT,
-            env=self.environment,
+            env=environment or self.environment,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
         )
 
-    def assert_dispatch(self, arguments: tuple[str, ...], expected: list[str]) -> None:
-        result = self.run_cli(*arguments)
+    def assert_dispatch(
+        self,
+        arguments: tuple[str, ...],
+        expected: list[str],
+        environment: dict[str, str] | None = None,
+    ) -> None:
+        result = self.run_cli(*arguments, environment=environment)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines(), [f"arg=<{arg}>" for arg in expected])
 
@@ -65,6 +77,27 @@ class LowercaseCliDispatchTests(unittest.TestCase):
         ):
             with self.subTest(arguments=arguments):
                 self.assert_dispatch(arguments, list(arguments))
+
+    def test_android_commands_use_the_explicit_device_namespace(self) -> None:
+        non_device_environment = self.environment.copy()
+        non_device_environment["O_LANG_DEVICE_BIN"] = str(
+            Path(self.temporary.name) / "missing-device-controller"
+        )
+        self.assert_dispatch(
+            ("doctor", "--json"),
+            ["doctor", "--json"],
+            non_device_environment,
+        )
+        self.assert_dispatch(
+            ("device", "doctor", "--json"),
+            ["doctor", "--json"],
+        )
+
+    def test_why_preserves_arguments_under_posix_sh(self) -> None:
+        self.assert_dispatch(
+            ("why", "program.O", "P7", "--json"),
+            ["program.O", "--target", "ir", "--why", "P7", "--json"],
+        )
 
     def test_hosted_client_and_service_have_unambiguous_routes(self) -> None:
         self.assert_dispatch(("node", "doctor", "--address", "node:7337"), [
@@ -359,7 +392,6 @@ class InstalledWrapperDispatchTests(unittest.TestCase):
             destination = Path(temporary) / "O"
             result = subprocess.run(
                 [
-                    "/bin/bash",
                     str(PROJECT_ROOT / "scripts" / "install-o-cli-wrapper.sh"),
                     str(destination),
                 ],
@@ -371,9 +403,30 @@ class InstalledWrapperDispatchTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             source = destination.read_text(encoding="utf-8")
+            self.assertTrue(source.startswith("#!/bin/sh\n"))
             self.assertIn('exec "', source)
             self.assertIn('/scripts/o-cli.sh" "$@"', source)
             self.assertNotIn('${0##*/}', source)
+
+            true_command = shutil.which("true")
+            self.assertIsNotNone(true_command)
+            environment = os.environ.copy()
+            environment["O_LANG_OCLI_BIN"] = true_command
+            result = subprocess.run(
+                [str(destination), "help"],
+                cwd=PROJECT_ROOT,
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_repository_dispatcher_has_an_android_safe_interpreter(self) -> None:
+        source = O_CLI.read_text(encoding="utf-8")
+        self.assertTrue(source.startswith("#!/bin/sh\n"))
+        self.assertNotIn("/usr/bin/env", source)
 
 
 if __name__ == "__main__":

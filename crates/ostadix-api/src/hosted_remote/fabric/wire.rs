@@ -309,11 +309,13 @@ fn encode_message_parts(
     Ok(frame)
 }
 
+type EncodedFabricMessageV1 = (Vec<u8>, Option<Vec<u8>>);
+
 fn read_encoded_message<R: Read>(
     reader: &mut R,
     maximum_payload: usize,
     kind: &'static str,
-) -> Result<Option<(Vec<u8>, Option<Vec<u8>>)>> {
+) -> Result<Option<EncodedFabricMessageV1>> {
     let Some(header_len) = read_optional_u32(reader, "Fabric header length")? else {
         return Ok(None);
     };

@@ -1,0 +1,5 @@
+text^(
+Hello from Ostadix Terminal.
+
+This expression is evaluated by the native Android Ostadix runtime.
+)_text

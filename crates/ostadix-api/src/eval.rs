@@ -386,6 +386,16 @@ pub struct Evaluator {
     /// no local-renderer fallback.
     physical_attempt_adapter: Option<Arc<dyn crate::executor::PhysicalAttemptAdapterV1>>,
 
+    /// Whether idle worker threads may survive across evaluation boundaries.
+    /// Disabled by default because thread-local security state such as
+    /// Landlock or seccomp cannot be fully inspected after construction.
+    reuse_local_worker_pool: bool,
+
+    /// Idle graph workers retained across sequential evaluations. A running
+    /// coordinator takes ownership of the pool, which also keeps nested
+    /// O.eval callbacks from borrowing the workers that are servicing them.
+    local_worker_pool: Option<crate::executor::pool::WorkerPool>,
+
     /// Optional native `O --o-backend` entrypoint for embedding processes that
     /// are not themselves the O evaluator (for example `o-node`). Ordinary O
     /// execution leaves this unset and binds `current_exe()` as before.
@@ -791,6 +801,8 @@ impl Evaluator {
             scheduler: AutonomousScheduler::new(),
             local_worker_parallelism_override: None,
             physical_attempt_adapter: None,
+            reuse_local_worker_pool: false,
+            local_worker_pool: None,
             runtime_executable_override: None,
             autonomous_buffer: Vec::new(),
             last_execution_plan: None,
@@ -822,6 +834,17 @@ impl Evaluator {
     /// are legal to overlap; this only caps the feasible local subset.
     pub fn with_local_worker_parallelism(mut self, workers: usize) -> Self {
         self.local_worker_parallelism_override = Some(workers.max(1));
+        self
+    }
+
+    /// Retain idle graph workers across evaluations.
+    ///
+    /// The caller must guarantee that the evaluator thread's security
+    /// authority is not tightened between calls. Linux/Android CPU-affinity
+    /// changes are detected and rebuild the pool, but per-thread Landlock,
+    /// seccomp, signal, and scheduler state cannot be exhaustively compared.
+    pub fn with_reusable_local_workers(mut self) -> Self {
+        self.reuse_local_worker_pool = true;
         self
     }
 
@@ -3695,6 +3718,37 @@ impl GraphEvaluationHost for Evaluator {
     }
 }
 
+impl crate::executor::GraphExecutorHost for Evaluator {
+    fn take_local_worker_pool(
+        &mut self,
+        capacity: usize,
+    ) -> Result<crate::executor::pool::WorkerPool> {
+        match self.local_worker_pool.take() {
+            Some(pool)
+                if pool.capacity() == capacity
+                    && pool.outstanding() == 0
+                    && pool.matches_current_affinity() =>
+            {
+                Ok(pool)
+            }
+            Some(pool) => {
+                drop(pool);
+                crate::executor::pool::WorkerPool::new(capacity)
+            }
+            None => crate::executor::pool::WorkerPool::new(capacity),
+        }
+    }
+
+    fn return_local_worker_pool(&mut self, pool: crate::executor::pool::WorkerPool) {
+        if self.reuse_local_worker_pool
+            && pool.outstanding() == 0
+            && self.local_worker_pool.is_none()
+        {
+            self.local_worker_pool = Some(pool);
+        }
+    }
+}
+
 impl<'a> crate::executor::Coordinator<'a> {
     /// Execute through the evaluator compatibility surface while the executor
     /// itself depends only on the crate-private graph host contract.
@@ -3715,6 +3769,40 @@ impl<'a> crate::executor::Coordinator<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn evaluator_retains_idle_graph_workers_and_resizes_on_demand() {
+        let mut default_evaluator = Evaluator::new(PathBuf::from("/tmp"));
+        let default_pool = crate::executor::pool::WorkerPool::new(1).unwrap();
+        crate::executor::GraphExecutorHost::return_local_worker_pool(
+            &mut default_evaluator,
+            default_pool,
+        );
+        assert!(default_evaluator.local_worker_pool.is_none());
+
+        let mut evaluator = Evaluator::new(PathBuf::from("/tmp")).with_reusable_local_workers();
+        let pool = crate::executor::pool::WorkerPool::new(2).unwrap();
+        crate::executor::GraphExecutorHost::return_local_worker_pool(&mut evaluator, pool);
+        assert_eq!(
+            evaluator
+                .local_worker_pool
+                .as_ref()
+                .expect("idle pool must be retained")
+                .capacity(),
+            2
+        );
+
+        let pool =
+            crate::executor::GraphExecutorHost::take_local_worker_pool(&mut evaluator, 2).unwrap();
+        assert_eq!(pool.capacity(), 2);
+        assert!(evaluator.local_worker_pool.is_none());
+        crate::executor::GraphExecutorHost::return_local_worker_pool(&mut evaluator, pool);
+
+        let resized =
+            crate::executor::GraphExecutorHost::take_local_worker_pool(&mut evaluator, 1).unwrap();
+        assert_eq!(resized.capacity(), 1);
+        crate::executor::GraphExecutorHost::return_local_worker_pool(&mut evaluator, resized);
+    }
 
     fn placement_attempt() -> crate::placement::TaskAttemptIdV1 {
         crate::placement::TaskAttemptIdV1::new(

@@ -658,7 +658,7 @@ pub fn is_timeout_error(err: &anyhow::Error) -> bool {
 
 /// Credential-safe projection for persistent observations and remote status.
 ///
-/// Direct executor callers retain the historical [`Display`] text (including
+/// Direct executor callers retain the historical [`std::fmt::Display`] text (including
 /// argv), while this projection deliberately excludes command arguments that
 /// may have arrived through a route declaration.
 pub fn public_route_execution_diagnostic(err: &anyhow::Error) -> String {

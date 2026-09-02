@@ -1,0 +1,26 @@
+[package]
+name = "ostadix-android-runtime"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "LGPL-2.1-only"
+
+[lib]
+name = "ostadix_runtime"
+crate-type = ["cdylib"]
+
+[dependencies]
+jni = { version = "0.21.1", default-features = false }
+ostadix-api = { path = "../../../crates/ostadix-api", version = "=0.4.0", default-features = false, features = ["graph_executor"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+# This crate is intentionally built independently from the main Cargo
+# workspace so the Android JNI surface cannot change the canonical lockfile.
+[workspace]

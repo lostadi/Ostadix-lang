@@ -42,6 +42,9 @@ impl FabricEncodedMessageV1 {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "command", content = "body", rename_all = "kebab-case")]
+// Request headers are encoded on the execution hot path. Keep their payloads
+// inline to avoid a heap allocation without changing their JSON wire shape.
+#[allow(clippy::large_enum_variant)]
 enum FabricRequestHeaderKindV1 {
     SubmitPureAttempt(FabricSubmissionHeaderV1),
     QueryAttempt(FabricAttemptQueryV1),
@@ -56,6 +59,8 @@ struct FabricRequestEnvelopeV1 {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", content = "body", rename_all = "kebab-case")]
+// Response headers follow the same allocation-free representation contract.
+#[allow(clippy::large_enum_variant)]
 enum FabricResponseHeaderKindV1 {
     Accepted(FabricAttemptStatusV1),
     Running(FabricAttemptStatusV1),

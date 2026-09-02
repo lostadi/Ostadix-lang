@@ -150,6 +150,17 @@ impl Runtime {
         }
     }
 
+    /// Retain idle graph worker threads across calls when the embedding owns a
+    /// stable thread-authority context.
+    ///
+    /// This is opt-in because per-thread sandbox restrictions cannot be fully
+    /// observed or compared. Embeddings that may tighten Landlock, seccomp, or
+    /// equivalent authority between evaluations must keep the default.
+    pub fn with_reusable_local_workers(mut self) -> Self {
+        self.evaluator = self.evaluator.with_reusable_local_workers();
+        self
+    }
+
     /// Parse and evaluate one complete O source document. A leading shebang
     /// is excluded from executable syntax by the same rule as the O CLI. Each
     /// call receives a fresh lexical scope, while this owned runtime retains

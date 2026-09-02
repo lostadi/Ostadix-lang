@@ -1324,7 +1324,6 @@ fn directory_entry_names(
 
 #[cfg(any(
     target_os = "linux",
-    target_os = "android",
     target_os = "dragonfly",
     target_os = "emscripten",
     target_os = "hurd",
@@ -1334,6 +1333,15 @@ fn clear_readdir_errno() {
     unsafe {
         // SAFETY: this writes the calling thread's errno slot.
         *libc::__errno_location() = 0;
+    }
+}
+
+#[cfg(target_os = "android")]
+fn clear_readdir_errno() {
+    unsafe {
+        // SAFETY: Bionic exposes the calling thread's errno slot through
+        // __errno(), unlike glibc's __errno_location().
+        *libc::__errno() = 0;
     }
 }
 

@@ -1,7 +1,8 @@
 //! Fixed-size persistent local-worker pool.
 //!
-//! Workers are created once per graph-coordinator execution and reused across
-//! changing HGraph readiness frontiers. Each completion is delivered
+//! By default, workers live for one graph-coordinator execution and are reused
+//! across changing HGraph readiness frontiers. Embeddings may explicitly retain
+//! an idle pool across sequential executions. Each completion is delivered
 //! independently; this module does not batch, order, or settle results.
 
 use std::sync::{
@@ -17,6 +18,7 @@ use super::task::{TaskCompletion, TaskContext, TaskSubmission, WorkerEvent};
 /// A bounded pool of persistent local workers.
 pub(crate) struct WorkerPool {
     capacity: usize,
+    creator_affinity: Option<Vec<u8>>,
     outstanding: usize,
     submissions: Option<SyncSender<TaskSubmission>>,
     events: Receiver<WorkerEvent>,
@@ -33,6 +35,7 @@ impl WorkerPool {
         let submission_rx = Arc::new(Mutex::new(submission_rx));
         let (event_tx, event_rx) = mpsc::channel();
         let mut workers = Vec::with_capacity(capacity);
+        let creator_affinity = current_thread_affinity();
 
         for index in 0..capacity {
             let submissions = Arc::clone(&submission_rx);
@@ -53,6 +56,7 @@ impl WorkerPool {
 
         Ok(Self {
             capacity,
+            creator_affinity,
             outstanding: 0,
             submissions: Some(submission_tx),
             events: event_rx,
@@ -62,6 +66,28 @@ impl WorkerPool {
 
     pub(crate) fn outstanding(&self) -> usize {
         self.outstanding
+    }
+
+    pub(crate) fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Worker threads inherit the creator's Linux/Android affinity mask.
+    /// Retained pools are reusable only while the calling thread still has
+    /// that exact mask; a CPU-policy or cpuset change must create new workers.
+    pub(crate) fn matches_current_affinity(&self) -> bool {
+        #[cfg(any(target_os = "android", target_os = "linux"))]
+        {
+            return self
+                .creator_affinity
+                .as_ref()
+                .zip(current_thread_affinity().as_ref())
+                .is_some_and(|(created, current)| created == current);
+        }
+        #[cfg(not(any(target_os = "android", target_os = "linux")))]
+        {
+            self.creator_affinity.is_none()
+        }
     }
 
     pub(crate) fn available_slots(&self) -> usize {
@@ -136,6 +162,26 @@ impl WorkerPool {
         self.outstanding -= 1;
         Ok(())
     }
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn current_thread_affinity() -> Option<Vec<u8>> {
+    // SAFETY: the value is zero-initialized, the kernel receives its exact
+    // allocation size, pid 0 selects the calling thread, and the immutable
+    // byte view does not outlive `set`.
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        let size = std::mem::size_of::<libc::cpu_set_t>();
+        if libc::sched_getaffinity(0, size, &mut set) != 0 {
+            return None;
+        }
+        Some(std::slice::from_raw_parts((&set as *const libc::cpu_set_t).cast(), size).to_vec())
+    }
+}
+
+#[cfg(not(any(target_os = "android", target_os = "linux")))]
+fn current_thread_affinity() -> Option<Vec<u8>> {
+    None
 }
 
 impl Drop for WorkerPool {
@@ -256,6 +302,12 @@ mod tests {
     #[test]
     fn pool_rejects_zero_capacity() {
         assert!(WorkerPool::new(0).is_err());
+    }
+
+    #[test]
+    fn new_pool_matches_its_creator_affinity() {
+        let pool = WorkerPool::new(1).unwrap();
+        assert!(pool.matches_current_affinity());
     }
 
     #[test]

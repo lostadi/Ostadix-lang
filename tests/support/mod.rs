@@ -17,6 +17,25 @@ use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
 
+/// Normalize non-semantic permission bits from an assembled fixture, then
+/// restore the fingerprint invariant. Production bundles intentionally preserve
+/// all Unix mode bits; canonical goldens must not inherit the checkout umask.
+pub(crate) fn normalize_project_fixture_modes(
+    mut bundle: o_lang::project::ProjectBundle,
+) -> o_lang::project::ProjectBundle {
+    for file in &mut bundle.files {
+        file.unix_mode = if file.is_symlink() {
+            None
+        } else if file.executable {
+            Some(0o100755)
+        } else {
+            Some(0o100644)
+        };
+    }
+    bundle.root_fingerprint = o_lang::project::bundle::fingerprint(&bundle.files);
+    bundle
+}
+
 const POLICY_ENV: &str = "OSTADIX_TEST_RUNTIME_POLICY";
 const RUNTIME_PROBE_CONTRACT: &str = include_str!("../../ci/test-suites.toml");
 
