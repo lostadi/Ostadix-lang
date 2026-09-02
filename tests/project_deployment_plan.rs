@@ -4,6 +4,8 @@
 //! They do not prove current inventory, admission, runtime instantiation,
 //! authority, remote dispatch, recovery, native/O-core continuity, or G1.
 
+mod support;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -25,7 +27,9 @@ fn fixture_path() -> PathBuf {
 }
 
 fn fixture_bundle() -> ProjectBundle {
-    project::assemble(&fixture_path(), "pr7-project-hgraph", &[]).unwrap()
+    support::normalize_project_fixture_modes(
+        project::assemble(&fixture_path(), "pr7-project-hgraph", &[]).unwrap(),
+    )
 }
 
 fn fixture_logical() -> project::LogicalHGraphV1 {

@@ -163,7 +163,8 @@ license shipped in the source release.
 At startup, the server preserves the client's `PATH` order and appends existing
 local runtime locations commonly omitted by GUI/MCP launchers: repository and
 user bins, Homebrew, Nix profiles, mise/asdf/pyenv/rbenv, Conda, Volta/fnm,
-GHCup/OPAM, .NET, Wasmtime/Wasmer, and SDKMAN Java. Set
+GHCup/OPAM, .NET, Wasmtime/Wasmer, SDKMAN Java, and the Termux package prefix
+(from its environment or the package-independent `.../files/home` layout). Set
 `OSTADIX_RUNTIME_PATH` to append additional explicit directories.
 
 `OSTADIX_RUNTIME_PATH_MODE` selects the search policy:

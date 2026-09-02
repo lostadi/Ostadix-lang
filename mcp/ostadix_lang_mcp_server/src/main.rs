@@ -562,6 +562,7 @@ fn runtime_search_path_with_mode_and_manager_environment(
         ] {
             append_existing_runtime_path(&mut entries, home.join(relative), label);
         }
+        append_termux_runtime_paths(&mut entries, home, manager_environment);
         // Explicit runtime-manager roots are more specific than generic
         // machine fallbacks and therefore retain precedence over them.
         append_environment_runtime_paths(&mut entries, manager_environment);
@@ -589,6 +590,49 @@ fn runtime_search_path_with_mode_and_manager_environment(
     }
 
     RuntimeSearchPath::new(mode, entries)
+}
+
+/// Add Termux's package prefix without relying on the launcher's PATH. Android
+/// GUI and MCP hosts commonly retain HOME but omit both PREFIX and the Termux
+/// bin directory. The `.../files/home` layout is stable across Termux package
+/// IDs, so it is a safer fallback than baking in `/data/data/com.termux`.
+fn append_termux_runtime_paths(
+    entries: &mut Vec<RuntimePathEntry>,
+    home: &Path,
+    environment: &[(OsString, OsString)],
+) {
+    for variable in ["TERMUX__PREFIX", "PREFIX"] {
+        if let Some((_, prefix)) = environment
+            .iter()
+            .find(|(key, _)| key == OsStr::new(variable))
+        {
+            let prefix = PathBuf::from(prefix);
+            if variable == "PREFIX" && !is_termux_prefix(&prefix) {
+                continue;
+            }
+            append_existing_runtime_path(
+                entries,
+                prefix.join("bin"),
+                format!("termux-env:{variable}"),
+            );
+        }
+    }
+
+    if home.file_name() == Some(OsStr::new("home")) {
+        if let Some(files_root) = home
+            .parent()
+            .filter(|parent| parent.file_name() == Some(OsStr::new("files")))
+        {
+            append_existing_runtime_path(entries, files_root.join("usr/bin"), "termux-home-prefix");
+        }
+    }
+}
+
+fn is_termux_prefix(prefix: &Path) -> bool {
+    prefix.file_name() == Some(OsStr::new("usr"))
+        && prefix
+            .parent()
+            .is_some_and(|parent| parent.file_name() == Some(OsStr::new("files")))
 }
 
 fn append_environment_runtime_paths(
@@ -673,6 +717,8 @@ fn runtime_manager_environment() -> Vec<(OsString, OsString)> {
         "PYENV_ROOT",
         "RBENV_ROOT",
         "DOTNET_ROOT",
+        "TERMUX__PREFIX",
+        "PREFIX",
     ]
     .into_iter()
     .filter_map(|name| std::env::var_os(name).map(|value| (OsString::from(name), value)))
@@ -2928,6 +2974,109 @@ mod tests {
             search.source_for_executable(&shared.join("python3")),
             "inherited:0"
         );
+    }
+
+    #[test]
+    fn runtime_path_finds_termux_prefix_from_home_with_restricted_path() {
+        let fixture = Fixture::new();
+        let home = fixture.0.join("termux-app/files/home");
+        let prefix_bin = fixture.0.join("termux-app/files/usr/bin");
+        let restricted = fixture.0.join("android-system-bin");
+        fs::create_dir_all(&home).expect("create Termux home fixture");
+        fs::create_dir_all(&prefix_bin).expect("create Termux prefix fixture");
+        fs::create_dir_all(&restricted).expect("create restricted PATH fixture");
+        let inherited = std::env::join_paths([&restricted]).expect("join restricted PATH");
+
+        let search = runtime_search_path_with_mode(
+            &fixture.0,
+            &home,
+            Some(OsStr::new(&inherited)),
+            None,
+            RuntimePathMode::DiscoverLocal,
+        )
+        .expect("construct Termux discover-local path");
+
+        assert_eq!(search.entries[0].directory, restricted);
+        let termux = search
+            .entries
+            .iter()
+            .find(|entry| entry.directory == prefix_bin)
+            .expect("inferred Termux prefix must be searched");
+        assert_eq!(termux.source, "termux-home-prefix");
+    }
+
+    #[test]
+    fn termux_environment_prefix_obeys_mode_and_keeps_inherited_precedence() {
+        let fixture = Fixture::new();
+        let selected_prefix = fixture.0.join("selected-termux-prefix");
+        let selected_bin = selected_prefix.join("bin");
+        let inherited_dir = fixture.0.join("inherited");
+        fs::create_dir_all(&selected_bin).expect("create selected Termux bin");
+        fs::create_dir_all(&inherited_dir).expect("create inherited bin");
+        let inherited = std::env::join_paths([&inherited_dir]).expect("join inherited PATH");
+        let manager_environment = vec![(
+            std::ffi::OsString::from("TERMUX__PREFIX"),
+            selected_prefix.as_os_str().to_os_string(),
+        )];
+
+        let discover_local = runtime_search_path_with_mode_and_manager_environment(
+            &fixture.0,
+            &fixture.0.join("ordinary-home"),
+            Some(OsStr::new(&inherited)),
+            None,
+            RuntimePathMode::DiscoverLocal,
+            &manager_environment,
+        )
+        .expect("construct discover-local path with Termux prefix");
+        assert_eq!(discover_local.entries[0].directory, inherited_dir);
+        let termux = discover_local
+            .entries
+            .iter()
+            .find(|entry| entry.directory == selected_bin)
+            .expect("environment Termux prefix must be searched");
+        assert_eq!(termux.source, "termux-env:TERMUX__PREFIX");
+
+        let inherited_only = runtime_search_path_with_mode_and_manager_environment(
+            &fixture.0,
+            &fixture.0.join("ordinary-home"),
+            Some(OsStr::new(&inherited)),
+            None,
+            RuntimePathMode::InheritedOnly,
+            &manager_environment,
+        )
+        .expect("construct inherited-only path with ignored Termux prefix");
+        assert_eq!(inherited_only.entries.len(), 1);
+        assert!(inherited_only
+            .entries
+            .iter()
+            .all(|entry| entry.directory != selected_bin));
+    }
+
+    #[test]
+    fn generic_prefix_environment_is_not_treated_as_termux() {
+        let fixture = Fixture::new();
+        let generic_prefix = fixture.0.join("ordinary-prefix");
+        let generic_bin = generic_prefix.join("bin");
+        fs::create_dir_all(&generic_bin).expect("create generic prefix bin");
+        let manager_environment = vec![(
+            std::ffi::OsString::from("PREFIX"),
+            generic_prefix.as_os_str().to_os_string(),
+        )];
+
+        let search = runtime_search_path_with_mode_and_manager_environment(
+            &fixture.0,
+            &fixture.0.join("ordinary-home"),
+            None,
+            None,
+            RuntimePathMode::DiscoverLocal,
+            &manager_environment,
+        )
+        .expect("construct discover-local path with generic prefix");
+
+        assert!(search
+            .entries
+            .iter()
+            .all(|entry| entry.directory != generic_bin));
     }
 
     #[test]

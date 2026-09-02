@@ -75,9 +75,10 @@ mark 'Project HGraph malformed/substitution rejection: PASS'
 logical_tests_log="$work_dir/project-logical-hgraph-tests.log"
 run_logged "$logical_tests_log" env CARGO_TERM_COLOR=never \
     cargo test --locked --package o-lang --test project_logical_hgraph
-require_test_count "$logical_tests_log" 12
+require_test_count "$logical_tests_log" 13
 for name in \
     directory_and_lifted_project_have_identical_canonical_bytes_and_digest \
+    fixture_mode_normalization_ignores_group_write_umask_drift \
     project_profile_v1_digest_is_pinned \
     source_formatting_changes_the_exact_bundle_and_logical_identity \
     canonical_decode_round_trips_and_strict_mode_rejects_noncanonical_json \
@@ -115,7 +116,7 @@ done
 mark 'DeploymentPlanV1 canonical hosted intent and bundle-scoped snapshot proposal: PASS'
 mark 'DeploymentPlanV1 World-epoch, hierarchy/task, and substitution rejection: PASS'
 
-run cargo build --locked --package o-lang --bin olangc
+run cargo build --locked --package o-lang --bin olangc --bin o-cli
 first="$work_dir/project-plan-first.log"
 second="$work_dir/project-plan-second.log"
 run_logged "$first" "$ROOT/target/debug/olangc" "$fixture" \
@@ -126,6 +127,7 @@ cmp "$first" "$second"
 
 dispatcher_log="$work_dir/project-plan-dispatcher.log"
 O_LANG_OLANGC_BIN="$ROOT/target/debug/olangc" \
+    O_LANG_OCLI_BIN="$ROOT/target/debug/o-cli" \
     "$ROOT/scripts/o-cli.sh" plan "$fixture" --route main \
     >"$dispatcher_log" 2>>"$transcript"
 cmp "$first" "$dispatcher_log"
@@ -137,6 +139,7 @@ run "$ROOT/scripts/install-o-cli-wrapper.sh" "$installed_local_bin/o"
 installed_dispatch_log="$work_dir/project-plan-installed-dispatcher.log"
 PATH="$installed_local_bin:$installed_cargo_bin:$ROOT/target/release:/usr/bin:/bin" \
     O_LANG_OLANGC_BIN="$ROOT/target/debug/olangc" \
+    O_LANG_OCLI_BIN="$ROOT/target/debug/o-cli" \
     o plan "$fixture" --route main \
     >"$installed_dispatch_log" 2>>"$transcript"
 cmp "$first" "$installed_dispatch_log"

@@ -2,7 +2,7 @@
 //! Ostadix peer mesh.
 //!
 //! A mesh actor is one source-closed project route branch: its immutable
-//! [`ProjectBundle`](crate::project::ProjectBundle), selected route, and transitive
+//! [`ProjectBundle`], selected route, and transitive
 //! prerequisites move together so build products remain in one workspace.
 
 use std::cmp::Reverse;

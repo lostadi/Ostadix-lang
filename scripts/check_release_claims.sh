@@ -470,7 +470,7 @@ require_fixed Dockerfile \
     'COPY --from=builder /src/target/release/o-cli  /usr/local/bin/o-cli' \
     'the runtime image no longer installs the compiled Ostadix front door'
 require_fixed scripts/o-cli.sh \
-    'exec "$OLANGC_BIN" "$1" --target ir --why "$2" "${@:3}"' \
+    'exec "$OLANGC_BIN" "$source" --target ir --why "$operation" "$@"' \
     'the repository-owned o why dispatcher no longer reaches the focused admission query'
 require_fixed docs/HGRAPH_EXECUTOR_PLAN.md \
     '`olangc FILE.O --target ir --why P3` projects the same evidence-bound admission' \

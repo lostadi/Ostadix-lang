@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="ostadix_background">#0B0F14</color>
+    <color name="ostadix_surface">#121923</color>
+    <color name="ostadix_surface_raised">#182231</color>
+    <color name="ostadix_border">#2A3748</color>
+    <color name="ostadix_text">#E6EDF5</color>
+    <color name="ostadix_text_muted">#9AA9BA</color>
+    <color name="ostadix_accent">#67E8F9</color>
+    <color name="ostadix_accent_dark">#0891B2</color>
+    <color name="ostadix_navigation">#080B10</color>
+</resources>

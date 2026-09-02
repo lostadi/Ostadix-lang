@@ -1075,6 +1075,7 @@ class SourceReleaseTests(unittest.TestCase):
             "crates/ostadix-api/src/syntax_dialect.rs": "// fixture parser syntax dialect\n",
             "src/bin/o-cli.rs": "// fixture compiled intent front door\n",
             "src/bin/o-info.rs": "// fixture local information CLI\n",
+            "src/bin/ostadix-device.rs": "// fixture native Android host controller\n",
             "src/bin/o-node.rs": "// fixture direct hosted-node CLI\n",
             "src/bin/o-registry.rs": "// fixture signed local registry CLI\n",
             "src/bin/octl.rs": "// fixture direct hosted-node client CLI\n",
@@ -1258,6 +1259,7 @@ class SourceReleaseTests(unittest.TestCase):
             "tests/project_mesh_cli.rs": "#[test] fn project_mesh_cli_fixture() {}\n",
             "tests/support/mod.rs": "// fixture shared integration-test support\n",
             "tests/o_info_cli.rs": "#[test] fn o_info_cli_fixture() {}\n",
+            "tests/ostadix_device_cli.rs": "#[test] fn ostadix_device_cli_fixture() {}\n",
             "tests/information_bridge_v1.rs": "#[test] fn information_bridge_fixture() {}\n",
             "tests/placement_v6.rs": "#[test] fn placement_v6_fixture() {}\n",
             "tests/registry_v1.rs": "#[test] fn registry_v1_fixture() {}\n",
@@ -1277,6 +1279,8 @@ class SourceReleaseTests(unittest.TestCase):
         for path in WORLD_EVIDENCE_RELEASE_PATHS:
             contents[path] = (PROJECT_ROOT / path).read_bytes()
         for path in release.HOSTED_HGRAPH_BENCHMARK_RELEASE_PATHS:
+            contents[path] = (PROJECT_ROOT / path).read_bytes()
+        for path in release.CPU_RUNTIME_BENCHMARK_PATHS:
             contents[path] = (PROJECT_ROOT / path).read_bytes()
         for path in release.OSTADIX_API_ROOT_MODULE_PATHS.values():
             contents.setdefault(path, "// fixture engine root module\n")
@@ -1396,6 +1400,9 @@ class SourceReleaseTests(unittest.TestCase):
                 ".github/workflows/ci.yml": "name: fixture\n",
                 ".DS_Store": b"finder",
                 ".ocore-repair-backups/run/typeck.rs": "backup\n",
+                "apps/android-terminal/README.md": "# Fixture Android app\n",
+                "apps/android-terminal/runtime/src/lib.rs": "// fixture Android runtime\n",
+                "apps/android-terminal/runtime/target/debug/libfixture.rlib": b"build debris",
                 "assets/logo.bin": b"intentional asset",
                 "backends/__pycache__/shim.pyc": b"bytecode",
                 "backends/shim.py": "print('source')\n",
@@ -1500,6 +1507,8 @@ class SourceReleaseTests(unittest.TestCase):
                 ".github/workflows/fuzz.yml",
                 ".gitignore",
                 ".mcp.json",
+                "apps/android-terminal/README.md",
+                "apps/android-terminal/runtime/src/lib.rs",
                 "CITATION.cff",
                 "CHANGELOG.md",
                 "CODE_OF_CONDUCT.md",
@@ -1713,6 +1722,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "crates/ostadix-api/src/syntax_dialect.rs",
                 "src/bin/o-cli.rs",
                 "src/bin/o-info.rs",
+                "src/bin/ostadix-device.rs",
                 "src/bin/o-node.rs",
                 "src/bin/o-registry.rs",
                 "src/bin/octl.rs",
@@ -1873,6 +1883,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "tests/hosted_remote_v2.rs",
                 "tests/support/mod.rs",
                 "tests/o_info_cli.rs",
+                "tests/ostadix_device_cli.rs",
                 "tests/information_bridge_v1.rs",
                 "tests/placement_v6.rs",
                 "tests/registry_v1.rs",
@@ -1905,11 +1916,13 @@ class SourceReleaseTests(unittest.TestCase):
                 for index in range(FIXTURE_EVIDENCE_GATE_COUNT)
             )
             included.update(release.HOSTED_HGRAPH_BENCHMARK_RELEASE_PATHS)
+            included.update(release.CPU_RUNTIME_BENCHMARK_PATHS)
             included.update(release.OSTADIX_API_RELEASE_PATHS)
             included.update(release.OSTADIX_API_ROOT_MODULE_PATHS.values())
             excluded = {
                 ".DS_Store",
                 ".ocore-repair-backups/run/typeck.rs",
+                "apps/android-terminal/runtime/target/debug/libfixture.rlib",
                 "backends/__pycache__/shim.pyc",
                 "benchmarks/scratch.txt",
                 "c_cpp/O",

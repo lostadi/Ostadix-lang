@@ -1,3 +1,5 @@
+mod support;
+
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -310,7 +312,9 @@ fn self_sign_unvalidated_hosted_entry(entry: JournalEntryV2) -> SignedJournalEnt
 
 fn project_graph_fixture() -> o_lang::project::LogicalHGraphV1 {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/project_hgraph");
-    let bundle = project::assemble(&fixture, "information-bridge", &[]).unwrap();
+    let bundle = support::normalize_project_fixture_modes(
+        project::assemble(&fixture, "information-bridge", &[]).unwrap(),
+    );
     build_project_hgraph(&bundle, Some("main"), None)
         .unwrap()
         .logical_v1()
@@ -604,7 +608,7 @@ fn all_eight_native_projections_roundtrip_and_pin_t2_goldens() {
             "aab562e52f0bef68e5e8f855d4a01bb1ee4b8ef29c5567434536860f53d26aba",
             "c19dd8e66807b2d927fc89a85a2c62cfdb187bd41dd3ac4f6a38015f896f8e55",
             "e2df6e5aee888f9d8d44737393bd9a1ccca221658e54f1fe683c9ff99fff2cf1",
-            "b5b734e009431c1e1ad63db087a1ba0834aca2cc5af16215b84a73f45967c6fc",
+            "b291b1fbe84f7b2d7b802716996686d60f608db7572d4e3045bec1b2293ba0a7",
             "32afbe8d94ab044fffbe38e5d2bb121b2b8ff9f0cebe8f34b908c80f3501c829",
         ],
         "canonical/T2 digest changes require a schema review and updated vectors"

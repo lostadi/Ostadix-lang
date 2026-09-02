@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.OstadixTerminal" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowActionModeOverlay">true</item>
+        <item name="android:windowBackground">@color/ostadix_background</item>
+        <item name="android:colorAccent">@color/ostadix_accent</item>
+        <item name="android:colorControlActivated">@color/ostadix_accent</item>
+        <item name="android:colorControlHighlight">@color/ostadix_surface_raised</item>
+        <item name="android:statusBarColor">@color/ostadix_background</item>
+        <item name="android:navigationBarColor">@color/ostadix_navigation</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+        <item name="android:windowDisablePreview">true</item>
+        <item name="android:windowBackgroundFallback">@color/ostadix_background</item>
+    </style>
+
+    <style name="TextAppearance.OstadixTerminal.Section" parent="@android:style/TextAppearance.Material.Subhead">
+        <item name="android:textColor">@color/ostadix_accent</item>
+        <item name="android:textStyle">bold</item>
+    </style>
+
+    <style name="TextAppearance.OstadixTerminal.Label" parent="@android:style/TextAppearance.Material.Body1">
+        <item name="android:textColor">@color/ostadix_text</item>
+        <item name="android:textStyle">bold</item>
+    </style>
+
+    <style name="TextAppearance.OstadixTerminal.Summary" parent="@android:style/TextAppearance.Material.Caption">
+        <item name="android:textColor">@color/ostadix_text_muted</item>
+    </style>
+</resources>

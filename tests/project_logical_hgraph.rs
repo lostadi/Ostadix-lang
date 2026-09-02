@@ -4,6 +4,8 @@
 //! placement, runtime, recovery, native/O-core, Governor, or OSTADIX Alpha
 //! evidence.
 
+mod support;
+
 use std::path::{Path, PathBuf};
 
 use o_lang::project::{
@@ -20,7 +22,38 @@ fn fixture_path() -> PathBuf {
 }
 
 fn fixture_bundle() -> ProjectBundle {
-    project::assemble(&fixture_path(), "pr7-project-hgraph", &[]).unwrap()
+    support::normalize_project_fixture_modes(
+        project::assemble(&fixture_path(), "pr7-project-hgraph", &[]).unwrap(),
+    )
+}
+
+#[test]
+fn fixture_mode_normalization_ignores_group_write_umask_drift() {
+    let ordinary = project::assemble(&fixture_path(), "pr7-project-hgraph", &[]).unwrap();
+    let mut group_writable = ordinary.clone();
+    for file in &mut group_writable.files {
+        file.unix_mode = file.unix_mode.map(|mode| mode | 0o020);
+    }
+    group_writable.root_fingerprint = project::bundle::fingerprint(&group_writable.files);
+
+    assert_ne!(ordinary.root_fingerprint, group_writable.root_fingerprint);
+    assert_eq!(
+        support::normalize_project_fixture_modes(ordinary),
+        support::normalize_project_fixture_modes(group_writable)
+    );
+
+    let mut file_kinds = fixture_bundle();
+    file_kinds.files[0].executable = true;
+    file_kinds.files[0].unix_mode = Some(0o100775);
+    file_kinds.files[1].symlink_target = Some("input.txt".to_string());
+    file_kinds.files[1].unix_mode = Some(0o120777);
+    let normalized = support::normalize_project_fixture_modes(file_kinds);
+    assert_eq!(normalized.files[0].unix_mode, Some(0o100755));
+    assert_eq!(normalized.files[1].unix_mode, None);
+    assert_eq!(
+        normalized.root_fingerprint,
+        project::bundle::fingerprint(&normalized.files)
+    );
 }
 
 fn fixture_project() -> project::ProjectHGraph {

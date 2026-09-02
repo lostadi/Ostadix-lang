@@ -93,6 +93,9 @@ struct Cli {
 }
 
 #[derive(Debug, Subcommand)]
+// Clap constructs exactly one command per short-lived CLI process. Keep the
+// argument structs inline instead of adding allocation and match indirection.
+#[allow(clippy::large_enum_variant)]
 enum Command {
     /// Start the zero-configuration LAN node as a detached background process.
     Start(StartArgs),

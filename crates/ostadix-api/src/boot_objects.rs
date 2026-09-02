@@ -261,7 +261,7 @@ impl BootObjectIndex {
             MAX_BOOT_BINDINGS as u64,
         )?;
 
-        objects.sort_by(|left, right| left.sha256.cmp(&right.sha256));
+        objects.sort_by_key(|object| object.sha256);
         bindings.sort_by(|left, right| left.path.as_bytes().cmp(right.path.as_bytes()));
         validate_objects_and_bindings(&objects, &bindings)?;
         let stored_bytes = checked_sum_objects(&objects)?;
