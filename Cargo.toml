@@ -94,7 +94,7 @@ serde       = { version = "1", features = ["derive"] }
 serde_json  = { version = "1", features = ["preserve_order"] }
 
 # o.toml manifest parsing
-toml        = "0.8"
+toml        = "1.1"
 
 # PATH resolution for backend binary checking
 which       = "6"
