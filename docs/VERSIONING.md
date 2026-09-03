@@ -20,6 +20,7 @@ authorized, that an information projection is fresh, or that a World is live.
 | Release toolchain | `1.97.1` | `rust-toolchain.toml` `toolchain.channel` | Pinned compiler for release, formatting, Clippy, and generated-runtime evidence. This may advance without changing the MSRV. |
 | Execution intent | `oexec.execution-intent/v1` | `crates/ostadix-api/src/evidence/intent.rs` `EXECUTION_INTENT_SCHEMA_V1` | Stable, authority-free identity of exact source and analyzed semantics. |
 | Operation and realization descriptions | `ostadix.operation-contract/v1`, `ostadix.operation-interface/v1`, `ostadix.realization-descriptor/v1`, `ostadix.realization-set/v1` | the four `*_SCHEMA_V1` constants in `crates/ostadix-api/src/computation_core.rs` | Experimental canonical descriptive records. Their cross-check establishes referential consistency only, never planning, selection, equivalence, placement, execution, recovery, or authority. |
+| Operation planning and observation | planning records V1; logical, deployment, and runtime graphs V2; marked-project bridge V1 | the nine record constants in `crates/ostadix-api/src/computation/realization_plan.rs` and three `OPERATION_*_SCHEMA_V1` bridge constants in `src/bin/o-cli.rs` | Experimental canonical records, deterministic single-operation static ranking, exact marked-project joins, and current-binary observation reconstruction. Selection is not live eligibility, placement, execution authority, or recovery. |
 | Solved executable graph | `ostadix-solved-executable-hgraph/v2` | `crates/ostadix-api/src/evidence/analyze.rs` `SOLVED_EXECUTABLE_HGRAPH_DIGEST_DOMAIN_V2`; `graph_sha256_v2` | Current Graph V2 identity binds the complete canonical `FidelityAssessmentV2`. Graph V1 remains frozen for intent and archival V5 inspection. |
 | Evidence | `oexec.evidence/v6` | `crates/ostadix-api/src/evidence/fact.rs` `EVIDENCE_SCHEMA_V6`; `ANALYZER_ID_V6` = `ostadix-oir-evidence-compiler/v6` | Current typed pre-execution evidence vocabulary; evidence is not admission. |
 | Admission | `oexec.admission/v6` | `crates/ostadix-api/src/evidence/fact.rs` `ADMISSION_SCHEMA_V6` | Current process-local admitted-execution contract accepted by coordinator/evaluator. |
@@ -85,7 +86,7 @@ The frozen archival coordinates remain explicit: `EVIDENCE_SCHEMA_V5`
 `SCHEDULE_WHY_SCHEMA_V1` (`oexec.admission-why/v1`). They support compatibility
 inspection and golden verification only.
 
-### Operation-realization V1 coordinates
+### Operation-realization and planning coordinates
 
 The four source coordinates are independent records, not one interchangeable
 bundle version:
@@ -103,21 +104,86 @@ domain. Changing the serialized or validation meaning of one requires a new
 coordinate for that record; matching `v1` suffixes do not permit the others to
 be silently changed or uplifted.
 
+The additive authority-free planning family has these independent coordinates:
+
+| Record | Coordinate | Source constant |
+|---|---|---|
+| Physical representation | `ostadix.physical-representation/v1` | `PHYSICAL_REPRESENTATION_SCHEMA_V1` |
+| Transfer plan | `ostadix.transfer-plan/v1` | `TRANSFER_PLAN_SCHEMA_V1` |
+| Cost profile | `ostadix.cost-profile/v1` | `COST_PROFILE_SCHEMA_V1` |
+| Objective | `ostadix.objective/v1` | `OBJECTIVE_SCHEMA_V1` |
+| Logical operation HGraph | `ostadix.logical-hgraph/v2` | `LOGICAL_HGRAPH_SCHEMA_V2` |
+| Descriptive deployment plan | `ostadix.deployment-plan/v2` | `DEPLOYMENT_PLAN_SCHEMA_V2` |
+| Runtime observation graph | `ostadix.runtime-graph/v2` | `RUNTIME_GRAPH_SCHEMA_V2` |
+| Recovery plan | `ostadix.recovery-plan/v1` | `RECOVERY_PLAN_SCHEMA_V1` |
+| Operation-planning request | `ostadix.operation-planning-request/v1` | `OPERATION_PLANNING_REQUEST_SCHEMA_V1` |
+
+All nine constants, canonical encoders, and record-specific digest domains live
+in `crates/ostadix-api/src/computation/realization_plan.rs`. The V2 suffixes on
+`LogicalHGraphV2`, `DeploymentPlanV2`, and `RuntimeGraphV2` distinguish these
+general operation-schema shapes from project-specific V1 records and from the
+separate solved-executable-HGraph coordinate. Numerical agreement across those
+families conveys no conversion or compatibility.
+
+The marked-project CLI adds three independent bridge/report coordinates:
+
+| Surface | Coordinate | Source constant |
+|---|---|---|
+| Manifest route-pipeline projection | `ostadix.project-route-pipeline/v1` | `OPERATION_ROUTE_PIPELINE_SCHEMA_V1` in `src/bin/o-cli.rs` |
+| Runtime observation binding | `ostadix.operation-runtime-binding/v1` | `OPERATION_RUNTIME_BINDING_SCHEMA_V1` in `src/bin/o-cli.rs` |
+| Operation command error envelope | `ostadix.operation-command-error/v1` | `OPERATION_COMMAND_ERROR_SCHEMA_V1` in `src/bin/o-cli.rs` |
+
+The route-pipeline coordinate identifies the deterministic serialized projection
+of the exact manifest route fields; the descriptor's execution-pipeline content
+reference must match it. The descriptor's implementation digest independently
+binds a captured regular non-symlink file, and the manifest tuple key binds the
+exact cost-profile ID. These joins do not prove that the route loads the named
+implementation, behavioral equivalence, or physical target execution.
+
+The runtime-binding coordinate identifies content that includes an exact
+`RunContentRefV1`, unchanged bundle digest, current recomputed
+`OperationPlanningRequestV1`/`DeploymentPlanV2` IDs and selected tuple, exact
+route-pipeline identity, and recorded-versus-recomputed project-route
+logical-HGraph/deployment identities. `RunRecordV1` persisted the bundle, route,
+route result, and project-route plan identities, but it did not persist the
+operation planning-request ID, operation DeploymentPlan V2 ID, or selected
+candidate tuple. The runtime binding is therefore current-binary consistency
+evidence, not historical persistence of those operation-plan coordinates.
+
+`REQUIREMENT_FOOTPRINT_CONTENT_SCHEMA_V1` is
+`ostadix.placement.requirement-footprint/v1`. It labels a raw canonical-content
+join to the existing placement footprint; it is not a typed planning-record ID
+or an authority coordinate.
+
 `OComputationManifestV1` and `FacetKindV1` were first introduced after v0.3.0
 on the unreleased 0.4 line. The facet-kind spellings `operation_contract`,
-`operation_interface`, `realization_descriptor`, and `realization_set` are part
-of that manifest's initial V1 freeze before its first package release. Existing
-pinned `OComputationManifestV1` byte vectors remain unchanged. Older unreleased
-binaries may reject newly authored manifests that carry these spellings; this
-is not a claim of backwards reader compatibility.
+`operation_interface`, `realization_descriptor`, `realization_set`,
+`physical_representation`, `transfer_plan`, `cost_profile`, `objective`, and
+`recovery_plan` are part of that manifest's initial V1 freeze before its first
+package release. Existing pinned `OComputationManifestV1` byte vectors remain
+unchanged. Older unreleased binaries may reject newly authored manifests that
+carry these spellings; this is not a claim of backwards reader compatibility.
 
-`ostadix.operation-inspection/v1` and
-`ostadix.operation-verification/v1` version CLI output envelopes, not the four
-input records. They report validation and referential consistency. They do not
-version a planner, selector, proof system, evidence authenticator, placement or
-execution protocol, recovery mechanism, or authority object. The package
-version report does not currently add these experimental coordinates; the
-source constants and `docs/OPERATION_REALIZATION_V1.md` are authoritative.
+`ostadix.operation-inspection/v1`, `ostadix.operation-verification/v1`,
+`ostadix.operation-project-description/v1`,
+`ostadix.operation-realization-catalog/v1`,
+`ostadix.operation-plan-summary/v1`, `ostadix.operation-observation/v1`, and
+`ostadix.operation-replan/v1` version successful CLI output envelopes, not the
+input records or an authority protocol. `ostadix.operation-command-error/v1`
+separately versions their JSON error envelope. Inspection and verification
+retain their referential-only meaning. Planning envelopes report deterministic
+static selection. The observation envelope carries a `RuntimeGraphV2` bound to
+a content-verified retained record plus the current recomputed operation and
+project-route plans; it is not a historical operation-plan receipt. The
+replanning envelope carries a recomputed `DeploymentPlanV2` and carries a
+`RecoveryPlanV1` only for a failed source observation whose replacement
+selection changes. Its ambient target alternatives are descriptive/static, not
+distinct observed failure domains. Recovery planning and recovery execution are
+separate; the command does not dispatch the alternative. These envelopes create
+no World state, recovery action, or dispatch authority. The package version
+report does not currently add these experimental coordinates; the source
+constants, `docs/OPERATION_REALIZATION_V1.md`, and
+`docs/OPERATION_PLANNING_V1.md` are authoritative.
 
 ### Attribution-rewrite provenance map
 
@@ -247,6 +313,15 @@ commits to them.
     plan, winner selection, behavioral-equivalence proof, authenticated
     evidence, target eligibility, placement, execution, recovery, admission,
     capability, lease, or World authority.
+13. Operation-planning records use independent coordinates and typed identities.
+    Static rankability is not live eligibility. A deployment selection, runtime
+    observation, or verified recovery closure cannot be uplifted into admission,
+    reservation, lease, dispatch, checkpoint restoration, effect fencing, or
+    World authority. A current-binary observation does not retrospectively add
+    an operation plan or selected tuple to `RunRecordV1`; descriptive target
+    alternatives do not establish distinct failure domains; and recovery
+    planning does not execute recovery. Replanning a successful retained run is
+    not recovery.
 
 The frozen M2 records, additive Fabric authority, and exact ALPN routes use
 these exported coordinates:

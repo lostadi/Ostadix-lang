@@ -805,6 +805,9 @@ class SourceReleaseTests(unittest.TestCase):
             "docs/O_MACHINE_CONTRACT.md": WORLD_NORMATIVE_BYTES[
                 "docs/O_MACHINE_CONTRACT.md"
             ],
+            "docs/OPERATION_PLANNING_V1.md": (
+                "# Fixture operation-planning V1 contract\n"
+            ),
             "docs/OPERATION_REALIZATION_V1.md": (
                 "# Fixture operation-realization V1 contract\n"
             ),
@@ -901,6 +904,19 @@ class SourceReleaseTests(unittest.TestCase):
             )
             + "\n",
             "examples/docker_literal/main.py": "__oval_result__ = 42\n",
+            "examples/normalize/input.json": "{\"values\": [1, 2, 3]}\n",
+            "examples/normalize/normalize_chunked.py": (
+                "__oval_result__ = {'values': [0.0, 0.5, 1.0]}\n"
+            ),
+            "examples/normalize/normalize_scalar.py": (
+                "__oval_result__ = {'values': [0.0, 0.5, 1.0]}\n"
+            ),
+            "examples/normalize/olang.project.toml": (
+                "name = \"normalize-fixture\"\n"
+                "[operation]\n"
+                "request = \"operation-planning-request.json\"\n"
+            ),
+            "examples/normalize/operation-planning-request.json": "{}\n",
             "examples/semantic_custody.O": "text^(fixture)_text\n",
             "examples/wasm_hello.O": "text^(fixture-wasm)_text\n",
             "examples/webassembly_hello.O": "text^(fixture-webassembly)_text\n",
@@ -1064,6 +1080,7 @@ class SourceReleaseTests(unittest.TestCase):
             "crates/ostadix-api/src/computation/build_oir.rs": "// fixture ordinary-O computation projection\n",
             "crates/ostadix-api/src/computation/build_project.rs": "// fixture project computation projection\n",
             "crates/ostadix-api/src/computation/mod.rs": "pub mod verify;\n",
+            "crates/ostadix-api/src/computation/realization_plan.rs": "// fixture operation planning records\n",
             "crates/ostadix-api/src/computation/verify.rs": "// fixture computation artifact verification\n",
             "crates/ostadix-api/src/computation_core.rs": "// fixture authority-free computation identity\n",
             "crates/ostadix-api/src/dispatch_model.rs": "// fixture pure dispatch contract\n",
@@ -1255,6 +1272,9 @@ class SourceReleaseTests(unittest.TestCase):
             "tests/o_cli_intent_blackbox.rs": "#[test] fn o_cli_intent_blackbox_fixture() {}\n",
             "tests/o_cli_operation_blackbox.rs": (
                 "#[test] fn o_cli_operation_blackbox_fixture() {}\n"
+            ),
+            "tests/o_cli_operation_planner_blackbox.rs": (
+                "#[test] fn o_cli_operation_planner_blackbox_fixture() {}\n"
             ),
             "tests/unified_plan_boundaries.rs": "#[test] fn unified_plan_boundaries_fixture() {}\n",
             "tests/test_release_evidence.py": "# fixture release evidence tests\n",
@@ -1564,6 +1584,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "docs/HOSTED_WORLD_REFERENCE_PROFILE.md",
                 "docs/KERNEL_WORLD_CONTRACT.md",
                 "docs/O_MACHINE_CONTRACT.md",
+                "docs/OPERATION_PLANNING_V1.md",
                 "docs/OPERATION_REALIZATION_V1.md",
                 "docs/OSTADIX_BOOT.md",
                 "docs/OSTADIX_BOOT_OBJECTS.md",
@@ -1609,6 +1630,11 @@ class SourceReleaseTests(unittest.TestCase):
                 "evidence/world/transcripts/g2-aarch64-qemu-2026-08-03.log",
                 "examples/manifest.json",
                 "examples/docker_literal/main.py",
+                "examples/normalize/input.json",
+                "examples/normalize/normalize_chunked.py",
+                "examples/normalize/normalize_scalar.py",
+                "examples/normalize/olang.project.toml",
+                "examples/normalize/operation-planning-request.json",
                 "examples/semantic_custody.O",
                 "examples/wasm_hello.O",
                 "examples/webassembly_hello.O",
@@ -1724,6 +1750,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "crates/ostadix-api/src/computation/build_oir.rs",
                 "crates/ostadix-api/src/computation/build_project.rs",
                 "crates/ostadix-api/src/computation/mod.rs",
+                "crates/ostadix-api/src/computation/realization_plan.rs",
                 "crates/ostadix-api/src/computation/verify.rs",
                 "crates/ostadix-api/src/computation_core.rs",
                 "crates/ostadix-api/src/dispatch_model.rs",
@@ -1893,6 +1920,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "tests/unified_intent_acceptance.rs",
                 "tests/o_cli_intent_blackbox.rs",
                 "tests/o_cli_operation_blackbox.rs",
+                "tests/o_cli_operation_planner_blackbox.rs",
                 "tests/unified_plan_boundaries.rs",
                 "tests/test_release_evidence.py",
                 "tests/test_setup.py",
@@ -3103,6 +3131,26 @@ class SourceReleaseTests(unittest.TestCase):
 
         self._assert_missing_required_paths(
             "missing-operation-realization-contract.zip",
+            required,
+        )
+
+    def test_operation_planning_release_closure_is_required(self) -> None:
+        required = (
+            "docs/OPERATION_PLANNING_V1.md",
+            "crates/ostadix-api/src/computation/realization_plan.rs",
+            "tests/o_cli_operation_planner_blackbox.rs",
+            "examples/normalize/input.json",
+            "examples/normalize/normalize_chunked.py",
+            "examples/normalize/normalize_scalar.py",
+            "examples/normalize/olang.project.toml",
+            "examples/normalize/operation-planning-request.json",
+        )
+        self._commit()
+        self._git("rm", *required)
+        self._git("commit", "-q", "-m", "remove operation-planning closure")
+
+        self._assert_missing_required_paths(
+            "missing-operation-planning-closure.zip",
             required,
         )
 

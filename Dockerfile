@@ -67,7 +67,7 @@ RUN printf '%s\n' \
     '#!/bin/sh' \
     'set -e' \
     'case "${1:-}" in' \
-    '  run|routes|optimize|plan|explain|inspect|object|operation|help|--help|-h) exec o-cli "$@" ;;' \
+    '  run|routes|optimize|plan|explain|inspect|object|operation|realizations|observe|replan|help|--help|-h) exec o-cli "$@" ;;' \
     '  *) exec O "$@" ;;' \
     'esac' \
     > /usr/local/bin/o \

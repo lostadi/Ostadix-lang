@@ -33,6 +33,62 @@
   grant of evidence, admission, capability, lease, or World authority. Empty
   validation evidence is explicitly declaration-only. The complete boundary is
   specified in `docs/OPERATION_REALIZATION_V1.md`.
+- The additive operation-planning surface in
+  `crates/ostadix-api/src/computation/realization_plan.rs` defines bounded,
+  canonical physical-representation, transfer, cost-profile, objective,
+  Logical-HGraph V2, DeploymentPlan V2, RuntimeGraph V2, RecoveryPlan V1, and
+  planning-request records with independent domain-separated identities. Its
+  first planner profile accepts exactly one logical operation and explicitly
+  supplied complete candidate tuples; it performs no Cartesian expansion. It
+  checks the exact semantic-record closure, fidelity and target-footprint
+  content references, complete static target facts, port/value/representation
+  coverage, and cost-profile binding. Dynamic environment, effect, and resource
+  requirements are rejected. The only score is the checked sum of six integer
+  cost components plus `uncertainty_ns`; equal scores use the canonical
+  candidate tuple. `StaticallyCompatibleForRanking` is not live target
+  eligibility.
+- A marked operation project binds every declared descriptor/target offer to one
+  exact checked-in project route through a complete
+  `(descriptor, target, cost profile)` key. The descriptor's implementation
+  digest must equal the bytes of the manifest-named captured regular file, and
+  its execution-pipeline reference must equal the
+  `ostadix.project-route-pipeline/v1` projection of the bound route. These are
+  separate exact identity joins: they do not prove that the route loads the
+  named implementation, behavioral equivalence, or execution on the target
+  described by the tuple. `o operation` and `o realizations` inspect that
+  captured closure without selecting; `o plan --explain` selects without
+  dispatch; and `o run` repeats preflight, pins the selected route plus its
+  project HGraph/deployment identities, executes it through the existing project
+  admission/executor path, and requires durable recording.
+- `o observe` reads and content-verifies an exact terminal record and checks its
+  project path, captured bundle digest, selected route, single route result, and
+  recorded project-route plan identities against current-binary recomputation.
+  It emits a `RuntimeGraphV2` whose evidence binds the `RunContentRefV1` and
+  current recomputed operation plan IDs and tuple under
+  `ostadix.operation-runtime-binding/v1`. `RunRecordV1` did not persist the
+  operation planning-request ID, operation `DeploymentPlanV2` ID, or selected
+  `RealizationCandidateTupleV1`; the observation therefore does not prove those
+  operation coordinates or tuple were recorded at execution time.
+- `o replan --without-target` filters caller-named offers and emits a recomputed
+  `DeploymentPlanV2` without dispatch. It emits a descriptive `RecoveryPlanV1`
+  only for a failed exact source observation when selection changes. A
+  successful source run is not a recovery event.
+  Recovery planning is not recovery execution. The normalize example's two
+  ambient-Python target offers are static descriptions. They are not distinct
+  observed machines or failure domains; alternate selection is not a
+  fallback-success or independence claim.
+- `RuntimeGraphV2::verify_against` closes observations over candidates selected
+  by an exact deployment, while `RecoveryPlanV1::verify_against` additionally
+  requires the selected candidate to have a failed observation and every
+  ordered alternative to be a distinct non-rejected deployment candidate.
+  These are internally consistent caller-supplied records, not authenticated
+  runtime evidence or mechanisms that dispatch, retry, restore checkpoints,
+  migrate state, or fence effects. State and actor requirements, objective
+  ruleset content, cost/validation evidence, and physical residency feasibility
+  remain unresolved. Planning and record validation grant no admission,
+  capability, warrant, reservation, lease, dispatch, recovery, or World
+  authority. The exact boundary is specified in
+  `docs/OPERATION_PLANNING_V1.md`.
 - The hosted process protocol uses a 4-byte big-endian length prefix followed
   by canonical CBOR encoding in `crates/ostadix-api/src/wire.rs`; maps are sorted by encoded key
   length and bytes before transmission.

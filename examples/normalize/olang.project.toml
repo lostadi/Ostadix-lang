@@ -1,0 +1,51 @@
+[project]
+name = "normalize-operation-project"
+default_route = "normalize_scalar"
+
+[[routes]]
+id = "normalize_scalar"
+label = "normalize JSON values with the scalar Python realization"
+kind = "interpreter"
+command = ["python3", "normalize_scalar.py", "input.json"]
+inputs = ["normalize_scalar.py", "input.json"]
+result_codec = "json"
+guards = { requires_command = "python3" }
+default = true
+pure = true
+
+[[routes]]
+id = "normalize_chunked"
+label = "normalize JSON values with the chunked Python realization"
+kind = "interpreter"
+command = ["python3", "normalize_chunked.py", "input.json"]
+inputs = ["normalize_chunked.py", "input.json"]
+result_codec = "json"
+guards = { requires_command = "python3" }
+pure = true
+
+[operation]
+name = "normalize"
+logical_operation = "tensor/normalize"
+request = "operation-planning-request.json"
+
+[[operation.bindings]]
+descriptor_sha256 = "70793496c4d48f03e2678cb1eaada83fafff2d79b3f175a32b83558622e73ffb"
+realization = "normalize/python-chunked/v1"
+target_sha256 = "742beeb198868664078a9cf8e17a4f84574166f4702e6c05003d3603c82338f4"
+target = "Ambient Python Primary"
+cost_profile_sha256 = "be90f17dfdbd194fa854d8e6526beef3bcd043e4455622530da7f46e4c0a9042"
+route = "normalize_chunked"
+implementation = "normalize_chunked.py"
+
+[[operation.bindings]]
+descriptor_sha256 = "35b5aab91c82acacb5a6afa6c98075b3f8e57edde6cd86374d2543e190d237a7"
+realization = "normalize/python-scalar/v1"
+target_sha256 = "89ca2e344336767a0e0e28700f43157e70048989d10cb31919a4daafa9a2bc05"
+target = "Ambient Python Fallback"
+cost_profile_sha256 = "9858b0211dcc199ff21d8622c1eb2ba8dc71059a9be3a30ad034b2d131d8b5a5"
+route = "normalize_scalar"
+implementation = "normalize_scalar.py"
+
+[[operation.unavailable_targets]]
+target = "gpu-1"
+reason = "no GPU realization is offered by this offline ambient-Python example"

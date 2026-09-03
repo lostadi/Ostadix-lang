@@ -77,6 +77,10 @@ class LowercaseCliDispatchTests(unittest.TestCase):
             ("explain", "last-run"),
             ("inspect", "last-run", "--trace"),
             ("operation", "inspect", "set", "set.cbor", "--json"),
+            ("operation", "normalize", "--json"),
+            ("realizations", "normalize", "--json"),
+            ("observe", "normalize", "--run", "last-run", "--json"),
+            ("replan", "normalize", "--without-target", "gpu-1", "--json"),
         ):
             with self.subTest(arguments=arguments):
                 self.assert_dispatch(arguments, list(arguments))
@@ -214,7 +218,10 @@ class LowercaseCliDispatchTests(unittest.TestCase):
         capacity_host = (
             PROJECT_ROOT / "scripts" / "prepare-x86_64-capacity-host.sh"
         ).read_text(encoding="utf-8")
-        expected = "run|routes|optimize|plan|explain|inspect|object|operation"
+        expected = (
+            "run|routes|optimize|plan|explain|inspect|object|operation|"
+            "realizations|observe|replan"
+        )
         self.assertIn(expected, dockerfile)
         self.assertIn(expected, capacity_host)
 

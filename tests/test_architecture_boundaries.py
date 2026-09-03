@@ -177,7 +177,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         self.assertEqual(
             result.stdout,
             "architecture dependency boundaries: PASS "
-            "(186 production files, 47 roots, 223 cross-root edges)\n",
+            "(187 production files, 47 roots, 225 cross-root edges)\n",
         )
 
     def test_manifest_inventories_every_current_root_edge_override_and_facade(self) -> None:
@@ -200,7 +200,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         )
         self.assertEqual(len(roots), 47)
         self.assertEqual(
-            sum(len(root["allowed_dependencies"]) for root in roots), 223
+            sum(len(root["allowed_dependencies"]) for root in roots), 225
         )
         api_root = next(root for root in roots if root["name"] == "api")
         self.assertIn("ir", api_root["allowed_dependencies"])
@@ -317,6 +317,26 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         self.assertEqual(
             computation_core["allowed_dependencies"],
             ["canonical_cbor", "resource_identity"],
+        )
+
+        computation = next(
+            root for root in manifest["root"] if root["name"] == "computation"
+        )
+        self.assertEqual(computation["layer"], 15)
+        self.assertEqual(
+            computation["allowed_dependencies"],
+            [
+                "canonical_cbor",
+                "computation_core",
+                "evidence",
+                "execution_contract",
+                "hgraph",
+                "ir",
+                "parser",
+                "placement",
+                "project",
+                "resource_identity",
+            ],
         )
 
     def test_computation_core_accepts_only_its_frozen_lower_seams(self) -> None:

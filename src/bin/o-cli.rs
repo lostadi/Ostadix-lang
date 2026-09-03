@@ -2,7 +2,8 @@
 //!
 //! The Bash dispatcher retains legacy command routing and evaluator fallthrough,
 //! but sends `run`, `routes`, `optimize`, `plan`, `explain`, `inspect`, `object`,
-//! and `operation` here so their grammar is defined once. Execution and
+//! `operation`, `realizations`, `observe`, and `replan` here so their grammar
+//! is defined once. Execution and
 //! planning call the library intent API directly;
 //! this binary never shells out to `O`, `olangc`, `o-link`, or `o-node`.
 
@@ -14,13 +15,19 @@ use o_lang::boot_objects::{
     portable_boot_object_ref, BootObjectIndex, BootObjectRecord, BootObjectStore, BootPathBinding,
     BOOT_OBJECT_STORE_ENV, DEFAULT_BOOT_OBJECT_STORE,
 };
+use o_lang::computation::realization_plan::{
+    plan_operation_realization_v1, CandidateDispositionV1, DeploymentPlanV2,
+    OperationPlanningRequestV1, PlanningReasonV1, RealizationCandidateTupleV1,
+    RecoveryAlternativeV1, RecoveryPlanV1, RuntimeGraphV2, RuntimeMetricsV2,
+    RuntimeObservationStateV2, RuntimeObservationV2, MAX_REALIZATION_PLAN_RECORD_BYTES_V1,
+};
 use o_lang::computation::OComputationBuilderV1;
 use o_lang::computation_core::{
     artifact_id_for_bytes, verify_realization_set_v1, ComputationLineageId, ComputationTokenV1,
     DerivationInputV1, DerivationRefV1, DerivationRelationV1, FacetIdV1, FacetKindV1, FacetRefV1,
     OComputationErrorV1, OperationContractV1, OperationInterfaceV1, RealizationDescriptorV1,
-    RealizationSetV1, TransformIdentityV1, MAX_OPERATION_SEMANTIC_RECORD_BYTES_V1,
-    MAX_REALIZATION_SET_MEMBERS_V1,
+    RealizationSetV1, SemanticArtifactRefV1, TransformIdentityV1,
+    MAX_OPERATION_SEMANTIC_RECORD_BYTES_V1, MAX_REALIZATION_SET_MEMBERS_V1,
 };
 use o_lang::evidence::{
     source_sha256, ExecutionIntentV1, ADMISSION_SCHEMA_V6, SCHEDULE_EXPLANATION_SCHEMA_V2,
@@ -37,23 +44,25 @@ use o_lang::intent::{
     render_ordinary_value_stdout_with_color, route_result_references, CapturedStreamV1,
     ExecutionObservationV1, LocalOExecutorV1, OrdinaryExecutionTraceV1, OrdinaryOExecutionErrorV1,
     PrepareExecutionOptionsV1, PreparedExecutionIntentV1, ProjectExecutorV1,
-    ProjectSelectionReuseObservationV1, RecordedRouteResultV1, RunDispositionV1, RunFailureV1,
-    RunRecordV1, RunRecordingStatusV1, RunResultReferenceV1, RunSelectorV1, RunStoreReaderV1,
-    RunStoreV1, RunSummaryV1, RunTraceAttachmentV1, RunTraceBindingV1,
-    SelectionReuseExecutionErrorV1, RUN_SUMMARY_SCHEMA_V1,
+    ProjectSelectionReuseObservationV1, RecordedRouteResultV1, RunContentRefV1, RunDispositionV1,
+    RunFailureV1, RunInputKindV1, RunRecordV1, RunRecordingStatusV1, RunResultReferenceV1,
+    RunSelectorV1, RunStoreReaderV1, RunStoreV1, RunSummaryV1, RunTraceAttachmentV1,
+    RunTraceBindingV1, SelectionReuseExecutionErrorV1, RUN_SUMMARY_SCHEMA_V1,
 };
 use o_lang::project::executor::{ProjectExecutionError, ProjectExecutionFailureClass};
 use o_lang::project::model::OutputCapture;
 use o_lang::project::runtime::public_route_execution_diagnostic;
 use o_lang::project::{
-    OExecutionResult, ProjectBundle, ResultCodec, RouteKind, RoutePolicy, RouteSet,
-    SelectionReuseOutputStatusV1, ValidatedSelectionCandidateProgressV1,
+    build_project_hgraph, DeploymentPlanV1, OExecutionResult, ProjectBundle, ResultCodec,
+    RouteFailureContinuation, RouteGuard, RouteKind, RoutePolicy, RouteProvenance, RouteSet,
+    RouteSpec, SelectionReuseOutputStatusV1, ValidatedSelectionCandidateProgressV1,
     ValidatedSelectionDispositionV1, ValidatedSelectionMismatchV1,
     ValidatedSelectionProgressEventV1, ValidatedSelectionProgressObserverV1,
     ValidatedSelectionReceiptV1,
 };
 use o_lang::resource_identity::ArtifactId;
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
@@ -70,6 +79,17 @@ const OPTIMIZE_SUMMARY_SCHEMA_V1: &str = "ostadix.optimize-summary/v1";
 const ROUTE_CATALOG_SCHEMA_V1: &str = "ostadix.route-catalog/v1";
 const OPERATION_INSPECTION_SCHEMA_V1: &str = "ostadix.operation-inspection/v1";
 const OPERATION_VERIFICATION_SCHEMA_V1: &str = "ostadix.operation-verification/v1";
+const OPERATION_PROJECT_DESCRIPTION_SCHEMA_V1: &str = "ostadix.operation-project-description/v1";
+const OPERATION_REALIZATION_CATALOG_SCHEMA_V1: &str = "ostadix.operation-realization-catalog/v1";
+const OPERATION_PLAN_SUMMARY_SCHEMA_V1: &str = "ostadix.operation-plan-summary/v1";
+const OPERATION_OBSERVATION_SCHEMA_V1: &str = "ostadix.operation-observation/v1";
+const OPERATION_REPLAN_SCHEMA_V1: &str = "ostadix.operation-replan/v1";
+const OPERATION_COMMAND_ERROR_SCHEMA_V1: &str = "ostadix.operation-command-error/v1";
+const OPERATION_ROUTE_PIPELINE_SCHEMA_V1: &str = "ostadix.project-route-pipeline/v1";
+const OPERATION_RUNTIME_BINDING_SCHEMA_V1: &str = "ostadix.operation-runtime-binding/v1";
+const MAX_OPERATION_PROJECT_MANIFEST_BYTES_V1: usize = 256 * 1024;
+const MAX_OPERATION_PROJECT_BINDINGS_V1: usize = 65_536;
+const MAX_OPERATION_PROJECT_UNAVAILABLE_TARGETS_V1: usize = 4_096;
 const MAX_OPERATION_RECORD_FILE_BYTES_V1: u64 = MAX_OPERATION_SEMANTIC_RECORD_BYTES_V1 as u64;
 const MAX_OPERATION_VALIDATION_DIAGNOSTIC_BYTES_V1: usize = 16 * 1024;
 const OPERATION_DIAGNOSTIC_TRUNCATION_SUFFIX: &str = "...[truncated]";
@@ -77,7 +97,7 @@ const OPERATION_DIAGNOSTIC_TRUNCATION_SUFFIX: &str = "...[truncated]";
 /// This permits sixteen maximum-sized semantic records while bounding aggregate
 /// metadata walks, reads, and retained decoded values independently of ARG_MAX.
 const MAX_OPERATION_VERIFICATION_TOTAL_BYTES_V1: u64 = 64 * 1024 * 1024;
-const OPERATIONAL_COMMANDS: &str = "Run highlights:\n  o run FILE.O --parallel auto          local HGraph workers only\n  o run PROJECT --parallel auto         mesh prefer with safe local fallback\n  o run PROJECT --mesh=required         authenticated remote placement required\n  o routes PROJECT                      inspect routes without executing them\n  o optimize PROJECT --route ROUTE_SET  measure and validate every alternative\n  o run PROJECT --selection-run RUN_ID  execute one exact validated winner\n  Mesh controls include --mesh-retries, --mesh-local-fallback, and --closed-registry.\n\nSemantic operation records:\n  o operation inspect KIND FILE         validate and inspect one inert record\n  o operation verify --contract FILE --interface FILE --descriptor FILE --set FILE\n                                        check exact referential consistency only\n\nBoot-object commands:\n  o object root|list|stat|get|verify     typed read-only boot CAS\n\nOperational commands retained by the repository dispatcher:\n  node start|stop|status|restart|pair|list|use|profile|doctor|run|session ...\n  node-host <command> ...\n  registry <command> ...\n  info <command> ...\n  live <command> ...\n  receipt [ogit arguments]\n  kernel <command>\n  why FILE.O P<N> [olangc options]\n\nUnknown command forms retain historical evaluator behavior.";
+const OPERATIONAL_COMMANDS: &str = "Run highlights:\n  o run FILE.O --parallel auto          local HGraph workers only\n  o run PROJECT --parallel auto         mesh prefer with safe local fallback\n  o run PROJECT --mesh=required         authenticated remote placement required\n  o routes PROJECT                      inspect routes without executing them\n  o optimize PROJECT --route ROUTE_SET  measure and validate every alternative\n  o run PROJECT --selection-run RUN_ID  execute one exact validated winner\n  Mesh controls include --mesh-retries, --mesh-local-fallback, and --closed-registry.\n\nOperation-project vertical slice:\n  o operation PROJECT                   describe one explicitly marked project\n  o realizations PROJECT                list declared realization/route bindings\n  o plan PROJECT --explain              select and explain without dispatch\n  o run PROJECT                         plan, bind one route, execute, and record\n  o observe PROJECT                     recompute and match a content-verified run\n  o replan PROJECT --without-target ID  derive a new plan without dispatch\n\nSemantic operation records:\n  o operation inspect KIND FILE         validate and inspect one inert record\n  o operation verify --contract FILE --interface FILE --descriptor FILE --set FILE\n                                        check exact referential consistency only\n\nBoot-object commands:\n  o object root|list|stat|get|verify     typed read-only boot CAS\n\nOperational commands retained by the repository dispatcher:\n  node start|stop|status|restart|pair|list|use|profile|doctor|run|session ...\n  node-host <command> ...\n  registry <command> ...\n  info <command> ...\n  live <command> ...\n  receipt [ogit arguments]\n  kernel <command>\n  why FILE.O P<N> [olangc options]\n\nUnknown command forms retain historical evaluator behavior.";
 #[derive(Debug, Parser)]
 #[command(
     name = "o",
@@ -122,10 +142,16 @@ enum IntentCommand {
     Object(ObjectArgs),
     /// Inspect or cross-check inert semantic operation and realization records.
     #[command(
-        long_about = "Inspect canonical semantic operation records or check their exact referential consistency. These commands do not resolve referenced artifacts, prove behavioral equivalence, plan, select, place, execute, recover, observe World state, or grant authority.",
-        after_long_help = "KIND is one of: contract, interface, descriptor, set. Input is validated JSON when its first non-whitespace byte is `{`; every other input must be strict canonical CBOR. Record kind is never inferred from a filename or embedded schema."
+        long_about = "Describe one explicitly marked operation-project directory, inspect canonical semantic operation records, or check their exact referential consistency. Project description is read-only and validates each explicit descriptor implementation and route-pipeline reference against the captured bundle; standalone record inspection/verification does not resolve referenced artifacts. These commands do not prove behavioral equivalence, plan, select, place, execute, recover, observe World state, or grant authority.",
+        after_long_help = "PROJECT must be an existing directory whose captured olang.project.toml contains [operation]; names are never resolved through an implicit registry. KIND is one of: contract, interface, descriptor, set. Record input is validated JSON when its first non-whitespace byte is `{`; every other input must be strict canonical CBOR. Record kind is never inferred from a filename or embedded schema."
     )]
     Operation(OperationArgs),
+    /// List the realization candidates declared by one marked operation project.
+    Realizations(OperationTargetArgs),
+    /// Recompute a marked operation plan and match one content-verified retained run.
+    Observe(OperationObserveArgs),
+    /// Derive a new non-executing plan from one current-binary run observation.
+    Replan(OperationReplanArgs),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -349,6 +375,11 @@ struct RunArgs {
     /// Explain live mesh candidate and placement decisions on stderr.
     #[arg(long = "explain-mesh")]
     explain_mesh: bool,
+
+    /// Internal operation-plan binding installed only after exact marked-project
+    /// preflight. It is never accepted from argv.
+    #[arg(skip)]
+    operation_run: Option<OperationRunBindingV1>,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -422,6 +453,7 @@ impl OptimizeArgs {
             mesh_peer_root: None,
             mesh_trace_out: None,
             explain_mesh: false,
+            operation_run: None,
         }
     }
 }
@@ -484,6 +516,71 @@ struct LoadedRouteCatalog {
     bundle: ProjectBundle,
 }
 
+#[derive(Clone, Debug, serde::Deserialize)]
+struct OperationProjectManifestRootV1 {
+    operation: Option<OperationProjectSectionV1>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OperationProjectSectionV1 {
+    name: String,
+    logical_operation: String,
+    request: String,
+    #[serde(default)]
+    bindings: Vec<OperationRouteBindingV1>,
+    #[serde(default)]
+    unavailable_targets: Vec<UnavailableOperationTargetV1>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct OperationRouteBindingV1 {
+    descriptor_sha256: String,
+    realization: String,
+    target_sha256: String,
+    target: String,
+    cost_profile_sha256: String,
+    route: String,
+    implementation: String,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct UnavailableOperationTargetV1 {
+    target: String,
+    reason: String,
+}
+
+#[derive(Clone, Debug)]
+struct OperationRunBindingV1 {
+    bundle_sha256: String,
+    route: String,
+    route_plan_sha256: String,
+    route_deployment_sha256: String,
+}
+
+#[derive(serde::Serialize)]
+struct OperationRoutePipelineProjectionV1<'a> {
+    schema: &'static str,
+    route_id: &'a str,
+    kind: RouteKind,
+    command: &'a [String],
+    evaluator: Option<&'a str>,
+    entrypoint: Option<&'a str>,
+    working_directory: &'a str,
+    arguments: &'a [String],
+    environment: &'a BTreeMap<String, String>,
+    prerequisites: &'a [String],
+    inputs: &'a [String],
+    outputs: &'a [String],
+    effects: &'a o_lang::project::RouteEffects,
+    failure_continuation: RouteFailureContinuation,
+    result_codec: ResultCodec,
+    provides: &'a [String],
+    guards: &'a [RouteGuard],
+}
+
 #[derive(Debug, Args)]
 struct PlanArgs {
     /// A .O source/lifted bundle or project directory.
@@ -525,6 +622,10 @@ struct PlanArgs {
     /// Append the ordinary .O static admission and schedule explanation.
     #[arg(long = "explain-schedule")]
     explain_schedule: bool,
+
+    /// Explain deterministic realization selection for a marked operation project.
+    #[arg(long, conflicts_with = "explain_schedule")]
+    explain: bool,
 
     /// Select text or strict JSON schedule rendering.
     #[arg(long, value_enum)]
@@ -679,9 +780,69 @@ struct ObjectVerifyArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(args_conflicts_with_subcommands = true, arg_required_else_help = true)]
 struct OperationArgs {
     #[command(subcommand)]
-    command: OperationCommand,
+    command: Option<OperationCommand>,
+
+    #[command(flatten)]
+    describe: OperationDescribeArgs,
+}
+
+#[derive(Clone, Debug, Args)]
+struct OperationDescribeArgs {
+    /// Existing directory whose olang.project.toml contains an `[operation]` section.
+    #[arg(value_name = "TARGET")]
+    target: Option<PathBuf>,
+
+    /// Emit one versioned machine-readable operation description.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Clone, Debug, Args)]
+struct OperationTargetArgs {
+    /// Existing directory whose olang.project.toml contains an `[operation]` section.
+    #[arg(value_name = "TARGET")]
+    target: PathBuf,
+
+    /// Emit one versioned machine-readable result.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Clone, Debug, Args)]
+struct OperationObserveArgs {
+    /// Existing marked operation-project directory.
+    #[arg(value_name = "TARGET")]
+    target: PathBuf,
+
+    /// `last-run` or an exact retained run identifier.
+    #[arg(long, value_name = "RUN", default_value = "last-run")]
+    run: String,
+
+    /// Emit one versioned machine-readable observation.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Clone, Debug, Args)]
+struct OperationReplanArgs {
+    /// Existing marked operation-project directory.
+    #[arg(value_name = "TARGET")]
+    target: PathBuf,
+
+    /// Exclude this exact declared target from the new plan (repeatable).
+    #[arg(long = "without-target", value_name = "TARGET_ID", required = true)]
+    without_targets: Vec<String>,
+
+    /// `last-run` or an exact retained run identifier used as the prior observation.
+    #[arg(long, value_name = "RUN", default_value = "last-run")]
+    run: String,
+
+    /// Emit one versioned machine-readable replanning result.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -933,7 +1094,52 @@ fn dispatch(command: IntentCommand) -> Result<i32> {
         IntentCommand::Inspect(args) => inspect_pending(&args),
         IntentCommand::Computation(args) => computation_artifact(&args),
         IntentCommand::Object(args) => object_command(&args),
-        IntentCommand::Operation(args) => operation_command(&args),
+        IntentCommand::Operation(args) => {
+            let json = args.command.is_none() && args.describe.json;
+            operation_family_result("operation", json, || operation_command(&args))
+        }
+        IntentCommand::Realizations(args) => {
+            operation_family_result("realizations", args.json, || operation_realizations(&args))
+        }
+        IntentCommand::Observe(args) => {
+            operation_family_result("observe", args.json, || operation_observe(&args))
+        }
+        IntentCommand::Replan(args) => {
+            operation_family_result("replan", args.json, || operation_replan(&args))
+        }
+    }
+}
+
+fn operation_family_result(
+    command: &'static str,
+    json: bool,
+    action: impl FnOnce() -> Result<i32>,
+) -> Result<i32> {
+    match action() {
+        Ok(code) => Ok(code),
+        Err(error) if json => {
+            let detail = operation_validation_error(format!("{error:#}")).to_string();
+            let report = serde_json::json!({
+                "schema": OPERATION_COMMAND_ERROR_SCHEMA_V1,
+                "status": "error",
+                "command": command,
+                "error": {
+                    "kind": "validation_failed",
+                    "message": detail.clone(),
+                },
+                "nonclaims": operation_project_nonclaims(
+                    "not_completed",
+                    "not_completed",
+                    "not_run",
+                    "not_performed",
+                    "not_observed",
+                ),
+            });
+            println!("{}", serde_json::to_string(&report)?);
+            eprintln!("error: {detail}");
+            Ok(1)
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -1920,11 +2126,1231 @@ enum DecodedOperationRecord {
     Set(RealizationSetV1),
 }
 
+#[derive(Clone, Debug)]
+struct ResolvedOperationOfferV1 {
+    logical_operation: u64,
+    descriptor_sha256: String,
+    realization: String,
+    implementation: String,
+    implementation_sha256: String,
+    execution_pipeline_schema: String,
+    route_pipeline_sha256: String,
+    target_sha256: String,
+    target_node: String,
+    target: String,
+    cost_profile_sha256: String,
+    predicted_total_ns: u64,
+    route: String,
+}
+
+#[derive(Clone, Debug)]
+struct LoadedOperationProjectV1 {
+    root: PathBuf,
+    bundle: ProjectBundle,
+    bundle_sha256: String,
+    manifest: OperationProjectSectionV1,
+    request: OperationPlanningRequestV1,
+    request_id: String,
+    request_encoding: OperationInputEncodingV1,
+    offers: Vec<ResolvedOperationOfferV1>,
+}
+
+#[derive(Clone, Debug)]
+struct PlannedOperationProjectV1 {
+    request_id: String,
+    deployment: DeploymentPlanV2,
+    deployment_id: String,
+    selected: RealizationCandidateTupleV1,
+    selected_binding: ResolvedOperationOfferV1,
+    route_plan_sha256: String,
+    route_deployment_sha256: String,
+    excluded_targets: Vec<String>,
+    excluded_offer_count: usize,
+}
+
+struct ObservedOperationRunV1 {
+    record: RunRecordV1,
+    selected_route_result_index: usize,
+    planned: PlannedOperationProjectV1,
+    runtime_graph: RuntimeGraphV2,
+    runtime_graph_id: String,
+    runtime_binding: serde_json::Value,
+    run_record_ref: RunContentRefV1,
+}
+
+#[derive(serde::Serialize)]
+struct OperationRuntimeBindingV1<'a> {
+    schema: &'static str,
+    status: &'static str,
+    run_id: &'a str,
+    run_record: &'a RunContentRefV1,
+    bundle_sha256: &'a str,
+    recomputed_planning_request_id: &'a str,
+    recomputed_deployment_plan_id: &'a str,
+    recomputed_selected_candidate: &'a RealizationCandidateTupleV1,
+    recorded_route: &'a str,
+    exact_route_pipeline_sha256: &'a str,
+    recorded_route_plan_sha256: &'a str,
+    recomputed_route_plan_sha256: &'a str,
+    recorded_route_deployment_sha256: &'a str,
+    recomputed_route_deployment_sha256: &'a str,
+}
+
 fn operation_command(args: &OperationArgs) -> Result<i32> {
-    match &args.command {
-        OperationCommand::Inspect(command) => operation_inspect(command),
-        OperationCommand::Verify(command) => operation_verify(command),
+    match (&args.command, args.describe.target.as_ref()) {
+        (Some(OperationCommand::Inspect(command)), None) => operation_inspect(command),
+        (Some(OperationCommand::Verify(command)), None) => operation_verify(command),
+        (None, Some(_)) => operation_describe(&args.describe),
+        _ => bail!("operation command requires either a marked project target or one subcommand"),
     }
+}
+
+fn operation_describe(args: &OperationDescribeArgs) -> Result<i32> {
+    let target = args
+        .target
+        .as_deref()
+        .context("operation description requires an existing marked project directory")?;
+    let loaded = load_operation_project(target)?;
+    let description = serde_json::json!({
+        "schema": OPERATION_PROJECT_DESCRIPTION_SCHEMA_V1,
+        "status": "valid_marked_operation_project",
+        "input": operation_project_input_json(&loaded),
+        "operation": loaded.manifest.name,
+        "logical_operation": loaded.manifest.logical_operation,
+        "planning_request": {
+            "path": loaded.manifest.request,
+            "id": loaded.request_id,
+            "encoding": loaded.request_encoding.token(),
+        },
+        "contract_id": loaded.request.contract.id().map_err(operation_validation_error)?.as_sha256(),
+        "interface_id": loaded.request.interface.id().map_err(operation_validation_error)?.as_sha256(),
+        "realization_set_id": loaded.request.realization_set.id().map_err(operation_validation_error)?.as_sha256(),
+        "objective_id": loaded.request.objective.id().map_err(operation_validation_error)?.as_sha256(),
+        "candidate_offers": loaded.offers.len(),
+        "route_bindings": loaded.offers.len(),
+        "unavailable_targets": loaded.manifest.unavailable_targets,
+        "nonclaims": operation_project_nonclaims("not_performed", "not_performed", "not_run", "not_performed", "not_observed"),
+    });
+    if args.json {
+        println!("{}", serde_json::to_string(&description)?);
+    } else {
+        println!("Ostadix operation project");
+        println!(
+            "Operation: {}",
+            terminal_text_fragment(&loaded.manifest.name)
+        );
+        println!(
+            "Logical operation: {}",
+            terminal_text_fragment(&loaded.manifest.logical_operation)
+        );
+        println!(
+            "Project: {}",
+            terminal_text_fragment(&loaded.root.to_string_lossy())
+        );
+        println!("Bundle SHA-256: {}", loaded.bundle_sha256);
+        println!("Planning request: {}", loaded.request_id);
+        println!("Candidate offers: {}", loaded.offers.len());
+        println!("Explicit route bindings: {}", loaded.offers.len());
+        println!("planning=not_performed");
+        println!("dispatch=not_run");
+        println!("authority=none");
+    }
+    Ok(0)
+}
+
+fn operation_realizations(args: &OperationTargetArgs) -> Result<i32> {
+    let loaded = load_operation_project(&args.target)?;
+    let realizations = loaded
+        .offers
+        .iter()
+        .map(operation_offer_json)
+        .collect::<Vec<_>>();
+    let catalog = serde_json::json!({
+        "schema": OPERATION_REALIZATION_CATALOG_SCHEMA_V1,
+        "status": "declared_candidates",
+        "input": operation_project_input_json(&loaded),
+        "operation": loaded.manifest.name,
+        "logical_operation": loaded.manifest.logical_operation,
+        "planning_request_id": loaded.request_id,
+        "realizations": realizations,
+        "unavailable_targets": loaded.manifest.unavailable_targets,
+        "nonclaims": operation_project_nonclaims("not_performed", "not_performed", "not_run", "not_performed", "not_observed"),
+    });
+    if args.json {
+        println!("{}", serde_json::to_string(&catalog)?);
+    } else {
+        println!(
+            "Realizations for {}",
+            terminal_text_fragment(&loaded.manifest.name)
+        );
+        for offer in &loaded.offers {
+            println!(
+                "  {} @ {} -> {}  declared_cost={}ns  [descriptive target offer; live eligibility and failure-domain independence not observed]",
+                terminal_text_fragment(&offer.realization),
+                terminal_text_fragment(&offer.target),
+                terminal_route_id(&offer.route),
+                offer.predicted_total_ns,
+            );
+        }
+        for unavailable in &loaded.manifest.unavailable_targets {
+            println!(
+                "  target {} unavailable: {}",
+                terminal_text_fragment(&unavailable.target),
+                terminal_text_fragment(&unavailable.reason),
+            );
+        }
+        println!("selection=not_performed");
+        println!("dispatch=not_run");
+        println!("authority=none");
+    }
+    Ok(0)
+}
+
+fn operation_observe(args: &OperationObserveArgs) -> Result<i32> {
+    let loaded = load_operation_project(&args.target)?;
+    let observed = observe_operation_run(&loaded, &args.run)?;
+    let route_result = &observed.record.route_results[observed.selected_route_result_index];
+    let report = serde_json::json!({
+        "schema": OPERATION_OBSERVATION_SCHEMA_V1,
+        "status": "current_binary_recomputed_plan_matched_content_verified_run",
+        "input": operation_project_input_json(&loaded),
+        "operation": loaded.manifest.name,
+        "logical_operation": loaded.manifest.logical_operation,
+        "planning_request_id": loaded.request_id,
+        "deployment_plan_id": observed.planned.deployment_id,
+        "selected_candidate": observed.planned.selected,
+        "runtime_graph_id": observed.runtime_graph_id,
+        "runtime_graph": observed.runtime_graph,
+        "runtime_binding": observed.runtime_binding,
+        "run": {
+            "id": observed.record.run_id,
+            "record": observed.run_record_ref,
+            "sequence": observed.record.sequence,
+            "disposition": observed.record.disposition,
+            "started_unix_nanos": observed.record.started_unix_nanos,
+            "finished_unix_nanos": observed.record.finished_unix_nanos,
+            "elapsed_nanos": observed.record.elapsed_nanos,
+            "integrity": observed.record.integrity,
+        },
+        "selected": operation_selected_json(&observed.planned),
+        "execution": {
+            "route": route_result.route_id,
+            "disposition": route_result.disposition,
+            "exit_code": route_result.exit_code,
+            "duration_ns": route_result.duration_ns,
+            "stdout": route_result.stdout.capture,
+            "stderr": route_result.stderr.capture,
+            "value": route_result.value,
+            "result_references": observed.record.result_references,
+        },
+        "binding": {
+            "bundle": "exact_sha256_match",
+            "run": "content_verified_exact_terminal_record",
+            "operation_plan": "current_binary_recomputed_not_persisted_in_run_record_v1",
+            "realization_to_route": "current_bundle_exact_manifest_projection_match",
+            "route_plan": "recorded_identity_matches_current_binary_recomputation",
+        },
+        "nonclaims": operation_project_nonclaims("current_binary_recomputed_for_binding", "current_binary_recomputed_for_binding", "not_run_by_observe", "not_applicable", "run_record_only"),
+    });
+    if args.json {
+        println!("{}", serde_json::to_string(&report)?);
+    } else {
+        println!("Ostadix operation observation");
+        println!(
+            "Operation: {}",
+            terminal_text_fragment(&loaded.manifest.name)
+        );
+        println!("Run: {}", observed.record.run_id);
+        println!(
+            "RunRecord content: {} ({} bytes)",
+            observed.run_record_ref.sha256, observed.run_record_ref.bytes_len
+        );
+        println!("Bundle: exact SHA-256 match ({})", loaded.bundle_sha256);
+        println!(
+            "Operation plan: current-binary recomputation matched recorded route identities ({})",
+            observed.planned.deployment_id
+        );
+        println!(
+            "Realization: {}",
+            terminal_text_fragment(&observed.planned.selected_binding.realization)
+        );
+        println!(
+            "Descriptive target: {}",
+            terminal_text_fragment(&observed.planned.selected_binding.target)
+        );
+        println!(
+            "Route: {}",
+            terminal_route_id(&observed.planned.selected_binding.route)
+        );
+        println!("Disposition: {:?}", observed.record.disposition);
+        println!("world_state=run_record_only");
+        println!("authority=none");
+    }
+    Ok(0)
+}
+
+fn operation_replan(args: &OperationReplanArgs) -> Result<i32> {
+    let loaded = load_operation_project(&args.target)?;
+    let observed = observe_operation_run(&loaded, &args.run)?;
+    let replanned = plan_loaded_operation(&loaded, &args.without_targets)?;
+    let changed = observed.planned.selected != replanned.selected;
+    let recovery = if !observed.record.disposition.is_success() && changed {
+        let condition_bytes = serde_json::to_vec(&serde_json::json!({
+            "schema": "ostadix.recovery/excluded-targets/v1",
+            "runtime_graph_id": observed.runtime_graph_id,
+            "without_targets": replanned.excluded_targets,
+        }))?;
+        let recovery = RecoveryPlanV1::from_verified_runtime(
+            &observed.runtime_graph,
+            &observed.planned.deployment,
+            observed.planned.selected.logical_operation,
+            observed.planned.selected.clone(),
+            vec![RecoveryAlternativeV1 {
+                candidate: replanned.selected.clone(),
+                condition: operation_semantic_ref(
+                    "ostadix.recovery/excluded-targets/v1",
+                    &condition_bytes,
+                )?,
+                checkpoint: None,
+            }],
+        )
+        .map_err(operation_validation_error)
+        .context("failed to construct the operation RecoveryPlanV1")?;
+        let id = recovery
+            .id()
+            .map_err(operation_validation_error)?
+            .as_sha256()
+            .to_string();
+        Some((recovery, id))
+    } else {
+        None
+    };
+    let recovery_status = if recovery.is_some() {
+        "descriptive"
+    } else if observed.record.disposition.is_success() {
+        "not_applicable_source_succeeded"
+    } else {
+        "not_applicable_selection_unchanged"
+    };
+    let recovery_plan_id = recovery.as_ref().map(|(_, id)| id.clone());
+    let recovery_plan = recovery.as_ref().map(|(plan, _)| plan);
+    let recovery_nonclaim = if recovery.is_some() {
+        "descriptive"
+    } else {
+        "not_applicable"
+    };
+    let alternative_target_basis = if changed {
+        "statically_compatible_descriptive_offer_not_an_independent_failure_domain"
+    } else {
+        "not_applicable_selection_unchanged"
+    };
+    let report = serde_json::json!({
+        "schema": OPERATION_REPLAN_SCHEMA_V1,
+        "status": "planned_without_dispatch",
+        "input": operation_project_input_json(&loaded),
+        "operation": loaded.manifest.name,
+        "logical_operation": loaded.manifest.logical_operation,
+        "source_run_id": observed.record.run_id,
+        "source_bundle_sha256": observed.record.input.digest_sha256,
+        "source_runtime_graph_id": observed.runtime_graph_id,
+        "prior": operation_selected_json(&observed.planned),
+        "exclusions": replanned.excluded_targets,
+        "excluded_offer_count": replanned.excluded_offer_count,
+        "planning_request_id": replanned.request_id,
+        "deployment_plan_id": replanned.deployment_id,
+        "selected": operation_selected_json(&replanned),
+        "selection_changed": changed,
+        "alternative_target_basis": alternative_target_basis,
+        "deployment": replanned.deployment,
+        "recovery_plan_status": recovery_status,
+        "recovery_execution": "not_performed",
+        "recovery_plan_id": recovery_plan_id,
+        "recovery_plan": recovery_plan,
+        "nonclaims": operation_project_nonclaims("performed", "performed", "not_run", recovery_nonclaim, "source_run_record_only"),
+    });
+    if args.json {
+        println!("{}", serde_json::to_string(&report)?);
+    } else {
+        println!("Ostadix operation replan (read-only)");
+        println!("Source run: {}", observed.record.run_id);
+        println!(
+            "Excluded targets: {}",
+            replanned.excluded_targets.join(", ")
+        );
+        println!(
+            "Excluded candidate offers: {}",
+            replanned.excluded_offer_count
+        );
+        println!(
+            "Selected realization: {}",
+            terminal_text_fragment(&replanned.selected_binding.realization)
+        );
+        println!(
+            "Selected descriptive target: {}",
+            terminal_text_fragment(&replanned.selected_binding.target)
+        );
+        println!(
+            "Bound route: {}",
+            terminal_route_id(&replanned.selected_binding.route)
+        );
+        println!("Selection changed: {changed}");
+        println!("Recovery plan: {recovery_status}");
+        println!("Recovery execution: not_performed");
+        if changed {
+            println!("Alternative target basis: statically compatible descriptive offer; independent failure domain not established");
+        } else {
+            println!("Alternative target basis: not applicable; selection unchanged");
+        }
+        if let Some((_, id)) = &recovery {
+            println!("Recovery plan ID: {id}");
+        }
+        println!("dispatch=not_run");
+        println!("authority=none");
+    }
+    Ok(0)
+}
+
+fn operation_project_optional(target: &Path) -> Result<Option<LoadedOperationProjectV1>> {
+    let metadata = match fs::metadata(target) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect input {}", target.display()))
+        }
+    };
+    if !metadata.is_dir() {
+        return Ok(None);
+    }
+    let root = target
+        .canonicalize()
+        .with_context(|| format!("failed to resolve operation project {}", target.display()))?;
+    ensure!(
+        root.to_str().is_some(),
+        "operation project path is not valid UTF-8: {}",
+        root.display()
+    );
+    let manifest_path = root.join(o_lang::project::manifest::MANIFEST_FILENAME);
+    let manifest_metadata = match fs::symlink_metadata(&manifest_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to inspect operation manifest {}",
+                    manifest_path.display()
+                )
+            })
+        }
+    };
+    ensure!(
+        manifest_metadata.file_type().is_file(),
+        "operation manifest must be a regular non-symlink file: {}",
+        manifest_path.display()
+    );
+    let probe_bytes = read_bounded_regular_file(
+        &manifest_path,
+        "operation project manifest",
+        MAX_OPERATION_RECORD_FILE_BYTES_V1,
+    )?;
+    let probe_text = std::str::from_utf8(&probe_bytes).with_context(|| {
+        format!(
+            "operation manifest is not UTF-8: {}",
+            manifest_path.display()
+        )
+    })?;
+    let probe: toml::Value = toml::from_str(probe_text)
+        .with_context(|| format!("failed to parse {}", manifest_path.display()))?;
+    if probe.get("operation").is_none() {
+        return Ok(None);
+    }
+    ensure!(
+        probe_bytes.len() <= MAX_OPERATION_PROJECT_MANIFEST_BYTES_V1,
+        "marked operation manifest exceeds {MAX_OPERATION_PROJECT_MANIFEST_BYTES_V1} bytes"
+    );
+
+    let name = o_lang::project::name_from_path(&root);
+    let mut bundle = o_lang::project::bundle::bundle_dir(&root, &name).with_context(|| {
+        format!(
+            "failed to capture marked operation project {}",
+            root.display()
+        )
+    })?;
+    o_lang::project::discover::apply_discovery(&mut bundle, &root);
+    let captured_manifest = bundle
+        .files
+        .iter()
+        .find(|file| file.path == o_lang::project::manifest::MANIFEST_FILENAME)
+        .context("marked operation manifest was not captured in the project bundle")?;
+    ensure!(
+        !captured_manifest.is_symlink(),
+        "marked operation manifest must not be a symlink"
+    );
+    ensure!(
+        captured_manifest.bytes.len() <= MAX_OPERATION_PROJECT_MANIFEST_BYTES_V1,
+        "captured operation manifest exceeds {MAX_OPERATION_PROJECT_MANIFEST_BYTES_V1} bytes"
+    );
+    let captured_manifest_text = std::str::from_utf8(&captured_manifest.bytes)
+        .context("captured operation manifest is not UTF-8")?
+        .to_string();
+    let manifest_root: OperationProjectManifestRootV1 = toml::from_str(&captured_manifest_text)
+        .context("failed to decode the [operation] manifest section")?;
+    let manifest = manifest_root
+        .operation
+        .context("operation marker disappeared from the captured manifest")?;
+    o_lang::project::manifest::apply_manifest(
+        &mut bundle,
+        &captured_manifest_text,
+        o_lang::project::manifest::MANIFEST_FILENAME,
+    )?;
+    o_lang::project::finalize_default(&mut bundle);
+
+    validate_operation_project_text(&manifest.name, "operation name")?;
+    validate_operation_project_text(&manifest.logical_operation, "logical operation")?;
+    ensure!(
+        !manifest.bindings.is_empty(),
+        "marked operation project has no explicit realization-to-route bindings"
+    );
+    ensure!(
+        manifest.bindings.len() <= MAX_OPERATION_PROJECT_BINDINGS_V1,
+        "operation binding count exceeds {MAX_OPERATION_PROJECT_BINDINGS_V1}"
+    );
+    ensure!(
+        manifest.unavailable_targets.len() <= MAX_OPERATION_PROJECT_UNAVAILABLE_TARGETS_V1,
+        "unavailable target count exceeds {MAX_OPERATION_PROJECT_UNAVAILABLE_TARGETS_V1}"
+    );
+
+    let request_path = canonical_operation_bundle_path(&manifest.request)?;
+    let request_file = bundle
+        .files
+        .iter()
+        .find(|file| file.path == request_path)
+        .with_context(|| {
+            format!("operation planning request `{request_path}` is absent from the bundle")
+        })?;
+    ensure!(
+        !request_file.is_symlink(),
+        "operation planning request `{request_path}` must be a regular non-symlink file"
+    );
+    ensure!(
+        request_file.bytes.len() <= MAX_REALIZATION_PLAN_RECORD_BYTES_V1,
+        "operation planning request `{request_path}` exceeds {MAX_REALIZATION_PLAN_RECORD_BYTES_V1} bytes"
+    );
+    let request_encoding = operation_input_encoding(&request_file.bytes)?;
+    let request = match request_encoding {
+        OperationInputEncodingV1::ValidatedJson => {
+            OperationPlanningRequestV1::decode_json(&request_file.bytes)
+        }
+        OperationInputEncodingV1::CanonicalCbor => {
+            OperationPlanningRequestV1::decode_canonical(&request_file.bytes)
+        }
+    }
+    .map_err(operation_validation_error)
+    .with_context(|| format!("failed to validate operation planning request `{request_path}`"))?;
+    ensure!(
+        request.contract.operation.as_str() == manifest.logical_operation,
+        "manifest logical operation `{}` does not match planning request `{}`",
+        manifest.logical_operation,
+        request.contract.operation
+    );
+    let request_id = request
+        .id()
+        .map_err(operation_validation_error)?
+        .as_sha256()
+        .to_string();
+
+    let offers = resolve_operation_bindings(&bundle, &manifest, &request)?;
+    let bundle_bytes = o_lang::project::bundle::serialize(&bundle)
+        .context("failed to serialize exact operation project bundle")?;
+    let bundle_sha256 = hex::encode(Sha256::digest(bundle_bytes));
+    Ok(Some(LoadedOperationProjectV1 {
+        root,
+        bundle,
+        bundle_sha256,
+        manifest,
+        request,
+        request_id,
+        request_encoding,
+        offers,
+    }))
+}
+
+fn load_operation_project(target: &Path) -> Result<LoadedOperationProjectV1> {
+    operation_project_optional(target)?.with_context(|| {
+        format!(
+            "{} is not an existing marked operation project; expected a directory containing olang.project.toml with [operation]",
+            target.display()
+        )
+    })
+}
+
+fn operation_route_pipeline_ref(route: &RouteSpec) -> Result<SemanticArtifactRefV1> {
+    match &route.provenance {
+        RouteProvenance::Manifest { path }
+            if path == o_lang::project::manifest::MANIFEST_FILENAME => {}
+        _ => bail!(
+            "operation binding route `{}` must be declared in olang.project.toml",
+            route.id
+        ),
+    }
+    let projection = OperationRoutePipelineProjectionV1 {
+        schema: OPERATION_ROUTE_PIPELINE_SCHEMA_V1,
+        route_id: &route.id,
+        kind: route.kind,
+        command: &route.command,
+        evaluator: route.evaluator.as_deref(),
+        entrypoint: route.entrypoint.as_deref(),
+        working_directory: &route.working_directory,
+        arguments: &route.arguments,
+        environment: &route.environment,
+        prerequisites: &route.prerequisites,
+        inputs: &route.inputs,
+        outputs: &route.outputs,
+        effects: &route.effects,
+        failure_continuation: route.failure_continuation,
+        result_codec: route.result_codec,
+        provides: &route.provides,
+        guards: &route.guards,
+    };
+    let bytes = serde_json::to_vec(&projection)
+        .context("failed to encode the deterministic operation route-pipeline projection")?;
+    operation_semantic_ref(OPERATION_ROUTE_PIPELINE_SCHEMA_V1, &bytes)
+}
+
+fn resolve_operation_bindings(
+    bundle: &ProjectBundle,
+    manifest: &OperationProjectSectionV1,
+    request: &OperationPlanningRequestV1,
+) -> Result<Vec<ResolvedOperationOfferV1>> {
+    ensure!(
+        manifest.bindings.len() == request.offers.len(),
+        "operation binding count {} does not match candidate offer count {}",
+        manifest.bindings.len(),
+        request.offers.len()
+    );
+    let mut bindings = BTreeMap::<(String, String, String), OperationRouteBindingV1>::new();
+    for binding in &manifest.bindings {
+        decode_lower_hex::<32>(&binding.descriptor_sha256, "operation descriptor SHA-256")?;
+        decode_lower_hex::<32>(&binding.target_sha256, "operation target SHA-256")?;
+        decode_lower_hex::<32>(
+            &binding.cost_profile_sha256,
+            "operation cost-profile SHA-256",
+        )?;
+        validate_operation_project_text(&binding.realization, "binding realization")?;
+        validate_operation_project_text(&binding.target, "binding target")?;
+        validate_operation_project_text(&binding.route, "binding route")?;
+        canonical_operation_bundle_path(&binding.implementation)
+            .context("operation binding implementation path is invalid")?;
+        let route = bundle.route(&binding.route).with_context(|| {
+            format!(
+                "operation binding references missing project route `{}`",
+                binding.route
+            )
+        })?;
+        ensure!(
+            route.prerequisites.is_empty(),
+            "operation route `{}` has prerequisites; the v1 bridge dispatches exactly one explicit route",
+            binding.route
+        );
+        let key = (
+            binding.descriptor_sha256.clone(),
+            binding.target_sha256.clone(),
+            binding.cost_profile_sha256.clone(),
+        );
+        ensure!(
+            bindings.insert(key, binding.clone()).is_none(),
+            "operation bindings repeat descriptor/target/cost-profile tuple"
+        );
+    }
+
+    let descriptors = request
+        .descriptors
+        .iter()
+        .map(|descriptor| {
+            descriptor
+                .id()
+                .map(|id| (id, descriptor))
+                .map_err(operation_validation_error)
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    let mut offers = Vec::with_capacity(request.offers.len());
+    let mut offered_targets = BTreeSet::new();
+    for offer in &request.offers {
+        let candidate = offer.candidate().map_err(operation_validation_error)?;
+        let descriptor = descriptors
+            .get(&candidate.descriptor)
+            .copied()
+            .context("candidate descriptor disappeared from the validated planning request")?;
+        let descriptor_sha256 = candidate.descriptor.as_sha256().to_string();
+        let target_sha256 = candidate.target.as_sha256().to_string();
+        let cost_profile_sha256 = candidate.cost_profile.as_sha256().to_string();
+        let key = (
+            descriptor_sha256.clone(),
+            target_sha256.clone(),
+            cost_profile_sha256.clone(),
+        );
+        let binding = bindings.remove(&key).with_context(|| {
+            format!(
+                "candidate {} @ {} cost-profile {} has no exact descriptor/target/cost-profile route binding",
+                candidate.realization, candidate.target_display_name, candidate.cost_profile
+            )
+        })?;
+        ensure!(
+            binding.realization == candidate.realization.as_str(),
+            "binding realization `{}` does not match candidate `{}`",
+            binding.realization,
+            candidate.realization
+        );
+        ensure!(
+            binding.target == candidate.target_display_name,
+            "binding target `{}` does not match candidate target `{}`",
+            binding.target,
+            candidate.target_display_name
+        );
+        let implementation_file = bundle
+            .files
+            .iter()
+            .find(|file| file.path == binding.implementation)
+            .with_context(|| {
+                format!(
+                    "candidate implementation `{}` is absent from the captured project bundle",
+                    binding.implementation
+                )
+            })?;
+        ensure!(
+            !implementation_file.is_symlink(),
+            "candidate implementation `{}` must be a captured regular non-symlink file",
+            binding.implementation
+        );
+        let implementation_id = artifact_id_for_bytes(&implementation_file.bytes);
+        ensure!(
+            descriptor.implementation == implementation_id,
+            "descriptor {} implementation digest does not match captured `{}` bytes",
+            candidate.descriptor,
+            binding.implementation
+        );
+        let route = bundle
+            .route(&binding.route)
+            .expect("binding route was validated before candidate matching");
+        let route_pipeline = operation_route_pipeline_ref(route)?;
+        ensure!(
+            descriptor.execution_pipeline == route_pipeline,
+            "descriptor {} execution pipeline does not match the exact `{}` route projection",
+            candidate.descriptor,
+            binding.route
+        );
+        let predicted_total_ns = offer
+            .cost_profile
+            .checked_total_ns()
+            .context("validated candidate cost unexpectedly overflowed")?;
+        offered_targets.insert(candidate.target_display_name.clone());
+        offered_targets.insert(candidate.target.as_sha256().to_string());
+        offered_targets.insert(candidate.target_node.as_str().to_string());
+        offers.push(ResolvedOperationOfferV1 {
+            logical_operation: candidate.logical_operation.0,
+            descriptor_sha256,
+            realization: candidate.realization.as_str().to_string(),
+            implementation: binding.implementation,
+            implementation_sha256: implementation_id.as_sha256().to_string(),
+            execution_pipeline_schema: route_pipeline.schema.as_str().to_string(),
+            route_pipeline_sha256: route_pipeline.content.as_sha256().to_string(),
+            target_sha256,
+            target_node: candidate.target_node.as_str().to_string(),
+            target: candidate.target_display_name,
+            cost_profile_sha256,
+            predicted_total_ns,
+            route: binding.route,
+        });
+    }
+    ensure!(
+        bindings.is_empty(),
+        "operation manifest contains a binding for a candidate tuple absent from the planning request"
+    );
+    offers.sort_by(|left, right| {
+        (
+            left.logical_operation,
+            left.realization.as_str(),
+            left.target_sha256.as_str(),
+            left.descriptor_sha256.as_str(),
+            left.cost_profile_sha256.as_str(),
+        )
+            .cmp(&(
+                right.logical_operation,
+                right.realization.as_str(),
+                right.target_sha256.as_str(),
+                right.descriptor_sha256.as_str(),
+                right.cost_profile_sha256.as_str(),
+            ))
+    });
+
+    let mut unavailable = BTreeSet::new();
+    for target in &manifest.unavailable_targets {
+        validate_operation_project_text(&target.target, "unavailable target")?;
+        validate_operation_project_text(&target.reason, "unavailable target reason")?;
+        ensure!(
+            unavailable.insert(target.target.clone()),
+            "unavailable target `{}` is repeated",
+            target.target
+        );
+        ensure!(
+            !offered_targets.contains(&target.target),
+            "target `{}` is both offered and declared unavailable",
+            target.target
+        );
+    }
+    Ok(offers)
+}
+
+fn plan_loaded_operation(
+    loaded: &LoadedOperationProjectV1,
+    excluded_targets: &[String],
+) -> Result<PlannedOperationProjectV1> {
+    let mut exclusions = BTreeSet::new();
+    for target in excluded_targets {
+        validate_operation_project_text(target, "excluded target")?;
+        ensure!(
+            exclusions.insert(target.clone()),
+            "--without-target repeats `{target}`"
+        );
+    }
+    let offered_selectors = loaded
+        .offers
+        .iter()
+        .flat_map(|offer| {
+            [
+                offer.target.as_str(),
+                offer.target_sha256.as_str(),
+                offer.target_node.as_str(),
+            ]
+        })
+        .collect::<BTreeSet<_>>();
+    let unavailable_selectors = loaded
+        .manifest
+        .unavailable_targets
+        .iter()
+        .map(|target| target.target.as_str())
+        .collect::<BTreeSet<_>>();
+    for target in &exclusions {
+        ensure!(
+            offered_selectors.contains(target.as_str())
+                || unavailable_selectors.contains(target.as_str()),
+            "unknown operation target `{target}`"
+        );
+    }
+
+    let mut excluded_offer_count = 0usize;
+    let mut offers = Vec::with_capacity(loaded.request.offers.len());
+    for offer in &loaded.request.offers {
+        let candidate = offer.candidate().map_err(operation_validation_error)?;
+        let excluded = exclusions.contains(candidate.target_display_name.as_str())
+            || exclusions.contains(candidate.target.as_sha256())
+            || exclusions.contains(candidate.target_node.as_str());
+        if excluded {
+            excluded_offer_count += 1;
+        } else {
+            offers.push(offer.clone());
+        }
+    }
+    let request = OperationPlanningRequestV1::new(
+        loaded.request.graph.clone(),
+        loaded.request.contract.clone(),
+        loaded.request.interface.clone(),
+        loaded.request.descriptors.clone(),
+        loaded.request.realization_set.clone(),
+        loaded.request.objective.clone(),
+        offers,
+        loaded.request.transfer_plans.clone(),
+    )
+    .map_err(operation_validation_error)
+    .context("failed to construct filtered operation planning request")?;
+    let request_id = request
+        .id()
+        .map_err(operation_validation_error)?
+        .as_sha256()
+        .to_string();
+    let deployment = plan_operation_realization_v1(&request)
+        .map_err(operation_validation_error)
+        .context("operation realization planning failed")?;
+    let selected = deployment
+        .selected_candidate()
+        .cloned()
+        .context("operation planner found no rankable candidate")?;
+    let selected_binding = resolved_binding_for_candidate(loaded, &selected)?.clone();
+    let route_plan = build_project_hgraph(&loaded.bundle, Some(&selected_binding.route), None)
+        .map_err(anyhow::Error::msg)
+        .context("failed to construct the exact selected project-route plan")?;
+    let route_logical = route_plan
+        .logical_v1()
+        .context("failed to normalize the exact selected project-route plan")?;
+    let route_plan_sha256 = route_logical
+        .digest()
+        .context("failed to identify the exact selected project-route plan")?
+        .as_sha256()
+        .to_string();
+    let route_deployment_sha256 = DeploymentPlanV1::hosted(&route_logical)
+        .context("failed to construct the exact selected route deployment")?
+        .digest()
+        .context("failed to identify the exact selected route deployment")?
+        .as_sha256()
+        .to_string();
+    let deployment_id = deployment
+        .id()
+        .map_err(operation_validation_error)?
+        .as_sha256()
+        .to_string();
+    Ok(PlannedOperationProjectV1 {
+        request_id,
+        deployment,
+        deployment_id,
+        selected,
+        selected_binding,
+        route_plan_sha256,
+        route_deployment_sha256,
+        excluded_targets: exclusions.into_iter().collect(),
+        excluded_offer_count,
+    })
+}
+
+fn resolved_binding_for_candidate<'a>(
+    loaded: &'a LoadedOperationProjectV1,
+    candidate: &RealizationCandidateTupleV1,
+) -> Result<&'a ResolvedOperationOfferV1> {
+    let matches = loaded
+        .offers
+        .iter()
+        .filter(|offer| {
+            offer.descriptor_sha256 == candidate.descriptor.as_sha256()
+                && offer.target_sha256 == candidate.target.as_sha256()
+                && offer.cost_profile_sha256 == candidate.cost_profile.as_sha256()
+        })
+        .collect::<Vec<_>>();
+    ensure!(
+        matches.len() == 1,
+        "selected candidate must map to exactly one explicit descriptor/target/cost-profile project-route binding, found {}",
+        matches.len()
+    );
+    Ok(matches[0])
+}
+
+fn observe_operation_run(
+    loaded: &LoadedOperationProjectV1,
+    selector: &str,
+) -> Result<ObservedOperationRunV1> {
+    let planned = plan_loaded_operation(loaded, &[])?;
+    let selector = parse_run_selector(selector)?;
+    let reader = RunStoreReaderV1::open_default_existing()
+        .context("operation observation requires an existing private run store")?;
+    let exact_selector = match selector {
+        RunSelectorV1::LastRun => {
+            let (aliased_record, _) = reader
+                .read_terminal(RunSelectorV1::LastRun, false)
+                .context("failed to resolve the last-run alias to an exact operation run ID")?;
+            RunSelectorV1::RunId(aliased_record.run_id)
+        }
+        exact @ RunSelectorV1::RunId(_) => exact,
+    };
+    let verified = reader
+        .read_terminal_verified(exact_selector, false)
+        .context("failed to read the content-verified exact operation run")?;
+    verified
+        .validate()
+        .context("exact operation run failed content verification")?;
+    let record = verified.record().clone();
+    let run_record_ref = verified.record_ref().clone();
+    ensure!(
+        record.input.kind == RunInputKindV1::ProjectDirectory,
+        "selected run was not recorded from a project directory"
+    );
+    ensure!(
+        record.input.path == loaded.root,
+        "selected run input {} does not match operation project {}",
+        record.input.path.display(),
+        loaded.root.display()
+    );
+    ensure!(
+        record.input.digest_sha256 == loaded.bundle_sha256,
+        "operation project changed after run {}; expected bundle {}, observed {}",
+        record.run_id,
+        record.input.digest_sha256,
+        loaded.bundle_sha256
+    );
+    ensure!(
+        record.intent.selected_route.as_deref() == Some(planned.selected_binding.route.as_str()),
+        "run {} selected route {:?}, but the current-binary operation plan binds route `{}`",
+        record.run_id,
+        record.intent.selected_route,
+        planned.selected_binding.route
+    );
+    ensure!(
+        record.plan.hgraph_sha256.as_deref() == Some(planned.route_plan_sha256.as_str())
+            && record.plan.deployment_sha256.as_deref()
+                == Some(planned.route_deployment_sha256.as_str()),
+        "run {} recorded project-route plan identities that differ from the current-binary recomputation",
+        record.run_id
+    );
+    ensure!(
+        record.route_results.len() == 1,
+        "run {} contains {} route results; an operation-project run must record exactly one explicit route",
+        record.run_id,
+        record.route_results.len()
+    );
+    let matching_results = record
+        .route_results
+        .iter()
+        .enumerate()
+        .filter(|(_, result)| result.route_id == planned.selected_binding.route)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    ensure!(
+        matching_results.len() == 1,
+        "run {} contains {} results for selected route `{}`",
+        record.run_id,
+        matching_results.len(),
+        planned.selected_binding.route
+    );
+    let route_result_index = matching_results[0];
+    let (runtime_graph, runtime_binding) = operation_runtime_graph(
+        loaded,
+        &planned,
+        &record,
+        &run_record_ref,
+        &record.route_results[route_result_index],
+    )?;
+    let runtime_graph_id = runtime_graph
+        .id()
+        .map_err(operation_validation_error)?
+        .as_sha256()
+        .to_string();
+    Ok(ObservedOperationRunV1 {
+        record,
+        selected_route_result_index: route_result_index,
+        planned,
+        runtime_graph,
+        runtime_graph_id,
+        runtime_binding,
+        run_record_ref,
+    })
+}
+
+fn operation_runtime_graph(
+    loaded: &LoadedOperationProjectV1,
+    planned: &PlannedOperationProjectV1,
+    record: &RunRecordV1,
+    run_record_ref: &RunContentRefV1,
+    route_result: &RecordedRouteResultV1,
+) -> Result<(RuntimeGraphV2, serde_json::Value)> {
+    let execution_ns = route_result
+        .duration_ns
+        .parse::<u128>()
+        .context("recorded operation route duration is not an unsigned integer")?;
+    let execution_ns = u64::try_from(execution_ns)
+        .context("recorded operation route duration exceeds RuntimeMetricsV2")?;
+    let succeeded = record.disposition.is_success() && route_result.exit_code == Some(0);
+    let failure_classification = (!succeeded)
+        .then(|| {
+            let classification = record
+                .failure
+                .as_ref()
+                .map(|failure| failure.stage.as_str())
+                .unwrap_or("project_route_failure");
+            operation_semantic_ref(
+                "ostadix.runtime/failure-classification/v1",
+                classification.as_bytes(),
+            )
+        })
+        .transpose()?;
+    let recorded_route_plan_sha256 = record
+        .plan
+        .hgraph_sha256
+        .as_deref()
+        .context("operation run omitted its selected project-route HGraph identity")?;
+    let recorded_route_deployment_sha256 = record
+        .plan
+        .deployment_sha256
+        .as_deref()
+        .context("operation run omitted its selected project-route deployment identity")?;
+    let binding = OperationRuntimeBindingV1 {
+        schema: OPERATION_RUNTIME_BINDING_SCHEMA_V1,
+        status: "current_binary_recomputed_plan_matched_recorded_route",
+        run_id: &record.run_id,
+        run_record: run_record_ref,
+        bundle_sha256: &loaded.bundle_sha256,
+        recomputed_planning_request_id: &planned.request_id,
+        recomputed_deployment_plan_id: &planned.deployment_id,
+        recomputed_selected_candidate: &planned.selected,
+        recorded_route: &route_result.route_id,
+        exact_route_pipeline_sha256: &planned.selected_binding.route_pipeline_sha256,
+        recorded_route_plan_sha256,
+        recomputed_route_plan_sha256: &planned.route_plan_sha256,
+        recorded_route_deployment_sha256,
+        recomputed_route_deployment_sha256: &planned.route_deployment_sha256,
+    };
+    let binding_bytes =
+        serde_json::to_vec(&binding).context("failed to encode the operation runtime binding")?;
+    let binding_json =
+        serde_json::to_value(&binding).context("failed to render the operation runtime binding")?;
+    let evidence = operation_semantic_ref(OPERATION_RUNTIME_BINDING_SCHEMA_V1, &binding_bytes)?;
+    let observation = RuntimeObservationV2 {
+        ordinal: 0,
+        logical_operation: planned.selected.logical_operation,
+        candidate: planned.selected.clone(),
+        state: if succeeded {
+            RuntimeObservationStateV2::Succeeded
+        } else {
+            RuntimeObservationStateV2::Failed
+        },
+        metrics: RuntimeMetricsV2 {
+            bytes_transferred: None,
+            queue_ns: None,
+            startup_ns: None,
+            conversion_ns: None,
+            execution_ns: Some(execution_ns),
+            checkpoint_ns: None,
+            elapsed_ns: Some(record.elapsed_nanos),
+            peak_memory_bytes: None,
+        },
+        observed_fidelity: None,
+        failure_classification,
+        actor_generation: None,
+        evidence: vec![evidence],
+        detail: Some(format!(
+            "content-verified retained run {} over unchanged bundle {} matched current-binary recomputation for route {}",
+            record.run_id, loaded.bundle_sha256, route_result.route_id
+        )),
+    };
+    let runtime_graph = RuntimeGraphV2::from_deployment(&planned.deployment, vec![observation])
+        .map_err(operation_validation_error)
+        .context("failed to construct the operation RuntimeGraphV2")?;
+    Ok((runtime_graph, binding_json))
+}
+
+fn operation_semantic_ref(schema: &str, content: &[u8]) -> Result<SemanticArtifactRefV1> {
+    SemanticArtifactRefV1::new(computation_token(schema)?, artifact_id_for_bytes(content))
+        .map_err(operation_validation_error)
+}
+
+fn operation_project_input_json(loaded: &LoadedOperationProjectV1) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "project_directory",
+        "path": loaded.root,
+        "bundle_sha256": loaded.bundle_sha256,
+    })
+}
+
+fn operation_offer_json(offer: &ResolvedOperationOfferV1) -> serde_json::Value {
+    serde_json::json!({
+        "logical_operation": offer.logical_operation,
+        "descriptor_sha256": offer.descriptor_sha256,
+        "realization": offer.realization,
+        "implementation": offer.implementation,
+        "implementation_sha256": offer.implementation_sha256,
+        "execution_pipeline_schema": offer.execution_pipeline_schema,
+        "route_pipeline_sha256": offer.route_pipeline_sha256,
+        "target_sha256": offer.target_sha256,
+        "target_node": offer.target_node,
+        "target": offer.target,
+        "target_semantics": "descriptive_execution_context_not_verified_physical_node_or_failure_domain",
+        "cost_profile_sha256": offer.cost_profile_sha256,
+        "predicted_total_ns": offer.predicted_total_ns,
+        "route": offer.route,
+        "availability": "declared_offer_with_explicit_route",
+        "live_eligibility": "not_observed",
+    })
+}
+
+fn operation_selected_json(planned: &PlannedOperationProjectV1) -> serde_json::Value {
+    serde_json::json!({
+        "logical_operation": planned.selected.logical_operation.0,
+        "descriptor_sha256": planned.selected_binding.descriptor_sha256,
+        "realization": planned.selected_binding.realization,
+        "implementation": planned.selected_binding.implementation,
+        "implementation_sha256": planned.selected_binding.implementation_sha256,
+        "execution_pipeline_schema": planned.selected_binding.execution_pipeline_schema,
+        "route_pipeline_sha256": planned.selected_binding.route_pipeline_sha256,
+        "target_sha256": planned.selected_binding.target_sha256,
+        "target_node": planned.selected_binding.target_node,
+        "target": planned.selected_binding.target,
+        "target_semantics": "descriptive_execution_context_not_verified_physical_node_or_failure_domain",
+        "cost_profile_sha256": planned.selected_binding.cost_profile_sha256,
+        "predicted_total_ns": planned.selected_binding.predicted_total_ns,
+        "route": planned.selected_binding.route,
+        "route_plan_sha256": planned.route_plan_sha256,
+        "route_deployment_sha256": planned.route_deployment_sha256,
+    })
+}
+
+fn operation_project_nonclaims(
+    planning: &'static str,
+    selection: &'static str,
+    dispatch: &'static str,
+    recovery_plan: &'static str,
+    world_state: &'static str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "behavioral_equivalence": "not_proven",
+        "live_target_eligibility": "not_observed",
+        "target_execution_context": "descriptive_offer_not_physical_execution_proof",
+        "target_failure_domain_independence": "not_established",
+        "cost_prediction_guarantee": "none",
+        "planning": planning,
+        "selection": selection,
+        "dispatch": dispatch,
+        "recovery_plan": recovery_plan,
+        "recovery_execution": "not_performed",
+        "operation_plan_persistence": "not_stored_in_run_record_v1",
+        "retrospective_planner_proof": "current_binary_recomputation_only_future_planner_coordinates_require_new_schema",
+        "world_state": world_state,
+        "authority": "none",
+    })
+}
+
+fn canonical_operation_bundle_path(value: &str) -> Result<String> {
+    validate_operation_project_text(value, "operation request path")?;
+    ensure!(
+        !value.contains('\\'),
+        "operation request path must use canonical `/` separators"
+    );
+    let path = Path::new(value);
+    ensure!(
+        !path.is_absolute(),
+        "operation request path must be relative to the project"
+    );
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(part) => {
+                let part = part
+                    .to_str()
+                    .context("operation request path is not valid UTF-8")?;
+                ensure!(
+                    !part.is_empty(),
+                    "operation request path has an empty component"
+                );
+                parts.push(part);
+            }
+            _ => bail!("operation request path must not contain `.`, `..`, a root, or a prefix"),
+        }
+    }
+    ensure!(
+        !parts.is_empty(),
+        "operation request path must not be empty"
+    );
+    let canonical = parts.join("/");
+    ensure!(
+        canonical == value,
+        "operation request path must be canonical; expected `{canonical}`"
+    );
+    Ok(canonical)
+}
+
+fn validate_operation_project_text(value: &str, label: &str) -> Result<()> {
+    ensure!(!value.is_empty(), "{label} must not be empty");
+    ensure!(value.len() <= 4_096, "{label} exceeds 4096 bytes");
+    ensure!(
+        !value.chars().any(char::is_control),
+        "{label} contains a control character"
+    );
+    Ok(())
 }
 
 fn operation_inspect(args: &OperationInspectArgs) -> Result<i32> {
@@ -2355,8 +3781,12 @@ fn operation_input_encoding(bytes: &[u8]) -> Result<OperationInputEncodingV1> {
 }
 
 fn read_bounded_operation_record(path: &Path, label: &str) -> Result<Vec<u8>> {
+    read_bounded_regular_file(path, label, MAX_OPERATION_RECORD_FILE_BYTES_V1)
+}
+
+fn read_bounded_regular_file(path: &Path, label: &str, maximum: u64) -> Result<Vec<u8>> {
     let safe_path = quoted_terminal_text(&path.to_string_lossy());
-    let before_open = checked_operation_record_metadata(path, label)?;
+    let before_open = checked_regular_file_metadata(path, label, maximum)?;
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -2377,25 +3807,29 @@ fn read_bounded_operation_record(path: &Path, label: &str) -> Result<Vec<u8>> {
         "{label} changed between inspection and open: {safe_path}"
     );
     ensure!(
-        after_open.len() <= MAX_OPERATION_RECORD_FILE_BYTES_V1,
-        "{label} exceeds {MAX_OPERATION_RECORD_FILE_BYTES_V1} bytes (got {})",
+        after_open.len() <= maximum,
+        "{label} exceeds {maximum} bytes (got {})",
         after_open.len()
     );
-    let limit = MAX_OPERATION_RECORD_FILE_BYTES_V1
+    let limit = maximum
         .checked_add(1)
-        .context("operation-record bounded-read limit overflowed")?;
+        .context("bounded regular-file read limit overflowed")?;
     let mut bytes = Vec::with_capacity(after_open.len() as usize);
     file.take(limit)
         .read_to_end(&mut bytes)
         .with_context(|| format!("failed to read {label} {safe_path}"))?;
     ensure!(
-        bytes.len() as u64 <= MAX_OPERATION_RECORD_FILE_BYTES_V1,
-        "{label} exceeded {MAX_OPERATION_RECORD_FILE_BYTES_V1} bytes while it was being read"
+        bytes.len() as u64 <= maximum,
+        "{label} exceeded {maximum} bytes while it was being read"
     );
     Ok(bytes)
 }
 
 fn checked_operation_record_metadata(path: &Path, label: &str) -> Result<fs::Metadata> {
+    checked_regular_file_metadata(path, label, MAX_OPERATION_RECORD_FILE_BYTES_V1)
+}
+
+fn checked_regular_file_metadata(path: &Path, label: &str, maximum: u64) -> Result<fs::Metadata> {
     let safe_path = quoted_terminal_text(&path.to_string_lossy());
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("failed to inspect {label} {safe_path} before opening it"))?;
@@ -2404,8 +3838,8 @@ fn checked_operation_record_metadata(path: &Path, label: &str) -> Result<fs::Met
         "{label} must be a regular non-symlink file: {safe_path}"
     );
     ensure!(
-        metadata.len() <= MAX_OPERATION_RECORD_FILE_BYTES_V1,
-        "{label} exceeds {MAX_OPERATION_RECORD_FILE_BYTES_V1} bytes (got {})",
+        metadata.len() <= maximum,
+        "{label} exceeds {maximum} bytes (got {})",
         metadata.len()
     );
     Ok(metadata)
@@ -2702,6 +4136,41 @@ fn validate_explicit_output_paths(
     Ok(())
 }
 
+fn bind_operation_run(mut args: RunArgs) -> Result<RunArgs> {
+    let Some(loaded) = operation_project_optional(&args.target)? else {
+        return Ok(args);
+    };
+    if args.legacy_backends.is_some()
+        || args.parallel.is_some()
+        || args.no_record
+        || args.selection_run.is_some()
+        || args.shim_dir.is_some()
+        || !args.backend_grants.is_empty()
+        || args.executor.is_some()
+        || args.workers.is_some()
+        || args.route.is_some()
+        || args.routes_policy.is_some()
+        || !args.route_decls.is_empty()
+        || args.project_trace_out.is_some()
+        || args.selection_receipt_out.is_some()
+        || args.mesh.is_some()
+        || run_has_mesh_tuning(&args)
+    {
+        bail!("marked operation-project execution accepts only TARGET, --project, --json, or --require-record; realization planning owns the exact route and requires durable recording");
+    }
+    let planned = plan_loaded_operation(&loaded, &[])?;
+    args.require_record = true;
+    args.project = true;
+    args.route = Some(planned.selected_binding.route.clone());
+    args.operation_run = Some(OperationRunBindingV1 {
+        bundle_sha256: loaded.bundle_sha256,
+        route: planned.selected_binding.route,
+        route_plan_sha256: planned.route_plan_sha256,
+        route_deployment_sha256: planned.route_deployment_sha256,
+    });
+    Ok(args)
+}
+
 fn prepare_run(args: &RunArgs) -> Result<PreparedExecutionIntentV1> {
     if args.json && args.optimize_progress == Some(OptimizeProgressMode::Always) {
         bail!("--json conflicts with --progress always; use --progress never or the default auto mode");
@@ -2748,6 +4217,25 @@ fn prepare_run(args: &RunArgs) -> Result<PreparedExecutionIntentV1> {
         bail!("--shim-dir is available only for ordinary .O runs; project routes carry their own runtime declarations");
     }
     if let PreparedExecutionIntentV1::Project(project) = &prepared {
+        if let Some(operation) = &args.operation_run {
+            ensure!(
+                project.identities.bundle_sha256 == operation.bundle_sha256,
+                "marked operation project changed between realization planning and execution preflight"
+            );
+            ensure!(
+                project.route.as_deref() == Some(operation.route.as_str())
+                    && project.effective_policy
+                        == RoutePolicy::Explicit(operation.route.clone()).token(),
+                "prepared project execution is not pinned to the planned operation route `{}`",
+                operation.route
+            );
+            ensure!(
+                project.identities.logical_hgraph_sha256 == operation.route_plan_sha256
+                    && project.identities.deployment_plan_sha256
+                        == operation.route_deployment_sha256,
+                "prepared project route-plan identities differ from the operation preflight"
+            );
+        }
         if args.project_trace_out.is_some() && project.executor != ProjectExecutorV1::Hgraph {
             bail!(
                 "--project-trace-out requires O_PROJECT_EXECUTOR=hgraph without mesh execution; use --mesh-trace-out for mesh placement and retry evidence"
@@ -3386,6 +4874,20 @@ fn run_intent(args: &RunArgs, presentation: RunPresentation) -> Result<i32> {
             return Ok(1);
         }
         Err(error) => return Err(error),
+    };
+    let resolved_args = if presentation == RunPresentation::Ordinary {
+        match bind_operation_run(resolved_args) {
+            Ok(args) => args,
+            Err(error) if args.json => {
+                let detail = format!("{error:#}");
+                emit_preflight_failure_summary(&detail, presentation)?;
+                eprintln!("error: {detail}");
+                return Ok(1);
+            }
+            Err(error) => return Err(error),
+        }
+    } else {
+        resolved_args
     };
     let args = &resolved_args;
     let prepared = match prepare_run(args) {
@@ -4413,7 +5915,146 @@ fn plan_prepare_options(args: &PlanArgs) -> Result<PrepareExecutionOptionsV1> {
     })
 }
 
+fn operation_plan_intent(args: &PlanArgs, loaded: LoadedOperationProjectV1) -> Result<i32> {
+    if args.parallel.is_some()
+        || args.live
+        || args.route.is_some()
+        || args.routes_policy.is_some()
+        || !args.route_decls.is_empty()
+        || args.shim_dir.is_some()
+        || !args.backend_grants.is_empty()
+        || args.explain_schedule
+        || args.workers.is_some()
+        || args.execution_intent_json
+        || args.grounding
+        || args.world_id.is_some()
+        || args.world_epoch.is_some()
+        || args.mesh_discovery_timeout_ms.is_some()
+        || args.mesh_no_lan_discovery
+        || args.mesh_peer_root.is_some()
+    {
+        bail!("marked operation-project planning accepts only TARGET, --explain, --json, or --format text|json");
+    }
+    let planned = plan_loaded_operation(&loaded, &[])?;
+    let project_route_plan = o_lang::intent::render_project_static_plan(
+        &loaded.bundle,
+        Some(&planned.selected_binding.route),
+        None,
+    )?;
+    let report = serde_json::json!({
+        "schema": OPERATION_PLAN_SUMMARY_SCHEMA_V1,
+        "status": "planned_without_dispatch",
+        "input": operation_project_input_json(&loaded),
+        "operation": loaded.manifest.name,
+        "logical_operation": loaded.manifest.logical_operation,
+        "planning_request_id": planned.request_id,
+        "deployment_plan_id": planned.deployment_id,
+        "selected": operation_selected_json(&planned),
+        "explain_requested": args.explain,
+        "deployment": planned.deployment,
+        "project_route_plan": project_route_plan,
+        "nonclaims": operation_project_nonclaims("performed", "performed", "not_run", "not_performed", "not_observed"),
+    });
+    if args.json || args.format == Some(PlanFormat::Json) {
+        println!("{}", serde_json::to_string(&report)?);
+        return Ok(0);
+    }
+
+    println!("Ostadix operation plan (read-only)");
+    println!(
+        "Operation: {}",
+        terminal_text_fragment(&loaded.manifest.name)
+    );
+    println!("Planning request: {}", planned.request_id);
+    println!("Deployment plan: {}", planned.deployment_id);
+    println!(
+        "Selected realization: {}",
+        terminal_text_fragment(&planned.selected_binding.realization)
+    );
+    println!(
+        "Selected descriptive target: {}",
+        terminal_text_fragment(&planned.selected_binding.target)
+    );
+    println!(
+        "Bound route: {}",
+        terminal_route_id(&planned.selected_binding.route)
+    );
+    println!(
+        "Predicted total: {} ns (descriptive cost, not a guarantee)",
+        planned.selected_binding.predicted_total_ns
+    );
+    if args.explain {
+        println!("Because:");
+        for operation in &planned.deployment.operations {
+            for assessment in &operation.candidates {
+                let marker = if assessment.candidate == planned.selected {
+                    "selected"
+                } else {
+                    candidate_disposition_token(assessment.disposition)
+                };
+                println!(
+                    "  candidate {} @ {} [{}] predicted_total={}ns",
+                    terminal_text_fragment(assessment.candidate.realization.as_str()),
+                    terminal_text_fragment(&assessment.candidate.target_display_name),
+                    marker,
+                    assessment
+                        .predicted_total_ns
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "unrankable".to_string()),
+                );
+                for reason in &assessment.reasons {
+                    println!("    - {}", planning_reason_text(reason)?);
+                }
+            }
+            for reason in &operation.reasons {
+                println!("  - {}", planning_reason_text(reason)?);
+            }
+        }
+        println!(
+            "  selected tuple maps exactly to project route {}",
+            terminal_route_id(&planned.selected_binding.route)
+        );
+    }
+    println!("dispatch=not_run");
+    println!("authority=none");
+    Ok(0)
+}
+
+fn candidate_disposition_token(disposition: CandidateDispositionV1) -> &'static str {
+    match disposition {
+        CandidateDispositionV1::Rejected => "rejected",
+        CandidateDispositionV1::Rankable => "rankable",
+        CandidateDispositionV1::Selected => "selected",
+    }
+}
+
+fn planning_reason_text(reason: &PlanningReasonV1) -> Result<String> {
+    let value = serde_json::to_value(reason)?;
+    let kind = value
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .context("planning reason omitted its kind")?;
+    let fields = value
+        .as_object()
+        .expect("serialized planning reason is an object")
+        .iter()
+        .filter(|(name, _)| name.as_str() != "kind")
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect::<Vec<_>>();
+    if fields.is_empty() {
+        Ok(kind.to_string())
+    } else {
+        Ok(format!("{kind} ({})", fields.join(", ")))
+    }
+}
+
 fn plan_intent(args: &PlanArgs) -> Result<i32> {
+    if let Some(loaded) = operation_project_optional(&args.target)? {
+        return operation_plan_intent(args, loaded);
+    }
+    if args.explain {
+        bail!("--explain is available only for an existing marked operation-project directory");
+    }
     if args.explain_schedule {
         bail!(
             "the root static plan already includes the OIR/HGraph execution view; use direct `olangc INPUT --target ir --explain-schedule` for admission-detail formatting"
@@ -5425,7 +7066,7 @@ mod tests {
         for text in [
             "Usage: o operation",
             "contract, interface, descriptor, set",
-            "do not resolve referenced artifacts",
+            "does not resolve referenced artifacts",
             "prove behavioral equivalence",
             "grant authority",
         ] {

@@ -13,10 +13,20 @@
 
 I created Ostadix-lang to make a whole polyglot program one typed expression
 tree. A language boundary appears where computation changes language, and the
-result crosses that boundary as an `OValue`. The same source becomes an
-admitted operation graph, receives an explicit placement, executes through
-persistent evaluators or native machinery, and leaves evidence that can be
-inspected independently of the prose describing it.
+result crosses that boundary as an `OValue`. The same source can become an
+admitted operation graph, execute through persistent evaluators or native
+machinery, and leave evidence that can be inspected independently of the prose
+describing it.
+
+An experimental operation-project layer now keeps one logical operation
+invariant while comparing explicitly supplied realization, target,
+representation, and residency tuples. Its authority-free planner selects a
+statically compatible tuple deterministically; the marked-project bridge binds
+the descriptor to exact captured implementation bytes and a deterministic,
+versioned serialized route-pipeline projection before `o run` enters the existing admission
+and executor path. Those separate joins do not prove that the route loads the
+named artifact, behavioral equivalence, live target eligibility, placement
+authority, or execution on the described physical target.
 
 ```O
 html^(
@@ -431,7 +441,7 @@ Choose the next path according to what you want to inspect:
 | Learn typed-parenthesis syntax | [Gentle introduction](#gentle-introduction) |
 | Build all supported local tools | [Full setup guide](#getting-started-full-setup-guide) |
 | Inspect source -> OIR -> HGraph -> observed-result custody | [Bounded semantic custody](docs/SEMANTIC_CUSTODY.md) |
-| Inspect operation and realization declarations | [Operation and realization records V1](docs/OPERATION_REALIZATION_V1.md) |
+| Inspect or plan an operation's realization declarations | [Operation planning and observation V1](docs/OPERATION_PLANNING_V1.md) |
 | Run durable signed sessions | [Hosted V2 development quickstart](#hosted-v2-development-quickstart) |
 | Compile freestanding native code | [O-core native systems language](#o-core-native-systems-language) |
 | Run the repository gates | [Running the tests](#running-the-tests) |
@@ -444,7 +454,7 @@ Choose the next path according to what you want to inspect:
 | OIR, ExecutionPlan, Graph V2, Evidence/Admission V6, local executor | Supported core under hardening |
 | Explicit Graph V1 / Evidence and Admission V5 / Why V1 | Archival inspection and compatibility verification only |
 | Information Kernel V1 and backend-morphism V1 | Experimental local shadow surfaces; non-authorizing |
-| Operation contract/interface and realization descriptor/set V1 | Experimental canonical records and referential-consistency inspection only; non-executing and non-authorizing |
+| Operation semantics and realization planning V1/V2 | Experimental canonical records, deterministic single-operation static ranking, and exact project-route binding; non-authorizing |
 | Hosted V2 durable sessions and direct-node placement | Experimental integration with dedicated lifecycle and recovery tests |
 | Authenticated pure Execution Fabric M3 | Experimental same-host, two-real-process proof; coordinator-only graph authority |
 | Project lifting, route execution, and live supervision | Experimental integration |
@@ -456,7 +466,7 @@ compatibility, operational, and distributed guarantees are still being
 hardened around the supported hosted core. See
 [claims and evidence](docs/CLAIMS.md) for the exact qualification boundary.
 
-### Experimental operation and realization records
+### Experimental operation and realization planning
 
 The independent engine defines four canonical, authority-free semantic records:
 `OperationContractV1`, `OperationInterfaceV1`,
@@ -484,11 +494,63 @@ o operation verify \
 
 `inspect` performs single-record validation and leaves references unresolved.
 `verify` checks only exact contract/interface/descriptor/set referential
-consistency. Neither command plans or selects a realization, proves behavioral
-equivalence or evidence authenticity, determines placement, executes or
-recovers work, or grants admission, capability, lease, or World authority. See
-the [V1 contract](docs/OPERATION_REALIZATION_V1.md) for canonical encoding,
-identity, exit status, and full nonclaims.
+consistency. Neither command plans or selects a realization. See the
+[four-record V1 contract](docs/OPERATION_REALIZATION_V1.md) for canonical
+encoding, identity, exit status, and its exact boundary.
+
+The additive planner accepts one bounded, explicit list of complete
+realization/target/representation/residency tuples for exactly one logical
+operation. It checks the semantic closure, exact fidelity and target-footprint
+references, static target facts, port representations, and complete cost-profile
+binding. It rejects dynamic environment, effect, and capacity requirements,
+then selects the lowest checked component-plus-uncertainty cost with a canonical
+tie break. It does not construct a Cartesian product.
+
+The bundled normalize operation exercises the marked-project front door:
+
+```bash
+cd examples
+o operation normalize
+o realizations normalize
+o plan normalize --explain
+o run normalize
+o observe normalize
+o replan normalize --without-target gpu-1
+```
+
+`operation` and `realizations` validate the descriptor's implementation digest
+against one captured regular file, its execution-pipeline reference against the
+`ostadix.project-route-pipeline/v1` projection of one manifest route, and the
+complete candidate's cost-profile binding. They do not select or execute.
+`plan` ranks and selects without dispatch. `run` repeats exact preflight, pins
+the selected project route and its project HGraph/deployment identities,
+executes through the existing project path, and requires a durable run record.
+
+`observe` reads a content-verified terminal record without executing, checks its
+exact bundle, route, and recorded project-plan identities against current-binary
+recomputation, and emits a `RuntimeGraphV2`. `RunRecordV1` did not persist the
+operation planning-request ID, operation `DeploymentPlanV2` ID, or selected
+candidate tuple, so the reported operation plan is current reconstruction, not
+a historical receipt for those coordinates. `replan` applies caller-supplied
+exclusions and emits a recomputed, non-executing `DeploymentPlanV2`. It emits a
+descriptive `RecoveryPlanV1` only when the exact source observation failed and
+selection changed; a successful source run is not a recovery event. Recovery
+planning is not recovery execution, and no alternative is dispatched.
+In the displayed successful flow, `gpu-1` is declared unavailable but has no
+offer, so the exclusion is a no-op and emits no recovery plan.
+
+Static rankability is not live target eligibility. State and actor requirements,
+objective ruleset content, cost and validation evidence, and physical residency
+feasibility remain unresolved. A manifest route binding does not prove
+behavioral equivalence, that the route loaded the separately bound implementation,
+or that it ran on the target described by the tuple. The example's two ambient
+Python targets are descriptive static alternatives, not distinct observed
+machines or failure domains. None of these records or inspection/planning
+commands grants admission, capability, reservation, lease, dispatch, retry,
+checkpoint, effect-fencing, or World authority. See the
+[operation planning and observation contract](docs/OPERATION_PLANNING_V1.md)
+for the complete schema, runtime/recovery-record, execution, and nonclaim
+boundaries.
 
 ## Hosted Placement V6
 

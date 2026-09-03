@@ -303,6 +303,11 @@ pub enum FacetKindV1 {
     OperationInterface,
     RealizationDescriptor,
     RealizationSet,
+    PhysicalRepresentation,
+    TransferPlan,
+    CostProfile,
+    Objective,
+    RecoveryPlan,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -2396,6 +2401,14 @@ mod tests {
             (FacetKindV1::OperationInterface, "operation_interface"),
             (FacetKindV1::RealizationDescriptor, "realization_descriptor"),
             (FacetKindV1::RealizationSet, "realization_set"),
+            (
+                FacetKindV1::PhysicalRepresentation,
+                "physical_representation",
+            ),
+            (FacetKindV1::TransferPlan, "transfer_plan"),
+            (FacetKindV1::CostProfile, "cost_profile"),
+            (FacetKindV1::Objective, "objective"),
+            (FacetKindV1::RecoveryPlan, "recovery_plan"),
         ] {
             assert_eq!(
                 serde_json::to_string(&kind).unwrap(),

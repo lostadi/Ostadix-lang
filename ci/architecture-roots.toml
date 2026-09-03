@@ -111,7 +111,7 @@ allowed_dependencies = ["canonical_cbor", "resource_identity"]
 [[root]]
 name = "computation"
 layer = 15
-allowed_dependencies = ["computation_core", "evidence", "execution_contract", "hgraph", "ir", "parser", "project", "resource_identity"]
+allowed_dependencies = ["canonical_cbor", "computation_core", "evidence", "execution_contract", "hgraph", "ir", "parser", "placement", "project", "resource_identity"]
 
 [[root]]
 name = "dispatch_model"

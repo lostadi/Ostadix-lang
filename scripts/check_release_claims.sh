@@ -483,8 +483,8 @@ require_fixed scripts/o-cli.sh \
     'exec "$OCLI_BIN" "$@"' \
     'the repository-owned intent commands no longer reach the compiled Ostadix front door'
 require_fixed scripts/o-cli.sh \
-    'inspect|object|operation)' \
-    'the repository dispatcher no longer routes the operation namespace to o-cli'
+    'inspect|object|operation|realizations|observe|replan)' \
+    'the repository dispatcher no longer routes the operation-project commands to o-cli'
 require_fixed src/bin/o-cli.rs \
     'Plan(PlanArgs)' \
     'the compiled Ostadix front door no longer owns the plan grammar'
@@ -748,6 +748,19 @@ operation_coordinates=(
     'OPERATION_INTERFACE_SCHEMA_V1|ostadix.operation-interface/v1'
     'REALIZATION_DESCRIPTOR_SCHEMA_V1|ostadix.realization-descriptor/v1'
     'REALIZATION_SET_SCHEMA_V1|ostadix.realization-set/v1'
+    'PHYSICAL_REPRESENTATION_SCHEMA_V1|ostadix.physical-representation/v1'
+    'TRANSFER_PLAN_SCHEMA_V1|ostadix.transfer-plan/v1'
+    'COST_PROFILE_SCHEMA_V1|ostadix.cost-profile/v1'
+    'OBJECTIVE_SCHEMA_V1|ostadix.objective/v1'
+    'LOGICAL_HGRAPH_SCHEMA_V2|ostadix.logical-hgraph/v2'
+    'DEPLOYMENT_PLAN_SCHEMA_V2|ostadix.deployment-plan/v2'
+    'RUNTIME_GRAPH_SCHEMA_V2|ostadix.runtime-graph/v2'
+    'RECOVERY_PLAN_SCHEMA_V1|ostadix.recovery-plan/v1'
+    'OPERATION_PLANNING_REQUEST_SCHEMA_V1|ostadix.operation-planning-request/v1'
+    'REQUIREMENT_FOOTPRINT_CONTENT_SCHEMA_V1|ostadix.placement.requirement-footprint/v1'
+    'OPERATION_ROUTE_PIPELINE_SCHEMA_V1|ostadix.project-route-pipeline/v1'
+    'OPERATION_RUNTIME_BINDING_SCHEMA_V1|ostadix.operation-runtime-binding/v1'
+    'OPERATION_COMMAND_ERROR_SCHEMA_V1|ostadix.operation-command-error/v1'
 )
 for coordinate in "${operation_coordinates[@]}"; do
     coordinate_name=${coordinate%%|*}
@@ -757,6 +770,103 @@ for coordinate in "${operation_coordinates[@]}"; do
     require_fixed docs/VERSIONING.md "\`$coordinate_value\`" \
         "versioning omits operation-realization coordinate value $coordinate_value"
 done
+for bridge_coordinate in \
+    'OPERATION_ROUTE_PIPELINE_SCHEMA_V1|ostadix.project-route-pipeline/v1' \
+    'OPERATION_RUNTIME_BINDING_SCHEMA_V1|ostadix.operation-runtime-binding/v1' \
+    'OPERATION_COMMAND_ERROR_SCHEMA_V1|ostadix.operation-command-error/v1'
+do
+    bridge_name=${bridge_coordinate%%|*}
+    bridge_value=${bridge_coordinate#*|}
+    require_fixed src/bin/o-cli.rs \
+        "const $bridge_name: &str = \"$bridge_value\";" \
+        "operation-project bridge coordinate drifted: $bridge_name"
+done
+require_fixed README.md \
+    '[Operation planning and observation V1](docs/OPERATION_PLANNING_V1.md)' \
+    'README omits the operation-planning contract'
+require_fixed docs/OPERATION_PLANNING_V1.md \
+    'The word *selected* in this document means only that a tuple won the declared' \
+    'operation-planning selection is no longer explicitly authority-free'
+require_fixed docs/OPERATION_PLANNING_V1.md \
+    'Replanning after a successful run is not recovery and must not be represented' \
+    'operation replanning is no longer separated from failed-run recovery'
+for demo_command in \
+    'cd examples' \
+    'o operation normalize' \
+    'o realizations normalize' \
+    'o plan normalize --explain' \
+    'o run normalize' \
+    'o observe normalize' \
+    'o replan normalize --without-target gpu-1'
+do
+    require_fixed docs/OPERATION_PLANNING_V1.md "$demo_command" \
+        "operation-planning contract lost flagship command: $demo_command"
+    require_fixed README.md "$demo_command" \
+        "README lost flagship operation command: $demo_command"
+done
+require_fixed docs/OPERATION_PLANNING_V1.md \
+    'implementation digest must equal the bytes of the named captured' \
+    'operation-project contract no longer states the exact implementation-artifact join'
+require_fixed docs/OPERATION_PLANNING_V1.md \
+    '`ostadix.project-route-pipeline/v1` projection of the bound' \
+    'operation-project contract no longer states the exact route-pipeline join'
+require_fixed docs/OPERATION_PLANNING_V1.md \
+    '`RunRecordV1` did not persist the `OperationPlanningRequestV1` ID' \
+    'operation observation no longer states the historical operation-plan persistence gap'
+require_fixed docs/OPERATION_PLANNING_V1.md \
+    'Recovery planning is not recovery execution' \
+    'operation recovery planning is no longer separated from recovery execution'
+require_fixed docs/OPERATION_PLANNING_V1.md \
+    'they are not distinct observed machines or failure domains' \
+    'operation demo no longer disclaims independent observed failure domains'
+require_fixed docs/CLAIMS.md \
+    '`StaticallyCompatibleForRanking` is not live target' \
+    'public claims no longer distinguish static rankability from live eligibility'
+require_fixed docs/CLAIMS.md \
+    'Recovery planning is not recovery execution' \
+    'public claims no longer distinguish a recovery plan from recovery execution'
+require_fixed docs/CLAIMS.md \
+    '`RunRecordV1` did not persist the' \
+    'public claims no longer disclose the operation-plan persistence gap'
+require_fixed docs/CLAIMS.md \
+    'ambient-Python target offers are static descriptions' \
+    'public claims no longer disclose the ambient-target failure-domain boundary'
+require_fixed docs/CLAIMS.md \
+    'successful source run is not a recovery' \
+    'public claims no longer distinguish successful replanning from recovery'
+require_fixed tests/o_cli_operation_planner_blackbox.rs \
+    'fn marked_normalize_project_plans_runs_observes_and_replans_exactly()' \
+    'the compiled operation-project vertical-slice proof is missing'
+require_fixed tests/o_cli_operation_planner_blackbox.rs \
+    '"ostadix.runtime-graph/v2"' \
+    'the operation-project test no longer proves RuntimeGraphV2 emission'
+require_fixed tests/o_cli_operation_planner_blackbox.rs \
+    'recovery["recovery_plan_status"], "descriptive"' \
+    'the operation-project test no longer proves conditional RecoveryPlanV1 emission'
+require_fixed tests/o_cli_operation_planner_blackbox.rs \
+    '"implementation digest does not match captured"' \
+    'the operation-project test no longer proves exact implementation-artifact binding'
+require_fixed tests/o_cli_operation_planner_blackbox.rs \
+    'execution pipeline does not match the exact' \
+    'the operation-project test no longer proves exact route-pipeline binding'
+require_fixed tests/o_cli_operation_planner_blackbox.rs \
+    '"ostadix.operation-runtime-binding/v1"' \
+    'the operation-project test no longer proves runtime-binding evidence emission'
+require_fixed tests/o_cli_operation_planner_blackbox.rs \
+    '"current_binary_recomputed_not_persisted_in_run_record_v1"' \
+    'the operation-project test no longer proves the operation-plan persistence boundary'
+require_fixed tests/o_cli_operation_planner_blackbox.rs \
+    '"descriptive_execution_context_not_verified_physical_node_or_failure_domain"' \
+    'the operation-project test no longer proves descriptive target semantics'
+require_fixed tests/o_cli_operation_planner_blackbox.rs \
+    '"statically_compatible_descriptive_offer_not_an_independent_failure_domain"' \
+    'the operation-project test no longer proves the alternative failure-domain nonclaim'
+require_fixed tests/o_cli_operation_planner_blackbox.rs \
+    'recovery["recovery_execution"], "not_performed"' \
+    'the operation-project test no longer proves recovery was not executed'
+require_fixed tests/o_cli_operation_planner_blackbox.rs \
+    '"invalid mapping reached dispatch"' \
+    'the operation-project test no longer proves invalid route binding fails before dispatch'
 require_fixed docs/VERSIONING.md \
     '`crates/ostadix-api/src/execution_fabric/protocol.rs`' \
     'versioning omits the frozen M2 record source coordinate'
