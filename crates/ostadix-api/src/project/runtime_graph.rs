@@ -1308,7 +1308,13 @@ fn validate_observation_operation_shape(
     if label == "materialize-project" && shape_is(true, None) {
         return Ok(());
     }
-    if label == "compare-route-results" && policy == "verify_equivalent" && shape_is(false, None) {
+    if label == "compare-route-results"
+        && matches!(
+            policy,
+            "verify_equivalent" | "benchmark_validate_and_select"
+        )
+        && shape_is(false, None)
+    {
         return Ok(());
     }
     if let Some(route_id) = label.strip_prefix("build-route:") {
@@ -1449,5 +1455,8 @@ fn logical_policy_token(policy: &LogicalRoutePolicyV1) -> String {
         LogicalRoutePolicyV1::All => "all".to_string(),
         LogicalRoutePolicyV1::VerifyEquivalent => "verify_equivalent".to_string(),
         LogicalRoutePolicyV1::BenchmarkAndSelect => "benchmark_and_select".to_string(),
+        LogicalRoutePolicyV1::BenchmarkValidateAndSelect => {
+            "benchmark_validate_and_select".to_string()
+        }
     }
 }

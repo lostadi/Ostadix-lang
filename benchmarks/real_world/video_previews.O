@@ -1,0 +1,31 @@
+# Produce nine HD VP9 web previews from the repository's real animation
+# sources. FFmpeg is single-threaded per lane so Ostadix owns job concurrency.
+autonomous(batch(
+bash^(
+benchmarks/real_world/transcode_preview.sh Olang_Mascot_little-o/little-o/qa/previews/failed.gif "\${O_VIDEO_OUT}/failed.webm" failed
+)_bash,
+bash^(
+benchmarks/real_world/transcode_preview.sh Olang_Mascot_little-o/little-o/qa/previews/idle.gif "\${O_VIDEO_OUT}/idle.webm" idle
+)_bash,
+bash^(
+benchmarks/real_world/transcode_preview.sh Olang_Mascot_little-o/little-o/qa/previews/jumping.gif "\${O_VIDEO_OUT}/jumping.webm" jumping
+)_bash,
+bash^(
+benchmarks/real_world/transcode_preview.sh Olang_Mascot_little-o/little-o/qa/previews/review.gif "\${O_VIDEO_OUT}/review.webm" review
+)_bash,
+bash^(
+benchmarks/real_world/transcode_preview.sh Olang_Mascot_little-o/little-o/qa/previews/running-left.gif "\${O_VIDEO_OUT}/running-left.webm" running-left
+)_bash,
+bash^(
+benchmarks/real_world/transcode_preview.sh Olang_Mascot_little-o/little-o/qa/previews/running-right.gif "\${O_VIDEO_OUT}/running-right.webm" running-right
+)_bash,
+bash^(
+benchmarks/real_world/transcode_preview.sh Olang_Mascot_little-o/little-o/qa/previews/running.gif "\${O_VIDEO_OUT}/running.webm" running
+)_bash,
+bash^(
+benchmarks/real_world/transcode_preview.sh Olang_Mascot_little-o/little-o/qa/previews/waiting.gif "\${O_VIDEO_OUT}/waiting.webm" waiting
+)_bash,
+bash^(
+benchmarks/real_world/transcode_preview.sh Olang_Mascot_little-o/little-o/qa/previews/waving.gif "\${O_VIDEO_OUT}/waving.webm" waving
+)_bash
+))

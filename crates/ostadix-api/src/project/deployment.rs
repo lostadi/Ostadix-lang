@@ -597,6 +597,7 @@ fn policy_runtime_class(policy: &LogicalRoutePolicyV1) -> &'static str {
         LogicalRoutePolicyV1::All => "policy.all",
         LogicalRoutePolicyV1::VerifyEquivalent => "policy.verify-equivalent",
         LogicalRoutePolicyV1::BenchmarkAndSelect => "policy.benchmark-and-select",
+        LogicalRoutePolicyV1::BenchmarkValidateAndSelect => "policy.benchmark-validate-and-select",
     }
 }
 

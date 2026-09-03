@@ -62,15 +62,20 @@ pub use logical::{
     LogicalRouteKindV1, LogicalRoutePolicyV1, LOGICAL_HGRAPH_SCHEMA_V1, MAX_LOGICAL_HGRAPH_BYTES,
 };
 pub use model::{
-    Artifact, ArtifactCaptureFailure, ArtifactCaptureStatus, ExecutionProvenance, FileRole,
-    OExecutionResult, ProjectBundle, ProjectFile, ResultCodec, RouteEffects,
-    RouteExecutionDisposition, RouteFailureContinuation, RouteGuard, RouteKind, RoutePolicy,
-    RouteProvenance, RouteSet, RouteSpec,
+    validated_selection_json_sha256, Artifact, ArtifactCaptureFailure, ArtifactCaptureStatus,
+    ExecutionProvenance, FileRole, OExecutionResult, ProjectBundle, ProjectFile, ResultCodec,
+    RouteEffects, RouteExecutionDisposition, RouteFailureContinuation, RouteGuard, RouteKind,
+    RoutePolicy, RouteProvenance, RouteSet, RouteSpec, ValidatedArtifactCaptureFailureKindV1,
+    ValidatedArtifactCaptureStatusV1, ValidatedSelectionCandidateV1,
+    ValidatedSelectionDispositionV1, ValidatedSelectionMismatchV1, ValidatedSelectionObservationV1,
+    ValidatedSelectionReceiptV1, VALIDATED_SELECTION_EQUIVALENCE_V1,
+    VALIDATED_SELECTION_RECEIPT_SCHEMA_V1, VALIDATED_SELECTION_RULE_V1,
 };
 pub use plan::{
     build_project_hgraph, ProjectCancellationSemantics, ProjectDependency, ProjectExecutionPlan,
     ProjectHGraph, ProjectPlanOperation, RoutePlanFacts,
 };
+pub use runtime::{run_selection_observed, RouteSelectionExecution, ValidatedSelectionMeasurement};
 pub use runtime_graph::{
     RuntimeGraphError, RuntimeGraphObservationV1, RuntimeGraphOperationV1, RuntimeGraphTerminalV1,
     RuntimeGraphV1, MAX_RUNTIME_GRAPH_OBSERVATIONS, MAX_RUNTIME_GRAPH_OPERATIONS,

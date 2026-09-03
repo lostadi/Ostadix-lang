@@ -2363,7 +2363,7 @@ explicitly admitted nonzero-to-success cases in disposable workspaces:
 The typed project plan is bound to an exact bundle digest and the resolved route
 policy. It builds logically separate materialization branches with prerequisite routes and
 projects `MaterializeProject`, `BuildRoute`, `RunRoute`, `SelectRoute`, and,
-for `verify_equivalent`, `CompareRouteResults` into a validated HGraph. Guards,
+for output-validating policies, `CompareRouteResults` into a validated HGraph. Guards,
 environment key names, inputs, outputs, declared effects, cancellation, and
 equivalence policy remain visible in stable inspection output. The route facts
 also show the `failure-continuation` contract; command strings and environment
@@ -3950,14 +3950,65 @@ automatically.
 Project planning is a separate inspection path. Select a route or
 route set with `--route`; an optional checked `--routes-policy` override accepts
 `explicit`/`explicit:ROUTE`, `default`, `fallback`, `any_success`,
-`race_success`, `race_settle`, `all`, `verify_equivalent`, or
-`benchmark_and_select`:
+`race_success`, `race_settle`, `all`, `verify_equivalent`,
+`benchmark_and_select`, or `benchmark_validate_and_select`:
 
 ```bash
 olangc src/ --target ir --route main
 olangc project.O --target dot --route main > project.dot
 ./scripts/o-cli.sh plan src/ --route main
 ```
+
+`benchmark_validate_and_select` is the evidence-gated measured policy. It
+treats the first declared alternative as the reference, runs every alternative
+in an isolated workspace, rejects settled unsuccessful candidates and
+candidates whose declared outputs differ, then returns the fastest eligible
+result. Candidates must use the reference's result codec. The v1
+declared-output contract compares canonical decoded JSON for `json` routes or
+the exact complete stdout byte stream for `text`/`bytes` routes, and always
+compares captured artifact manifests by path, length, and SHA-256. Ranking uses
+the complete candidate branch call: local materialization, prerequisites,
+terminal execution, output draining, and artifact capture are included; mesh
+dispatch, retry, and result retrieval are included when the mesh runs it.
+
+```bash
+o run src/ --project --route main \
+  --routes-policy benchmark_validate_and_select \
+  --selection-receipt-out validated-selection.json
+```
+
+Evidence output paths must be outside a directory used as the project input
+(and must not be the lifted project file itself), so receipt or trace
+publication does not normally replace source material. The input and output
+parents are resolved to canonical paths and output-path aliases are rejected
+before execution. This guarantee assumes a route or concurrent process cannot
+replace the already-resolved input entry or rename/replace an output's
+canonical parent directory; the atomic publisher protects the selected leaf,
+not an adversarially mutable namespace.
+
+The compatibility runtime and project mesh emit canonical
+`ostadix.project-validated-selection/v1` JSON. It preserves original candidate
+order, terminal and complete-branch durations, credential-minimized result evidence,
+independently checkable declared-output digests, eligibility or rejection
+reason, reference route, selected route, bundle digest, and the exact
+comparison/selection contract. Its printed receipt SHA-256 is the ordinary
+SHA-256 of the emitted file bytes, and recorded `o run` executions embed the
+typed receipt in the durable run record. It is still an unsigned observation,
+not a proof of full semantic equivalence or authority to reuse the decision.
+Hidden filesystem, network, device, and other undeclared effects are not traced
+by this policy. Errors before a route settles (including launch, timeout, and
+prerequisite errors) and artifact-capture failures after an otherwise
+successful command abort selection. Incomplete capture attached to an already
+nonzero settled candidate is retained as sanitized rejection evidence.
+
+Credential minimization applies to the selection receipt. Durable run records
+remain lossless diagnostics and can retain bounded process stdout/stderr and
+typed runtime failure details, so they should be handled as potentially
+sensitive execution logs.
+
+This policy is an autotuning/evidence run: it executes every candidate, so it
+does not reduce the latency of that same invocation. A separate receipt-gated
+reuse path is required before a learned winner can accelerate later runs.
 
 The second command is the project-lift DOT route: `o-link --project` preserves
 the route table inside `project.O`, and `olangc --target dot --route main`
@@ -4397,6 +4448,12 @@ measurements, not a CPU-parallelism claim.
 The reproducible four-shape hosted benchmark, expected outputs, methodology,
 and single-core wait-overlap caveat are documented in
 [`benchmarks/hgraph_hosted/README.md`](benchmarks/hgraph_hosted/README.md).
+The complementary
+[`benchmarks/real_world/README.md`](benchmarks/real_world/README.md) runs the
+same serial-versus-graph comparison over responsive-image generation, actual
+repository CI shards, and playable VP9 preview encoding. It retains inspected
+artifacts and whole-process wall timings, while explicitly avoiding any claim
+that all programs speed up.
 
 Project inputs take a direct, typed
 `ProjectBundle -> ProjectExecutionPlan -> HGraph` inspection path rather than

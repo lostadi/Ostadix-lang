@@ -68,8 +68,12 @@ use clap::{Parser as ClapParser, ValueEnum};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use o_lang::eval::Evaluator;
 use o_lang::parser::Parser;
@@ -181,7 +185,7 @@ struct WalkState<'a> {
 }
 
 /// o-link links multiple scripts or codebases into a single .O file.
-#[derive(Debug, ClapParser)]
+#[derive(Clone, Debug, ClapParser)]
 #[command(
     name = "o-link",
     about = "Link scripts into one .O program; bare directories link and run by default"
@@ -258,7 +262,8 @@ struct Cli {
 
     /// With `--run`, apply this policy to the selected route set.
     /// One of: explicit, default, fallback, any_success, race_success,
-    /// race_settle, all, verify_equivalent, benchmark_and_select.
+    /// race_settle, all, verify_equivalent, benchmark_and_select,
+    /// benchmark_validate_and_select.
     #[arg(long = "routes-policy", value_name = "POLICY", requires = "run")]
     routes_policy: Option<String>,
 
@@ -266,6 +271,11 @@ struct Cli {
     /// hosted project execution through --run and O_PROJECT_EXECUTOR=hgraph.
     #[arg(long = "project-trace-out", value_name = "PATH", requires = "run")]
     project_trace_out: Option<PathBuf>,
+
+    /// Write the canonical validated benchmark-selection receipt. Requires
+    /// benchmark_validate_and_select.
+    #[arg(long = "selection-receipt-out", value_name = "PATH", requires = "run")]
+    selection_receipt_out: Option<PathBuf>,
 
     /// Add or override a route from the command line (repeatable). Micro-syntax:
     /// `id=NAME;cmd=PROGRAM ARGS;cwd=.;provides=a,b;codec=json;depends=r1,r2`.
@@ -368,6 +378,7 @@ fn has_project_intent(cli: &Cli) -> bool {
         || cli.route.is_some()
         || cli.routes_policy.is_some()
         || cli.project_trace_out.is_some()
+        || cli.selection_receipt_out.is_some()
         || !cli.route_decls.is_empty()
         || cli.mesh.is_some()
 }
@@ -668,6 +679,118 @@ fn single_input(cli: &Cli) -> Result<PathBuf> {
     Ok(cli.inputs[0].clone())
 }
 
+fn publication_path(path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()
+            .context("failed to resolve the current directory")?
+            .join(path)
+    };
+    let file_name = absolute
+        .file_name()
+        .context("explicit output path must end in a file name")?;
+    file_name
+        .to_str()
+        .context("explicit output path must end in a UTF-8 file name")?;
+    let parent = absolute
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .context("explicit output path has no parent directory")?;
+    let parent = parent
+        .canonicalize()
+        .with_context(|| format!("failed to resolve output directory {}", parent.display()))?;
+    Ok(parent.join(file_name))
+}
+
+fn resolve_evidence_output_paths(cli: &Cli) -> Result<Cli> {
+    let mut resolved = cli.clone();
+    let input = single_input(&resolved)?;
+    resolved.inputs[0] = input
+        .canonicalize()
+        .with_context(|| format!("failed to resolve input {}", input.display()))?;
+    for path in [
+        &mut resolved.project_trace_out,
+        &mut resolved.mesh_trace_out,
+        &mut resolved.selection_receipt_out,
+    ] {
+        if let Some(value) = path {
+            *value = publication_path(value)?;
+        }
+    }
+    Ok(resolved)
+}
+
+fn validate_evidence_output_paths(cli: &Cli, input: &Path) -> Result<()> {
+    let outputs = [
+        ("--project-trace-out", cli.project_trace_out.as_ref()),
+        ("--mesh-trace-out", cli.mesh_trace_out.as_ref()),
+        (
+            "--selection-receipt-out",
+            cli.selection_receipt_out.as_ref(),
+        ),
+    ];
+    if outputs.iter().all(|(_, path)| path.is_none()) {
+        return Ok(());
+    }
+    let input_canonical = input.to_path_buf();
+    let input_is_directory = input_canonical.is_dir();
+    let input_publication = (!input_is_directory)
+        .then(|| publication_path(input))
+        .transpose()?;
+    let mut resolved_outputs: Vec<(&str, PathBuf, Option<PathBuf>)> = Vec::new();
+    for (name, path) in outputs {
+        let Some(path) = path else {
+            continue;
+        };
+        let resolved = publication_path(path)?;
+        let referent = path
+            .exists()
+            .then(|| {
+                path.canonicalize()
+                    .with_context(|| format!("failed to resolve output path {}", path.display()))
+            })
+            .transpose()?;
+        if let Some((other_name, _, _)) = resolved_outputs.iter().find(|(_, other, target)| {
+            other.as_path() == resolved.as_path()
+                || referent
+                    .as_ref()
+                    .is_some_and(|referent| referent == other || target.as_ref() == Some(referent))
+                || target.as_ref() == Some(&resolved)
+        }) {
+            bail!(
+                "{other_name} and {name} must not resolve to the same output path ({})",
+                resolved.display()
+            );
+        }
+        if input_publication
+            .as_ref()
+            .is_some_and(|input| input.as_path() == resolved.as_path())
+            || resolved == input_canonical
+            || referent.as_ref() == Some(&input_canonical)
+            || (input_is_directory
+                && (resolved.starts_with(&input_canonical)
+                    || referent
+                        .as_ref()
+                        .is_some_and(|target| target.starts_with(&input_canonical))))
+        {
+            if input_is_directory {
+                bail!(
+                    "{name} must be outside the project input directory {}; refusing to replace project input at {}",
+                    input_canonical.display(),
+                    resolved.display()
+                );
+            }
+            bail!(
+                "{name} must not replace the input file {}",
+                input_canonical.display()
+            );
+        }
+        resolved_outputs.push((name, resolved, referent));
+    }
+    Ok(())
+}
+
 /// Build a `ProjectBundle` for the single input, whether it is a directory
 /// or an already-lifted `.O` file.
 fn load_project_bundle(cli: &Cli) -> Result<o_lang::project::ProjectBundle> {
@@ -683,6 +806,9 @@ fn load_project_bundle(cli: &Cli) -> Result<o_lang::project::ProjectBundle> {
         }
         if let Some(trace_out) = &cli.mesh_trace_out {
             exclusions.push(trace_out.clone());
+        }
+        if let Some(receipt_out) = &cli.selection_receipt_out {
+            exclusions.push(receipt_out.clone());
         }
         o_lang::project::assemble_excluding(&input, &name, &cli.route_decls, &exclusions)
     } else if input.is_file() {
@@ -713,6 +839,10 @@ fn list_routes_mode(cli: &Cli) -> Result<()> {
 /// `--project`: lift into a single .O document, or (with `--run`) execute a
 /// route through the project runtime.
 fn project_mode(cli: &Cli) -> Result<()> {
+    let resolved_cli = resolve_evidence_output_paths(cli)?;
+    let cli = &resolved_cli;
+    let input = single_input(cli)?;
+    validate_evidence_output_paths(cli, &input)?;
     let bundle = load_project_bundle(cli)?;
 
     if cli.run {
@@ -751,10 +881,11 @@ fn project_mode(cli: &Cli) -> Result<()> {
 
 /// Execute a route (or route set) through the project runtime.
 fn run_project(cli: &Cli, bundle: &o_lang::project::ProjectBundle) -> Result<()> {
-    use o_lang::hosted_remote::project_mesh::execute_mesh_selection;
+    use o_lang::hosted_remote::project_mesh::{
+        execute_mesh_selection_observed, MeshExecutionError,
+    };
     use o_lang::project::executor::{
-        execute_selection_with_configured_executor, write_project_attempt_trace,
-        ProjectExecutionError, PROJECT_EXECUTOR_ENV,
+        execute_selection_with_configured_executor, ProjectExecutionError, PROJECT_EXECUTOR_ENV,
     };
     use o_lang::project::runtime::RunOptions;
     use o_lang::project::RoutePolicy;
@@ -770,33 +901,74 @@ fn run_project(cli: &Cli, bundle: &o_lang::project::ProjectBundle) -> Result<()>
         .map(RoutePolicy::parse_checked)
         .transpose()
         .map_err(anyhow::Error::msg)?;
-    let opts = RunOptions::default();
-    let mesh_config = mesh_execution_config(cli);
-    if mesh_config.is_none()
-        && cli.project_trace_out.is_some()
-        && std::env::var_os(PROJECT_EXECUTOR_ENV).as_deref() != Some(std::ffi::OsStr::new("hgraph"))
+    let resolved =
+        o_lang::project::runtime::resolve_selection(bundle, cli.route.as_deref(), policy.clone())?;
+    if cli.selection_receipt_out.is_some()
+        && resolved.policy != RoutePolicy::BenchmarkValidateAndSelect
     {
         bail!(
-            "--project-trace-out requires {PROJECT_EXECUTOR_ENV}=hgraph; the legacy project runtime does not produce a Project HGraph attempt trace"
+            "--selection-receipt-out requires effective project policy benchmark_validate_and_select, got {}",
+            resolved.policy.token()
+        );
+    }
+    if cli.selection_receipt_out.is_some()
+        && mesh_execution_config(cli).is_none()
+        && std::env::var_os(PROJECT_EXECUTOR_ENV).as_deref() == Some(std::ffi::OsStr::new("hgraph"))
+    {
+        bail!(
+            "--selection-receipt-out is unavailable with O_PROJECT_EXECUTOR=hgraph because that executor does not implement benchmark_validate_and_select"
+        );
+    }
+    let opts = RunOptions::default();
+    let mesh_config = mesh_execution_config(cli).map(|mut config| {
+        // o-link retains the returned trace through its private atomic writer.
+        config.trace_out = None;
+        config
+    });
+    if cli.project_trace_out.is_some()
+        && (mesh_config.is_some()
+            || std::env::var_os(PROJECT_EXECUTOR_ENV).as_deref()
+                != Some(std::ffi::OsStr::new("hgraph")))
+    {
+        bail!(
+            "--project-trace-out requires {PROJECT_EXECUTOR_ENV}=hgraph without mesh execution; use --mesh-trace-out for mesh placement and retry evidence"
         );
     }
 
     let execution_result = match mesh_config.as_ref() {
-        Some(config) => execute_mesh_selection(bundle, cli.route.as_deref(), policy, &opts, config),
+        Some(config) => {
+            execute_mesh_selection_observed(bundle, cli.route.as_deref(), policy, &opts, config)
+                .map(|outcome| (outcome.execution, Some(outcome.trace)))
+        }
         None => {
             execute_selection_with_configured_executor(bundle, cli.route.as_deref(), policy, &opts)
+                .map(|execution| (execution, None))
         }
     };
-    let execution = match execution_result {
+    let (execution, mesh_trace) = match execution_result {
         Ok(execution) => execution,
         Err(error) => {
             if let (Some(path), Some(project_error)) = (
                 cli.project_trace_out.as_deref(),
                 error.downcast_ref::<ProjectExecutionError>(),
             ) {
-                if let Err(trace_error) = write_project_attempt_trace(path, &project_error.trace) {
+                if let Err(trace_error) = write_json_private_atomic(path, &project_error.trace) {
                     return Err(error.context(format!(
                         "additionally failed to retain the Project HGraph attempt trace: {trace_error:#}"
+                    )));
+                }
+            }
+            if let (Some(path), Some(mesh_error)) = (
+                cli.mesh_trace_out.as_deref(),
+                error.downcast_ref::<MeshExecutionError>(),
+            ) {
+                if let Err(trace_error) = mesh_error
+                    .trace
+                    .validate()
+                    .and_then(|()| write_json_private_atomic(path, &mesh_error.trace))
+                {
+                    return Err(error.context(format!(
+                        "additionally failed to validate or retain the mesh attempt trace: {trace_error:#}"
                     )));
                 }
             }
@@ -809,7 +981,23 @@ fn run_project(cli: &Cli, bundle: &o_lang::project::ProjectBundle) -> Result<()>
             .trace
             .as_ref()
             .context("HGraph project execution returned no Project HGraph attempt trace")?;
-        write_project_attempt_trace(path, trace)?;
+        write_json_private_atomic(path, trace)?;
+    }
+    if let Some(path) = cli.mesh_trace_out.as_deref() {
+        let trace = mesh_trace
+            .as_ref()
+            .context("mesh project execution returned no mesh attempt trace")?;
+        write_json_private_atomic(path, trace)?;
+    }
+    if let Some(path) = cli.selection_receipt_out.as_deref() {
+        let receipt = execution.validated_selection_receipt.as_ref().context(
+            "benchmark_validate_and_select execution returned no validated-selection receipt",
+        )?;
+        let bytes = receipt
+            .canonical_bytes()
+            .map_err(anyhow::Error::msg)
+            .context("failed to encode validated-selection receipt")?;
+        write_private_atomic(path, &bytes)?;
     }
     let results = execution.results;
 
@@ -820,6 +1008,61 @@ fn run_project(cli: &Cli, bundle: &o_lang::project::ProjectBundle) -> Result<()>
         bail!("no route succeeded");
     }
     Ok(())
+}
+
+fn write_json_private_atomic(path: &Path, value: &impl serde::Serialize) -> Result<()> {
+    let mut bytes = serde_json::to_vec_pretty(value).context("failed to encode evidence JSON")?;
+    bytes.push(b'\n');
+    write_private_atomic(path, &bytes)
+}
+
+fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("output path must end in a UTF-8 file name")?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temporary = parent.join(format!(
+        ".{file_name}.o-write-{}-{nonce}.tmp",
+        std::process::id()
+    ));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let write_result = (|| -> Result<()> {
+        let mut file = options
+            .open(&temporary)
+            .with_context(|| format!("failed to create {}", temporary.display()))?;
+        file.write_all(bytes)
+            .with_context(|| format!("failed to write {}", temporary.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to sync {}", temporary.display()))?;
+        drop(file);
+        fs::rename(&temporary, path).with_context(|| {
+            format!(
+                "failed to atomically publish {} as {}",
+                temporary.display(),
+                path.display()
+            )
+        })?;
+        #[cfg(unix)]
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .with_context(|| format!("failed to sync output directory {}", parent.display()))?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    write_result
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

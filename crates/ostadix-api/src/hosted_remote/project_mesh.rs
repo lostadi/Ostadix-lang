@@ -35,8 +35,9 @@ use crate::project::model::{
     OExecutionResult, ProjectBundle, RouteFailureContinuation, RoutePolicy, RouteSpec,
 };
 use crate::project::runtime::{
-    is_cancellation_error, potential_route_execution_count, resolve_selection, RouteExecutionError,
-    RunOptions,
+    benchmark_validate_and_select, is_cancellation_error, potential_route_execution_count,
+    resolve_selection, run_all_alternatives_parallel_measured, verify_results_equivalent,
+    RouteExecutionError, RouteSelectionExecution, RunOptions,
 };
 
 pub const MESH_EXECUTION_TRACE_SCHEMA_V1: &str = "ostadix.project-mesh-trace/v1";
@@ -2057,10 +2058,13 @@ pub fn execute_mesh_selection_observed(
     });
 
     match (execution, trace_retention) {
-        (Ok(results), Ok(())) => Ok(MeshExecutionOutcome {
+        (Ok(selection_execution), Ok(())) => Ok(MeshExecutionOutcome {
             execution: ConfiguredProjectExecution {
-                results,
+                results: selection_execution.results,
                 trace: None,
+                validated_selection_receipt: selection_execution.validated_selection_receipt,
+                validated_selection_measurements: selection_execution
+                    .validated_selection_measurements,
             },
             trace,
         }),
@@ -2097,7 +2101,7 @@ fn execute_mesh_policy(
     opts: &RunOptions,
     config: &MeshExecutionConfig,
     trace: &mut MeshExecutionTraceV1,
-) -> Result<Vec<OExecutionResult>> {
+) -> Result<RouteSelectionExecution> {
     let mut peers = discover_mesh_peers(config, trace)?;
     let bundle_bytes_len = u64::try_from(bundle_bytes.len()).unwrap_or(u64::MAX);
     let requested_limits = MeshExecutionLimitsV1::from_run_options(opts);
@@ -2176,8 +2180,11 @@ fn execute_mesh_policy(
             cancel,
         )
     };
-
-    let outcome = (|| -> Result<Vec<OExecutionResult>> {
+    let outcome = (|| -> Result<RouteSelectionExecution> {
+        if matches!(policy, RoutePolicy::BenchmarkValidateAndSelect) {
+            let measured = run_all_alternatives_parallel_measured(alternatives, &dispatch_one)?;
+            return benchmark_validate_and_select(bundle, &trace.target, alternatives, measured);
+        }
         let results = match policy {
             RoutePolicy::Explicit(_) | RoutePolicy::Default => vec![dispatch_one(
                 0,
@@ -2218,7 +2225,7 @@ fn execute_mesh_policy(
                         failures.join(", ")
                     );
                 }
-                verify_mesh_results_equivalent(&results)?;
+                verify_results_equivalent(&results)?;
                 results
             }
             RoutePolicy::BenchmarkAndSelect => {
@@ -2240,8 +2247,11 @@ fn execute_mesh_policy(
             RoutePolicy::RaceSettle => {
                 run_mesh_race(alternatives, &dispatch_one, MeshRaceMode::FirstSettle)?
             }
+            RoutePolicy::BenchmarkValidateAndSelect => unreachable!(
+                "validated benchmark selection is finalized before ordinary mesh policies"
+            ),
         };
-        Ok(results)
+        Ok(RouteSelectionExecution::plain(results))
     })();
 
     let mut recorded = match Arc::try_unwrap(events) {
@@ -2432,58 +2442,13 @@ where
     })
 }
 
-fn verify_mesh_results_equivalent(results: &[OExecutionResult]) -> Result<()> {
-    if results.len() < 2 {
-        return Ok(());
-    }
-    let reference = &results[0];
-    if results.iter().any(|result| result.stdout_capture.truncated) {
-        for other in &results[1..] {
-            if other.stdout_capture.sha256 != reference.stdout_capture.sha256
-                || other.stdout_capture.total_observed_bytes
-                    != reference.stdout_capture.total_observed_bytes
-            {
-                bail!(
-                    "verify_equivalent: route `{}` and route `{}` produced different stdout",
-                    reference.route_id,
-                    other.route_id
-                );
-            }
-        }
-        return Ok(());
-    }
-    if results.iter().all(|result| result.value.is_some()) {
-        for other in &results[1..] {
-            if other.value != reference.value {
-                bail!(
-                    "verify_equivalent: route `{}` and route `{}` produced different JSON values",
-                    reference.route_id,
-                    other.route_id
-                );
-            }
-        }
-        return Ok(());
-    }
-    let reference_stdout = reference.stdout_text();
-    for other in &results[1..] {
-        if other.stdout_text().trim_end() != reference_stdout.trim_end() {
-            bail!(
-                "verify_equivalent: route `{}` and route `{}` produced different stdout",
-                reference.route_id,
-                other.route_id
-            );
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::project::model::OutputCapture;
     use crate::project::{
         ArtifactCaptureStatus, ExecutionProvenance, RouteEffects, RouteExecutionDisposition,
-        RouteProvenance,
+        RouteProvenance, RouteSet,
     };
 
     fn successful_result(route_id: &str) -> OExecutionResult {
@@ -2666,6 +2631,87 @@ mod tests {
         assert_eq!(observed.trace.policy, "explicit:run");
         assert!(observed.trace.candidates.is_empty());
         observed.trace.validate().unwrap();
+    }
+
+    #[test]
+    fn validated_selection_survives_mesh_fallback_and_uses_complete_branch_time() {
+        let shell = which::which("sh").expect("test host must provide sh");
+        let shell = shell.to_string_lossy().into_owned();
+        let mut prerequisite = RouteSpec::new("slow-prep", RouteProvenance::CliOverride);
+        prerequisite.command = vec![shell.clone(), "-c".to_string(), "sleep 0.80".to_string()];
+        let mut reference = RouteSpec::new("reference", RouteProvenance::CliOverride);
+        reference.command = vec![shell.clone(), "-c".to_string(), "printf same".to_string()];
+        reference.prerequisites = vec!["slow-prep".to_string()];
+        let mut candidate = RouteSpec::new("candidate", RouteProvenance::CliOverride);
+        candidate.command = vec![
+            shell,
+            "-c".to_string(),
+            "sleep 0.25; printf same".to_string(),
+        ];
+        let mut bundle = ProjectBundle::empty("mesh-validated-selection");
+        bundle.routes = vec![prerequisite, reference, candidate];
+        bundle.route_sets = vec![RouteSet {
+            provides: "main".to_string(),
+            alternatives: vec!["reference".to_string(), "candidate".to_string()],
+            policy: RoutePolicy::BenchmarkValidateAndSelect,
+        }];
+        let peer_root = tempfile::tempdir().unwrap().path().join("no-peers");
+        let outcome = execute_mesh_selection_observed(
+            &bundle,
+            Some("main"),
+            None,
+            &RunOptions::default(),
+            &MeshExecutionConfig {
+                discover_lan: false,
+                discovery_timeout: Duration::from_millis(1),
+                peer_root: Some(peer_root),
+                ..MeshExecutionConfig::default()
+            },
+        )
+        .unwrap();
+
+        let receipt = outcome
+            .execution
+            .validated_selection_receipt
+            .expect("mesh validated selection must retain its receipt");
+        receipt.validate().unwrap();
+        assert_eq!(receipt.selected_route_id, "candidate");
+        let reference_result = outcome
+            .execution
+            .results
+            .iter()
+            .find(|result| result.route_id == "reference")
+            .unwrap();
+        let candidate_result = outcome
+            .execution
+            .results
+            .iter()
+            .find(|result| result.route_id == "candidate")
+            .unwrap();
+        assert!(
+            reference_result.duration_ns < candidate_result.duration_ns,
+            "terminal timing alone should prefer the reference"
+        );
+        assert!(
+            receipt.candidates[0]
+                .branch_elapsed_ns
+                .parse::<u128>()
+                .unwrap()
+                > receipt.candidates[1]
+                    .branch_elapsed_ns
+                    .parse::<u128>()
+                    .unwrap(),
+            "complete branch timing must include the reference prerequisite"
+        );
+        assert_eq!(
+            outcome
+                .trace
+                .events
+                .iter()
+                .filter(|event| matches!(event, MeshTraceEventV1::LocalFallback { .. }))
+                .count(),
+            2
+        );
     }
 
     #[test]
