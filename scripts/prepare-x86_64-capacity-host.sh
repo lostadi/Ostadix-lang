@@ -730,7 +730,7 @@ else
 #!/bin/sh
 set -eu
 case "${1:-}" in
-  run|plan|explain|inspect|help|--help|-h) exec o-cli "$@" ;;
+  run|optimize|plan|explain|inspect|help|--help|-h) exec o-cli "$@" ;;
   *) exec O "$@" ;;
 esac
 O_WRAPPER

@@ -9,6 +9,14 @@ Package SemVer is only one of the independent coordinates documented in
 
 ### Added
 
+- `o optimize TARGET --route ROUTE_SET [--receipt PATH] [--json]` provides the
+  initial evidence-gated optimization UI. It requires an explicit route set and
+  durable run record, runs and validates every candidate against the first
+  declared reference, reports the fastest eligible route as a human summary or
+  `ostadix.optimize-summary/v1` JSON, and can export the canonical receipt
+  outside the project. V1 provides neither same-invocation acceleration nor
+  cached reuse and does not claim universal semantic equivalence.
+
 - Project route policy `benchmark_validate_and_select` runs the first declared
   alternative as a reference and measures every candidate in an isolated
   workspace. It rejects unsuccessful or declared-output-divergent candidates,

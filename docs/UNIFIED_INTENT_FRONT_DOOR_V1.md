@@ -1,6 +1,6 @@
 # Unified Ostadix Intent Front Door V1
 
-`o run`, `o plan`, `o explain`, and `o inspect` are routed by the
+`o run`, `o optimize`, `o plan`, `o explain`, and `o inspect` are routed by the
 repository-owned Bash dispatcher to the compiled `o-cli` orchestrator. The
 dispatcher remains necessary on case-insensitive macOS filesystems where `O`
 and `o` cannot be separate installed filenames. Direct `O`, `olangc`,
@@ -23,6 +23,57 @@ project mesh `prefer`; `--mesh=required` is the explicit mandatory-remote
 spelling. Automatic and explicit mesh spellings conflict. No command in this
 front door starts `o-node`; mesh execution can use only already-running,
 authenticated peers and its configured retry/fallback policy.
+
+## Optimization boundary
+
+The initial evidence-gated optimization UI is:
+
+```text
+o optimize TARGET --route ROUTE_SET [--receipt PATH] [--json]
+```
+
+The route set is explicit and required in v1. `TARGET` must expose that named
+project route set; the command does not guess a default comparison set.
+Repeated `--route-decl DECL` values can supply explicit route declarations,
+and `--receipt-out` is an accepted spelling of `--receipt`.
+
+`o optimize` implies project execution, fixes the route policy to
+`benchmark_validate_and_select`, and requires durable run recording. It does
+not expose mesh, parallelism, executor, alternate-policy, or no-record controls.
+The first declared alternative is the reference, and every candidate runs in
+an isolated workspace. A candidate is eligible only when it settles
+successfully and its complete captured result and declared artifact manifest
+match the reference under the route set's declared-output contract. The
+fastest eligible complete branch is selected. Missing or incomplete evidence
+fails closed according to the underlying policy rather than silently admitting
+a faster route.
+
+The default presentation is a human candidate summary in declaration order.
+It identifies the reference and selected routes; shows eligibility or a
+sanitized rejection reason and complete-branch duration for every candidate;
+reports the measured reference/selected speedup ratio when defined; and prints the
+receipt digest plus the durable run ID consumable by `o inspect`. It explicitly
+states that all candidates ran and, when applicable, that none beat the
+reference during this validation run.
+
+`--json` emits exactly one `ostadix.optimize-summary/v1` object with `schema`,
+`run`, `receipt`, `receipt_sha256`, and `receipt_export_path`. `run` is the
+existing `ostadix.run-summary/v1` object. `receipt` is the typed
+`ostadix.project-validated-selection/v1` value when available; structured
+preflight and recording failures retain the same envelope and use `null` for
+unavailable receipt fields.
+
+The receipt is always embedded in the required durable run record when
+selection succeeds. `--receipt PATH` additionally exports its canonical bytes;
+that destination must be outside the project input and cannot replace a lifted
+project file. Omitting the export does not disable recording.
+
+This is an evidence-gathering invocation, not same-invocation acceleration:
+the reference and every candidate have already run before a winner is known.
+V1 neither caches nor reuses that winner on a later invocation. Its comparison
+covers complete captured results and declared artifacts, not hidden filesystem,
+network, device, or other effects, so it makes no universal semantic-equivalence
+claim.
 
 ## Planning boundary
 

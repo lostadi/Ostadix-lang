@@ -3974,6 +3974,45 @@ the complete candidate branch call: local materialization, prerequisites,
 terminal execution, output draining, and artifact capture are included; mesh
 dispatch, retry, and result retrieval are included when the mesh runs it.
 
+The initial user-facing optimization command fixes those choices behind one
+explicit interface:
+
+```text
+o optimize TARGET --route ROUTE_SET [--receipt PATH] [--json]
+```
+
+`--route` is required in v1: `TARGET` must expose the named project route set,
+and Ostadix does not infer which alternatives the user intended to compare.
+`o optimize` implies project execution, forces
+`benchmark_validate_and_select`, and requires a durable run record. It exposes
+no executor, mesh, parallelism, policy, or no-record switch. Repeated
+`--route-decl DECL` values remain available for explicit project route
+declarations, and `--receipt-out` is an alias for `--receipt`.
+
+Without `--json`, the command prints `Ostadix optimization evidence` followed
+by every candidate in declaration order. The summary labels the reference and
+selected routes, shows each route's eligibility or sanitized rejection reason
+and complete-branch duration, names the selected route, and reports its
+measured ratio against the reference when defined. It also prints the
+declared-output contract, receipt SHA-256, durable run ID for `o inspect`, an
+optional receipt export path, and an explicit reminder that every candidate
+ran. If the reference remains fastest, the summary says that no eligible
+candidate beat it in this validation run.
+
+`--json` emits exactly one `ostadix.optimize-summary/v1` envelope. Its fields
+are `schema`, `run` (the existing `ostadix.run-summary/v1` object), `receipt`
+(the typed validated-selection receipt or `null`), `receipt_sha256`, and
+`receipt_export_path`. Structured preflight and record-start failures use the
+same envelope with unavailable receipt fields set to `null`.
+
+`--receipt PATH` optionally exports the exact canonical validated-selection
+receipt. The destination must be outside the project input (and must not be
+the lifted project file); the durable run record remains mandatory whether or
+not a separate receipt file is requested.
+
+The underlying policy is also available through the lower-level project-run
+interface:
+
 ```bash
 o run src/ --project --route main \
   --routes-policy benchmark_validate_and_select \
@@ -4010,8 +4049,11 @@ typed runtime failure details, so they should be handled as potentially
 sensitive execution logs.
 
 This policy is an autotuning/evidence run: it executes every candidate, so it
-does not reduce the latency of that same invocation. A separate receipt-gated
-reuse path is required before a learned winner can accelerate later runs.
+does not reduce the latency of that same invocation. V1 does not cache or reuse
+the selected route; a separate receipt-gated reuse path is required before a
+learned winner can accelerate later runs. Matching complete captured results
+and declared artifact manifests is strong declared-output evidence, not a
+universal semantic-equivalence claim about hidden effects.
 
 The second command is the project-lift DOT route: `o-link --project` preserves
 the route table inside `project.O`, and `olangc --target dot --route main`

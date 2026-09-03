@@ -39,7 +39,10 @@ use o_lang::intent::{
 use o_lang::project::executor::{ProjectExecutionError, ProjectExecutionFailureClass};
 use o_lang::project::model::OutputCapture;
 use o_lang::project::runtime::public_route_execution_diagnostic;
-use o_lang::project::{OExecutionResult, RoutePolicy, ValidatedSelectionReceiptV1};
+use o_lang::project::{
+    OExecutionResult, RoutePolicy, ValidatedSelectionDispositionV1, ValidatedSelectionMismatchV1,
+    ValidatedSelectionReceiptV1,
+};
 use o_lang::resource_identity::ArtifactId;
 use sha2::{Digest, Sha256};
 use std::env;
@@ -53,10 +56,12 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const OPERATIONAL_COMMANDS: &str = "Run highlights:\n  o run FILE.O --parallel auto          local HGraph workers only\n  o run PROJECT --parallel auto         mesh prefer with safe local fallback\n  o run PROJECT --mesh=required         authenticated remote placement required\n  Mesh controls include --mesh-retries, --mesh-local-fallback, and --closed-registry.\n\nBoot-object commands:\n  o object root|list|stat|get|verify     typed read-only boot CAS\n\nOperational commands retained by the repository dispatcher:\n  node start|stop|status|restart|pair|list|use|profile|doctor|run|session ...\n  node-host <command> ...\n  registry <command> ...\n  info <command> ...\n  live <command> ...\n  receipt [ogit arguments]\n  kernel <command>\n  why FILE.O P<N> [olangc options]\n\nUnknown command forms retain historical evaluator behavior.";
+const OPTIMIZE_SUMMARY_SCHEMA_V1: &str = "ostadix.optimize-summary/v1";
+const OPERATIONAL_COMMANDS: &str = "Run highlights:\n  o run FILE.O --parallel auto          local HGraph workers only\n  o run PROJECT --parallel auto         mesh prefer with safe local fallback\n  o run PROJECT --mesh=required         authenticated remote placement required\n  o optimize PROJECT --route ROUTE_SET  measure and validate every alternative\n  Mesh controls include --mesh-retries, --mesh-local-fallback, and --closed-registry.\n\nBoot-object commands:\n  o object root|list|stat|get|verify     typed read-only boot CAS\n\nOperational commands retained by the repository dispatcher:\n  node start|stop|status|restart|pair|list|use|profile|doctor|run|session ...\n  node-host <command> ...\n  registry <command> ...\n  info <command> ...\n  live <command> ...\n  receipt [ogit arguments]\n  kernel <command>\n  why FILE.O P<N> [olangc options]\n\nUnknown command forms retain historical evaluator behavior.";
 #[derive(Debug, Parser)]
 #[command(
     name = "o",
+    bin_name = "o",
     version,
     about = "One intent-oriented front door for Ostadix execution and evidence",
     long_about = "Run or plan an Ostadix document or source-closed heterogeneous project, then explain or inspect retained execution evidence.",
@@ -73,6 +78,12 @@ struct Cli {
 enum IntentCommand {
     /// Run a local .O document or a route-preserving heterogeneous project.
     Run(RunArgs),
+    /// Measure project alternatives and select only after declared outputs match.
+    #[command(
+        long_about = "Measure project alternatives and select only after declared outputs match.\n\nThis command executes the reference and every candidate before selection, and it requires durable run recording. The selected route is recorded as evidence; v1 does not activate, cache, or reuse it automatically.",
+        after_long_help = "ROUTE_SET is the `provides` value of a `[[route_sets]]` entry.\n\nExample:\n  o optimize . --route main --receipt selection.json"
+    )]
+    Optimize(OptimizeArgs),
     /// Build a non-executing static plan, or opt into a read-only live snapshot.
     Plan(PlanArgs),
     /// Explain the placement and execution decisions retained for a run.
@@ -142,6 +153,18 @@ impl MeshFallbackMode {
 enum PlanFormat {
     Text,
     Json,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunPresentation {
+    Ordinary,
+    Optimize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProjectReportOptions {
+    explain_mesh: bool,
+    presentation: RunPresentation,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -250,6 +273,69 @@ struct RunArgs {
     /// Explain live mesh candidate and placement decisions on stderr.
     #[arg(long = "explain-mesh")]
     explain_mesh: bool,
+}
+
+#[derive(Clone, Debug, Args)]
+struct OptimizeArgs {
+    /// A route-preserving project directory or lifted project bundle.
+    #[arg(value_name = "TARGET")]
+    target: PathBuf,
+
+    /// Route-set name (`provides` in `[[route_sets]]`); first alternative is the reference.
+    #[arg(long, value_name = "ROUTE_SET")]
+    route: String,
+
+    /// Export the unsigned validated-selection receipt as canonical JSON.
+    #[arg(long, visible_alias = "receipt-out", value_name = "PATH")]
+    receipt: Option<PathBuf>,
+
+    /// Produce one versioned optimization-summary JSON envelope on stdout.
+    #[arg(long)]
+    json: bool,
+
+    /// Add or replace a project route declaration (repeatable).
+    #[arg(long = "route-decl", value_name = "DECL")]
+    route_decls: Vec<String>,
+}
+
+impl OptimizeArgs {
+    fn run_args(&self) -> RunArgs {
+        RunArgs {
+            target: self.target.clone(),
+            legacy_backends: None,
+            parallel: None,
+            json: self.json,
+            no_record: false,
+            require_record: true,
+            project: true,
+            shim_dir: None,
+            backend_grants: Vec::new(),
+            executor: None,
+            workers: None,
+            route: Some(self.route.clone()),
+            routes_policy: Some(RoutePolicy::BenchmarkValidateAndSelect.token()),
+            route_decls: self.route_decls.clone(),
+            project_trace_out: None,
+            selection_receipt_out: self.receipt.clone(),
+            mesh: None,
+            mesh_retries: None,
+            mesh_local_fallback: None,
+            mesh_discovery_timeout_ms: None,
+            mesh_no_lan_discovery: false,
+            mesh_peer_root: None,
+            mesh_trace_out: None,
+            explain_mesh: false,
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct OptimizeSummaryV1<'a> {
+    schema: &'static str,
+    run: &'a RunSummaryV1,
+    receipt: Option<&'a ValidatedSelectionReceiptV1>,
+    receipt_sha256: Option<String>,
+    receipt_export_path: Option<&'a str>,
 }
 
 #[derive(Debug, Args)]
@@ -509,9 +595,12 @@ fn main() {
                 error.kind(),
                 clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
             );
-            if !informational && invocation_requests_run_json(&arguments) {
+            if let Some(presentation) = (!informational)
+                .then(|| invocation_json_presentation(&arguments))
+                .flatten()
+            {
                 let detail = error.to_string();
-                if let Err(summary_error) = emit_preflight_failure_summary(&detail) {
+                if let Err(summary_error) = emit_preflight_failure_summary(&detail, presentation) {
                     eprintln!("error: failed to encode preflight run summary: {summary_error:#}");
                 }
                 eprint!("{error}");
@@ -529,24 +618,64 @@ fn main() {
     }
 }
 
-fn invocation_requests_run_json(arguments: &[OsString]) -> bool {
-    arguments.get(1).is_some_and(|value| value == "run")
-        && arguments.iter().skip(2).any(|value| value == "--json")
+fn invocation_json_presentation(arguments: &[OsString]) -> Option<RunPresentation> {
+    let presentation = match arguments.get(1)?.to_str()? {
+        "run" => RunPresentation::Ordinary,
+        "optimize" => RunPresentation::Optimize,
+        _ => return None,
+    };
+    arguments
+        .iter()
+        .skip(2)
+        .any(|value| value == "--json")
+        .then_some(presentation)
 }
 
-fn emit_preflight_failure_summary(detail: &str) -> Result<()> {
+fn emit_preflight_failure_summary(detail: &str, presentation: RunPresentation) -> Result<()> {
     let summary = RunSummaryV1::preflight_failed(detail);
     summary
         .validate()
         .map_err(anyhow::Error::msg)
         .context("front door produced an invalid preflight-failure run summary")?;
-    println!("{}", serde_json::to_string(&summary)?);
+    emit_run_json(&summary, presentation, None, None)?;
     Ok(())
+}
+
+fn emit_run_json(
+    summary: &RunSummaryV1,
+    presentation: RunPresentation,
+    receipt: Option<&ValidatedSelectionReceiptV1>,
+    receipt_export_path: Option<&Path>,
+) -> Result<()> {
+    match presentation {
+        RunPresentation::Ordinary => println!("{}", serde_json::to_string(summary)?),
+        RunPresentation::Optimize => {
+            let receipt_sha256 = receipt
+                .map(ValidatedSelectionReceiptV1::sha256)
+                .transpose()
+                .map_err(anyhow::Error::msg)
+                .context("failed to hash validated-selection receipt")?;
+            let optimized = OptimizeSummaryV1 {
+                schema: OPTIMIZE_SUMMARY_SCHEMA_V1,
+                run: summary,
+                receipt,
+                receipt_sha256,
+                receipt_export_path: json_safe_receipt_export_path(receipt_export_path),
+            };
+            println!("{}", serde_json::to_string(&optimized)?);
+        }
+    }
+    Ok(())
+}
+
+fn json_safe_receipt_export_path(path: Option<&Path>) -> Option<&str> {
+    path.and_then(Path::to_str)
 }
 
 fn dispatch(command: IntentCommand) -> Result<i32> {
     match command {
-        IntentCommand::Run(args) => run_intent(&args),
+        IntentCommand::Run(args) => run_intent(&args, RunPresentation::Ordinary),
+        IntentCommand::Optimize(args) => run_intent(&args.run_args(), RunPresentation::Optimize),
         IntentCommand::Plan(args) => plan_intent(&args),
         IntentCommand::Explain(args) => explain_pending(&args),
         IntentCommand::Inspect(args) => inspect_pending(&args),
@@ -1676,6 +1805,7 @@ struct ExecutionReport {
     decoded_value: Option<serde_json::Value>,
     route_results: Vec<RecordedRouteResultV1>,
     validated_selection_receipt: Option<ValidatedSelectionReceiptV1>,
+    selection_receipt_published: bool,
     result_references: Vec<RunResultReferenceV1>,
     trace: Option<RunTraceAttachmentV1>,
     trace_unavailable_reason: String,
@@ -1692,6 +1822,7 @@ impl ExecutionReport {
             decoded_value: None,
             route_results: Vec::new(),
             validated_selection_receipt: None,
+            selection_receipt_published: false,
             result_references: Vec::new(),
             trace: None,
             trace_unavailable_reason:
@@ -1712,6 +1843,7 @@ impl ExecutionReport {
             decoded_value: None,
             route_results: Vec::new(),
             validated_selection_receipt: None,
+            selection_receipt_published: false,
             result_references: Vec::new(),
             trace: None,
             trace_unavailable_reason:
@@ -1746,6 +1878,7 @@ fn required_recording_begin_failure(
     args: &RunArgs,
     prepared: &PreparedExecutionIntentV1,
     error: &str,
+    presentation: RunPresentation,
 ) -> Result<i32> {
     let detail =
         format!("required run recording could not begin; no computation was executed: {error}");
@@ -1771,7 +1904,7 @@ fn required_recording_begin_failure(
         .validate()
         .map_err(anyhow::Error::msg)
         .context("front door produced an invalid pre-execution run summary")?;
-    println!("{}", serde_json::to_string(&summary)?);
+    emit_run_json(&summary, presentation, None, None)?;
     eprintln!("error: {detail}");
     Ok(1)
 }
@@ -1780,6 +1913,7 @@ fn stream_observation_begin_failure(
     args: &RunArgs,
     prepared: &PreparedExecutionIntentV1,
     error: &str,
+    presentation: RunPresentation,
 ) -> Result<i32> {
     let detail = format!(
         "execution stream observation could not begin; no computation was executed: {error}"
@@ -1807,17 +1941,17 @@ fn stream_observation_begin_failure(
         .validate()
         .map_err(anyhow::Error::msg)
         .context("front door produced an invalid stream-observation summary")?;
-    println!("{}", serde_json::to_string(&summary)?);
+    emit_run_json(&summary, presentation, None, None)?;
     eprintln!("error: {detail}");
     Ok(1)
 }
 
-fn run_intent(args: &RunArgs) -> Result<i32> {
+fn run_intent(args: &RunArgs, presentation: RunPresentation) -> Result<i32> {
     let resolved_args = match resolve_run_output_paths(args) {
         Ok(args) => args,
         Err(error) if args.json => {
             let detail = format!("{error:#}");
-            emit_preflight_failure_summary(&detail)?;
+            emit_preflight_failure_summary(&detail, presentation)?;
             eprintln!("error: {detail}");
             return Ok(1);
         }
@@ -1828,7 +1962,7 @@ fn run_intent(args: &RunArgs) -> Result<i32> {
         Ok(prepared) => prepared,
         Err(error) if args.json => {
             let detail = format!("{error:#}");
-            emit_preflight_failure_summary(&detail)?;
+            emit_preflight_failure_summary(&detail, presentation)?;
             eprintln!("error: {detail}");
             return Ok(1);
         }
@@ -1851,10 +1985,20 @@ fn run_intent(args: &RunArgs) -> Result<i32> {
         match PreparedProcessCapture::prepare() {
             Ok(capture) => Some(capture),
             Err(error) if args.require_record => {
-                return required_recording_begin_failure(args, &prepared, &error.to_string());
+                return required_recording_begin_failure(
+                    args,
+                    &prepared,
+                    &error.to_string(),
+                    presentation,
+                );
             }
             Err(error) if args.json => {
-                return stream_observation_begin_failure(args, &prepared, &error.to_string());
+                return stream_observation_begin_failure(
+                    args,
+                    &prepared,
+                    &error.to_string(),
+                    presentation,
+                );
             }
             Err(error) => {
                 let detail = error.to_string();
@@ -1872,7 +2016,12 @@ fn run_intent(args: &RunArgs) -> Result<i32> {
         match RunStoreV1::open_default().and_then(|store| store.begin(seed.clone())) {
             Ok(run_lease) => lease = Some(run_lease),
             Err(error) if args.require_record => {
-                return required_recording_begin_failure(args, &prepared, &error.to_string());
+                return required_recording_begin_failure(
+                    args,
+                    &prepared,
+                    &error.to_string(),
+                    presentation,
+                );
             }
             Err(error) => {
                 let detail = error.to_string();
@@ -1885,9 +2034,18 @@ fn run_intent(args: &RunArgs) -> Result<i32> {
     }
 
     let (report, recorded_stdout, recorded_stderr) = if let Some(capture) = process_capture.take() {
-        match capture.execute(!args.json, || {
-            execute_for_report(args, &prepared, stdout_is_terminal, stderr_is_terminal)
-        }) {
+        match capture.execute(
+            !args.json && presentation == RunPresentation::Ordinary,
+            || {
+                execute_for_report(
+                    args,
+                    &prepared,
+                    stdout_is_terminal,
+                    stderr_is_terminal,
+                    presentation,
+                )
+            },
+        ) {
             Ok((mut report, mut stdout, mut stderr, capture_error)) => {
                 if let Some(error) = capture_error {
                     report.add_post_execution_failure("stream_observation", &error);
@@ -1909,7 +2067,13 @@ fn run_intent(args: &RunArgs) -> Result<i32> {
             }
         }
     } else {
-        let report = execute_for_report(args, &prepared, stdout_is_terminal, stderr_is_terminal);
+        let report = execute_for_report(
+            args,
+            &prepared,
+            stdout_is_terminal,
+            stderr_is_terminal,
+            presentation,
+        );
         let recorded_stdout = CapturedStreamV1::complete(report.stdout.clone());
         let recorded_stderr = CapturedStreamV1::complete(report.stderr.clone());
         (report, recorded_stdout, recorded_stderr)
@@ -1984,13 +2148,29 @@ fn run_intent(args: &RunArgs) -> Result<i32> {
         .validate()
         .map_err(anyhow::Error::msg)
         .context("front door produced an invalid run summary")?;
+    let receipt_export_path = reported_receipt_export_path(
+        summary.disposition,
+        report.selection_receipt_published,
+        args.selection_receipt_out.as_deref(),
+    );
 
     if args.json {
-        println!("{}", serde_json::to_string(&summary)?);
+        emit_run_json(
+            &summary,
+            presentation,
+            report.validated_selection_receipt.as_ref(),
+            receipt_export_path,
+        )?;
         io::stderr().write_all(&report.stderr)?;
         io::stderr().flush()?;
     } else {
         io::stdout().write_all(&report.stdout)?;
+        if presentation == RunPresentation::Optimize && report.validated_selection_receipt.is_some()
+        {
+            io::stdout().write_all(
+                optimization_evidence_footer(&summary, receipt_export_path).as_bytes(),
+            )?;
+        }
         io::stdout().flush()?;
         io::stderr().write_all(&report.stderr)?;
         io::stderr().flush()?;
@@ -2001,11 +2181,24 @@ fn run_intent(args: &RunArgs) -> Result<i32> {
     Ok(command_exit)
 }
 
+fn reported_receipt_export_path(
+    disposition: RunDispositionV1,
+    selection_receipt_published: bool,
+    requested_path: Option<&Path>,
+) -> Option<&Path> {
+    if disposition.is_success() && selection_receipt_published {
+        requested_path
+    } else {
+        None
+    }
+}
+
 fn execute_for_report(
     args: &RunArgs,
     prepared: &PreparedExecutionIntentV1,
     stdout_is_terminal: bool,
     stderr_is_terminal: bool,
+    presentation: RunPresentation,
 ) -> ExecutionReport {
     let execution_started = Instant::now();
     let mut report = match execute_prepared_intent(prepared) {
@@ -2043,6 +2236,7 @@ fn execute_for_report(
                 decoded_value,
                 route_results: Vec::new(),
                 validated_selection_receipt: None,
+                selection_receipt_published: false,
                 result_references,
                 trace,
                 trace_unavailable_reason,
@@ -2057,12 +2251,19 @@ fn execute_for_report(
                 observation.project_trace.as_ref(),
                 observation.mesh_trace.as_ref(),
                 observation.trace_unavailable_reason.as_deref(),
-                args.explain_mesh,
+                ProjectReportOptions {
+                    explain_mesh: args.explain_mesh,
+                    presentation,
+                },
             );
             match report {
                 Ok(mut report) => {
-                    if let Err(error) = write_observed_project_traces(args, &observation) {
-                        report.add_post_execution_failure("trace_output", &error);
+                    match write_observed_project_traces(args, &observation) {
+                        Ok(()) => {
+                            report.selection_receipt_published =
+                                args.selection_receipt_out.is_some();
+                        }
+                        Err(error) => report.add_post_execution_failure("trace_output", &error),
                     }
                     report
                 }
@@ -2074,7 +2275,7 @@ fn execute_for_report(
         }
         Err(error) => {
             let trace_write = write_error_traces(args, &error);
-            let mut report = error_report(&error, args.explain_mesh, prepared);
+            let mut report = error_report(&error, args.explain_mesh, prepared, presentation);
             if let Err(trace_error) = trace_write {
                 report.add_post_execution_failure("trace_output", &trace_error);
             }
@@ -2100,6 +2301,135 @@ fn execute_for_report(
     report
 }
 
+fn render_optimization_evidence(receipt: &ValidatedSelectionReceiptV1) -> Result<String> {
+    receipt
+        .validate()
+        .map_err(anyhow::Error::msg)
+        .context("refusing to render an invalid validated-selection receipt")?;
+    let mut out = String::from("Ostadix optimization evidence\n");
+    for candidate in &receipt.candidates {
+        let mut markers = Vec::new();
+        if candidate.route_id == receipt.reference_route_id {
+            markers.push("reference");
+        }
+        if candidate.route_id == receipt.selected_route_id {
+            markers.push("selected");
+        }
+        let marker = if markers.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", markers.join(", "))
+        };
+        let status = match candidate.disposition {
+            ValidatedSelectionDispositionV1::Eligible
+                if candidate.route_id == receipt.reference_route_id =>
+            {
+                "eligible reference".to_string()
+            }
+            ValidatedSelectionDispositionV1::Eligible => {
+                "eligible: declared outputs match reference".to_string()
+            }
+            ValidatedSelectionDispositionV1::RejectedExecution { exit_code } => {
+                let exit = exit_code
+                    .map(|code| format!("exit {code}"))
+                    .unwrap_or_else(|| "no exit code".to_string());
+                format!("rejected: execution or artifact capture failed ({exit})")
+            }
+            ValidatedSelectionDispositionV1::RejectedOutput { mismatch } => {
+                let reason = match mismatch {
+                    ValidatedSelectionMismatchV1::ResultCodec => "result codec differs",
+                    ValidatedSelectionMismatchV1::JsonValue => "canonical JSON differs",
+                    ValidatedSelectionMismatchV1::Stdout => "complete stdout differs",
+                    ValidatedSelectionMismatchV1::ArtifactManifest => {
+                        "declared artifact manifest differs"
+                    }
+                };
+                format!("rejected: {reason}")
+            }
+        };
+        out.push_str(&format!(
+            "- {}{} - {} - {} complete branch\n",
+            candidate.route_id,
+            marker,
+            status,
+            format_optimization_duration(&candidate.branch_elapsed_ns)?,
+        ));
+    }
+
+    let reference = receipt
+        .candidates
+        .first()
+        .context("validated-selection receipt has no reference candidate")?;
+    let selected = receipt
+        .candidates
+        .iter()
+        .find(|candidate| candidate.route_id == receipt.selected_route_id)
+        .context("validated-selection receipt has no selected candidate")?;
+    out.push_str(&format!("Selected route: {}\n", receipt.selected_route_id));
+    let reference_ns = parse_optimization_duration(&reference.branch_elapsed_ns)?;
+    let selected_ns = parse_optimization_duration(&selected.branch_elapsed_ns)?;
+    if selected_ns != 0 {
+        out.push_str(&format!(
+            "Measured complete-branch ratio versus reference: {:.2}x (this validation run)\n",
+            reference_ns as f64 / selected_ns as f64,
+        ));
+    }
+    if receipt.selected_route_id == receipt.reference_route_id {
+        out.push_str("No eligible candidate beat the reference in this validation run.\n");
+    }
+    out.push_str(
+        "Declared-output contract: canonical JSON or complete stdout, plus declared artifact manifests, must match the reference.\n",
+    );
+    out.push_str(&format!(
+        "Receipt SHA-256: {}\n",
+        receipt
+            .sha256()
+            .map_err(anyhow::Error::msg)
+            .context("failed to hash validated-selection receipt")?,
+    ));
+    Ok(out)
+}
+
+fn parse_optimization_duration(value: &str) -> Result<u128> {
+    value
+        .parse::<u128>()
+        .with_context(|| format!("invalid complete-branch duration `{value}`"))
+}
+
+fn format_optimization_duration(value: &str) -> Result<String> {
+    let nanos = parse_optimization_duration(value)?;
+    let rendered = if nanos >= 1_000_000_000 {
+        format!("{:.3} s", nanos as f64 / 1_000_000_000.0)
+    } else if nanos >= 1_000_000 {
+        format!("{:.3} ms", nanos as f64 / 1_000_000.0)
+    } else if nanos >= 1_000 {
+        format!("{:.3} us", nanos as f64 / 1_000.0)
+    } else {
+        format!("{nanos} ns")
+    };
+    Ok(rendered)
+}
+
+fn optimization_evidence_footer(
+    summary: &RunSummaryV1,
+    receipt_export_path: Option<&Path>,
+) -> String {
+    let mut out = String::new();
+    match (&summary.recording, summary.run_id.as_deref()) {
+        (RunRecordingStatusV1::Recorded { .. }, Some(run_id)) => {
+            out.push_str(&format!("Durable evidence: o inspect {run_id}\n"));
+        }
+        _ => out.push_str("Durable evidence: unavailable\n"),
+    }
+    if let Some(path) = receipt_export_path {
+        out.push_str(&format!("Receipt export path: {}\n", path.display()));
+    }
+    out.push_str(
+        "Note: every candidate ran; the selected route was recorded as evidence but was not activated or reused, and this invocation was not accelerated.\n",
+    );
+    out
+}
+
 fn project_report(
     results: &[OExecutionResult],
     validated_selection_receipt: Option<&o_lang::project::ValidatedSelectionReceiptV1>,
@@ -2107,28 +2437,38 @@ fn project_report(
     project_trace: Option<&o_lang::project::ProjectAttemptTrace>,
     mesh_trace: Option<&o_lang::hosted_remote::project_mesh::MeshExecutionTraceV1>,
     unavailable_reason: Option<&str>,
-    explain_mesh: bool,
+    options: ProjectReportOptions,
 ) -> Result<ExecutionReport> {
     let succeeded = results.iter().any(OExecutionResult::succeeded);
-    let mut stdout = Vec::new();
-    for result in results {
-        stdout.extend_from_slice(result.observation_summary().as_bytes());
-    }
-    if let Some(receipt) = validated_selection_receipt {
-        let digest = receipt.sha256().unwrap_or_else(|_| "<invalid>".to_string());
-        stdout.extend_from_slice(
-            format!(
-                "validated selection: reference={} selected={} candidates={} receipt-sha256={}\n",
-                receipt.reference_route_id,
-                receipt.selected_route_id,
-                receipt.candidates.len(),
-                digest,
-            )
-            .as_bytes(),
-        );
-    }
+    let stdout = match options.presentation {
+        RunPresentation::Ordinary => {
+            let mut stdout = Vec::new();
+            for result in results {
+                stdout.extend_from_slice(result.observation_summary().as_bytes());
+            }
+            if let Some(receipt) = validated_selection_receipt {
+                let digest = receipt.sha256().unwrap_or_else(|_| "<invalid>".to_string());
+                stdout.extend_from_slice(
+                    format!(
+                        "validated selection: reference={} selected={} candidates={} receipt-sha256={}\n",
+                        receipt.reference_route_id,
+                        receipt.selected_route_id,
+                        receipt.candidates.len(),
+                        digest,
+                    )
+                    .as_bytes(),
+                );
+            }
+            stdout
+        }
+        RunPresentation::Optimize => {
+            let receipt = validated_selection_receipt
+                .context("o optimize execution returned no validated-selection receipt")?;
+            render_optimization_evidence(receipt)?.into_bytes()
+        }
+    };
     let mut stderr = Vec::new();
-    if explain_mesh {
+    if options.explain_mesh {
         if let Some(trace) = mesh_trace {
             stderr.extend_from_slice(mesh_explanation(trace).as_bytes());
         } else {
@@ -2191,6 +2531,7 @@ fn project_report(
         decoded_value,
         route_results,
         validated_selection_receipt: validated_selection_receipt.cloned(),
+        selection_receipt_published: false,
         result_references,
         trace,
         trace_unavailable_reason,
@@ -2260,6 +2601,7 @@ fn error_report(
     error: &anyhow::Error,
     explain_mesh: bool,
     prepared: &PreparedExecutionIntentV1,
+    presentation: RunPresentation,
 ) -> ExecutionReport {
     if let Some(ordinary) = error.downcast_ref::<OrdinaryOExecutionErrorV1>() {
         let message = format!("{error:#}");
@@ -2287,6 +2629,7 @@ fn error_report(
             decoded_value: None,
             route_results: Vec::new(),
             validated_selection_receipt: None,
+            selection_receipt_published: false,
             result_references: Vec::new(),
             trace,
             trace_unavailable_reason,
@@ -2321,9 +2664,15 @@ fn error_report(
         project.map(|failure| &failure.trace),
         mesh.map(|failure| &failure.trace),
         Some("execution failed before a validated engine trace was available"),
-        explain_mesh,
+        ProjectReportOptions {
+            explain_mesh,
+            presentation: RunPresentation::Ordinary,
+        },
     )
     .expect("a project error report carries no validated-selection evidence to bind");
+    if presentation == RunPresentation::Optimize {
+        report.stdout.clear();
+    }
     let semantic = project
         .is_some_and(|failure| failure.class() == ProjectExecutionFailureClass::Semantic)
         || mesh.is_some_and(|failure| failure.class() == MeshExecutionFailureClass::Semantic);
@@ -2768,6 +3117,10 @@ fn parse_discovery_timeout_ms(value: &str) -> std::result::Result<u64, String> {
 mod tests {
     use super::*;
     use clap::error::ErrorKind;
+    use o_lang::project::{
+        ResultCodec, RouteExecutionDisposition, ValidatedArtifactCaptureStatusV1,
+        ValidatedSelectionCandidateV1, ValidatedSelectionObservationV1,
+    };
     use tempfile::tempdir;
 
     fn parse_run(arguments: &[&str]) -> RunArgs {
@@ -2776,6 +3129,81 @@ mod tests {
             panic!("expected run command")
         };
         run
+    }
+
+    fn parse_optimize(arguments: &[&str]) -> OptimizeArgs {
+        let cli = Cli::try_parse_from(arguments).unwrap();
+        let IntentCommand::Optimize(optimize) = cli.command else {
+            panic!("expected optimize command")
+        };
+        optimize
+    }
+
+    fn optimization_observation(stdout: &[u8]) -> ValidatedSelectionObservationV1 {
+        ValidatedSelectionObservationV1 {
+            result_codec: ResultCodec::Text,
+            exit_code: Some(0),
+            stdout_capture: OutputCapture::complete(stdout),
+            stderr_capture: OutputCapture::complete(&[]),
+            json_value_sha256: None,
+            artifacts: Vec::new(),
+            artifact_requirements: Vec::new(),
+            artifact_capture: ValidatedArtifactCaptureStatusV1::Complete,
+            execution_disposition: RouteExecutionDisposition::Executed,
+        }
+    }
+
+    fn optimization_candidate(
+        route_id: &str,
+        branch_elapsed_ns: &str,
+        stdout: &[u8],
+        disposition: ValidatedSelectionDispositionV1,
+    ) -> ValidatedSelectionCandidateV1 {
+        let observation = optimization_observation(stdout);
+        ValidatedSelectionCandidateV1 {
+            route_id: route_id.to_string(),
+            terminal_elapsed_ns: "1".to_string(),
+            branch_elapsed_ns: branch_elapsed_ns.to_string(),
+            observation_sha256: observation.sha256().unwrap(),
+            declared_output_sha256: observation.declared_output_sha256().unwrap(),
+            observation,
+            disposition,
+        }
+    }
+
+    fn optimization_receipt(selected: &str) -> ValidatedSelectionReceiptV1 {
+        let reference_duration = if selected == "reference" { "10" } else { "30" };
+        let fast_duration = if selected == "reference" { "20" } else { "10" };
+        ValidatedSelectionReceiptV1::new(
+            "optimize-fixture",
+            "ab".repeat(32),
+            "main",
+            "reference",
+            vec![
+                optimization_candidate(
+                    "reference",
+                    reference_duration,
+                    b"same",
+                    ValidatedSelectionDispositionV1::Eligible,
+                ),
+                optimization_candidate(
+                    "fast",
+                    fast_duration,
+                    b"same",
+                    ValidatedSelectionDispositionV1::Eligible,
+                ),
+                optimization_candidate(
+                    "wrong",
+                    "2",
+                    b"wrong",
+                    ValidatedSelectionDispositionV1::RejectedOutput {
+                        mismatch: ValidatedSelectionMismatchV1::Stdout,
+                    },
+                ),
+            ],
+            selected,
+        )
+        .unwrap()
     }
 
     fn parse_plan(arguments: &[&str]) -> PlanArgs {
@@ -2832,6 +3260,182 @@ mod tests {
             Path::new("execution-intent.json")
         );
         assert_eq!(computation.lineage, "examples/semantic-custody");
+    }
+
+    #[test]
+    fn optimize_command_is_closed_sugar_for_durable_validated_selection() {
+        let optimize = parse_optimize(&[
+            "o",
+            "optimize",
+            "project",
+            "--route",
+            "main",
+            "--receipt-out",
+            "selection.json",
+            "--route-decl",
+            "id=fast,command=fast",
+            "--route-decl",
+            "id=safe,command=safe",
+            "--json",
+        ]);
+        assert_eq!(optimize.target, Path::new("project"));
+        assert_eq!(optimize.route, "main");
+        assert_eq!(
+            optimize.receipt.as_deref(),
+            Some(Path::new("selection.json"))
+        );
+        assert_eq!(optimize.route_decls.len(), 2);
+        assert!(optimize.json);
+
+        let run = optimize.run_args();
+        assert!(run.project);
+        assert!(run.require_record);
+        assert!(!run.no_record);
+        assert_eq!(run.route.as_deref(), Some("main"));
+        assert_eq!(
+            run.routes_policy.as_deref(),
+            Some("benchmark_validate_and_select")
+        );
+        assert_eq!(run.selection_receipt_out, optimize.receipt);
+        assert!(run.parallel.is_none());
+        assert!(run.executor.is_none());
+        assert!(run.workers.is_none());
+        assert!(run.mesh.is_none());
+        assert!(run.mesh_retries.is_none());
+        assert!(run.mesh_local_fallback.is_none());
+        assert!(run.mesh_discovery_timeout_ms.is_none());
+        assert!(!run.mesh_no_lan_discovery);
+        assert!(run.mesh_peer_root.is_none());
+        assert!(run.mesh_trace_out.is_none());
+    }
+
+    #[test]
+    fn optimize_requires_a_route_and_hides_general_run_policy_knobs() {
+        let missing_route = Cli::try_parse_from(["o", "optimize", "project"]).unwrap_err();
+        assert_eq!(missing_route.kind(), ErrorKind::MissingRequiredArgument);
+
+        for forbidden in [
+            "--parallel",
+            "--routes-policy",
+            "--no-record",
+            "--executor",
+            "--workers",
+            "--mesh",
+        ] {
+            let error =
+                Cli::try_parse_from(["o", "optimize", "project", "--route", "main", forbidden])
+                    .unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::UnknownArgument, "{forbidden}");
+        }
+    }
+
+    #[test]
+    fn optimize_render_is_compact_ordered_and_explicit_about_its_boundary() {
+        let receipt = optimization_receipt("fast");
+        let rendered = render_optimization_evidence(&receipt).unwrap();
+        let reference = rendered.find("- reference [reference]").unwrap();
+        let fast = rendered.find("- fast [selected]").unwrap();
+        let wrong = rendered
+            .find("- wrong - rejected: complete stdout differs")
+            .unwrap();
+        assert!(reference < fast && fast < wrong);
+        assert!(rendered.contains("eligible: declared outputs match reference"));
+        assert!(rendered.contains(
+            "Measured complete-branch ratio versus reference: 3.00x (this validation run)"
+        ));
+        assert!(rendered.contains("Declared-output contract:"));
+        assert!(rendered.contains(&format!("Receipt SHA-256: {}", receipt.sha256().unwrap())));
+        assert!(!rendered.contains("same"));
+        assert!(!rendered.contains("wrong\n"));
+
+        let reference_wins =
+            render_optimization_evidence(&optimization_receipt("reference")).unwrap();
+        assert!(reference_wins.contains("[reference, selected]"));
+        assert!(reference_wins
+            .contains("No eligible candidate beat the reference in this validation run."));
+
+        let mut summary = RunSummaryV1::preflight_failed("fixture");
+        let run_id = "cd".repeat(32);
+        summary.run_id = Some(run_id.clone());
+        summary.recording = RunRecordingStatusV1::Recorded {
+            sequence: 1,
+            record_sha256: "ef".repeat(32),
+        };
+        summary.disposition = RunDispositionV1::Succeeded;
+        let run = parse_optimize(&[
+            "o",
+            "optimize",
+            "project",
+            "--route",
+            "main",
+            "--receipt",
+            "selection.json",
+        ])
+        .run_args();
+        let export_path = reported_receipt_export_path(
+            summary.disposition,
+            true,
+            run.selection_receipt_out.as_deref(),
+        );
+        let footer = optimization_evidence_footer(&summary, export_path);
+        assert!(footer.contains(&format!("Durable evidence: o inspect {run_id}")));
+        assert!(footer.contains("Receipt export path: selection.json"));
+        assert!(footer.contains("every candidate ran"));
+        assert!(footer.contains("was not accelerated"));
+
+        let failed_export_path = reported_receipt_export_path(
+            RunDispositionV1::InfrastructureFailed,
+            true,
+            run.selection_receipt_out.as_deref(),
+        );
+        let failed_footer = optimization_evidence_footer(&summary, failed_export_path);
+        assert!(!failed_footer.contains("Receipt export path:"));
+    }
+
+    #[test]
+    fn optimize_json_envelope_is_versioned_and_nullable_before_execution() {
+        let run = RunSummaryV1::preflight_failed("missing route");
+        let envelope = OptimizeSummaryV1 {
+            schema: OPTIMIZE_SUMMARY_SCHEMA_V1,
+            run: &run,
+            receipt: None,
+            receipt_sha256: None,
+            receipt_export_path: Some("selection.json"),
+        };
+        let value = serde_json::to_value(envelope).unwrap();
+        assert_eq!(value["schema"], OPTIMIZE_SUMMARY_SCHEMA_V1);
+        assert_eq!(value["run"]["schema"], RUN_SUMMARY_SCHEMA_V1);
+        assert!(value["receipt"].is_null());
+        assert!(value["receipt_sha256"].is_null());
+        assert_eq!(value["receipt_export_path"], "selection.json");
+
+        let arguments = ["o", "optimize", "--json"]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            invocation_json_presentation(&arguments),
+            Some(RunPresentation::Optimize)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn optimize_json_envelope_nulls_a_non_utf8_receipt_export_path() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let invalid_path = Path::new(OsStr::from_bytes(b"selection-\xff.json"));
+        let run = RunSummaryV1::preflight_failed("invalid receipt path");
+        let envelope = OptimizeSummaryV1 {
+            schema: OPTIMIZE_SUMMARY_SCHEMA_V1,
+            run: &run,
+            receipt: None,
+            receipt_sha256: None,
+            receipt_export_path: json_safe_receipt_export_path(Some(invalid_path)),
+        };
+        let value = serde_json::to_value(envelope).unwrap();
+        assert!(value["receipt_export_path"].is_null());
     }
 
     #[test]
@@ -3016,6 +3620,7 @@ mod tests {
         let help = Cli::command().render_long_help().to_string();
         for text in [
             "run",
+            "optimize",
             "plan",
             "explain",
             "inspect",
@@ -3027,6 +3632,23 @@ mod tests {
         ] {
             assert!(help.contains(text), "help omitted {text:?}:\n{help}");
         }
+
+        let optimize_help = Cli::try_parse_from(["o-cli", "optimize", "--help"]).unwrap_err();
+        assert_eq!(optimize_help.kind(), ErrorKind::DisplayHelp);
+        let optimize_help = optimize_help.to_string();
+        for text in [
+            "Usage: o optimize",
+            "executes the reference and every candidate",
+            "requires durable run recording",
+            "does not activate, cache, or reuse it automatically",
+            "o optimize . --route main --receipt selection.json",
+        ] {
+            assert!(
+                optimize_help.contains(text),
+                "optimize help omitted {text:?}:\n{optimize_help}"
+            );
+        }
+        assert!(!optimize_help.contains("Usage: o-cli"));
 
         let error = Cli::try_parse_from(["o", "run"]).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);

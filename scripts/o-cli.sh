@@ -26,7 +26,7 @@ case "${1:-}" in
         fi
         exec "$DEVICE_BIN" "$@"
         ;;
-    help|--help|-h|run|plan|explain|inspect|object)
+    help|--help|-h|run|optimize|plan|explain|inspect|object)
         if [ ! -x "$OCLI_BIN" ]; then
             printf 'error: compiled Ostadix front door is missing or not executable: %s\n' "$OCLI_BIN" >&2
             exit 1

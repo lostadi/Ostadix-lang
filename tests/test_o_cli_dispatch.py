@@ -71,6 +71,7 @@ class LowercaseCliDispatchTests(unittest.TestCase):
         for arguments in (
             ("run", "program.O", "backends"),
             ("run", "project", "--parallel", "auto"),
+            ("optimize", "project", "--route", "main", "--json"),
             ("plan", "--parallel", "auto", "project", "--live"),
             ("explain", "last-run"),
             ("inspect", "last-run", "--trace"),
@@ -205,6 +206,15 @@ class LowercaseCliDispatchTests(unittest.TestCase):
 
     def test_unknown_command_forms_still_fall_through_to_the_evaluator(self) -> None:
         self.assert_dispatch(("program.O", "backends"), ["program.O", "backends"])
+
+    def test_packaged_dispatchers_route_optimize_to_the_compiled_front_door(self) -> None:
+        dockerfile = (PROJECT_ROOT / "Dockerfile").read_text(encoding="utf-8")
+        capacity_host = (
+            PROJECT_ROOT / "scripts" / "prepare-x86_64-capacity-host.sh"
+        ).read_text(encoding="utf-8")
+        expected = "run|optimize|plan|explain|inspect"
+        self.assertIn(expected, dockerfile)
+        self.assertIn(expected, capacity_host)
 
 
 class KernelCapacityCliDispatchTests(unittest.TestCase):
