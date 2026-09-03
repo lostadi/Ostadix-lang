@@ -1640,7 +1640,7 @@ fn affinity_for_pid(pid: i32) -> Option<Vec<u32>> {
     if result != 0 {
         return None;
     }
-    let cpus = (0..libc::CPU_SETSIZE)
+    let cpus = (0..cpu_set_size())
         .filter(|cpu| unsafe { libc::CPU_ISSET(*cpu, &set) })
         .map(|cpu| cpu as u32)
         .collect::<Vec<_>>();
@@ -1655,7 +1655,7 @@ fn set_affinity_for_pid(pid: i32, cpus: &[u32]) -> Result<()> {
     let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
     for cpu in cpus {
         let cpu = usize::try_from(*cpu).context("CPU index does not fit usize")?;
-        if cpu >= libc::CPU_SETSIZE {
+        if cpu >= cpu_set_size() {
             bail!("CPU {cpu} exceeds the platform affinity limit");
         }
         unsafe { libc::CPU_SET(cpu, &mut set) };
@@ -1671,6 +1671,19 @@ fn set_affinity_for_pid(pid: i32, cpus: &[u32]) -> Result<()> {
         return Err(std::io::Error::last_os_error()).context("sched_setaffinity failed");
     }
     Ok(())
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn cpu_set_size() -> usize {
+    // libc exposes CPU_SETSIZE as c_int on Linux and size_t on Android.
+    #[cfg(target_os = "linux")]
+    {
+        libc::CPU_SETSIZE as usize
+    }
+    #[cfg(target_os = "android")]
+    {
+        libc::CPU_SETSIZE
+    }
 }
 
 #[cfg(not(any(target_os = "android", target_os = "linux")))]

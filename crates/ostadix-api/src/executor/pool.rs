@@ -78,11 +78,10 @@ impl WorkerPool {
     pub(crate) fn matches_current_affinity(&self) -> bool {
         #[cfg(any(target_os = "android", target_os = "linux"))]
         {
-            return self
-                .creator_affinity
+            self.creator_affinity
                 .as_ref()
                 .zip(current_thread_affinity().as_ref())
-                .is_some_and(|(created, current)| created == current);
+                .is_some_and(|(created, current)| created == current)
         }
         #[cfg(not(any(target_os = "android", target_os = "linux")))]
         {
