@@ -71,6 +71,28 @@ class ContractSurfacesTests(unittest.TestCase):
             readme,
         )
 
+    def test_readme_separates_historical_audit_from_current_world_status(self) -> None:
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn("### Validation at the historical audited master", readme)
+        self.assertIn(
+            "The focused pre-repair World-alpha tests recorded 30 passes, one failure, and",
+            readme,
+        )
+        self.assertIn(
+            "append-only ledger now supersedes the old G0 head with that new schema-v3",
+            readme,
+        )
+        self.assertNotIn("fresh " + "current-master observation", readme)
+        self.assertNotIn(
+            "G0 source-digest " + "lineage is not continuous", readme
+        )
+        self.assertNotIn(
+            "G0 and dependent G2 " + "therefore do not validate", readme
+        )
+        self.assertNotIn(
+            "26 of 26 fresh " + "portable native execution gates", readme
+        )
+
     def test_rust_suite_projects_openssl_from_one_manifest(self) -> None:
         result = self.run_contracts("required-executables", "--suite", "rust-hosted")
         self.assertEqual(result.returncode, 0, result.stderr)

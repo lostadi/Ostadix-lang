@@ -5345,15 +5345,19 @@ python3 scripts/release_evidence.py validate
 ```
 <!-- END GENERATED: REQUIRED_QEMU_EVIDENCE -->
 
-### Validation at the audited master
+### Validation at the historical audited master
 
-This README and the accompanying whitepaper use master commit
+This section preserves the results of a historical audit; it is not a fresh
+measurement of the current checkout. The README and accompanying whitepaper
+used pre-rewrite `master` commit
 `36787b16476bc0c8c4ddf665c7228b314d04e716`, tree
 `5bd6625fc0cac91b414caec9f6a4aad027d28cfd`, as their implementation snapshot.
+The sealed 2026-09-03 attribution-rewrite map resolves that commit to rewritten
+`master` commit `b6122c914ed5a8d30028b503b4f686e80767e6b6`, which has the same Git tree.
 
 | Validation surface | Observed result |
 |---|---|
-| Isolated current-master Rust audit | 1,351 passed, 3 ignored |
+| Isolated Rust audit at the historical snapshot | 1,351 passed, 3 ignored |
 | Root Rust quality gates | `cargo fmt --check`, locked all-target/all-feature check, and clippy with warnings denied passed |
 | Release binary surface | `cargo build --release --workspace --bins --all-features --locked` passed in 3 minutes 13 seconds |
 | Root binary boundary audit | All 14 binaries executed: 13 accepted `--help`; `o-notebook` served its UI and API successfully |
@@ -5363,7 +5367,7 @@ This README and the accompanying whitepaper use master commit
 | C17 CMake suite | 4 of 4 tests passed |
 | Python edition | 18 parser tests and 46 evaluator tests passed; `compileall` passed |
 | Rust example manifest | 39 examples passed and 5 manifest-declared examples skipped |
-| Recursive `.O` inventory | All 44 current-master tracked examples were discovered and classified |
+| Recursive `.O` inventory | All 44 examples tracked at the historical snapshot were discovered and classified |
 | Source-release validation | 77 of 77 required release entries passed |
 | `olangc` target matrix | All five public targets were exercised: binary, wasm, script, IR, and DOT |
 | Hosted integration smokes | Hosted Live, Project HGraph, and World smoke suites passed |
@@ -5374,24 +5378,30 @@ This README and the accompanying whitepaper use master commit
 | Portable native aggregate duration | 361.11 seconds wall time on the audited host |
 | `olangc --target wasm` | `wasm32-wasip1` compilation succeeded and repeated builds were byte-identical |
 | Wasmtime execution on the audited host | The produced module started and failed while locating `O` |
-| Direct World-alpha validator | Historical evidence continuity failure described below |
+| Direct World-alpha validator before the provenance-bridge repair | Historical evidence continuity failure described below |
 
-The current execution result is complete for the required portable native
-manifest: every required gate passed. The checked-in World-alpha historical
-registry has a separate continuity defect. Direct execution of
-`scripts/world_alpha_evidence.py` reports:
+The recorded execution result was complete for the required portable native
+manifest at that historical snapshot: every required gate passed. After the
+attribution-only rewrite, but before the sealed provenance bridge was added,
+direct execution of `scripts/world_alpha_evidence.py` reported:
 
 ```text
 evidence/world/g0-independent-engine-2026-08-17.toml.source digests do not resolve to one working tree, base commit, or descendant commit
 ```
 
-The focused World-alpha tests recorded 30 passes, one failure, and one error.
-The checked-in registry therefore cannot validate G0 or its dependent G2 for
-that source-digest lineage. The schema-v2 validator snapshot digest beginning
-`c25d38c` also does not resolve to accepted repository history. This is a
-checked-in historical evidence continuity defect. It does not change the fresh
-current-master observation that all 26 required portable QEMU execution gates
-passed.
+The focused pre-repair World-alpha tests recorded 30 passes, one failure, and
+one error. This was a commit-coordinate continuity defect: the immutable
+evidence bytes still named pre-rewrite commits, while rewritten `master` no
+longer shared their ancestry.
+
+Commit `4b8d83d2f748b2376570ad05db7e4479be6e5d70` added the SHA-256-sealed
+598-row provenance bridge without moving the immutable `v0.2.0` or `v0.3.0`
+tags or weakening source-digest validation. A fresh G0 run at that exact clean
+commit emitted all seven PASS markers and six typed evidence observations. The
+append-only ledger now supersedes the old G0 head with that new schema-v3
+attestation, and the direct World-alpha validator passes. This repair does not
+rerun the 26 historical portable QEMU gates or turn their recorded results into
+fresh current-`master` observations.
 
 The binary boundary audit exercised every root Cargo binary. Thirteen binaries
 accepted their public `--help` boundary. `o-notebook`, whose first argument is
@@ -5649,11 +5659,12 @@ confuse with the implemented mechanisms described above.
   admitted `O` proxy and fails closed when that executable authority cannot be
   captured. Hosted-live publication separately requires Wasmtime to execute the
   exact source-bound Olangc module.
-- The World-alpha registry's checked-in G0 source-digest lineage is not
-  continuous in accepted repository history. G0 and dependent G2 therefore do
-  not validate through `scripts/world_alpha_evidence.py` at this snapshot. This
-  historical registry defect is separate from the 26 of 26 fresh portable
-  native execution gates that passed at the same master commit.
+- The attribution-only rewrite initially disconnected the World-alpha
+  registry's immutable G0 commit coordinates from rewritten `master`. The
+  sealed 598-row provenance bridge and append-only replacement G0 attestation
+  now restore source-digest validation; the registry derives only G0 and G2 as
+  passed. This repair does not refresh the historical 26-of-26 portable native
+  execution-gate observation.
 - The standalone MCP crate passed all 29 Rust tests, and the real built server
   passed a smoke of all ten tools. Separately, root Python
   `tests.test_mcp_smoke` recorded four passes and one brittle assertion failure:

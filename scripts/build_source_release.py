@@ -446,6 +446,8 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "evidence/world/g0-ostadix-alpha-branding-supersession-2026-08-09.toml",
         "evidence/world/g0-independent-engine-2026-08-17.toml",
         "evidence/world/g0-independent-engine-supersession-2026-08-17.toml",
+        "evidence/world/g0-attribution-history-continuity-2026-09-03.toml",
+        "evidence/world/g0-attribution-history-continuity-supersession-2026-09-03.toml",
         "evidence/world/g2-aarch64-qemu.toml",
         "evidence/world/g2-aarch64-qemu-2026-08-03.toml",
         "evidence/world/g2-derivation-rederive-2026-08-03.toml",
@@ -455,6 +457,7 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "evidence/world/transcripts/g0-repository-conformance-2026-08-03-v2.log",
         "evidence/world/transcripts/g0-ostadix-alpha-branding-2026-08-09.log",
         "evidence/world/transcripts/g0-independent-engine-2026-08-17.log",
+        "evidence/world/transcripts/g0-attribution-history-continuity-2026-09-03.log",
         "evidence/world/transcripts/g2-aarch64-qemu.log",
         "evidence/world/transcripts/g2-aarch64-qemu-2026-08-03.log",
         "examples/manifest.json",
@@ -900,6 +903,9 @@ WORLD_HISTORICAL_ATTESTATION_SHA256 = {
     "evidence/world/g0-ostadix-alpha-branding-2026-08-09.toml": (
         "32b76b190aab1c51ba73beccee350ea2a20928798605e980173c86da916450df"
     ),
+    "evidence/world/g0-independent-engine-2026-08-17.toml": (
+        "2c48ef0100bf944e2ce50a70162adff2078836e5e755c92177f366714e7b21be"
+    ),
     "evidence/world/g2-aarch64-qemu.toml": (
         "99414f1cf356b3666c163e0e28172eaf2b46e3f14c8f13f2ce12fa24cc9d30d7"
     ),
@@ -908,14 +914,17 @@ WORLD_HISTORICAL_ATTESTATION_SHA256 = {
     ),
 }
 WORLD_CURRENT_ATTESTATION_SHA256 = {
-    "evidence/world/g0-independent-engine-2026-08-17.toml": (
-        "2c48ef0100bf944e2ce50a70162adff2078836e5e755c92177f366714e7b21be"
+    "evidence/world/g0-attribution-history-continuity-2026-09-03.toml": (
+        "262ff3db77adc827126e4edde4a3d38a344aecf1c5d881a1c786b82f95693dbd"
     ),
 }
 # Repository-authored lifecycle and derivation events are immutable ledger
 # records.  The release verifier seals their complete bytes independently of
 # the payload hash carried by a rederive event.
 WORLD_EVIDENCE_EVENT_SHA256 = {
+    "evidence/world/g0-attribution-history-continuity-supersession-2026-09-03.toml": (
+        "5594d94cb9355bb50b5de6d2dccdc51b8fce649cb2bb6204444453426ba20d73"
+    ),
     "evidence/world/g0-independent-engine-supersession-2026-08-17.toml": (
         "aeec68018bd7416cc7b24b1a4d8b102e3df31122a56856784796b73f4a1d90ce"
     ),
@@ -2782,14 +2791,14 @@ def _validate_world_attestation_release_surface(
     schema_version = attestation.get("schema_version")
     if type(schema_version) is not int or schema_version not in {1, 2, 3}:
         raise ReleaseError(f"{path} schema_version must be 1, 2, or 3")
-    if schema_version <= 2:
-        expected_historical_digest = WORLD_HISTORICAL_ATTESTATION_SHA256.get(path)
-        if expected_historical_digest is None:
-            raise ReleaseError(
-                f"{path} historical attestation lacks a trusted exact-byte seal"
-            )
+    expected_historical_digest = WORLD_HISTORICAL_ATTESTATION_SHA256.get(path)
+    if expected_historical_digest is not None:
         if hashlib.sha256(files[path]).hexdigest() != expected_historical_digest:
             raise ReleaseError(f"{path} historical attestation bytes differ from seal")
+    elif schema_version <= 2:
+        raise ReleaseError(
+            f"{path} historical attestation lacks a trusted exact-byte seal"
+        )
     current_attestation = path in WORLD_CURRENT_ATTESTATION_SHA256
     if schema_version == 1:
         version_keys = {"claims"}

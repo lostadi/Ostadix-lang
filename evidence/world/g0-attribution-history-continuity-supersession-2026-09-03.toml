@@ -1,0 +1,9 @@
+schema_version = 1
+id = "g0-attribution-history-continuity-supersession-2026-09-03"
+event = "supersede"
+subject = "g0-independent-engine-2026-08-17"
+replacement = "g0-attribution-history-continuity-2026-09-03"
+reason_code = "attribution-history-provenance-bridge"
+reason = "The 2026-09-03 attribution-only master rewrite changed commit identities while preserving every mapped Git tree; the prior G0 record remains immutable and is superseded by a fresh exact-Commit-A G0 run whose source closure binds the current validator and sealed rewrite map."
+source_commit = "4b8d83d2f748b2376570ad05db7e4479be6e5d70"
+signatures = []

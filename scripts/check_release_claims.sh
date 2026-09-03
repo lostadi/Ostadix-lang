@@ -155,6 +155,13 @@ check 'An open evaluator set' \
 check 'nix\{lazy\}\^' \
     "nix{lazy} is rejected; use nix{defer}^ or bare nix_expr^"
 
+check 'fresh current-master observation' \
+    "the preserved master audit is historical, not a fresh current-checkout observation"
+check 'G0 source-digest lineage is not continuous|G0 and dependent G2 therefore do not validate' \
+    "the sealed attribution-rewrite bridge restores current G0/G2 ledger validation"
+check '26 of 26 fresh portable native execution gates' \
+    "the 26-gate native result is a preserved historical observation, not a fresh result"
+
 # O-core Milestone 0.3 implements capability-returning anonymous/shared page
 # allocation. Historical baseline text may still mention the old bump
 # allocator, but active ABI text must not call syscall 3 reserved.
@@ -334,6 +341,15 @@ done
 require_fixed README.md \
     '*By Lee Daghlar Ostadi*' \
     'the README byline does not use the full release author name'
+require_fixed README.md \
+    '### Validation at the historical audited master' \
+    'the historical master audit is presented as current validation'
+require_fixed README.md \
+    'The focused pre-repair World-alpha tests recorded 30 passes, one failure, and' \
+    'the historical World-alpha failure observation was not preserved'
+require_fixed README.md \
+    'append-only ledger now supersedes the old G0 head with that new schema-v3' \
+    'the current World-alpha provenance-bridge repair is missing'
 require_fixed Cargo.toml \
     'authors     = ["Lee Daghlar Ostadi"]' \
     'Cargo package metadata does not use the full release author name'
