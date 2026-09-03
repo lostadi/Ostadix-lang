@@ -709,14 +709,15 @@ fn resolve_evidence_output_paths(cli: &Cli) -> Result<Cli> {
     resolved.inputs[0] = input
         .canonicalize()
         .with_context(|| format!("failed to resolve input {}", input.display()))?;
-    for path in [
+    for value in [
         &mut resolved.project_trace_out,
         &mut resolved.mesh_trace_out,
         &mut resolved.selection_receipt_out,
-    ] {
-        if let Some(value) = path {
-            *value = publication_path(value)?;
-        }
+    ]
+    .into_iter()
+    .flatten()
+    {
+        *value = publication_path(value)?;
     }
     Ok(resolved)
 }
