@@ -972,7 +972,7 @@ policy = "all"
     assert_eq!(failure["receipt_export_path"], Value::Null);
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_vendor = "apple")))]
 fn optimize_rejects_non_utf8_target_without_execution_or_state(root: &Path) {
     use std::os::unix::ffi::OsStringExt;
 
@@ -1026,7 +1026,10 @@ policy = "all"
     assert_eq!(snapshot_tree(&state), TreeSnapshot::Missing);
 }
 
-#[cfg(not(unix))]
+// Darwin filesystems reject non-UTF-8 path components with EILSEQ before the
+// compiled CLI can observe them, so this contract is exercisable only on Unix
+// hosts whose filesystem admits arbitrary path bytes.
+#[cfg(any(not(unix), target_vendor = "apple"))]
 fn optimize_rejects_non_utf8_target_without_execution_or_state(_root: &Path) {}
 
 fn optimize_rejects_a_direct_route_before_execution(root: &Path) {

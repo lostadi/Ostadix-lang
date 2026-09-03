@@ -210,6 +210,7 @@ pub const RUNTIME_PROJECT_SOURCES: &[(&str, &str)] = &[
     ("materialize.rs", include_str!("../project/materialize.rs")),
     ("model.rs", include_str!("../project/model.rs")),
     ("plan.rs", include_str!("../project/plan.rs")),
+    ("reuse.rs", include_str!("../project/reuse.rs")),
     ("runtime.rs", include_str!("../project/runtime.rs")),
     (
         "runtime_graph.rs",

@@ -3487,6 +3487,31 @@ mod tests {
                 "generated project source {relative_path} must match its embedded source"
             );
         }
+
+        let embedded_paths = RUNTIME_PROJECT_SOURCES
+            .iter()
+            .map(|(relative_path, _)| *relative_path)
+            .collect::<std::collections::BTreeSet<_>>();
+        let project_module = RUNTIME_PROJECT_SOURCES
+            .iter()
+            .find_map(|(relative_path, source)| (*relative_path == "mod.rs").then_some(*source))
+            .expect("generated project runtime must embed its module root");
+        for line in project_module.lines() {
+            let Some(module) = line
+                .trim()
+                .strip_prefix("pub mod ")
+                .and_then(|module| module.strip_suffix(';'))
+            else {
+                continue;
+            };
+            let source_path = format!("{module}.rs");
+            let nested_source_path = format!("{module}/mod.rs");
+            assert!(
+                embedded_paths.contains(source_path.as_str())
+                    || embedded_paths.contains(nested_source_path.as_str()),
+                "generated project module `{module}` has no embedded source"
+            );
+        }
     }
 
     #[test]
