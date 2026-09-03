@@ -1,7 +1,8 @@
 # Unified Ostadix Intent Front Door V1
 
-`o run`, `o optimize`, `o plan`, `o explain`, and `o inspect` are routed by the
-repository-owned Bash dispatcher to the compiled `o-cli` orchestrator. The
+`o run`, `o routes`, `o optimize`, `o plan`, `o explain`, and `o inspect` are
+routed by the repository-owned Bash dispatcher to the compiled `o-cli`
+orchestrator. The
 dispatcher remains necessary on case-insensitive macOS filesystems where `O`
 and `o` cannot be separate installed filenames. Direct `O`, `olangc`,
 `o-link`, node, registry, information, live, receipt, kernel, `o why`, and
@@ -26,10 +27,30 @@ authenticated peers and its configured retry/fallback policy.
 
 ## Optimization boundary
 
+Route discovery is a separate, read-only operation:
+
+```text
+o routes TARGET [--json] [--route-decl DECL]...
+```
+
+For a project directory or lifted project bundle it reports safe, ordered
+metadata only: route IDs, kinds, result codecs, and explicitly declared route
+sets with their first alternative identified as the reference. Each route set
+is marked structurally ready or rejected for
+`benchmark_validate_and_select`, and separately reports whether its transitive
+routes meet the declared-pure boundary needed for later winner reuse. Discovery
+never executes a route, creates or
+opens run state, infers a set from routes that merely share `provides`, or
+prints commands, environment values, guards, labels, or source bytes. JSON is
+one versioned `ostadix.route-catalog/v1` object with separate
+`optimize_ready`/`optimize_rejection` and
+`reuse_ready`/`reuse_rejection` fields for each route set.
+
 The initial evidence-gated optimization UI is:
 
 ```text
-o optimize TARGET --route ROUTE_SET [--receipt PATH] [--json]
+o optimize TARGET --route ROUTE_SET [--receipt PATH] [--progress auto|always|never] [--json]
+o run TARGET --selection-run RUN_ID [--json]
 ```
 
 The route set is explicit and required in v1. `TARGET` must expose that named
@@ -70,10 +91,42 @@ project file. Omitting the export does not disable recording.
 
 This is an evidence-gathering invocation, not same-invocation acceleration:
 the reference and every candidate have already run before a winner is known.
-V1 neither caches nor reuses that winner on a later invocation. Its comparison
-covers complete captured results and declared artifacts, not hidden filesystem,
-network, device, or other effects, so it makes no universal semantic-equivalence
-claim.
+For human output, `--progress auto` reports safe candidate settlements on the
+original terminal stderr, `always` forces that view for non-terminal stderr,
+and `never` suppresses it. Progress is excluded from candidate captures and
+JSON stdout; `--json --progress always` is rejected before execution.
+
+`o run TARGET --selection-run RUN_ID` is a distinct, later-invocation reuse
+path. It accepts only an exact successful terminal run loaded and revalidated
+through the private content-addressed run store: `last-run` and exported
+receipt files are not authority. The current bundle, benchmark HGraph and
+deployment identities, route declarations, target, ordered alternatives,
+reference, winner, and expected declared-output digest must match. Ostadix
+then derives an explicit winner plan from that same in-memory bundle, pins the
+preflighted local compatibility executor, and revalidates every mutable
+prepared-project coordinate immediately before dispatch.
+
+Only the selected top-level branch is dispatched (its declared prerequisites
+may run), and the CLI front door requires and finalizes a fresh durable record.
+The selected branch's declared output is recomputed after execution. A route
+failure, malformed observation, or digest mismatch is a typed terminal
+failure; no candidate is retried and no fallback executes.
+
+Reuse additionally requires every route-set alternative and every transitive
+prerequisite to carry the bundle author's explicit `pure = true` declaration.
+That is an auditable assertion, not independently enforced sandbox evidence.
+The output check occurs after execution and cannot undo undeclared filesystem,
+network, device, or other effects, so V1 makes no universal
+semantic-equivalence or transactional-substitution claim.
+
+Systems can embed this without parsing CLI text by calling
+`RunStoreReaderV1::read_terminal_verified`,
+`prepare_selection_reuse_intent`, and `execute_prepared_intent`. The resulting
+`PreparedSelectionReuseV1` is opaque and non-serializable; durable observations
+bind the source run object, receipt, reuse contract, selected route, and
+postcondition. These library calls do not automatically begin or finalize a
+run-store transaction: execution returns the typed reuse observation, and an
+embedder that requires durable audit evidence must persist it itself.
 
 ## Planning boundary
 
@@ -88,7 +141,7 @@ an actor, read a result, execute a command, or start a node.
 
 ## Private observations
 
-Validated executions are recorded by default below
+Validated executions through the CLI front door are recorded by default below
 `${XDG_STATE_HOME:-$HOME/.local/state}/ostadix/runs-v1`. Preflight failures do
 not allocate a run ID and do not change `last-run`. `--no-record` never opens
 the store. `--require-record` aborts before execution when recording cannot

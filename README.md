@@ -2614,8 +2614,8 @@ products so every public command surface has an explicit home.
 | Binary | Location | What it does |
 |--------|----------|--------------|
 | `O` | `target/release/O` | Runs `.O` documents and provides the interactive REPL. |
-| `o-cli` | `target/release/o-cli` | Compiled intent orchestrator for validated `run`, static/live `plan`, verified `explain`, and strict JSON `inspect`. |
-| `o` | `scripts/o-cli.sh` through an installed wrapper | Routes the stateful intent commands to `o-cli`, preserves the explicit `device` namespace, `why`, node, registry, information, live, receipt, and kernel tools, and retains evaluator compatibility for unknown command forms. |
+| `o-cli` | `target/release/o-cli` | Compiled intent orchestrator for validated `run`, read-only `routes`, evidence-gated `optimize`, static/live `plan`, verified `explain`, and strict JSON `inspect`. |
+| `o` | `scripts/o-cli.sh` through an installed wrapper | Routes `run`, `routes`, `optimize`, `plan`, `explain`, and `inspect` to `o-cli`; preserves the explicit `device` namespace, `why`, node, registry, information, live, receipt, and kernel tools; and retains evaluator compatibility for unknown command forms. |
 | `olangc` | `target/release/olangc` | Produces native hosted binaries, WASI modules, script execution, OIR dumps, or Graphviz DOT hypergraph export. |
 | `ocorec` | `target/release/ocorec` | Compiles `.oc` modules through AST, typed HIR, and SSA MIR to freestanding ELF64 objects for the primary x86_64 and bounded AArch64 targets. |
 | `o-link` | `target/release/o-link` | Recursively literal-links and runs a bare single directory; `--project` creates an inert route-preserving bundle. |
@@ -3978,8 +3978,23 @@ The initial user-facing optimization command fixes those choices behind one
 explicit interface:
 
 ```text
-o optimize TARGET --route ROUTE_SET [--receipt PATH] [--json]
+o routes TARGET [--json] [--route-decl DECL]...
+o optimize TARGET --route ROUTE_SET [--receipt PATH] [--progress auto|always|never] [--json]
+o run TARGET --selection-run RUN_ID [--json]
 ```
+
+`o routes` is the inert discovery step for a project directory or lifted
+project bundle. It lists routes and explicitly declared route sets in their
+declaration order, identifies each set's first alternative as its reference,
+and reports both validated-optimization readiness and whether a later winner
+can satisfy the transitive declared-pure reuse boundary.
+It does not execute routes, open or create run history, infer a route set from
+shared `provides`, or reveal route commands, environment values, guards,
+labels, or source bytes. `--json` emits one
+`ostadix.route-catalog/v1` object. Each route set includes separate
+`optimize_ready`/`optimize_rejection` and
+`reuse_ready`/`reuse_rejection` fields; repeated `--route-decl DECL` values
+apply only to this in-memory inspection.
 
 `--route` is required in v1: `TARGET` must expose the named project route set,
 and Ostadix does not infer which alternatives the user intended to compare.
@@ -3988,6 +4003,13 @@ and Ostadix does not infer which alternatives the user intended to compare.
 no executor, mesh, parallelism, policy, or no-record switch. Repeated
 `--route-decl DECL` values remain available for explicit project route
 declarations, and `--receipt-out` is an alias for `--receipt`.
+
+For human output, `--progress auto` streams a compact candidate-settlement view
+to the original terminal stderr; `always` enables it for non-terminal stderr
+and `never` disables it. Progress contains only route IDs, ordinal counts,
+durations, and typed outcomes. It never enters candidate stdout/stderr capture,
+the declared-output comparison, or JSON stdout. `--json --progress always` is
+rejected before execution.
 
 Without `--json`, the command prints `Ostadix optimization evidence` followed
 by every candidate in declaration order. The summary labels the reference and
@@ -4037,6 +4059,55 @@ comparison/selection contract. Its printed receipt SHA-256 is the ordinary
 SHA-256 of the emitted file bytes, and recorded `o run` executions embed the
 typed receipt in the durable run record. It is still an unsigned observation,
 not a proof of full semantic equivalence or authority to reuse the decision.
+
+An exact successful optimization run can be applied on a later CLI invocation
+with `o run TARGET --selection-run RUN_ID`. Ostadix reads that exact terminal run
+through the verified private run store (the mutable `last-run` alias and loose
+receipt files are not accepted), rebuilds the current bundle and benchmark
+contract, and derives one explicit winner branch from the same in-memory
+bundle. The source bundle, ordered alternatives, reference, winner, route
+declarations, benchmark plan identities, and expected declared-output digest
+must all still match. Execution is pinned to the local compatibility engine;
+only the selected top-level branch is dispatched, although its declared
+prerequisites may run. The CLI front door requires and finalizes a new durable
+run record for this invocation.
+
+Reuse is admitted only when every alternative and transitive prerequisite has
+the bundle author's explicit `pure = true` declaration. That declaration is an
+auditable trust boundary, not sandbox proof. After execution, Ostadix
+recomputes the selected branch's declared-output digest. Failure or drift is a
+typed terminal failure with no replay and no fallback to another candidate.
+Because a postcondition cannot undo undeclared host or network effects, this is
+not universal semantic substitution; systems should use it for computations
+whose effects fit the declared-pure boundary.
+
+Embedders can use the same mechanism without parsing CLI output:
+
+```rust
+use o_lang::intent::{
+    execute_prepared_intent, prepare_selection_reuse_intent,
+    PrepareExecutionOptionsV1, RunSelectorV1, RunStoreReaderV1,
+};
+
+let source = RunStoreReaderV1::open_default_existing()?
+    .read_terminal_verified(RunSelectorV1::RunId(run_id.into()), false)?;
+let prepared = prepare_selection_reuse_intent(
+    target,
+    PrepareExecutionOptionsV1::default(),
+    &source,
+)?;
+let observed = execute_prepared_intent(&prepared)?;
+```
+
+`PreparedSelectionReuseV1` is opaque and non-serializable. The library
+revalidates its binding and all mutable prepared-project coordinates immediately
+before dispatch, so changing the bundle, route, policy, plan, executor, or mesh
+configuration after admission fails before a command runs. Unlike the CLI front
+door, these library calls do not begin or finalize a run-store transaction:
+`execute_prepared_intent` returns the typed reuse observation to the embedder,
+which must durably persist that observation itself when durable audit evidence
+is required.
+
 Hidden filesystem, network, device, and other undeclared effects are not traced
 by this policy. Errors before a route settles (including launch, timeout, and
 prerequisite errors) and artifact-capture failures after an otherwise
@@ -4048,12 +4119,13 @@ remain lossless diagnostics and can retain bounded process stdout/stderr and
 typed runtime failure details, so they should be handled as potentially
 sensitive execution logs.
 
-This policy is an autotuning/evidence run: it executes every candidate, so it
-does not reduce the latency of that same invocation. V1 does not cache or reuse
-the selected route; a separate receipt-gated reuse path is required before a
-learned winner can accelerate later runs. Matching complete captured results
-and declared artifact manifests is strong declared-output evidence, not a
-universal semantic-equivalence claim about hidden effects.
+The optimization command is an autotuning/evidence run: it executes every
+candidate, so it does not reduce the latency of that same invocation. It does
+not cache candidate result values. Its durable evidence can instead admit the
+separate, explicit `--selection-run RUN_ID` path described above so a learned
+winner accelerates a later run. Matching complete captured results and declared
+artifact manifests is strong declared-output evidence, not a universal
+semantic-equivalence claim about hidden effects.
 
 The second command is the project-lift DOT route: `o-link --project` preserves
 the route table inside `project.O`, and `olangc --target dot --route main`
@@ -4068,7 +4140,8 @@ or command.
 `olangc --target ir` remains the direct compiler planner interface.
 `scripts/o-cli.sh` is the repository-owned lowercase dispatcher: `setup.sh`
 installs an `o` wrapper that delegates to it, and the dispatcher routes `run`,
-`plan`, `explain`, and `inspect` to the compiled `o-cli` orchestrator. The
+`routes`, `optimize`, `plan`, `explain`, and `inspect` to the compiled `o-cli`
+orchestrator. The
 orchestrator reuses the exact `olangc` planning renderers; static planning does
 not execute, discover peers, or open run history. Other command families and
 unknown arguments retain their historical compatibility behavior. Keep

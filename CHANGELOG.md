@@ -9,13 +9,39 @@ Package SemVer is only one of the independent coordinates documented in
 
 ### Added
 
-- `o optimize TARGET --route ROUTE_SET [--receipt PATH] [--json]` provides the
-  initial evidence-gated optimization UI. It requires an explicit route set and
-  durable run record, runs and validates every candidate against the first
-  declared reference, reports the fastest eligible route as a human summary or
-  `ostadix.optimize-summary/v1` JSON, and can export the canonical receipt
-  outside the project. V1 provides neither same-invocation acceleration nor
-  cached reuse and does not claim universal semantic equivalence.
+- `o routes TARGET [--json] [--route-decl DECL]...` provides a read-only
+  route-discovery UI for project directories and lifted project bundles. It
+  reports ordered route IDs, kinds, result codecs, explicitly declared route
+  sets, reference routes,
+  structural optimization readiness, and later-winner declared-effect
+  readiness as either human text or one
+  `ostadix.route-catalog/v1` object. It never executes a route, creates a run
+  record, infers equivalence from shared `provides`, or exposes commands,
+  environment values, guards, labels, or source bytes.
+
+- `o optimize TARGET --route ROUTE_SET [--receipt PATH] [--progress auto|always|never] [--json]`
+  provides the initial evidence-gated optimization UI. It requires an explicit
+  route set and durable run record, runs and validates every candidate against
+  the first declared reference, reports the fastest eligible route as a human
+  summary or `ostadix.optimize-summary/v1` JSON, and can export the canonical
+  receipt outside the project. `--progress auto|always|never` adds a
+  credential-minimized candidate-settlement view on terminal stderr without
+  contaminating captured outputs or JSON stdout. The evidence-gathering
+  invocation itself is not accelerated and does not claim universal semantic
+  equivalence.
+
+- `o run TARGET --selection-run RUN_ID` and the corresponding typed Rust API
+  execute the explicit winner from one exact verified local optimization run.
+  Admission binds the unchanged bundle, benchmark plans, route declarations,
+  ordered alternatives, reference, winner, and expected declared output;
+  requires transitive `pure = true` declarations; seals the in-process token;
+  pins the preflighted compatibility executor; dispatches no other top-level
+  candidate branch; and produces a fresh typed postcondition. The CLI front
+  door durably records it; the library API returns it to the embedder, which
+  must persist it itself when durable audit evidence is required. Failure or
+  output drift is terminal with no replay or fallback. This is an opt-in,
+  non-transactional declared-effect boundary, not proof against undeclared side
+  effects.
 
 - Project route policy `benchmark_validate_and_select` runs the first declared
   alternative as a reference and measures every candidate in an isolated

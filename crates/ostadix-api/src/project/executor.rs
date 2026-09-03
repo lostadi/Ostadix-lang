@@ -31,7 +31,7 @@ use super::plan::{
 };
 use super::runtime::{
     execute_route_in_workspace, is_skipped_result, public_route_execution_diagnostic, RunOptions,
-    ValidatedSelectionMeasurement,
+    ValidatedSelectionMeasurement, ValidatedSelectionProgressObserverV1,
 };
 use super::trace::{
     project_deployment_digest, project_hosted_deployment_digest, project_logical_graph_digest,
@@ -1221,10 +1221,52 @@ pub fn execute_selection_with_configured_executor(
     policy_override: Option<RoutePolicy>,
     opts: &RunOptions,
 ) -> Result<ConfiguredProjectExecution> {
+    execute_selection_with_configured_executor_inner(bundle, target, policy_override, opts, None)
+}
+
+/// Dispatch project selection through the configured runtime while reporting
+/// presentation-safe validated-selection progress when the compatibility
+/// project runtime executes `benchmark_validate_and_select`.
+///
+/// The HGraph executor currently supports a different policy surface and
+/// therefore emits no validated-selection progress events.
+pub fn execute_selection_with_configured_executor_with_progress(
+    bundle: &ProjectBundle,
+    target: Option<&str>,
+    policy_override: Option<RoutePolicy>,
+    opts: &RunOptions,
+    observer: &dyn ValidatedSelectionProgressObserverV1,
+) -> Result<ConfiguredProjectExecution> {
+    execute_selection_with_configured_executor_inner(
+        bundle,
+        target,
+        policy_override,
+        opts,
+        Some(observer),
+    )
+}
+
+fn execute_selection_with_configured_executor_inner(
+    bundle: &ProjectBundle,
+    target: Option<&str>,
+    policy_override: Option<RoutePolicy>,
+    opts: &RunOptions,
+    observer: Option<&dyn ValidatedSelectionProgressObserverV1>,
+) -> Result<ConfiguredProjectExecution> {
     match std::env::var_os(PROJECT_EXECUTOR_ENV) {
         None => {
-            let execution =
-                super::runtime::run_selection_observed(bundle, target, policy_override, opts)?;
+            let execution = match observer {
+                Some(observer) => super::runtime::run_selection_observed_with_progress(
+                    bundle,
+                    target,
+                    policy_override,
+                    opts,
+                    observer,
+                )?,
+                None => {
+                    super::runtime::run_selection_observed(bundle, target, policy_override, opts)?
+                }
+            };
             Ok(ConfiguredProjectExecution {
                 results: execution.results,
                 trace: None,

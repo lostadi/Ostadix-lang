@@ -37,7 +37,7 @@ use crate::project::model::{
 use crate::project::runtime::{
     benchmark_validate_and_select, is_cancellation_error, potential_route_execution_count,
     resolve_selection, run_all_alternatives_parallel_measured, verify_results_equivalent,
-    RouteExecutionError, RouteSelectionExecution, RunOptions,
+    RouteExecutionError, RouteSelectionExecution, RunOptions, ValidatedSelectionProgressObserverV1,
 };
 
 pub const MESH_EXECUTION_TRACE_SCHEMA_V1: &str = "ostadix.project-mesh-trace/v1";
@@ -2008,6 +2008,40 @@ pub fn execute_mesh_selection_observed(
     opts: &RunOptions,
     config: &MeshExecutionConfig,
 ) -> Result<MeshExecutionOutcome> {
+    execute_mesh_selection_observed_inner(bundle, target, policy_override, opts, config, None)
+}
+
+/// Execute a mesh selection while reporting presentation-safe progress for
+/// `benchmark_validate_and_select` candidate execution.
+///
+/// Other policies retain their ordinary execution behavior and emit no
+/// validated-selection progress events.
+pub fn execute_mesh_selection_observed_with_progress(
+    bundle: &ProjectBundle,
+    target: Option<&str>,
+    policy_override: Option<RoutePolicy>,
+    opts: &RunOptions,
+    config: &MeshExecutionConfig,
+    observer: &dyn ValidatedSelectionProgressObserverV1,
+) -> Result<MeshExecutionOutcome> {
+    execute_mesh_selection_observed_inner(
+        bundle,
+        target,
+        policy_override,
+        opts,
+        config,
+        Some(observer),
+    )
+}
+
+fn execute_mesh_selection_observed_inner(
+    bundle: &ProjectBundle,
+    target: Option<&str>,
+    policy_override: Option<RoutePolicy>,
+    opts: &RunOptions,
+    config: &MeshExecutionConfig,
+    observer: Option<&dyn ValidatedSelectionProgressObserverV1>,
+) -> Result<MeshExecutionOutcome> {
     config.validate()?;
     let selection = resolve_selection(bundle, target, policy_override)?;
     let bundle_bytes = crate::project::bundle::serialize(bundle)?;
@@ -2049,6 +2083,7 @@ pub fn execute_mesh_selection_observed(
         opts,
         config,
         &mut trace,
+        observer,
     );
     let trace_retention = trace.validate().and_then(|()| {
         config
@@ -2093,6 +2128,7 @@ pub fn execute_mesh_selection(
     Ok(execute_mesh_selection_observed(bundle, target, policy_override, opts, config)?.execution)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_mesh_policy(
     bundle: &ProjectBundle,
     bundle_bytes: &[u8],
@@ -2101,6 +2137,7 @@ fn execute_mesh_policy(
     opts: &RunOptions,
     config: &MeshExecutionConfig,
     trace: &mut MeshExecutionTraceV1,
+    observer: Option<&dyn ValidatedSelectionProgressObserverV1>,
 ) -> Result<RouteSelectionExecution> {
     let mut peers = discover_mesh_peers(config, trace)?;
     let bundle_bytes_len = u64::try_from(bundle_bytes.len()).unwrap_or(u64::MAX);
@@ -2182,8 +2219,15 @@ fn execute_mesh_policy(
     };
     let outcome = (|| -> Result<RouteSelectionExecution> {
         if matches!(policy, RoutePolicy::BenchmarkValidateAndSelect) {
-            let measured = run_all_alternatives_parallel_measured(alternatives, &dispatch_one)?;
-            return benchmark_validate_and_select(bundle, &trace.target, alternatives, measured);
+            let measured =
+                run_all_alternatives_parallel_measured(alternatives, &dispatch_one, observer)?;
+            return benchmark_validate_and_select(
+                bundle,
+                &trace.target,
+                alternatives,
+                measured,
+                observer,
+            );
         }
         let results = match policy {
             RoutePolicy::Explicit(_) | RoutePolicy::Default => vec![dispatch_one(

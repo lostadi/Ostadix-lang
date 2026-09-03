@@ -263,7 +263,8 @@ fn json_help_is_informational_not_a_failure_envelope(root: &Path) {
             for boundary in [
                 "executes the reference and every candidate",
                 "requires durable run recording",
-                "does not activate, cache, or reuse it automatically",
+                "evidence-gathering invocation is not accelerated",
+                "o run TARGET --selection-run RUN_ID",
             ] {
                 assert!(
                     stdout.contains(boundary),

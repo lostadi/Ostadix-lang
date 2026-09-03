@@ -27,20 +27,25 @@ use o_lang::hosted_remote::project_mesh::{
     MeshRequirement, MeshTraceEventV1,
 };
 use o_lang::intent::{
-    decoded_value_result_references, execute_prepared_intent, explain_verified_run,
-    live_placement_preview, parse_run_selector, prepare_execution_intent,
+    decoded_value_result_references, execute_prepared_intent,
+    execute_prepared_intent_with_progress, explain_verified_run, live_placement_preview,
+    parse_run_selector, prepare_execution_intent, prepare_selection_reuse_intent,
     render_ordinary_value_stdout_with_color, route_result_references, CapturedStreamV1,
     ExecutionObservationV1, LocalOExecutorV1, OrdinaryExecutionTraceV1, OrdinaryOExecutionErrorV1,
-    PrepareExecutionOptionsV1, PreparedExecutionIntentV1, ProjectExecutorV1, RecordedRouteResultV1,
-    RunDispositionV1, RunFailureV1, RunRecordV1, RunRecordingStatusV1, RunResultReferenceV1,
-    RunStoreReaderV1, RunStoreV1, RunSummaryV1, RunTraceAttachmentV1, RunTraceBindingV1,
-    RUN_SUMMARY_SCHEMA_V1,
+    PrepareExecutionOptionsV1, PreparedExecutionIntentV1, ProjectExecutorV1,
+    ProjectSelectionReuseObservationV1, RecordedRouteResultV1, RunDispositionV1, RunFailureV1,
+    RunRecordV1, RunRecordingStatusV1, RunResultReferenceV1, RunSelectorV1, RunStoreReaderV1,
+    RunStoreV1, RunSummaryV1, RunTraceAttachmentV1, RunTraceBindingV1,
+    SelectionReuseExecutionErrorV1, RUN_SUMMARY_SCHEMA_V1,
 };
 use o_lang::project::executor::{ProjectExecutionError, ProjectExecutionFailureClass};
 use o_lang::project::model::OutputCapture;
 use o_lang::project::runtime::public_route_execution_diagnostic;
 use o_lang::project::{
-    OExecutionResult, RoutePolicy, ValidatedSelectionDispositionV1, ValidatedSelectionMismatchV1,
+    OExecutionResult, ProjectBundle, ResultCodec, RouteKind, RoutePolicy, RouteSet,
+    SelectionReuseOutputStatusV1, ValidatedSelectionCandidateProgressV1,
+    ValidatedSelectionDispositionV1, ValidatedSelectionMismatchV1,
+    ValidatedSelectionProgressEventV1, ValidatedSelectionProgressObserverV1,
     ValidatedSelectionReceiptV1,
 };
 use o_lang::resource_identity::ArtifactId;
@@ -54,10 +59,12 @@ use std::os::fd::{AsRawFd, FromRawFd};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const OPTIMIZE_SUMMARY_SCHEMA_V1: &str = "ostadix.optimize-summary/v1";
-const OPERATIONAL_COMMANDS: &str = "Run highlights:\n  o run FILE.O --parallel auto          local HGraph workers only\n  o run PROJECT --parallel auto         mesh prefer with safe local fallback\n  o run PROJECT --mesh=required         authenticated remote placement required\n  o optimize PROJECT --route ROUTE_SET  measure and validate every alternative\n  Mesh controls include --mesh-retries, --mesh-local-fallback, and --closed-registry.\n\nBoot-object commands:\n  o object root|list|stat|get|verify     typed read-only boot CAS\n\nOperational commands retained by the repository dispatcher:\n  node start|stop|status|restart|pair|list|use|profile|doctor|run|session ...\n  node-host <command> ...\n  registry <command> ...\n  info <command> ...\n  live <command> ...\n  receipt [ogit arguments]\n  kernel <command>\n  why FILE.O P<N> [olangc options]\n\nUnknown command forms retain historical evaluator behavior.";
+const ROUTE_CATALOG_SCHEMA_V1: &str = "ostadix.route-catalog/v1";
+const OPERATIONAL_COMMANDS: &str = "Run highlights:\n  o run FILE.O --parallel auto          local HGraph workers only\n  o run PROJECT --parallel auto         mesh prefer with safe local fallback\n  o run PROJECT --mesh=required         authenticated remote placement required\n  o routes PROJECT                      inspect routes without executing them\n  o optimize PROJECT --route ROUTE_SET  measure and validate every alternative\n  o run PROJECT --selection-run RUN_ID  execute one exact validated winner\n  Mesh controls include --mesh-retries, --mesh-local-fallback, and --closed-registry.\n\nBoot-object commands:\n  o object root|list|stat|get|verify     typed read-only boot CAS\n\nOperational commands retained by the repository dispatcher:\n  node start|stop|status|restart|pair|list|use|profile|doctor|run|session ...\n  node-host <command> ...\n  registry <command> ...\n  info <command> ...\n  live <command> ...\n  receipt [ogit arguments]\n  kernel <command>\n  why FILE.O P<N> [olangc options]\n\nUnknown command forms retain historical evaluator behavior.";
 #[derive(Debug, Parser)]
 #[command(
     name = "o",
@@ -78,10 +85,16 @@ struct Cli {
 enum IntentCommand {
     /// Run a local .O document or a route-preserving heterogeneous project.
     Run(RunArgs),
+    /// Inspect declared project routes and optimization-ready route sets.
+    #[command(
+        long_about = "Inspect a route-preserving project without executing commands, opening run history, or creating run state.",
+        after_long_help = "Only safe route metadata is shown. Commands, environment values, guards, and source bytes are never included.\n\nExample:\n  o routes .\n  o routes project.O --json"
+    )]
+    Routes(RoutesArgs),
     /// Measure project alternatives and select only after declared outputs match.
     #[command(
-        long_about = "Measure project alternatives and select only after declared outputs match.\n\nThis command executes the reference and every candidate before selection, and it requires durable run recording. The selected route is recorded as evidence; v1 does not activate, cache, or reuse it automatically.",
-        after_long_help = "ROUTE_SET is the `provides` value of a `[[route_sets]]` entry.\n\nExample:\n  o optimize . --route main --receipt selection.json"
+        long_about = "Measure project alternatives and select only after declared outputs match.\n\nThis command executes the reference and every candidate before selection, and it requires durable run recording. The evidence-gathering invocation is not accelerated; its exact winner can be applied later with `o run TARGET --selection-run RUN_ID` when the declared-pure reuse boundary is satisfied.",
+        after_long_help = "ROUTE_SET is the `provides` value of a `[[route_sets]]` entry.\n\nExamples:\n  o optimize . --route main --progress auto\n  o optimize . --route main --receipt selection.json"
     )]
     Optimize(OptimizeArgs),
     /// Build a non-executing static plan, or opt into a read-only live snapshot.
@@ -155,6 +168,17 @@ enum PlanFormat {
     Json,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+enum OptimizeProgressMode {
+    /// Show progress only for human output connected to a terminal.
+    #[default]
+    Auto,
+    /// Always stream presentation-safe progress to stderr.
+    Always,
+    /// Never emit live progress.
+    Never,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RunPresentation {
     Ordinary,
@@ -192,6 +216,39 @@ struct RunArgs {
     /// Fail the command if its run record cannot be durably finalized.
     #[arg(long, conflicts_with = "no_record")]
     require_record: bool,
+
+    /// Reuse the selected route from one exact verified local optimization run.
+    #[arg(
+        long = "selection-run",
+        visible_alias = "reuse-selection",
+        value_name = "RUN_ID",
+        conflicts_with_all = [
+            "legacy_backends",
+            "parallel",
+            "no_record",
+            "shim_dir",
+            "backend_grants",
+            "executor",
+            "workers",
+            "route",
+            "routes_policy",
+            "project_trace_out",
+            "selection_receipt_out",
+            "mesh",
+            "mesh_retries",
+            "mesh_local_fallback",
+            "mesh_discovery_timeout_ms",
+            "mesh_no_lan_discovery",
+            "mesh_peer_root",
+            "mesh_trace_out",
+            "explain_mesh"
+        ]
+    )]
+    selection_run: Option<String>,
+
+    /// Internal presentation setting supplied only by `o optimize`.
+    #[arg(skip)]
+    optimize_progress: Option<OptimizeProgressMode>,
 
     /// Explicitly interpret TARGET as a route-preserving project input.
     #[arg(long)]
@@ -276,6 +333,21 @@ struct RunArgs {
 }
 
 #[derive(Clone, Debug, Args)]
+struct RoutesArgs {
+    /// A route-preserving project directory or lifted project bundle.
+    #[arg(value_name = "TARGET")]
+    target: PathBuf,
+
+    /// Produce one versioned route-catalog JSON object on stdout.
+    #[arg(long)]
+    json: bool,
+
+    /// Add or replace a project route declaration for this inspection.
+    #[arg(long = "route-decl", value_name = "DECL")]
+    route_decls: Vec<String>,
+}
+
+#[derive(Clone, Debug, Args)]
 struct OptimizeArgs {
     /// A route-preserving project directory or lifted project bundle.
     #[arg(value_name = "TARGET")]
@@ -293,6 +365,10 @@ struct OptimizeArgs {
     #[arg(long)]
     json: bool,
 
+    /// Stream candidate completion progress to stderr.
+    #[arg(long, value_enum, default_value_t)]
+    progress: OptimizeProgressMode,
+
     /// Add or replace a project route declaration (repeatable).
     #[arg(long = "route-decl", value_name = "DECL")]
     route_decls: Vec<String>,
@@ -307,6 +383,8 @@ impl OptimizeArgs {
             json: self.json,
             no_record: false,
             require_record: true,
+            selection_run: None,
+            optimize_progress: Some(self.progress),
             project: true,
             shim_dir: None,
             backend_grants: Vec::new(),
@@ -336,6 +414,55 @@ struct OptimizeSummaryV1<'a> {
     receipt: Option<&'a ValidatedSelectionReceiptV1>,
     receipt_sha256: Option<String>,
     receipt_export_path: Option<&'a str>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct RouteCatalogInputV1 {
+    kind: &'static str,
+    path: String,
+    bundle_sha256: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct RouteCatalogRouteV1 {
+    id: String,
+    kind: &'static str,
+    result_codec: &'static str,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct RouteCatalogRouteSetV1 {
+    name: String,
+    declared_policy: String,
+    reference_route: Option<String>,
+    alternatives: Vec<String>,
+    optimize_ready: bool,
+    optimize_rejection: Option<String>,
+    reuse_ready: bool,
+    reuse_rejection: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct RouteCatalogFailureV1 {
+    code: &'static str,
+    message: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct RouteCatalogV1 {
+    schema: &'static str,
+    input: Option<RouteCatalogInputV1>,
+    project_name: Option<String>,
+    routes: Vec<RouteCatalogRouteV1>,
+    route_sets: Vec<RouteCatalogRouteSetV1>,
+    failure: Option<RouteCatalogFailureV1>,
+}
+
+struct LoadedRouteCatalog {
+    input_kind: &'static str,
+    input_path: String,
+    bundle_sha256: String,
+    bundle: ProjectBundle,
 }
 
 #[derive(Debug, Args)]
@@ -595,6 +722,16 @@ fn main() {
                 error.kind(),
                 clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
             );
+            if !informational && invocation_requests_route_catalog_json(&arguments) {
+                if let Err(summary_error) = emit_route_catalog_failure_json(
+                    "invalid_arguments",
+                    "route catalog arguments were invalid",
+                ) {
+                    eprintln!("error: failed to encode route-catalog failure: {summary_error:#}");
+                }
+                eprint!("{error}");
+                std::process::exit(error.exit_code());
+            }
             if let Some(presentation) = (!informational)
                 .then(|| invocation_json_presentation(&arguments))
                 .flatten()
@@ -629,6 +766,11 @@ fn invocation_json_presentation(arguments: &[OsString]) -> Option<RunPresentatio
         .skip(2)
         .any(|value| value == "--json")
         .then_some(presentation)
+}
+
+fn invocation_requests_route_catalog_json(arguments: &[OsString]) -> bool {
+    arguments.get(1).is_some_and(|value| value == "routes")
+        && arguments.iter().skip(2).any(|value| value == "--json")
 }
 
 fn emit_preflight_failure_summary(detail: &str, presentation: RunPresentation) -> Result<()> {
@@ -675,6 +817,7 @@ fn json_safe_receipt_export_path(path: Option<&Path>) -> Option<&str> {
 fn dispatch(command: IntentCommand) -> Result<i32> {
     match command {
         IntentCommand::Run(args) => run_intent(&args, RunPresentation::Ordinary),
+        IntentCommand::Routes(args) => route_catalog(&args),
         IntentCommand::Optimize(args) => run_intent(&args.run_args(), RunPresentation::Optimize),
         IntentCommand::Plan(args) => plan_intent(&args),
         IntentCommand::Explain(args) => explain_pending(&args),
@@ -682,6 +825,364 @@ fn dispatch(command: IntentCommand) -> Result<i32> {
         IntentCommand::Computation(args) => computation_artifact(&args),
         IntentCommand::Object(args) => object_command(&args),
     }
+}
+
+fn route_catalog(args: &RoutesArgs) -> Result<i32> {
+    let loaded = match load_route_catalog(&args.target, &args.route_decls) {
+        Ok(loaded) => loaded,
+        Err(failure) => {
+            if args.json {
+                emit_route_catalog_json(RouteCatalogV1 {
+                    schema: ROUTE_CATALOG_SCHEMA_V1,
+                    input: None,
+                    project_name: None,
+                    routes: Vec::new(),
+                    route_sets: Vec::new(),
+                    failure: Some(failure),
+                })?;
+            } else {
+                eprintln!("error: {}", failure.message);
+            }
+            return Ok(1);
+        }
+    };
+    let catalog = build_route_catalog(loaded);
+    if args.json {
+        emit_route_catalog_json(catalog)?;
+    } else {
+        render_route_catalog(&catalog)?;
+    }
+    Ok(0)
+}
+
+fn load_route_catalog(
+    target: &Path,
+    route_declarations: &[String],
+) -> std::result::Result<LoadedRouteCatalog, RouteCatalogFailureV1> {
+    let metadata = fs::metadata(target).map_err(|_| {
+        route_catalog_failure(
+            "input_unavailable",
+            "route catalog input could not be inspected",
+        )
+    })?;
+    let canonical = target.canonicalize().map_err(|_| {
+        route_catalog_failure(
+            "input_unavailable",
+            "route catalog input could not be resolved",
+        )
+    })?;
+    let input_path = canonical
+        .to_str()
+        .ok_or_else(|| {
+            route_catalog_failure(
+                "unsupported_path_encoding",
+                "route catalog input path is not valid UTF-8",
+            )
+        })?
+        .to_string();
+
+    let (input_kind, bundle) = if metadata.is_dir() {
+        let name = o_lang::project::name_from_path(&canonical);
+        let bundle =
+            o_lang::project::assemble(&canonical, &name, route_declarations).map_err(|_| {
+                route_catalog_failure(
+                    "invalid_project_metadata",
+                    "project route metadata could not be assembled",
+                )
+            })?;
+        ("project_directory", bundle)
+    } else if metadata.is_file()
+        && canonical
+            .extension()
+            .and_then(|extension| extension.to_str())
+            == Some("O")
+    {
+        let source = fs::read(&canonical).map_err(|_| {
+            route_catalog_failure(
+                "input_unavailable",
+                "lifted project input could not be read",
+            )
+        })?;
+        let source = std::str::from_utf8(&source).map_err(|_| {
+            route_catalog_failure(
+                "invalid_lifted_project",
+                "lifted project input is not valid UTF-8",
+            )
+        })?;
+        if !o_lang::project::lower::has_embedded_bundle(source) {
+            return Err(route_catalog_failure(
+                "unsupported_input",
+                "route catalog requires a project directory or lifted project bundle",
+            ));
+        }
+        let mut bundle = o_lang::project::lower::extract_bundle_from_o(source).map_err(|_| {
+            route_catalog_failure(
+                "invalid_lifted_project",
+                "lifted project metadata could not be decoded",
+            )
+        })?;
+        o_lang::project::manifest::apply_cli_overrides(&mut bundle, route_declarations).map_err(
+            |_| {
+                route_catalog_failure(
+                    "invalid_route_declaration",
+                    "route override metadata could not be applied",
+                )
+            },
+        )?;
+        o_lang::project::finalize_default(&mut bundle);
+        ("lifted_project_bundle", bundle)
+    } else {
+        return Err(route_catalog_failure(
+            "unsupported_input",
+            "route catalog requires a project directory or lifted project bundle",
+        ));
+    };
+
+    // Canonical bundle serialization is the same identity used by project
+    // planning and validated-selection receipts. It contains source bytes, but
+    // only its digest crosses the catalog presentation boundary.
+    let bundle_bytes = o_lang::project::bundle::serialize(&bundle).map_err(|_| {
+        route_catalog_failure(
+            "invalid_project_metadata",
+            "project route metadata could not be canonically identified",
+        )
+    })?;
+    let bundle_sha256 = hex::encode(Sha256::digest(bundle_bytes));
+    Ok(LoadedRouteCatalog {
+        input_kind,
+        input_path,
+        bundle_sha256,
+        bundle,
+    })
+}
+
+fn build_route_catalog(loaded: LoadedRouteCatalog) -> RouteCatalogV1 {
+    let routes = loaded
+        .bundle
+        .routes
+        .iter()
+        .map(|route| RouteCatalogRouteV1 {
+            id: route.id.clone(),
+            kind: route_kind_token(route.kind),
+            result_codec: result_codec_token(route.result_codec),
+        })
+        .collect();
+    let route_sets = loaded
+        .bundle
+        .route_sets
+        .iter()
+        .map(|set| route_catalog_set(&loaded.bundle, set))
+        .collect();
+    RouteCatalogV1 {
+        schema: ROUTE_CATALOG_SCHEMA_V1,
+        input: Some(RouteCatalogInputV1 {
+            kind: loaded.input_kind,
+            path: loaded.input_path,
+            bundle_sha256: loaded.bundle_sha256,
+        }),
+        project_name: Some(loaded.bundle.name),
+        routes,
+        route_sets,
+        failure: None,
+    }
+}
+
+fn route_catalog_set(bundle: &ProjectBundle, set: &RouteSet) -> RouteCatalogRouteSetV1 {
+    let optimize_rejection = route_set_optimize_rejection(bundle, set);
+    let reuse_rejection = route_set_reuse_rejection(bundle, set, optimize_rejection.as_deref());
+    RouteCatalogRouteSetV1 {
+        name: set.provides.clone(),
+        declared_policy: set.policy.token(),
+        reference_route: set.alternatives.first().cloned(),
+        alternatives: set.alternatives.clone(),
+        optimize_ready: optimize_rejection.is_none(),
+        optimize_rejection,
+        reuse_ready: reuse_rejection.is_none(),
+        reuse_rejection,
+    }
+}
+
+fn route_set_reuse_rejection(
+    bundle: &ProjectBundle,
+    set: &RouteSet,
+    optimize_rejection: Option<&str>,
+) -> Option<String> {
+    if let Some(rejection) = optimize_rejection {
+        return Some(rejection.to_string());
+    }
+    o_lang::project::validate_selection_reuse_effect_boundary(bundle, &set.alternatives).err()
+}
+
+fn route_set_optimize_rejection(bundle: &ProjectBundle, set: &RouteSet) -> Option<String> {
+    if set.provides.is_empty() {
+        return Some("route set has no name".to_string());
+    }
+    if set.alternatives.len() < 2 {
+        return Some("route set must declare a reference and at least one candidate".to_string());
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    if set
+        .alternatives
+        .iter()
+        .any(|route_id| route_id.is_empty() || !seen.insert(route_id.as_str()))
+    {
+        return Some("route set contains an empty or repeated alternative".to_string());
+    }
+    if set
+        .alternatives
+        .iter()
+        .any(|route_id| bundle.route(route_id).is_none())
+    {
+        return Some("route set references a missing route".to_string());
+    }
+    if o_lang::project::build_project_hgraph(
+        bundle,
+        Some(&set.provides),
+        Some(RoutePolicy::BenchmarkValidateAndSelect),
+    )
+    .is_err()
+    {
+        return Some(
+            "project structure is not valid for benchmark_validate_and_select".to_string(),
+        );
+    }
+    None
+}
+
+fn route_kind_token(kind: RouteKind) -> &'static str {
+    match kind {
+        RouteKind::InterpreterCommand => "interpreter_command",
+        RouteKind::CompiledBinary => "compiled_binary",
+        RouteKind::BuildTarget => "build_target",
+        RouteKind::PackageEntrypoint => "package_entrypoint",
+        RouteKind::ShellTask => "shell_task",
+        RouteKind::OEvaluator => "o_evaluator",
+        RouteKind::Composite => "composite",
+    }
+}
+
+fn result_codec_token(codec: ResultCodec) -> &'static str {
+    match codec {
+        ResultCodec::Text => "text",
+        ResultCodec::Json => "json",
+        ResultCodec::Bytes => "bytes",
+    }
+}
+
+fn render_route_catalog(catalog: &RouteCatalogV1) -> Result<()> {
+    let input = catalog
+        .input
+        .as_ref()
+        .context("successful route catalog has no input identity")?;
+    let project_name = catalog
+        .project_name
+        .as_deref()
+        .context("successful route catalog has no project name")?;
+    println!("Ostadix route catalog");
+    println!("Project: {}", quoted_catalog_text(project_name)?);
+    println!("Input: {}", quoted_catalog_text(&input.path)?);
+    println!("Bundle SHA-256: {}", input.bundle_sha256);
+    println!("Routes:");
+    if catalog.routes.is_empty() {
+        println!("- none");
+    }
+    for route in &catalog.routes {
+        println!(
+            "- {} - kind={} - result={}",
+            quoted_catalog_text(&route.id)?,
+            route.kind,
+            route.result_codec,
+        );
+    }
+    println!("Route sets:");
+    if catalog.route_sets.is_empty() {
+        println!("- none declared; Ostadix will not infer equivalence from shared capabilities");
+    }
+    for set in &catalog.route_sets {
+        let name = quoted_catalog_text(&set.name)?;
+        let declared_policy = quoted_catalog_text(&set.declared_policy)?;
+        println!("- {name} - declared policy={declared_policy}");
+        if let Some(reference) = &set.reference_route {
+            println!("  reference: {}", quoted_catalog_text(reference)?);
+        } else {
+            println!("  reference: none");
+        }
+        let alternatives = set
+            .alternatives
+            .iter()
+            .map(|route| quoted_catalog_text(route))
+            .collect::<Result<Vec<_>>>()?
+            .join(", ");
+        println!("  alternatives: [{alternatives}]");
+        if let Some(rejection) = &set.optimize_rejection {
+            println!(
+                "  optimize: unavailable ({})",
+                terminal_text_fragment(rejection)
+            );
+        } else {
+            println!("  optimize: ready");
+            if let Some(route_argument) = safe_posix_route_argument(&set.name) {
+                println!("  next: o optimize TARGET --route {route_argument}");
+            } else {
+                println!(
+                    "  guidance: pass the route-set name shown above to `o optimize TARGET --route ROUTE_SET`"
+                );
+            }
+        }
+        if let Some(rejection) = &set.reuse_rejection {
+            println!(
+                "  later winner reuse: unavailable ({})",
+                terminal_text_fragment(rejection)
+            );
+        } else {
+            println!("  later winner reuse: ready after successful optimization");
+        }
+    }
+    Ok(())
+}
+
+fn quoted_catalog_text(value: &str) -> Result<String> {
+    Ok(quoted_terminal_text(value))
+}
+
+fn terminal_text_fragment(value: &str) -> String {
+    value.chars().flat_map(char::escape_default).collect()
+}
+
+fn quoted_terminal_text(value: &str) -> String {
+    format!("\"{}\"", terminal_text_fragment(value))
+}
+
+fn safe_posix_route_argument(value: &str) -> Option<String> {
+    (!value.is_empty()
+        && !value.starts_with('-')
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'/' | b':' | b'+')
+        }))
+    .then(|| format!("\"{value}\""))
+}
+
+fn route_catalog_failure(code: &'static str, message: &str) -> RouteCatalogFailureV1 {
+    RouteCatalogFailureV1 {
+        code,
+        message: message.to_string(),
+    }
+}
+
+fn emit_route_catalog_json(catalog: RouteCatalogV1) -> Result<()> {
+    println!("{}", serde_json::to_string(&catalog)?);
+    Ok(())
+}
+
+fn emit_route_catalog_failure_json(code: &'static str, message: &str) -> Result<()> {
+    emit_route_catalog_json(RouteCatalogV1 {
+        schema: ROUTE_CATALOG_SCHEMA_V1,
+        input: None,
+        project_name: None,
+        routes: Vec::new(),
+        route_sets: Vec::new(),
+        failure: Some(route_catalog_failure(code, message)),
+    })
 }
 
 fn computation_artifact(args: &ComputationArgs) -> Result<i32> {
@@ -1370,6 +1871,11 @@ fn publication_path(path: &Path) -> Result<PathBuf> {
 
 fn resolve_run_output_paths(args: &RunArgs) -> Result<RunArgs> {
     let mut resolved = args.clone();
+    if resolved.selection_run.is_some() {
+        // Selected-route reuse is useful only when its admission and terminal
+        // output postcondition are durably bound into a new record.
+        resolved.require_record = true;
+    }
     resolved.target = args
         .target
         .canonicalize()
@@ -1452,6 +1958,9 @@ fn validate_explicit_output_paths(
 }
 
 fn prepare_run(args: &RunArgs) -> Result<PreparedExecutionIntentV1> {
+    if args.json && args.optimize_progress == Some(OptimizeProgressMode::Always) {
+        bail!("--json conflicts with --progress always; use --progress never or the default auto mode");
+    }
     let explicit_outputs = [
         ("--project-trace-out", args.project_trace_out.as_ref()),
         ("--mesh-trace-out", args.mesh_trace_out.as_ref()),
@@ -1461,7 +1970,17 @@ fn prepare_run(args: &RunArgs) -> Result<PreparedExecutionIntentV1> {
         ),
     ];
     validate_explicit_output_paths(&args.target, &explicit_outputs)?;
-    let prepared = prepare_execution_intent(&args.target, run_prepare_options(args)?)?;
+    let options = run_prepare_options(args)?;
+    let prepared = if let Some(source_run_id) = args.selection_run.as_deref() {
+        let selector = exact_selection_run_selector(source_run_id)?;
+        let source = RunStoreReaderV1::open_default_existing()
+            .context("selection reuse requires an existing private run store")?
+            .read_terminal_verified(selector, false)
+            .context("failed to load the exact selection source run")?;
+        prepare_selection_reuse_intent(&args.target, options, &source)?
+    } else {
+        prepare_execution_intent(&args.target, options)?
+    };
     if args.project && matches!(prepared, PreparedExecutionIntentV1::OrdinaryO(_)) {
         bail!("--project requires a project directory or lifted project bundle");
     }
@@ -1504,6 +2023,15 @@ fn prepare_run(args: &RunArgs) -> Result<PreparedExecutionIntentV1> {
         }
     }
     Ok(prepared)
+}
+
+fn exact_selection_run_selector(value: &str) -> Result<RunSelectorV1> {
+    match parse_run_selector(value)? {
+        RunSelectorV1::RunId(run_id) => Ok(RunSelectorV1::RunId(run_id)),
+        RunSelectorV1::LastRun => {
+            bail!("--selection-run requires an exact 64-character run ID; `last-run` is mutable")
+        }
+    }
 }
 
 struct StreamObservation {
@@ -1569,6 +2097,12 @@ impl PreparedProcessCapture {
                 "failed to preserve process stderr for run observation",
             )?,
         })
+    }
+
+    fn progress_stderr(&self) -> Result<File> {
+        self.saved_stderr
+            .try_clone()
+            .context("failed to duplicate the original stderr for live progress")
     }
 
     fn execute(
@@ -1681,6 +2215,10 @@ struct PreparedProcessCapture;
 impl PreparedProcessCapture {
     fn prepare() -> Result<Self> {
         bail!("run observation requires Unix descriptor capture on this build")
+    }
+
+    fn progress_stderr(&self) -> Result<File> {
+        bail!("live optimize progress requires Unix descriptor capture on this build")
     }
 
     fn execute(
@@ -1796,6 +2334,148 @@ fn drain_captured_stream(
     Ok((observation, replay_error))
 }
 
+struct OptimizeProgressRenderer {
+    state: Mutex<OptimizeProgressState>,
+}
+
+struct OptimizeProgressState {
+    stderr: File,
+    finished: usize,
+    settled: usize,
+}
+
+impl OptimizeProgressRenderer {
+    fn new(stderr: File) -> Self {
+        Self {
+            state: Mutex::new(OptimizeProgressState {
+                stderr,
+                finished: 0,
+                settled: 0,
+            }),
+        }
+    }
+
+    fn write_line(state: &mut OptimizeProgressState, line: &str) {
+        let _ = state.stderr.write_all(line.as_bytes());
+        let _ = state.stderr.write_all(b"\n");
+        let _ = state.stderr.flush();
+    }
+}
+
+impl ValidatedSelectionProgressObserverV1 for OptimizeProgressRenderer {
+    fn observe(&self, event: ValidatedSelectionProgressEventV1) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        match event {
+            ValidatedSelectionProgressEventV1::SelectionStarted {
+                reference_route_id,
+                candidate_count,
+            } => Self::write_line(
+                &mut state,
+                &format!(
+                    "o optimize: measuring {candidate_count} candidates concurrently; reference={}",
+                    progress_route_id(&reference_route_id),
+                ),
+            ),
+            ValidatedSelectionProgressEventV1::CandidateStarted { .. } => {}
+            ValidatedSelectionProgressEventV1::CandidateFinished {
+                route_id,
+                candidate_count,
+                branch_elapsed_ns,
+                outcome,
+                ..
+            } => {
+                let line = candidate_progress_line(
+                    &mut state,
+                    &route_id,
+                    candidate_count,
+                    branch_elapsed_ns,
+                    outcome,
+                );
+                Self::write_line(&mut state, &line);
+            }
+            ValidatedSelectionProgressEventV1::ValidationStarted { .. } => {
+                Self::write_line(&mut state, "o optimize: validating declared outputs")
+            }
+        }
+    }
+}
+
+fn progress_route_id(route_id: &str) -> String {
+    quoted_terminal_text(route_id)
+}
+
+fn terminal_route_id(route_id: &str) -> String {
+    if !route_id.is_empty()
+        && route_id.chars().all(|character| {
+            character.is_ascii_alphanumeric()
+                || matches!(character, '_' | '-' | '.' | '/' | ':' | '+')
+        })
+    {
+        route_id.to_string()
+    } else {
+        progress_route_id(route_id)
+    }
+}
+
+fn candidate_progress_line(
+    state: &mut OptimizeProgressState,
+    route_id: &str,
+    candidate_count: usize,
+    branch_elapsed_ns: u128,
+    outcome: ValidatedSelectionCandidateProgressV1,
+) -> String {
+    state.finished = state.finished.saturating_add(1).min(candidate_count);
+    let route_id = progress_route_id(route_id);
+    let duration = format_optimization_nanos(branch_elapsed_ns);
+    match outcome {
+        ValidatedSelectionCandidateProgressV1::InfrastructureFailed => format!(
+            "o optimize: {}/{} finished {} - {} - infrastructure failure before settlement",
+            state.finished, candidate_count, route_id, duration,
+        ),
+        ValidatedSelectionCandidateProgressV1::Succeeded => {
+            state.settled = state.settled.saturating_add(1).min(candidate_count);
+            let finished = if state.finished == state.settled {
+                String::new()
+            } else {
+                format!(" ({}/{} finished)", state.finished, candidate_count)
+            };
+            format!(
+                "o optimize: {}/{} settled{} {} - {} - complete branch (exit 0)",
+                state.settled, candidate_count, finished, route_id, duration,
+            )
+        }
+        ValidatedSelectionCandidateProgressV1::SettledUnsuccessful { exit_code } => {
+            state.settled = state.settled.saturating_add(1).min(candidate_count);
+            let finished = if state.finished == state.settled {
+                String::new()
+            } else {
+                format!(" ({}/{} finished)", state.finished, candidate_count)
+            };
+            let outcome = exit_code
+                .map(|exit_code| format!("unsuccessful branch (exit {exit_code})"))
+                .unwrap_or_else(|| "unsuccessful branch (no exit code)".to_string());
+            format!(
+                "o optimize: {}/{} settled{} {} - {} - {}",
+                state.settled, candidate_count, finished, route_id, duration, outcome,
+            )
+        }
+    }
+}
+
+fn format_optimization_nanos(nanos: u128) -> String {
+    if nanos >= 1_000_000_000 {
+        format!("{:.3} s", nanos as f64 / 1_000_000_000.0)
+    } else if nanos >= 1_000_000 {
+        format!("{:.3} ms", nanos as f64 / 1_000_000.0)
+    } else if nanos >= 1_000 {
+        format!("{:.3} us", nanos as f64 / 1_000.0)
+    } else {
+        format!("{nanos} ns")
+    }
+}
+
 #[derive(Debug)]
 struct ExecutionReport {
     disposition: RunDispositionV1,
@@ -1805,6 +2485,7 @@ struct ExecutionReport {
     decoded_value: Option<serde_json::Value>,
     route_results: Vec<RecordedRouteResultV1>,
     validated_selection_receipt: Option<ValidatedSelectionReceiptV1>,
+    selection_reuse: Option<ProjectSelectionReuseObservationV1>,
     selection_receipt_published: bool,
     result_references: Vec<RunResultReferenceV1>,
     trace: Option<RunTraceAttachmentV1>,
@@ -1822,6 +2503,7 @@ impl ExecutionReport {
             decoded_value: None,
             route_results: Vec::new(),
             validated_selection_receipt: None,
+            selection_reuse: None,
             selection_receipt_published: false,
             result_references: Vec::new(),
             trace: None,
@@ -1843,6 +2525,7 @@ impl ExecutionReport {
             decoded_value: None,
             route_results: Vec::new(),
             validated_selection_receipt: None,
+            selection_reuse: None,
             selection_receipt_published: false,
             result_references: Vec::new(),
             trace: None,
@@ -1892,6 +2575,7 @@ fn required_recording_begin_failure(
         plan: Some(prepared.run_plan_identities()),
         disposition: RunDispositionV1::InfrastructureFailed,
         result_references: Vec::new(),
+        selection_reuse: None,
         recording: RunRecordingStatusV1::Incomplete {
             detail: detail.clone(),
         },
@@ -1925,6 +2609,7 @@ fn stream_observation_begin_failure(
         plan: Some(prepared.run_plan_identities()),
         disposition: RunDispositionV1::InfrastructureFailed,
         result_references: Vec::new(),
+        selection_reuse: None,
         recording: if args.no_record {
             RunRecordingStatusV1::Disabled
         } else {
@@ -2012,6 +2697,16 @@ fn run_intent(args: &RunArgs, presentation: RunPresentation) -> Result<i32> {
     } else {
         None
     };
+    let progress_renderer = if optimize_progress_enabled(args, presentation, stderr_is_terminal) {
+        let progress_stderr = process_capture
+            .as_ref()
+            .context("live optimize progress requires process-stream observation")?
+            .progress_stderr()
+            .context("live optimize progress could not be prepared; no computation was executed")?;
+        Some(OptimizeProgressRenderer::new(progress_stderr))
+    } else {
+        None
+    };
     if !args.no_record && process_capture.is_some() {
         match RunStoreV1::open_default().and_then(|store| store.begin(seed.clone())) {
             Ok(run_lease) => lease = Some(run_lease),
@@ -2043,6 +2738,9 @@ fn run_intent(args: &RunArgs, presentation: RunPresentation) -> Result<i32> {
                     stdout_is_terminal,
                     stderr_is_terminal,
                     presentation,
+                    progress_renderer
+                        .as_ref()
+                        .map(|renderer| renderer as &dyn ValidatedSelectionProgressObserverV1),
                 )
             },
         ) {
@@ -2073,6 +2771,9 @@ fn run_intent(args: &RunArgs, presentation: RunPresentation) -> Result<i32> {
             stdout_is_terminal,
             stderr_is_terminal,
             presentation,
+            progress_renderer
+                .as_ref()
+                .map(|renderer| renderer as &dyn ValidatedSelectionProgressObserverV1),
         );
         let recorded_stdout = CapturedStreamV1::complete(report.stdout.clone());
         let recorded_stderr = CapturedStreamV1::complete(report.stderr.clone());
@@ -2101,6 +2802,7 @@ fn run_intent(args: &RunArgs, presentation: RunPresentation) -> Result<i32> {
             report.failure.clone(),
         );
         record.validated_selection_receipt = report.validated_selection_receipt.clone();
+        record.selection_reuse = report.selection_reuse.clone();
         match lease.finalize(record.clone(), report.trace.clone()) {
             Ok(finalized) => RunSummaryV1::from_record(
                 &record,
@@ -2132,6 +2834,7 @@ fn run_intent(args: &RunArgs, presentation: RunPresentation) -> Result<i32> {
             plan: Some(prepared.run_plan_identities()),
             disposition: report.disposition,
             result_references: report.result_references.clone(),
+            selection_reuse: report.selection_reuse.clone(),
             recording: if args.no_record {
                 RunRecordingStatusV1::Disabled
             } else {
@@ -2171,6 +2874,13 @@ fn run_intent(args: &RunArgs, presentation: RunPresentation) -> Result<i32> {
                 optimization_evidence_footer(&summary, receipt_export_path).as_bytes(),
             )?;
         }
+        if let Some(reuse) = report
+            .selection_reuse
+            .as_ref()
+            .filter(|reuse| reuse.output_check.matched())
+        {
+            io::stdout().write_all(selection_reuse_footer(reuse).as_bytes())?;
+        }
         io::stdout().flush()?;
         io::stderr().write_all(&report.stderr)?;
         io::stderr().flush()?;
@@ -2179,6 +2889,32 @@ fn run_intent(args: &RunArgs, presentation: RunPresentation) -> Result<i32> {
         eprint!("{diagnostic}");
     }
     Ok(command_exit)
+}
+
+fn optimize_progress_enabled(
+    args: &RunArgs,
+    presentation: RunPresentation,
+    stderr_is_terminal: bool,
+) -> bool {
+    if presentation != RunPresentation::Optimize || args.json {
+        return false;
+    }
+    match args
+        .optimize_progress
+        .unwrap_or(OptimizeProgressMode::Never)
+    {
+        OptimizeProgressMode::Auto => stderr_is_terminal,
+        OptimizeProgressMode::Always => true,
+        OptimizeProgressMode::Never => false,
+    }
+}
+
+fn selection_reuse_footer(reuse: &ProjectSelectionReuseObservationV1) -> String {
+    format!(
+        "Ostadix selected-route reuse\nSource run: {}\nExecuted route: {}\nDeclared-output postcondition: matched\nNo other top-level candidate branch was dispatched; declared prerequisites may run.\n",
+        reuse.source_run_id,
+        terminal_route_id(&reuse.selected_route_id),
+    )
 }
 
 fn reported_receipt_export_path(
@@ -2199,9 +2935,14 @@ fn execute_for_report(
     stdout_is_terminal: bool,
     stderr_is_terminal: bool,
     presentation: RunPresentation,
+    progress: Option<&dyn ValidatedSelectionProgressObserverV1>,
 ) -> ExecutionReport {
     let execution_started = Instant::now();
-    let mut report = match execute_prepared_intent(prepared) {
+    let execution = match progress {
+        Some(observer) => execute_prepared_intent_with_progress(prepared, observer),
+        None => execute_prepared_intent(prepared),
+    };
+    let mut report = match execution {
         Ok(ExecutionObservationV1::OrdinaryO(outcome)) => {
             let stdout = render_ordinary_value_stdout_with_color(
                 &outcome.value,
@@ -2236,6 +2977,7 @@ fn execute_for_report(
                 decoded_value,
                 route_results: Vec::new(),
                 validated_selection_receipt: None,
+                selection_reuse: None,
                 selection_receipt_published: false,
                 result_references,
                 trace,
@@ -2258,6 +3000,8 @@ fn execute_for_report(
             );
             match report {
                 Ok(mut report) => {
+                    report.selection_reuse = observation.selection_reuse.as_deref().cloned();
+                    bind_selection_reuse_result_codec(&mut report, prepared);
                     match write_observed_project_traces(args, &observation) {
                         Ok(()) => {
                             report.selection_receipt_published =
@@ -2349,7 +3093,7 @@ fn render_optimization_evidence(receipt: &ValidatedSelectionReceiptV1) -> Result
         };
         out.push_str(&format!(
             "- {}{} - {} - {} complete branch\n",
-            candidate.route_id,
+            terminal_route_id(&candidate.route_id),
             marker,
             status,
             format_optimization_duration(&candidate.branch_elapsed_ns)?,
@@ -2365,7 +3109,10 @@ fn render_optimization_evidence(receipt: &ValidatedSelectionReceiptV1) -> Result
         .iter()
         .find(|candidate| candidate.route_id == receipt.selected_route_id)
         .context("validated-selection receipt has no selected candidate")?;
-    out.push_str(&format!("Selected route: {}\n", receipt.selected_route_id));
+    out.push_str(&format!(
+        "Selected route: {}\n",
+        terminal_route_id(&receipt.selected_route_id)
+    ));
     let reference_ns = parse_optimization_duration(&reference.branch_elapsed_ns)?;
     let selected_ns = parse_optimization_duration(&selected.branch_elapsed_ns)?;
     if selected_ns != 0 {
@@ -2415,19 +3162,40 @@ fn optimization_evidence_footer(
     receipt_export_path: Option<&Path>,
 ) -> String {
     let mut out = String::new();
-    match (&summary.recording, summary.run_id.as_deref()) {
+    let reusable_run_id = match (&summary.recording, summary.run_id.as_deref()) {
         (RunRecordingStatusV1::Recorded { .. }, Some(run_id)) => {
             out.push_str(&format!("Durable evidence: o inspect {run_id}\n"));
+            Some(run_id)
         }
-        _ => out.push_str("Durable evidence: unavailable\n"),
-    }
+        _ => {
+            out.push_str("Durable evidence: unavailable\n");
+            None
+        }
+    };
     if let Some(path) = receipt_export_path {
         out.push_str(&format!("Receipt export path: {}\n", path.display()));
     }
-    out.push_str(
-        "Note: every candidate ran; the selected route was recorded as evidence but was not activated or reused, and this invocation was not accelerated.\n",
-    );
+    if let Some(run_id) = reusable_run_id {
+        out.push_str(&format!(
+            "Note: every candidate ran, so this evidence-gathering invocation was not accelerated. When `o routes TARGET` reports later-winner reuse ready, apply this exact result with `o run TARGET --selection-run {run_id}`.\n"
+        ));
+    } else {
+        out.push_str(
+            "Note: every candidate ran, so this evidence-gathering invocation was not accelerated. No reusable durable run was produced.\n",
+        );
+    }
     out
+}
+
+fn validated_selection_summary_line(receipt: &ValidatedSelectionReceiptV1) -> String {
+    let digest = receipt.sha256().unwrap_or_else(|_| "<invalid>".to_string());
+    format!(
+        "validated selection: reference={} selected={} candidates={} receipt-sha256={}\n",
+        terminal_route_id(&receipt.reference_route_id),
+        terminal_route_id(&receipt.selected_route_id),
+        receipt.candidates.len(),
+        digest,
+    )
 }
 
 fn project_report(
@@ -2447,17 +3215,7 @@ fn project_report(
                 stdout.extend_from_slice(result.observation_summary().as_bytes());
             }
             if let Some(receipt) = validated_selection_receipt {
-                let digest = receipt.sha256().unwrap_or_else(|_| "<invalid>".to_string());
-                stdout.extend_from_slice(
-                    format!(
-                        "validated selection: reference={} selected={} candidates={} receipt-sha256={}\n",
-                        receipt.reference_route_id,
-                        receipt.selected_route_id,
-                        receipt.candidates.len(),
-                        digest,
-                    )
-                    .as_bytes(),
-                );
+                stdout.extend_from_slice(validated_selection_summary_line(receipt).as_bytes());
             }
             stdout
         }
@@ -2531,6 +3289,7 @@ fn project_report(
         decoded_value,
         route_results,
         validated_selection_receipt: validated_selection_receipt.cloned(),
+        selection_reuse: None,
         selection_receipt_published: false,
         result_references,
         trace,
@@ -2603,6 +3362,47 @@ fn error_report(
     prepared: &PreparedExecutionIntentV1,
     presentation: RunPresentation,
 ) -> ExecutionReport {
+    if let Some(reuse) = error.downcast_ref::<SelectionReuseExecutionErrorV1>() {
+        let mut report = project_report(
+            &reuse.results,
+            None,
+            None,
+            None,
+            None,
+            Some("selected-route reuse has no project coordinator trace"),
+            ProjectReportOptions {
+                explain_mesh: false,
+                presentation: RunPresentation::Ordinary,
+            },
+        )
+        .expect("selection-reuse error carries no fresh selection evidence to bind");
+        report.selection_reuse = Some(reuse.observation.clone());
+        bind_selection_reuse_result_codec(&mut report, prepared);
+        report.disposition = match reuse.observation.output_check.status {
+            SelectionReuseOutputStatusV1::ObservationInvalid => {
+                RunDispositionV1::InfrastructureFailed
+            }
+            _ => RunDispositionV1::ExecutionFailed,
+        };
+        report.exit_code = 1;
+        let message = reuse.public_message().to_string();
+        report
+            .stderr
+            .extend_from_slice(format!("error: {message}\n").as_bytes());
+        report.failure = Some(RunFailureV1 {
+            stage: match reuse.observation.output_check.status {
+                SelectionReuseOutputStatusV1::DeclaredOutputMismatch => {
+                    "selection_reuse_postcondition"
+                }
+                SelectionReuseOutputStatusV1::ObservationInvalid => "selection_reuse_evidence",
+                SelectionReuseOutputStatusV1::RouteFailed => "execution",
+                SelectionReuseOutputStatusV1::Matched => "selection_reuse_postcondition",
+            }
+            .to_string(),
+            message,
+        });
+        return report;
+    }
     if let Some(ordinary) = error.downcast_ref::<OrdinaryOExecutionErrorV1>() {
         let message = format!("{error:#}");
         let (trace, trace_unavailable_reason) = {
@@ -2629,6 +3429,7 @@ fn error_report(
             decoded_value: None,
             route_results: Vec::new(),
             validated_selection_receipt: None,
+            selection_reuse: None,
             selection_receipt_published: false,
             result_references: Vec::new(),
             trace,
@@ -2695,6 +3496,32 @@ fn error_report(
         message,
     });
     report
+}
+
+fn bind_selection_reuse_result_codec(
+    report: &mut ExecutionReport,
+    prepared: &PreparedExecutionIntentV1,
+) {
+    let PreparedExecutionIntentV1::Project(project) = prepared else {
+        return;
+    };
+    let Some(binding) = project.selection_reuse().map(|reuse| reuse.binding()) else {
+        return;
+    };
+    let Some(codec) = binding
+        .receipt
+        .candidates
+        .iter()
+        .find(|candidate| candidate.route_id == binding.contract.selected_route_id)
+        .map(|candidate| candidate.observation.result_codec)
+    else {
+        return;
+    };
+    for result in &mut report.route_results {
+        if result.route_id == binding.contract.selected_route_id {
+            result.result_codec = Some(codec);
+        }
+    }
 }
 
 fn project_error(error: &anyhow::Error) -> Option<&ProjectExecutionError> {
@@ -3118,8 +3945,8 @@ mod tests {
     use super::*;
     use clap::error::ErrorKind;
     use o_lang::project::{
-        ResultCodec, RouteExecutionDisposition, ValidatedArtifactCaptureStatusV1,
-        ValidatedSelectionCandidateV1, ValidatedSelectionObservationV1,
+        RouteExecutionDisposition, ValidatedArtifactCaptureStatusV1, ValidatedSelectionCandidateV1,
+        ValidatedSelectionObservationV1,
     };
     use tempfile::tempdir;
 
@@ -3137,6 +3964,14 @@ mod tests {
             panic!("expected optimize command")
         };
         optimize
+    }
+
+    fn parse_routes(arguments: &[&str]) -> RoutesArgs {
+        let cli = Cli::try_parse_from(arguments).unwrap();
+        let IntentCommand::Routes(routes) = cli.command else {
+            panic!("expected routes command")
+        };
+        routes
     }
 
     fn optimization_observation(stdout: &[u8]) -> ValidatedSelectionObservationV1 {
@@ -3263,6 +4098,31 @@ mod tests {
     }
 
     #[test]
+    fn routes_command_accepts_only_read_only_catalog_inputs() {
+        let routes = parse_routes(&[
+            "o",
+            "routes",
+            "project",
+            "--route-decl",
+            "id=fast;cmd=fast",
+            "--json",
+        ]);
+        assert_eq!(routes.target, Path::new("project"));
+        assert_eq!(routes.route_decls, ["id=fast;cmd=fast"]);
+        assert!(routes.json);
+
+        for execution_option in ["--route", "--parallel", "--workers", "--require-record"] {
+            let error =
+                Cli::try_parse_from(["o", "routes", "project", execution_option]).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                ErrorKind::UnknownArgument,
+                "{execution_option}"
+            );
+        }
+    }
+
+    #[test]
     fn optimize_command_is_closed_sugar_for_durable_validated_selection() {
         let optimize = parse_optimize(&[
             "o",
@@ -3330,6 +4190,40 @@ mod tests {
     }
 
     #[test]
+    fn selected_route_reuse_accepts_only_an_exact_closed_run_intent() {
+        let run_id = "ab".repeat(32);
+        let run = parse_run(&["o", "run", "project", "--selection-run", &run_id, "--json"]);
+        assert_eq!(run.selection_run.as_deref(), Some(run_id.as_str()));
+        assert!(run.json);
+        assert_eq!(
+            exact_selection_run_selector("last-run")
+                .unwrap_err()
+                .to_string(),
+            "--selection-run requires an exact 64-character run ID; `last-run` is mutable"
+        );
+
+        for conflicting in [
+            vec!["--parallel", "auto"],
+            vec!["--no-record"],
+            vec!["--executor", "graph"],
+            vec!["--workers", "1"],
+            vec!["--route", "main"],
+            vec!["--routes-policy", "all"],
+            vec!["--mesh=required"],
+        ] {
+            let mut arguments = vec!["o", "run", "project", "--selection-run", run_id.as_str()];
+            arguments.extend(conflicting.iter().copied());
+            let error = Cli::try_parse_from(arguments).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                ErrorKind::ArgumentConflict,
+                "{}",
+                conflicting[0]
+            );
+        }
+    }
+
+    #[test]
     fn optimize_render_is_compact_ordered_and_explicit_about_its_boundary() {
         let receipt = optimization_receipt("fast");
         let rendered = render_optimization_evidence(&receipt).unwrap();
@@ -3390,6 +4284,79 @@ mod tests {
         );
         let failed_footer = optimization_evidence_footer(&summary, failed_export_path);
         assert!(!failed_footer.contains("Receipt export path:"));
+
+        summary.recording = RunRecordingStatusV1::Incomplete {
+            detail: "finalization failed".to_string(),
+        };
+        let incomplete_footer = optimization_evidence_footer(&summary, None);
+        assert!(incomplete_footer.contains("Durable evidence: unavailable"));
+        assert!(incomplete_footer.contains("No reusable durable run was produced"));
+        assert!(!incomplete_footer.contains("--selection-run"));
+    }
+
+    #[test]
+    fn optimize_route_ids_are_terminal_safe_and_route_guidance_is_shell_safe() {
+        let unsafe_route = "fast\n\u{1b}[31m$(touch nope)\u{202e}";
+        let rendered_id = terminal_route_id(unsafe_route);
+        assert!(!rendered_id.contains('\n'));
+        assert!(!rendered_id.contains('\u{1b}'));
+        assert!(!rendered_id.contains('\u{202e}'));
+
+        let mut receipt = optimization_receipt("fast");
+        receipt.selected_route_id = unsafe_route.to_string();
+        receipt.candidates[1].route_id = unsafe_route.to_string();
+        let rendered = render_optimization_evidence(&receipt).unwrap();
+        assert!(!rendered.contains(unsafe_route));
+        assert!(rendered.contains(&format!("Selected route: {rendered_id}")));
+        let ordinary_summary = validated_selection_summary_line(&receipt);
+        assert!(!ordinary_summary.contains(unsafe_route));
+        assert!(ordinary_summary.contains(&format!("selected={rendered_id}")));
+
+        let catalog_text = quoted_catalog_text("name\n\u{1b}[31m\u{202e}").unwrap();
+        assert!(!catalog_text.contains('\n'));
+        assert!(!catalog_text.contains('\u{1b}'));
+        assert!(!catalog_text.contains('\u{202e}'));
+
+        assert_eq!(
+            safe_posix_route_argument("main"),
+            Some("\"main\"".to_string())
+        );
+        assert_eq!(safe_posix_route_argument("$(touch nope)"), None);
+        assert_eq!(safe_posix_route_argument("--another-option"), None);
+        assert_eq!(safe_posix_route_argument("line\nbreak"), None);
+    }
+
+    #[test]
+    fn optimize_progress_does_not_count_infrastructure_failure_as_settled() {
+        let mut state = OptimizeProgressState {
+            stderr: tempfile::tempfile().unwrap(),
+            finished: 0,
+            settled: 0,
+        };
+        let failed = candidate_progress_line(
+            &mut state,
+            "bad\n\u{1b}[31m",
+            3,
+            1_000,
+            ValidatedSelectionCandidateProgressV1::InfrastructureFailed,
+        );
+        assert!(failed.starts_with("o optimize: 1/3 finished"));
+        assert!(failed.contains("infrastructure failure before settlement"));
+        assert!(!failed.contains('\n'));
+        assert!(!failed.contains('\u{1b}'));
+        assert_eq!(state.finished, 1);
+        assert_eq!(state.settled, 0);
+
+        let succeeded = candidate_progress_line(
+            &mut state,
+            "safe",
+            3,
+            2_000,
+            ValidatedSelectionCandidateProgressV1::Succeeded,
+        );
+        assert!(succeeded.starts_with("o optimize: 1/3 settled (2/3 finished)"));
+        assert_eq!(state.finished, 2);
+        assert_eq!(state.settled, 1);
     }
 
     #[test]
@@ -3620,6 +4587,7 @@ mod tests {
         let help = Cli::command().render_long_help().to_string();
         for text in [
             "run",
+            "routes",
             "optimize",
             "plan",
             "explain",
@@ -3640,7 +4608,9 @@ mod tests {
             "Usage: o optimize",
             "executes the reference and every candidate",
             "requires durable run recording",
-            "does not activate, cache, or reuse it automatically",
+            "evidence-gathering invocation is not accelerated",
+            "o run TARGET --selection-run RUN_ID",
+            "--progress <PROGRESS>",
             "o optimize . --route main --receipt selection.json",
         ] {
             assert!(
@@ -3649,6 +4619,22 @@ mod tests {
             );
         }
         assert!(!optimize_help.contains("Usage: o-cli"));
+
+        let routes_help = Cli::try_parse_from(["o-cli", "routes", "--help"]).unwrap_err();
+        assert_eq!(routes_help.kind(), ErrorKind::DisplayHelp);
+        let routes_help = routes_help.to_string();
+        for text in [
+            "Usage: o routes",
+            "without executing commands",
+            "Commands, environment values, guards, and source bytes are never included",
+            "o routes project.O --json",
+        ] {
+            assert!(
+                routes_help.contains(text),
+                "routes help omitted {text:?}:\n{routes_help}"
+            );
+        }
+        assert!(!routes_help.contains("Usage: o-cli"));
 
         let error = Cli::try_parse_from(["o", "run"]).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);

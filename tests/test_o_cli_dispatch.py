@@ -71,6 +71,7 @@ class LowercaseCliDispatchTests(unittest.TestCase):
         for arguments in (
             ("run", "program.O", "backends"),
             ("run", "project", "--parallel", "auto"),
+            ("routes", "project", "--json"),
             ("optimize", "project", "--route", "main", "--json"),
             ("plan", "--parallel", "auto", "project", "--live"),
             ("explain", "last-run"),

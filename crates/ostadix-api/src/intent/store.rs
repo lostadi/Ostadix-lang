@@ -438,6 +438,54 @@ pub struct FinalizedRunV1 {
     pub record: RunContentRefV1,
 }
 
+/// A terminal record returned only after the private store has verified its
+/// index, canonical bytes, content address, embedded record invariants, and
+/// optional trace binding.
+#[derive(Clone, Debug)]
+pub struct VerifiedTerminalRunV1 {
+    record_ref: RunContentRefV1,
+    record: RunRecordV1,
+    trace: Option<RunTraceAttachmentV1>,
+}
+
+impl VerifiedTerminalRunV1 {
+    pub fn record_ref(&self) -> &RunContentRefV1 {
+        &self.record_ref
+    }
+
+    pub fn record(&self) -> &RunRecordV1 {
+        &self.record
+    }
+
+    pub fn trace(&self) -> Option<&RunTraceAttachmentV1> {
+        self.trace.as_ref()
+    }
+
+    /// Defensively recompute the exact record object identity and all embedded
+    /// observation invariants. The type itself cannot be fabricated outside
+    /// this module, but admission callers can still re-check it explicitly.
+    pub fn validate(&self) -> Result<(), RunStoreErrorV1> {
+        self.record.validate().map_err(RunStoreErrorV1::Invalid)?;
+        let bytes = canonical_bytes(&self.record)?;
+        let expected = RunContentRefV1 {
+            kind: RunContentKindV1::Record,
+            sha256: domain_digest(RunContentKindV1::Record.domain(), &bytes),
+            bytes_len: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        };
+        if self.record_ref != expected {
+            return Err(RunStoreErrorV1::Invalid(
+                "verified terminal record identity changed after store admission".to_string(),
+            ));
+        }
+        if let Some(trace) = &self.trace {
+            trace
+                .validate_for_record(&self.record)
+                .map_err(RunStoreErrorV1::Invalid)?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RunSelectorV1 {
     LastRun,
@@ -559,6 +607,35 @@ impl RunStoreReaderV1 {
                 Ok((*record, trace.map(|attachment| *attachment)))
             }
         }
+    }
+
+    /// Read an exactly named terminal run together with the content address
+    /// verified by the store. `LastRun` is rejected because mutable aliases
+    /// are not an admission coordinate for a new execution decision.
+    pub fn read_terminal_verified(
+        &self,
+        selector: RunSelectorV1,
+        include_trace: bool,
+    ) -> Result<VerifiedTerminalRunV1, RunStoreErrorV1> {
+        if matches!(&selector, RunSelectorV1::LastRun) {
+            return Err(RunStoreErrorV1::Invalid(
+                "verified terminal admission requires an exact run ID; last-run is mutable"
+                    .to_string(),
+            ));
+        }
+        let (record, trace) = self.read_terminal(selector, include_trace)?;
+        let bytes = canonical_bytes(&record)?;
+        let record_ref = RunContentRefV1 {
+            kind: super::record::RunContentKindV1::Record,
+            sha256: domain_digest(super::record::RunContentKindV1::Record.domain(), &bytes),
+            bytes_len: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        };
+        record_ref.validate().map_err(RunStoreErrorV1::Invalid)?;
+        Ok(VerifiedTerminalRunV1 {
+            record_ref,
+            record,
+            trace,
+        })
     }
 }
 
@@ -1663,6 +1740,7 @@ mod tests {
                 mesh_discovery_timeout_ms: None,
                 mesh_closed_registry: None,
                 mesh_peer_root: None,
+                selection_reuse: None,
             },
             plan: PlanIdentitiesV1 {
                 oir_sha256: Some(sha(b"oir")),
@@ -1759,6 +1837,17 @@ mod tests {
 
         let reader = RunStoreReaderV1::open_existing(store.root()).unwrap();
         let (record, trace) = reader.read_terminal(RunSelectorV1::LastRun, true).unwrap();
+        let verified = reader
+            .read_terminal_verified(RunSelectorV1::RunId(finalized.run_id.clone()), true)
+            .unwrap();
+        verified.validate().unwrap();
+        assert_eq!(verified.record_ref(), &finalized.record);
+        assert_eq!(verified.record(), &record);
+        assert_eq!(verified.trace(), trace.as_ref());
+        assert!(matches!(
+            reader.read_terminal_verified(RunSelectorV1::LastRun, false),
+            Err(RunStoreErrorV1::Invalid(message)) if message.contains("exact run ID")
+        ));
         assert_eq!(record.run_id, finalized.run_id);
         assert_eq!(record.stdout.retained, expected);
         assert!(trace.is_none());
