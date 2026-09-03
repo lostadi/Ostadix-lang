@@ -1,0 +1,31 @@
+# Three independent repository CI shards. The harness supplies O_CI_OUT;
+# each lane keeps its complete log and returns a stable checked summary.
+autonomous(batch(
+bash^(
+set -euo pipefail
+log="\${O_CI_OUT}/o-cli.log"
+python3 -m unittest discover -s tests -p test_o_cli_dispatch.py >"\$log" 2>&1
+grep -Eq '^OK$' "\$log"
+count=\$(sed -nE 's/^Ran ([0-9]+) tests? in .*$/\1/p' "\$log" | tail -n 1)
+[[ "\$count" =~ ^[0-9]+$ ]]
+printf 'suite=o-cli tests=%s status=pass\n' "\$count"
+)_bash,
+bash^(
+set -euo pipefail
+log="\${O_CI_OUT}/setup.log"
+python3 -m unittest discover -s tests -p test_setup.py >"\$log" 2>&1
+grep -Eq '^OK$' "\$log"
+count=\$(sed -nE 's/^Ran ([0-9]+) tests? in .*$/\1/p' "\$log" | tail -n 1)
+[[ "\$count" =~ ^[0-9]+$ ]]
+printf 'suite=setup tests=%s status=pass\n' "\$count"
+)_bash,
+bash^(
+set -euo pipefail
+log="\${O_CI_OUT}/boot-iso.log"
+python3 -m unittest discover -s tests -p test_ostadix_boot_iso.py >"\$log" 2>&1
+grep -Eq '^OK$' "\$log"
+count=\$(sed -nE 's/^Ran ([0-9]+) tests? in .*$/\1/p' "\$log" | tail -n 1)
+[[ "\$count" =~ ^[0-9]+$ ]]
+printf 'suite=boot-iso tests=%s status=pass\n' "\$count"
+)_bash
+))

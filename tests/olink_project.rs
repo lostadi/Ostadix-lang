@@ -5,6 +5,7 @@ use std::path::Path;
 use std::process::Command;
 
 use o_lang::project::lower::extract_bundle_from_o;
+use o_lang::project::ValidatedSelectionReceiptV1;
 
 mod support;
 
@@ -43,6 +44,289 @@ fn python_project() -> tempfile::TempDir {
         b"if __name__ == \"__main__\":\n    print('hello from app')\n",
     );
     dir
+}
+
+#[test]
+fn olink_writes_validated_selection_receipt() {
+    let project = tempfile::tempdir().unwrap();
+    write(
+        project.path(),
+        "olang.project.toml",
+        br#"[project]
+name = "olink-validated-selection"
+
+[[routes]]
+id = "reference"
+command = ["sh", "-c", "sleep 0.2; printf same"]
+
+[[routes]]
+id = "fast"
+command = ["sh", "-c", "printf same"]
+
+[[route_sets]]
+provides = "service"
+alternatives = ["reference", "fast"]
+policy = "benchmark_validate_and_select"
+"#,
+    );
+    let output_dir = tempfile::tempdir().unwrap();
+    let receipt_path = output_dir.path().join("selection.json");
+
+    let output = olink()
+        .arg("--project")
+        .arg(project.path())
+        .arg("--run")
+        .args([
+            "--route",
+            "service",
+            "--selection-receipt-out",
+            receipt_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "o-link validated selection failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let receipt: ValidatedSelectionReceiptV1 =
+        serde_json::from_slice(&fs::read(receipt_path).unwrap()).unwrap();
+    receipt.validate().unwrap();
+    assert_eq!(receipt.reference_route_id, "reference");
+    assert_eq!(receipt.selected_route_id, "fast");
+}
+
+#[test]
+fn olink_evidence_outputs_cannot_alias_each_other_or_project_inputs() {
+    let project = tempfile::tempdir().unwrap();
+    let external = tempfile::tempdir().unwrap();
+    let marker = external.path().join("must-not-execute");
+    let manifest_path = project.path().join("olang.project.toml");
+    let manifest = format!(
+        r#"[project]
+name = "olink-output-safety"
+
+[[routes]]
+id = "reference"
+command = ["sh", "-c", "printf ran > \"$MARKER\"; printf same"]
+env = {{ MARKER = "{}" }}
+
+[[routes]]
+id = "candidate"
+command = ["sh", "-c", "printf ran > \"$MARKER\"; printf same"]
+env = {{ MARKER = "{}" }}
+
+[[route_sets]]
+provides = "service"
+alternatives = ["reference", "candidate"]
+policy = "benchmark_validate_and_select"
+"#,
+        marker.display(),
+        marker.display()
+    );
+    fs::write(&manifest_path, &manifest).unwrap();
+
+    let input_alias = olink()
+        .arg("--project")
+        .arg(project.path())
+        .arg("--run")
+        .args(["--route", "service", "--selection-receipt-out"])
+        .arg(&manifest_path)
+        .output()
+        .unwrap();
+    assert!(!input_alias.status.success());
+    assert_eq!(fs::read_to_string(&manifest_path).unwrap(), manifest);
+    assert!(
+        !marker.exists(),
+        "route executed before input-alias rejection"
+    );
+
+    let lifted = external.path().join("lifted.O");
+    let lift = olink()
+        .arg("--project")
+        .arg(project.path())
+        .arg("-o")
+        .arg(&lifted)
+        .output()
+        .unwrap();
+    assert!(
+        lift.status.success(),
+        "could not create lifted safety fixture: {}",
+        String::from_utf8_lossy(&lift.stderr)
+    );
+    let lifted_before = fs::read(&lifted).unwrap();
+    let lifted_alias = olink()
+        .arg("--project")
+        .arg(&lifted)
+        .arg("--run")
+        .args(["--route", "service", "--selection-receipt-out"])
+        .arg(&lifted)
+        .output()
+        .unwrap();
+    assert!(!lifted_alias.status.success());
+    assert_eq!(fs::read(&lifted).unwrap(), lifted_before);
+    assert!(
+        !marker.exists(),
+        "lifted route executed before alias rejection"
+    );
+
+    let output_dir = tempfile::tempdir().unwrap();
+    let alias = output_dir.path().join("same.json");
+    let output_alias = olink()
+        .current_dir(output_dir.path())
+        .arg("--project")
+        .arg(project.path())
+        .arg("--run")
+        .args([
+            "--route",
+            "service",
+            "--mesh=prefer",
+            "--mesh-trace-out",
+            "same.json",
+            "--selection-receipt-out",
+        ])
+        .arg(&alias)
+        .output()
+        .unwrap();
+    assert!(!output_alias.status.success());
+    assert!(String::from_utf8_lossy(&output_alias.stderr).contains("same output path"));
+    assert!(!alias.exists());
+    assert!(
+        !marker.exists(),
+        "route executed before output-alias rejection"
+    );
+}
+
+#[test]
+fn olink_rejects_project_trace_with_mesh_before_execution() {
+    let project = tempfile::tempdir().unwrap();
+    let external = tempfile::tempdir().unwrap();
+    let marker = external.path().join("mesh-project-trace-must-not-run");
+    let manifest = format!(
+        r#"[project]
+name = "olink-mesh-project-trace-preflight"
+
+[[routes]]
+id = "main"
+command = ["sh", "-c", "printf ran > \"$MARKER\""]
+env = {{ MARKER = "{}" }}
+default = true
+"#,
+        marker.display()
+    );
+    fs::write(project.path().join("olang.project.toml"), manifest).unwrap();
+    let trace = external.path().join("wrong-trace.json");
+
+    let output = olink()
+        .arg("--project")
+        .arg(project.path())
+        .arg("--run")
+        .arg("--mesh=prefer")
+        .arg("--project-trace-out")
+        .arg(&trace)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("project-trace-out") && stderr.contains("mesh"),
+        "stderr: {stderr}"
+    );
+    assert!(!marker.exists(), "route ran before trace-mode rejection");
+    assert!(!trace.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn olink_evidence_publication_replaces_symlinks_without_touching_their_targets() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    let project = tempfile::tempdir().unwrap();
+    write(
+        project.path(),
+        "olang.project.toml",
+        br#"[project]
+name = "olink-atomic-receipt"
+
+[[routes]]
+id = "reference"
+command = ["sh", "-c", "printf same"]
+
+[[routes]]
+id = "candidate"
+command = ["sh", "-c", "printf same"]
+
+[[route_sets]]
+provides = "service"
+alternatives = ["reference", "candidate"]
+policy = "benchmark_validate_and_select"
+"#,
+    );
+    let output_dir = tempfile::tempdir().unwrap();
+    let victim = output_dir.path().join("victim.txt");
+    let receipt_path = output_dir.path().join("selection.json");
+    fs::write(&victim, b"do not replace").unwrap();
+    symlink(&victim, &receipt_path).unwrap();
+
+    let output = olink()
+        .arg("--project")
+        .arg(project.path())
+        .arg("--run")
+        .args(["--route", "service", "--selection-receipt-out"])
+        .arg(&receipt_path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "o-link receipt publication failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read(&victim).unwrap(), b"do not replace");
+    assert!(!fs::symlink_metadata(&receipt_path)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(
+        fs::metadata(&receipt_path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let receipt: ValidatedSelectionReceiptV1 =
+        serde_json::from_slice(&fs::read(receipt_path).unwrap()).unwrap();
+    receipt.validate().unwrap();
+
+    let trace_victim = output_dir.path().join("trace-victim.txt");
+    let trace_path = output_dir.path().join("attempt.json");
+    fs::write(&trace_victim, b"also do not replace").unwrap();
+    symlink(&trace_victim, &trace_path).unwrap();
+    let trace_output = olink()
+        .arg("--project")
+        .arg(project.path())
+        .arg("--run")
+        .args([
+            "--route",
+            "reference",
+            "--project-trace-out",
+            trace_path.to_str().unwrap(),
+        ])
+        .env("O_PROJECT_EXECUTOR", "hgraph")
+        .output()
+        .unwrap();
+    assert!(
+        trace_output.status.success(),
+        "o-link trace publication failed: {}",
+        String::from_utf8_lossy(&trace_output.stderr)
+    );
+    assert_eq!(fs::read(&trace_victim).unwrap(), b"also do not replace");
+    assert!(!fs::symlink_metadata(&trace_path)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(
+        fs::metadata(&trace_path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(read_project_trace(&trace_path)["format_version"], 6);
 }
 
 #[test]

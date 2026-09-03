@@ -9,6 +9,17 @@ Package SemVer is only one of the independent coordinates documented in
 
 ### Added
 
+- Project route policy `benchmark_validate_and_select` runs the first declared
+  alternative as a reference and measures every candidate in an isolated
+  workspace. It rejects unsuccessful or declared-output-divergent candidates,
+  selects the fastest eligible complete branch, and binds canonical result,
+  artifact-manifest, timing, and decision evidence into a content-addressed
+  `ostadix.project-validated-selection/v1` receipt and durable run record. The
+  accompanying FFmpeg, ImageMagick, and CPython benchmark suite checks outputs
+  independently and reports paired whole-process measurements without claiming
+  universal speedup, fixed-rate ceiling capture, or acceleration of the
+  evidence-gathering invocation itself.
+
 - Backend Catalog V6 admits `wasm-tools+wasmtime` and
   `wasm-tools+wasmer` as complete WebAssembly alternatives while preserving
   every published V3, V4, and V5 whole-catalog, source, and per-backend

@@ -569,6 +569,9 @@ impl std::error::Error for OrdinaryOExecutionErrorV1 {}
 #[derive(Debug)]
 pub struct ProjectExecutionObservationV1 {
     pub results: Vec<OExecutionResult>,
+    pub validated_selection_receipt: Option<Box<crate::project::ValidatedSelectionReceiptV1>>,
+    pub validated_selection_measurements:
+        Option<Vec<crate::project::ValidatedSelectionMeasurement>>,
     pub project_trace: Option<ProjectAttemptTrace>,
     pub mesh_trace: Option<MeshExecutionTraceV1>,
     pub trace_unavailable_reason: Option<String>,
@@ -1044,7 +1047,12 @@ pub fn execute_prepared_ordinary_o(
 fn execute_prepared_local_project(
     prepared: &PreparedProjectExecutionV1,
 ) -> Result<ProjectExecutionObservationV1> {
-    let ConfiguredProjectExecution { results, trace } = execute_selection_with_configured_executor(
+    let ConfiguredProjectExecution {
+        results,
+        trace,
+        validated_selection_receipt,
+        validated_selection_measurements,
+    } = execute_selection_with_configured_executor(
         &prepared.bundle,
         prepared.route.as_deref(),
         prepared.policy.clone(),
@@ -1055,6 +1063,8 @@ fn execute_prepared_local_project(
     });
     Ok(ProjectExecutionObservationV1 {
         results,
+        validated_selection_receipt: validated_selection_receipt.map(Box::new),
+        validated_selection_measurements,
         project_trace: trace,
         mesh_trace: None,
         trace_unavailable_reason,
@@ -1080,6 +1090,8 @@ pub fn execute_prepared_project(
     )?;
     Ok(ProjectExecutionObservationV1 {
         results: execution.results,
+        validated_selection_receipt: execution.validated_selection_receipt.map(Box::new),
+        validated_selection_measurements: execution.validated_selection_measurements,
         project_trace: execution.trace,
         mesh_trace: Some(trace),
         trace_unavailable_reason: None,
@@ -1360,6 +1372,15 @@ pub fn explain_verified_run(
             result.stdout.capture.total_observed_bytes,
             result.stderr.capture.retained_bytes,
             result.stderr.capture.total_observed_bytes
+        ));
+    }
+    if let Some(receipt) = &record.validated_selection_receipt {
+        output.push_str(&format!(
+            "Validated selection compared {} candidates against reference `{}` and selected `{}` by complete-branch elapsed time; receipt sha256:{} (unsigned observation).\n",
+            receipt.candidates.len(),
+            receipt.reference_route_id,
+            receipt.selected_route_id,
+            receipt.sha256().map_err(anyhow::Error::msg)?,
         ));
     }
     if let Some(failure) = &record.failure {

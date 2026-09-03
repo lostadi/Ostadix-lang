@@ -296,6 +296,7 @@ fn every_route_policy_uses_shared_resolution_and_exact_policy_metadata() {
         RoutePolicy::All,
         RoutePolicy::VerifyEquivalent,
         RoutePolicy::BenchmarkAndSelect,
+        RoutePolicy::BenchmarkValidateAndSelect,
     ];
     for policy in policies {
         let resolved = resolve_selection(&bundle, Some("main"), Some(policy.clone())).unwrap();
@@ -311,7 +312,7 @@ fn every_route_policy_uses_shared_resolution_and_exact_policy_metadata() {
         });
         assert_eq!(
             comparisons.len(),
-            usize::from(policy == RoutePolicy::VerifyEquivalent)
+            usize::from(policy.requires_declared_output_validation())
         );
     }
 

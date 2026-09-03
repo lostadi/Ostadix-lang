@@ -184,7 +184,7 @@ impl ProjectExecutionPlan {
             terminal_results.push(terminal);
         }
 
-        let selection_dependencies = if selection.policy == RoutePolicy::VerifyEquivalent {
+        let selection_dependencies = if selection.policy.requires_declared_output_validation() {
             let compare = builder.push(
                 ExecutableOp::CompareRouteResults,
                 terminal_results
@@ -522,16 +522,19 @@ impl ProjectExecutionPlan {
             .copied()
             .map(ProjectDependency::Value)
             .collect::<Vec<_>>();
-        if self.policy == RoutePolicy::VerifyEquivalent {
+        if self.policy.requires_declared_output_validation() {
             let compare = comparison.ok_or_else(|| {
-                "verify-equivalent project plan has no comparison operation".to_string()
+                format!(
+                    "output-validating project policy {} has no comparison operation",
+                    self.policy.token()
+                )
             })?;
             if compare.0 + 1 != select.0
                 || self.operations[compare.0].dependencies != terminal_values
                 || select_operation.dependencies != [ProjectDependency::Value(compare)]
             {
                 return Err(
-                    "verify-equivalent comparison/selection topology is non-canonical".to_string(),
+                    "output-validation comparison/selection topology is non-canonical".to_string(),
                 );
             }
         } else if comparison.is_some() {
@@ -567,7 +570,7 @@ impl ProjectExecutionPlan {
             self.policy.token(),
             self.alternatives.join(","),
             self.cancellation.token(),
-            if self.policy == RoutePolicy::VerifyEquivalent {
+            if self.policy.requires_declared_output_validation() {
                 "required"
             } else {
                 "none"
@@ -1068,7 +1071,10 @@ fn selection_effects(policy: &RoutePolicy) -> EffectSummary {
     summary.fallibility = Fallibility::MayFail;
     if matches!(
         policy,
-        RoutePolicy::RaceSuccess | RoutePolicy::RaceSettle | RoutePolicy::BenchmarkAndSelect
+        RoutePolicy::RaceSuccess
+            | RoutePolicy::RaceSettle
+            | RoutePolicy::BenchmarkAndSelect
+            | RoutePolicy::BenchmarkValidateAndSelect
     ) {
         summary.deterministic = false;
         summary.confidence = EffectConfidence::Conservative;

@@ -24,13 +24,14 @@ use super::launch::{HostedWorldCurrentV1, HostedWorldLaunchV1};
 use super::materialize::{materialize_isolated, Workspace};
 use super::model::{
     OExecutionResult, ProjectBundle, RouteFailureContinuation, RoutePolicy, RouteSpec,
+    ValidatedSelectionReceiptV1,
 };
 use super::plan::{
     build_project_hgraph, ProjectDependency, ProjectHGraph, ProjectPlanOperation, RoutePlanFacts,
 };
 use super::runtime::{
-    execute_route_in_workspace, is_skipped_result, public_route_execution_diagnostic,
-    run_selection, RunOptions,
+    execute_route_in_workspace, is_skipped_result, public_route_execution_diagnostic, RunOptions,
+    ValidatedSelectionMeasurement,
 };
 use super::trace::{
     project_deployment_digest, project_hosted_deployment_digest, project_logical_graph_digest,
@@ -192,6 +193,8 @@ enum OperationResult {
 pub struct ConfiguredProjectExecution {
     pub results: Vec<OExecutionResult>,
     pub trace: Option<ProjectAttemptTrace>,
+    pub validated_selection_receipt: Option<ValidatedSelectionReceiptV1>,
+    pub validated_selection_measurements: Option<Vec<ValidatedSelectionMeasurement>>,
 }
 
 struct ProjectCoordinatorOutcome {
@@ -1159,6 +1162,8 @@ pub fn execute_project_hgraph_selection(
     Ok(ConfiguredProjectExecution {
         results: outcome.attempted_results,
         trace: Some(outcome.trace),
+        validated_selection_receipt: None,
+        validated_selection_measurements: None,
     })
 }
 
@@ -1217,10 +1222,16 @@ pub fn execute_selection_with_configured_executor(
     opts: &RunOptions,
 ) -> Result<ConfiguredProjectExecution> {
     match std::env::var_os(PROJECT_EXECUTOR_ENV) {
-        None => Ok(ConfiguredProjectExecution {
-            results: run_selection(bundle, target, policy_override, opts)?,
-            trace: None,
-        }),
+        None => {
+            let execution =
+                super::runtime::run_selection_observed(bundle, target, policy_override, opts)?;
+            Ok(ConfiguredProjectExecution {
+                results: execution.results,
+                trace: None,
+                validated_selection_receipt: execution.validated_selection_receipt,
+                validated_selection_measurements: execution.validated_selection_measurements,
+            })
+        }
         Some(value) if value == "hgraph" => {
             let project = build_project_hgraph(bundle, target, policy_override)
                 .map_err(anyhow::Error::msg)

@@ -1053,7 +1053,8 @@
   lifted `ProjectBundle` is resolved through the shared typed route selector,
   bound by an exact bundle digest and policy in `ProjectExecutionPlan`, and
   projected into a validated HGraph containing real `MaterializeProject`,
-  `BuildRoute`, `RunRoute`, `SelectRoute`, and, for `verify_equivalent`,
+  `BuildRoute`, `RunRoute`, `SelectRoute`, and, for output-validating policies
+  (`verify_equivalent` and `benchmark_validate_and_select`),
   `CompareRouteResults` operations. Alternative materialization branches and
   prerequisites are explicit in both layers. The project plan also records
   guards, environment overlay key names, ambient environment-guard
@@ -1067,6 +1068,19 @@
   field and an in-memory bundle mislabeled as v1 are both rejected.
   Planning is deterministic and nonexecuting, and exact source/projection
   validation rejects malformed references, substitution, and graph forgery.
+- The compatibility project runtime and project mesh implement the bounded
+  `benchmark_validate_and_select` policy. The first declared route is the
+  reference; every candidate runs in an isolated workspace, settled failures
+  and declared-output mismatches are ineligible, and the fastest eligible
+  complete branch wins with declaration order as the tie break. The emitted
+  unsigned v1 receipt binds the exact bundle, target, policy, reference,
+  terminal and complete-branch timings, canonical JSON or complete stdout
+  fingerprints, declared artifact manifests, rejection classifications, and
+  selected route. Receipt failure details are reduced to closed non-sensitive
+  kinds, while durable run logs remain potentially sensitive. This is
+  same-invocation autotuning and differential artifact evidence—not proof of
+  full semantic equivalence, a reusable cached winner, or a comparison with a
+  different parallel runner.
 - World PR8-1 adds the bounded hosted project-profile `LogicalHGraphV1` schema.
   It canonically records the exact bundle/selection binding, operations, typed
   dependencies, route facts, declared input/output paths, raw effects, and

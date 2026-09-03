@@ -39,7 +39,7 @@ use o_lang::intent::{
 use o_lang::project::executor::{ProjectExecutionError, ProjectExecutionFailureClass};
 use o_lang::project::model::OutputCapture;
 use o_lang::project::runtime::public_route_execution_diagnostic;
-use o_lang::project::{OExecutionResult, RoutePolicy};
+use o_lang::project::{OExecutionResult, RoutePolicy, ValidatedSelectionReceiptV1};
 use o_lang::resource_identity::ArtifactId;
 use sha2::{Digest, Sha256};
 use std::env;
@@ -144,7 +144,7 @@ enum PlanFormat {
     Json,
 }
 
-#[derive(Debug, Args)]
+#[derive(Clone, Debug, Args)]
 struct RunArgs {
     /// A .O source/lifted bundle or project directory.
     #[arg(value_name = "TARGET")]
@@ -205,6 +205,10 @@ struct RunArgs {
     /// Write the local Project HGraph attempt trace to an explicit path.
     #[arg(long = "project-trace-out")]
     project_trace_out: Option<PathBuf>,
+
+    /// Write the unsigned validated benchmark-selection receipt as JSON.
+    #[arg(long = "selection-receipt-out")]
+    selection_receipt_out: Option<PathBuf>,
 
     /// Enable explicit peer-mesh execution. Bare --mesh means prefer.
     #[arg(
@@ -1199,15 +1203,135 @@ fn run_prepare_options(args: &RunArgs) -> Result<PrepareExecutionOptionsV1> {
         ordinary_executor: args.executor.map(ExecutorMode::intent),
         local_workers: args.workers,
         backend_grants: args.backend_grants.clone(),
-        excluded_project_paths: [args.project_trace_out.clone(), args.mesh_trace_out.clone()]
-            .into_iter()
-            .flatten()
-            .collect(),
+        excluded_project_paths: [
+            args.project_trace_out.clone(),
+            args.mesh_trace_out.clone(),
+            args.selection_receipt_out.clone(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
         shim_dir: resolve_shim_dir(args.shim_dir.as_deref(), args.legacy_backends.as_deref())?,
     })
 }
 
+fn publication_path(path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()
+            .context("failed to resolve the current directory")?
+            .join(path)
+    };
+    let file_name = absolute
+        .file_name()
+        .context("explicit output path must end in a file name")?;
+    file_name
+        .to_str()
+        .context("explicit output path must end in a UTF-8 file name")?;
+    let parent = absolute
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .context("explicit output path has no parent directory")?;
+    let parent = parent
+        .canonicalize()
+        .with_context(|| format!("failed to resolve output directory {}", parent.display()))?;
+    Ok(parent.join(file_name))
+}
+
+fn resolve_run_output_paths(args: &RunArgs) -> Result<RunArgs> {
+    let mut resolved = args.clone();
+    resolved.target = args
+        .target
+        .canonicalize()
+        .with_context(|| format!("failed to resolve input {}", args.target.display()))?;
+    for path in [
+        &mut resolved.project_trace_out,
+        &mut resolved.mesh_trace_out,
+        &mut resolved.selection_receipt_out,
+    ] {
+        if let Some(value) = path {
+            *value = publication_path(value)?;
+        }
+    }
+    Ok(resolved)
+}
+
+fn validate_explicit_output_paths(
+    input: &Path,
+    outputs: &[(&str, Option<&PathBuf>)],
+) -> Result<()> {
+    if outputs.iter().all(|(_, path)| path.is_none()) {
+        return Ok(());
+    }
+    let input_canonical = input.to_path_buf();
+    let input_is_directory = input_canonical.is_dir();
+    let input_publication = (!input_is_directory)
+        .then(|| publication_path(input))
+        .transpose()?;
+    let mut resolved_outputs: Vec<(&str, PathBuf, Option<PathBuf>)> = Vec::new();
+    for (name, path) in outputs {
+        let Some(path) = path else {
+            continue;
+        };
+        let resolved = publication_path(path)?;
+        let referent = path
+            .exists()
+            .then(|| {
+                path.canonicalize()
+                    .with_context(|| format!("failed to resolve output path {}", path.display()))
+            })
+            .transpose()?;
+        if let Some((other_name, _, _)) = resolved_outputs.iter().find(|(_, other, target)| {
+            other.as_path() == resolved.as_path()
+                || referent
+                    .as_ref()
+                    .is_some_and(|referent| referent == other || target.as_ref() == Some(referent))
+                || target.as_ref() == Some(&resolved)
+        }) {
+            bail!(
+                "{other_name} and {name} must not resolve to the same output path ({})",
+                resolved.display()
+            );
+        }
+        if input_publication
+            .as_ref()
+            .is_some_and(|input| input.as_path() == resolved.as_path())
+            || resolved == input_canonical
+            || referent.as_ref() == Some(&input_canonical)
+            || (input_is_directory
+                && (resolved.starts_with(&input_canonical)
+                    || referent
+                        .as_ref()
+                        .is_some_and(|target| target.starts_with(&input_canonical))))
+        {
+            if input_is_directory {
+                bail!(
+                    "{name} must be outside the project input directory {}; refusing to replace project input at {}",
+                    input_canonical.display(),
+                    resolved.display()
+                );
+            }
+            bail!(
+                "{name} must not replace the input file {}",
+                input_canonical.display()
+            );
+        }
+        resolved_outputs.push((name, resolved, referent));
+    }
+    Ok(())
+}
+
 fn prepare_run(args: &RunArgs) -> Result<PreparedExecutionIntentV1> {
+    let explicit_outputs = [
+        ("--project-trace-out", args.project_trace_out.as_ref()),
+        ("--mesh-trace-out", args.mesh_trace_out.as_ref()),
+        (
+            "--selection-receipt-out",
+            args.selection_receipt_out.as_ref(),
+        ),
+    ];
+    validate_explicit_output_paths(&args.target, &explicit_outputs)?;
     let prepared = prepare_execution_intent(&args.target, run_prepare_options(args)?)?;
     if args.project && matches!(prepared, PreparedExecutionIntentV1::OrdinaryO(_)) {
         bail!("--project requires a project directory or lifted project bundle");
@@ -1219,6 +1343,11 @@ fn prepare_run(args: &RunArgs) -> Result<PreparedExecutionIntentV1> {
             "--project-trace-out requires a project directory or lifted project bundle; ordinary .O uses its retained evaluator trace"
         );
     }
+    if args.selection_receipt_out.is_some()
+        && matches!(prepared, PreparedExecutionIntentV1::OrdinaryO(_))
+    {
+        bail!("--selection-receipt-out requires a project using benchmark_validate_and_select");
+    }
     if args.legacy_backends.is_some() && matches!(prepared, PreparedExecutionIntentV1::Project(_)) {
         bail!("the historical positional BACKENDS argument is available only for ordinary .O runs; project routes carry their own runtime declarations");
     }
@@ -1229,6 +1358,19 @@ fn prepare_run(args: &RunArgs) -> Result<PreparedExecutionIntentV1> {
         if args.project_trace_out.is_some() && project.executor != ProjectExecutorV1::Hgraph {
             bail!(
                 "--project-trace-out requires O_PROJECT_EXECUTOR=hgraph without mesh execution; use --mesh-trace-out for mesh placement and retry evidence"
+            );
+        }
+        if args.selection_receipt_out.is_some()
+            && project.effective_policy != "benchmark_validate_and_select"
+        {
+            bail!(
+                "--selection-receipt-out requires effective project policy benchmark_validate_and_select, got {}",
+                project.effective_policy
+            );
+        }
+        if args.selection_receipt_out.is_some() && project.executor == ProjectExecutorV1::Hgraph {
+            bail!(
+                "--selection-receipt-out is unavailable with O_PROJECT_EXECUTOR=hgraph because that executor does not implement benchmark_validate_and_select"
             );
         }
     }
@@ -1533,6 +1675,7 @@ struct ExecutionReport {
     stderr: Vec<u8>,
     decoded_value: Option<serde_json::Value>,
     route_results: Vec<RecordedRouteResultV1>,
+    validated_selection_receipt: Option<ValidatedSelectionReceiptV1>,
     result_references: Vec<RunResultReferenceV1>,
     trace: Option<RunTraceAttachmentV1>,
     trace_unavailable_reason: String,
@@ -1548,10 +1691,32 @@ impl ExecutionReport {
             stderr: format!("error: {message}\n").into_bytes(),
             decoded_value: None,
             route_results: Vec::new(),
+            validated_selection_receipt: None,
             result_references: Vec::new(),
             trace: None,
             trace_unavailable_reason:
                 "execution did not begin because front-door observation setup failed".to_string(),
+            failure: Some(RunFailureV1 {
+                stage: stage.to_string(),
+                message,
+            }),
+        }
+    }
+
+    fn post_execution_infrastructure_failure(stage: &str, message: String) -> Self {
+        Self {
+            disposition: RunDispositionV1::InfrastructureFailed,
+            exit_code: 1,
+            stdout: Vec::new(),
+            stderr: format!("error: {message}\n").into_bytes(),
+            decoded_value: None,
+            route_results: Vec::new(),
+            validated_selection_receipt: None,
+            result_references: Vec::new(),
+            trace: None,
+            trace_unavailable_reason:
+                "execution completed, but its validated-selection evidence could not be bound"
+                    .to_string(),
             failure: Some(RunFailureV1 {
                 stage: stage.to_string(),
                 message,
@@ -1634,7 +1799,7 @@ fn stream_observation_begin_failure(
             }
         },
         failure: Some(RunFailureV1 {
-            stage: "stream_observation".to_string(),
+            stage: "stream_observation_setup".to_string(),
             message: detail.clone(),
         }),
     };
@@ -1648,6 +1813,17 @@ fn stream_observation_begin_failure(
 }
 
 fn run_intent(args: &RunArgs) -> Result<i32> {
+    let resolved_args = match resolve_run_output_paths(args) {
+        Ok(args) => args,
+        Err(error) if args.json => {
+            let detail = format!("{error:#}");
+            emit_preflight_failure_summary(&detail)?;
+            eprintln!("error: {detail}");
+            return Ok(1);
+        }
+        Err(error) => return Err(error),
+    };
+    let args = &resolved_args;
     let prepared = match prepare_run(args) {
         Ok(prepared) => prepared,
         Err(error) if args.json => {
@@ -1722,7 +1898,7 @@ fn run_intent(args: &RunArgs) -> Result<i32> {
             }
             Err(error) => {
                 let report = ExecutionReport::infrastructure_failure(
-                    "stream_observation",
+                    "stream_observation_setup",
                     format!(
                         "execution was not started because process-stream observation failed: {error:#}"
                     ),
@@ -1745,7 +1921,7 @@ fn run_intent(args: &RunArgs) -> Result<i32> {
     let mut command_exit = report.exit_code;
     let summary = if let Some(lease) = lease {
         let attempt = lease.attempt().clone();
-        let record = RunRecordV1::terminal(
+        let mut record = RunRecordV1::terminal(
             attempt.run_id.clone(),
             attempt.sequence,
             &attempt.seed,
@@ -1760,6 +1936,7 @@ fn run_intent(args: &RunArgs) -> Result<i32> {
             RunTraceBindingV1::unavailable(report.trace_unavailable_reason.clone()),
             report.failure.clone(),
         );
+        record.validated_selection_receipt = report.validated_selection_receipt.clone();
         match lease.finalize(record.clone(), report.trace.clone()) {
             Ok(finalized) => RunSummaryV1::from_record(
                 &record,
@@ -1865,6 +2042,7 @@ fn execute_for_report(
                 stderr: Vec::new(),
                 decoded_value,
                 route_results: Vec::new(),
+                validated_selection_receipt: None,
                 result_references,
                 trace,
                 trace_unavailable_reason,
@@ -1872,18 +2050,27 @@ fn execute_for_report(
             }
         }
         Ok(ExecutionObservationV1::Project(observation)) => {
-            let trace_write = write_observed_project_traces(args, &observation);
-            let mut report = project_report(
-                observation.results,
+            let report = project_report(
+                &observation.results,
+                observation.validated_selection_receipt.as_deref(),
+                observation.validated_selection_measurements.as_deref(),
                 observation.project_trace.as_ref(),
                 observation.mesh_trace.as_ref(),
                 observation.trace_unavailable_reason.as_deref(),
                 args.explain_mesh,
             );
-            if let Err(error) = trace_write {
-                report.add_post_execution_failure("trace_output", &error);
+            match report {
+                Ok(mut report) => {
+                    if let Err(error) = write_observed_project_traces(args, &observation) {
+                        report.add_post_execution_failure("trace_output", &error);
+                    }
+                    report
+                }
+                Err(error) => ExecutionReport::post_execution_infrastructure_failure(
+                    "validated_selection_evidence",
+                    format!("validated-selection evidence binding failed: {error:#}"),
+                ),
             }
-            report
         }
         Err(error) => {
             let trace_write = write_error_traces(args, &error);
@@ -1914,16 +2101,31 @@ fn execute_for_report(
 }
 
 fn project_report(
-    results: Vec<OExecutionResult>,
+    results: &[OExecutionResult],
+    validated_selection_receipt: Option<&o_lang::project::ValidatedSelectionReceiptV1>,
+    validated_selection_measurements: Option<&[o_lang::project::ValidatedSelectionMeasurement]>,
     project_trace: Option<&o_lang::project::ProjectAttemptTrace>,
     mesh_trace: Option<&o_lang::hosted_remote::project_mesh::MeshExecutionTraceV1>,
     unavailable_reason: Option<&str>,
     explain_mesh: bool,
-) -> ExecutionReport {
+) -> Result<ExecutionReport> {
     let succeeded = results.iter().any(OExecutionResult::succeeded);
     let mut stdout = Vec::new();
-    for result in &results {
+    for result in results {
         stdout.extend_from_slice(result.observation_summary().as_bytes());
+    }
+    if let Some(receipt) = validated_selection_receipt {
+        let digest = receipt.sha256().unwrap_or_else(|_| "<invalid>".to_string());
+        stdout.extend_from_slice(
+            format!(
+                "validated selection: reference={} selected={} candidates={} receipt-sha256={}\n",
+                receipt.reference_route_id,
+                receipt.selected_route_id,
+                receipt.candidates.len(),
+                digest,
+            )
+            .as_bytes(),
+        );
     }
     let mut stderr = Vec::new();
     if explain_mesh {
@@ -1938,15 +2140,26 @@ fn project_report(
     if !succeeded {
         stderr.extend_from_slice(b"error: no project route succeeded\n");
     }
-    let decoded_value = results
-        .iter()
-        .rev()
-        .find(|result| result.succeeded() && result.value.is_some())
-        .and_then(|result| result.value.clone());
-    let route_results = results
+    let decoded_value = match validated_selection_receipt {
+        Some(receipt) => results
+            .iter()
+            .find(|result| result.route_id == receipt.selected_route_id && result.succeeded())
+            .and_then(|result| result.value.clone()),
+        None => results
+            .iter()
+            .rev()
+            .find(|result| result.succeeded() && result.value.is_some())
+            .and_then(|result| result.value.clone()),
+    };
+    let mut route_results = results
         .iter()
         .map(RecordedRouteResultV1::from)
         .collect::<Vec<_>>();
+    bind_validated_selection_measurements(
+        &mut route_results,
+        validated_selection_receipt,
+        validated_selection_measurements,
+    )?;
     let result_references = route_result_references(&route_results);
     let (trace, trace_unavailable_reason) = if let Some(trace) = mesh_trace {
         (
@@ -1966,7 +2179,7 @@ fn project_report(
                 .to_string(),
         )
     };
-    ExecutionReport {
+    Ok(ExecutionReport {
         disposition: if succeeded {
             RunDispositionV1::Succeeded
         } else {
@@ -1977,6 +2190,7 @@ fn project_report(
         stderr,
         decoded_value,
         route_results,
+        validated_selection_receipt: validated_selection_receipt.cloned(),
         result_references,
         trace,
         trace_unavailable_reason,
@@ -1984,7 +2198,62 @@ fn project_report(
             stage: "execution".to_string(),
             message: "no project route succeeded".to_string(),
         }),
+    })
+}
+
+fn bind_validated_selection_measurements(
+    route_results: &mut [RecordedRouteResultV1],
+    receipt: Option<&ValidatedSelectionReceiptV1>,
+    measurements: Option<&[o_lang::project::ValidatedSelectionMeasurement]>,
+) -> Result<()> {
+    let (Some(receipt), Some(measurements)) = (receipt, measurements) else {
+        if receipt.is_some() || measurements.is_some() {
+            bail!("validated-selection receipt and independent measurements must appear together");
+        }
+        return Ok(());
+    };
+    receipt.validate().map_err(anyhow::Error::msg)?;
+    if receipt.candidates.len() != route_results.len() || measurements.len() != route_results.len()
+    {
+        bail!("validated-selection result, receipt, and measurement cardinalities differ");
     }
+
+    for candidate in &receipt.candidates {
+        let matching_results = route_results
+            .iter()
+            .filter(|result| result.route_id == candidate.route_id)
+            .count();
+        let matching_measurements = measurements
+            .iter()
+            .filter(|measurement| measurement.route_id == candidate.route_id)
+            .count();
+        if matching_results != 1 || matching_measurements != 1 {
+            bail!(
+                "validated-selection candidate `{}` lacks a unique result/measurement binding",
+                candidate.route_id
+            );
+        }
+        let measurement = measurements
+            .iter()
+            .find(|measurement| measurement.route_id == candidate.route_id)
+            .expect("unique measurement count was checked");
+        let result = route_results
+            .iter_mut()
+            .find(|result| result.route_id == candidate.route_id)
+            .expect("unique result count was checked");
+        if result.duration_ns != candidate.terminal_elapsed_ns
+            || measurement.branch_elapsed_ns.to_string() != candidate.branch_elapsed_ns
+            || measurement.result_codec != candidate.observation.result_codec
+        {
+            bail!(
+                "validated-selection candidate `{}` receipt disagrees with independent runtime evidence",
+                candidate.route_id
+            );
+        }
+        result.result_codec = Some(measurement.result_codec);
+        result.branch_elapsed_ns = Some(measurement.branch_elapsed_ns.to_string());
+    }
+    Ok(())
 }
 
 fn error_report(
@@ -2017,6 +2286,7 @@ fn error_report(
             stderr: format!("error: {message}\n").into_bytes(),
             decoded_value: None,
             route_results: Vec::new(),
+            validated_selection_receipt: None,
             result_references: Vec::new(),
             trace,
             trace_unavailable_reason,
@@ -2045,12 +2315,15 @@ fn error_report(
         })
         .unwrap_or_default();
     let mut report = project_report(
-        results,
+        &results,
+        None,
+        None,
         project.map(|failure| &failure.trace),
         mesh.map(|failure| &failure.trace),
         Some("execution failed before a validated engine trace was available"),
         explain_mesh,
-    );
+    )
+    .expect("a project error report carries no validated-selection evidence to bind");
     let semantic = project
         .is_some_and(|failure| failure.class() == ProjectExecutionFailureClass::Semantic)
         || mesh.is_some_and(|failure| failure.class() == MeshExecutionFailureClass::Semantic);
@@ -2302,6 +2575,20 @@ fn write_observed_project_traces(
             )?;
         }
     }
+    if let Some(path) = &args.selection_receipt_out {
+        let receipt = observation.validated_selection_receipt.as_deref().context(
+            "benchmark_validate_and_select execution returned no validated-selection receipt",
+        )?;
+        receipt
+            .validate()
+            .map_err(anyhow::Error::msg)
+            .context("refusing to write an invalid validated-selection receipt")?;
+        let bytes = receipt
+            .canonical_bytes()
+            .map_err(anyhow::Error::msg)
+            .context("failed to encode validated-selection receipt")?;
+        write_file_atomically(path, &bytes)?;
+    }
     Ok(())
 }
 
@@ -2319,6 +2606,9 @@ fn write_error_traces(args: &RunArgs, error: &anyhow::Error) -> Result<()> {
     }
     if let Some(path) = &args.mesh_trace_out {
         if let Some(mesh) = error.downcast_ref::<MeshExecutionError>() {
+            mesh.trace
+                .validate()
+                .context("refusing to write an invalid mesh execution trace")?;
             write_json_file(path, &mesh.trace)?;
         } else {
             write_trace_unavailable(
@@ -2345,7 +2635,56 @@ fn write_trace_unavailable(path: &Path, kind: &str, reason: &str) -> Result<()> 
 fn write_json_file(path: &Path, value: &impl serde::Serialize) -> Result<()> {
     let mut bytes = serde_json::to_vec_pretty(value)?;
     bytes.push(b'\n');
-    fs::write(path, bytes).with_context(|| format!("failed to write {}", path.display()))
+    write_file_atomically(path, &bytes)
+}
+
+fn write_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("output path must end in a UTF-8 file name")?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temporary = parent.join(format!(
+        ".{file_name}.o-write-{}-{nonce}.tmp",
+        std::process::id()
+    ));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let write_result = (|| -> Result<()> {
+        let mut file = options
+            .open(&temporary)
+            .with_context(|| format!("failed to create {}", temporary.display()))?;
+        file.write_all(bytes)
+            .with_context(|| format!("failed to write {}", temporary.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to sync {}", temporary.display()))?;
+        drop(file);
+        fs::rename(&temporary, path).with_context(|| {
+            format!(
+                "failed to atomically publish {} as {}",
+                temporary.display(),
+                path.display()
+            )
+        })?;
+        #[cfg(unix)]
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .with_context(|| format!("failed to sync output directory {}", parent.display()))?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    write_result
 }
 
 fn write_text_block(mut output: impl Write, bytes: &[u8]) -> Result<()> {

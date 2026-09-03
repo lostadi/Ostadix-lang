@@ -18,9 +18,13 @@ use crate::hosted_remote::{
 };
 use crate::project::model::OutputCapture;
 use crate::project::{
-    Artifact, ArtifactCaptureStatus, OExecutionResult, ProjectAttemptEvent, ProjectAttemptTrace,
-    ProjectAttemptTraceHeader, RouteExecutionDisposition,
+    validated_selection_json_sha256, Artifact, ArtifactCaptureStatus, OExecutionResult,
+    ProjectAttemptEvent, ProjectAttemptTrace, ProjectAttemptTraceHeader, ResultCodec,
+    RouteExecutionDisposition, ValidatedArtifactCaptureStatusV1, ValidatedSelectionObservationV1,
+    ValidatedSelectionReceiptV1,
 };
+#[cfg(test)]
+use crate::project::{ValidatedSelectionCandidateV1, ValidatedSelectionDispositionV1};
 
 pub const RUN_RECORD_SCHEMA_V1: &str = "ostadix.run-record/v1";
 pub const RUN_SUMMARY_SCHEMA_V1: &str = "ostadix.run-summary/v1";
@@ -34,6 +38,19 @@ fn validate_nonempty(value: &str, label: &str) -> Result<(), String> {
     } else {
         Ok(())
     }
+}
+
+fn parse_canonical_duration(value: &str, label: &str) -> Result<u128, String> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!("{label} must be canonical unsigned decimal text"));
+    }
+    let duration = value
+        .parse::<u128>()
+        .map_err(|_| format!("{label} must be canonical unsigned decimal text"))?;
+    if duration.to_string() != value {
+        return Err(format!("{label} must be canonical unsigned decimal text"));
+    }
+    Ok(duration)
 }
 
 pub(crate) fn validate_lower_hex_64(value: &str, label: &str) -> Result<(), String> {
@@ -249,6 +266,10 @@ impl Default for CapturedStreamV1 {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct RecordedRouteResultV1 {
     pub route_id: String,
+    /// The declared result codec is retained only when another durable datum
+    /// (currently a validated-selection receipt) must be checked against it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_codec: Option<ResultCodec>,
     pub exit_code: Option<i32>,
     pub stdout: CapturedStreamV1,
     pub stderr: CapturedStreamV1,
@@ -258,6 +279,10 @@ pub struct RecordedRouteResultV1 {
     pub artifact_capture: ArtifactCaptureStatus,
     pub disposition: RouteExecutionDisposition,
     pub duration_ns: String,
+    /// Complete-branch timing retained for validated selection. Legacy route
+    /// results omit it, preserving their canonical encoding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_elapsed_ns: Option<String>,
     pub provenance: RecordedExecutionProvenanceV1,
 }
 
@@ -276,6 +301,7 @@ impl From<&OExecutionResult> for RecordedRouteResultV1 {
     fn from(result: &OExecutionResult) -> Self {
         Self {
             route_id: result.route_id.clone(),
+            result_codec: None,
             exit_code: result.exit_code,
             stdout: CapturedStreamV1 {
                 retained: result.stdout.clone(),
@@ -291,6 +317,7 @@ impl From<&OExecutionResult> for RecordedRouteResultV1 {
             artifact_capture: result.artifact_capture.clone(),
             disposition: result.disposition,
             duration_ns: result.duration_ns.to_string(),
+            branch_elapsed_ns: None,
             provenance: RecordedExecutionProvenanceV1 {
                 execution_scope: "isolated_project_workspace".to_string(),
                 command_argv_retained: false,
@@ -315,11 +342,26 @@ impl RecordedRouteResultV1 {
                     .to_string(),
             );
         }
-        self.duration_ns
+        if self.duration_ns.is_empty()
+            || !self.duration_ns.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return Err("route duration must be canonical unsigned decimal text".to_string());
+        }
+        let duration = self
+            .duration_ns
             .parse::<u128>()
             .map_err(|_| "route duration must be canonical unsigned decimal text".to_string())?;
-        if self.duration_ns.len() > 1 && self.duration_ns.starts_with('0') {
-            return Err("route duration must not have leading zeroes".to_string());
+        if duration.to_string() != self.duration_ns {
+            return Err("route duration must be canonical unsigned decimal text".to_string());
+        }
+        if let Some(branch_elapsed_ns) = &self.branch_elapsed_ns {
+            let branch_duration =
+                parse_canonical_duration(branch_elapsed_ns, "route complete-branch duration")?;
+            if branch_duration < duration {
+                return Err(
+                    "route complete-branch duration is shorter than terminal duration".to_string(),
+                );
+            }
         }
         for artifact in &self.artifacts {
             validate_nonempty(&artifact.path, "artifact path")?;
@@ -909,6 +951,11 @@ pub struct RunRecordV1 {
     pub stderr: CapturedStreamV1,
     pub decoded_value: Option<Value>,
     pub route_results: Vec<RecordedRouteResultV1>,
+    /// Structured evidence for the new validated benchmark selector. The
+    /// optional encoding preserves canonical bytes for records written before
+    /// this policy existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validated_selection_receipt: Option<ValidatedSelectionReceiptV1>,
     pub result_references: Vec<RunResultReferenceV1>,
     pub trace: RunTraceBindingV1,
     pub failure: Option<RunFailureV1>,
@@ -947,6 +994,7 @@ impl RunRecordV1 {
             stderr,
             decoded_value,
             route_results,
+            validated_selection_receipt: None,
             result_references,
             trace,
             failure,
@@ -1046,6 +1094,7 @@ impl RunRecordV1 {
                     || self.plan.execution_intent_sha256.is_none()
                     || self.plan.deployment_sha256.is_some()
                     || !self.route_results.is_empty()
+                    || self.validated_selection_receipt.is_some()
                 {
                     return Err(
                         "ordinary run input, engine, plan, or result fields are inconsistent"
@@ -1095,6 +1144,7 @@ impl RunRecordV1 {
                 ));
             }
         }
+        self.validate_validated_selection_receipt()?;
         let mut result_reference_ids = BTreeSet::new();
         for reference in &self.result_references {
             reference.validate()?;
@@ -1145,6 +1195,209 @@ impl RunRecordV1 {
         }
         Ok(())
     }
+
+    fn validate_validated_selection_receipt(&self) -> Result<(), String> {
+        let policy_is_validated =
+            self.intent.route_policy.as_deref() == Some("benchmark_validate_and_select");
+        let Some(receipt) = &self.validated_selection_receipt else {
+            let known_post_execution_failure = self.disposition
+                == RunDispositionV1::InfrastructureFailed
+                && self.failure.as_ref().is_some_and(|failure| {
+                    matches!(
+                        failure.stage.as_str(),
+                        "trace_output" | "stream_observation" | "validated_selection_evidence"
+                    )
+                });
+            if policy_is_validated
+                && (self.disposition == RunDispositionV1::Succeeded
+                    || !self.route_results.is_empty()
+                    || known_post_execution_failure)
+            {
+                return Err(
+                    "completed validated-selection execution has no selection receipt".to_string(),
+                );
+            }
+            return Ok(());
+        };
+        if matches!(self.input.kind, RunInputKindV1::OrdinaryO) || !policy_is_validated {
+            return Err(
+                "validated-selection receipt is attached to an incompatible run input or policy"
+                    .to_string(),
+            );
+        }
+        if !matches!(
+            self.disposition,
+            RunDispositionV1::Succeeded | RunDispositionV1::InfrastructureFailed
+        ) {
+            return Err(
+                "validated-selection receipt is attached to an incompatible run disposition"
+                    .to_string(),
+            );
+        }
+        receipt.validate()?;
+        if self.input.digest_sha256 != receipt.bundle_sha256
+            || self.intent.target.as_deref() != Some(receipt.target.as_str())
+            || self.intent.route_policy.as_deref() != Some(receipt.policy.as_str())
+        {
+            return Err(
+                "validated-selection receipt is not bound to the run input, target, and policy"
+                    .to_string(),
+            );
+        }
+        if receipt.candidates.len() != self.route_results.len() {
+            return Err(
+                "validated-selection receipt candidate count disagrees with route results"
+                    .to_string(),
+            );
+        }
+        let mut expected_result_order = receipt
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.route_id != receipt.selected_route_id)
+            .map(|candidate| candidate.route_id.as_str())
+            .collect::<Vec<_>>();
+        expected_result_order.push(receipt.selected_route_id.as_str());
+        let observed_result_order = self
+            .route_results
+            .iter()
+            .map(|result| result.route_id.as_str())
+            .collect::<Vec<_>>();
+        if observed_result_order != expected_result_order {
+            return Err(
+                "validated-selection route results do not preserve candidate order plus winner-last"
+                    .to_string(),
+            );
+        }
+        for candidate in &receipt.candidates {
+            let result = self
+                .route_results
+                .iter()
+                .find(|result| result.route_id == candidate.route_id)
+                .ok_or_else(|| {
+                    format!(
+                        "validated-selection candidate `{}` has no recorded route result",
+                        candidate.route_id
+                    )
+                })?;
+            let recorded_codec = result.result_codec.ok_or_else(|| {
+                format!(
+                    "validated-selection candidate `{}` has no recorded result codec",
+                    candidate.route_id
+                )
+            })?;
+            if recorded_codec != candidate.observation.result_codec {
+                return Err(format!(
+                    "validated-selection candidate `{}` codec disagrees with its recorded route result",
+                    candidate.route_id
+                ));
+            }
+            if result.branch_elapsed_ns.as_deref() != Some(candidate.branch_elapsed_ns.as_str())
+                || result.duration_ns != candidate.terminal_elapsed_ns
+            {
+                return Err(format!(
+                    "validated-selection candidate `{}` timing disagrees with its recorded route result",
+                    candidate.route_id
+                ));
+            }
+            let branch_duration = parse_canonical_duration(
+                &candidate.branch_elapsed_ns,
+                "validated-selection complete-branch duration",
+            )?;
+            let terminal_duration =
+                parse_canonical_duration(&result.duration_ns, "route terminal duration")?;
+            if branch_duration < terminal_duration
+                || branch_duration > u128::from(self.elapsed_nanos)
+            {
+                return Err(format!(
+                    "validated-selection candidate `{}` timing falls outside terminal and whole-run bounds",
+                    candidate.route_id
+                ));
+            }
+            let observation = recorded_validated_selection_observation(result, recorded_codec)?;
+            if observation != candidate.observation {
+                return Err(format!(
+                    "validated-selection candidate `{}` evidence disagrees with its recorded route result",
+                    candidate.route_id
+                ));
+            }
+        }
+        let selected = self.route_results.last().ok_or_else(|| {
+            "validated-selection receipt has no selected route result".to_string()
+        })?;
+        if selected.route_id != receipt.selected_route_id
+            || selected.exit_code != Some(0)
+            || !selected.artifact_capture.is_complete()
+            || self.decoded_value != selected.value
+        {
+            return Err(
+                "validated-selection selected result or decoded value is inconsistent".to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+fn recorded_validated_selection_observation(
+    result: &RecordedRouteResultV1,
+    result_codec: ResultCodec,
+) -> Result<ValidatedSelectionObservationV1, String> {
+    let json_value_sha256 = match result_codec {
+        ResultCodec::Json => {
+            let decoded = if result.stdout.capture.truncated {
+                None
+            } else {
+                serde_json::from_slice::<Value>(&result.stdout.retained).ok()
+            };
+            if decoded != result.value {
+                return Err(format!(
+                    "recorded route `{}` JSON value disagrees with stdout",
+                    result.route_id
+                ));
+            }
+            result
+                .value
+                .as_ref()
+                .map(validated_selection_json_sha256)
+                .transpose()?
+        }
+        ResultCodec::Text | ResultCodec::Bytes => {
+            if result.value.is_some() {
+                return Err(format!(
+                    "recorded non-JSON route `{}` carries a decoded JSON value",
+                    result.route_id
+                ));
+            }
+            None
+        }
+    };
+    let mut artifacts = result.artifacts.clone();
+    artifacts.sort_unstable_by(|left, right| {
+        (&left.path, left.bytes_len, &left.content_hash).cmp(&(
+            &right.path,
+            right.bytes_len,
+            &right.content_hash,
+        ))
+    });
+    let mut artifact_requirements = result.artifact_requirements.clone();
+    artifact_requirements.sort_unstable();
+    artifact_requirements.dedup();
+    let artifact_capture = ValidatedArtifactCaptureStatusV1::from_capture(
+        &result.artifact_capture,
+        &artifact_requirements,
+    )?;
+    let observation = ValidatedSelectionObservationV1 {
+        result_codec,
+        exit_code: result.exit_code,
+        stdout_capture: result.stdout.capture.clone(),
+        stderr_capture: result.stderr.capture.clone(),
+        json_value_sha256,
+        artifacts,
+        artifact_requirements,
+        artifact_capture,
+        execution_disposition: result.disposition,
+    };
+    observation.validate()?;
+    Ok(observation)
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1541,6 +1794,76 @@ mod tests {
         }
     }
 
+    fn validated_project_seed() -> RunAttemptSeedV1 {
+        RunAttemptSeedV1 {
+            input: RunInputIdentityV1 {
+                kind: RunInputKindV1::ProjectDirectory,
+                path: PathBuf::from("project"),
+                digest_sha256: "ab".repeat(32),
+            },
+            intent: ExecutionIntentObservationV1 {
+                engine: "project_compatibility".to_string(),
+                target: Some("main".to_string()),
+                selected_route: None,
+                route_policy: Some("benchmark_validate_and_select".to_string()),
+                route_declarations: Vec::new(),
+                parallel_policy: "project_policy".to_string(),
+                local_worker_limit: None,
+                mesh_mode: None,
+                mesh_max_retries: None,
+                mesh_fallback: None,
+                mesh_discovery_timeout_ms: None,
+                mesh_closed_registry: None,
+                mesh_peer_root: None,
+            },
+            plan: PlanIdentitiesV1 {
+                hgraph_sha256: Some(digest(b"project-hgraph")),
+                deployment_sha256: Some(digest(b"project-deployment")),
+                ..PlanIdentitiesV1::default()
+            },
+            started_unix_nanos: 1,
+        }
+    }
+
+    fn recorded_text_result(route_id: &str, stdout: &[u8]) -> RecordedRouteResultV1 {
+        RecordedRouteResultV1 {
+            route_id: route_id.to_string(),
+            result_codec: Some(ResultCodec::Text),
+            exit_code: Some(0),
+            stdout: CapturedStreamV1::complete(stdout.to_vec()),
+            stderr: CapturedStreamV1::default(),
+            value: None,
+            artifacts: Vec::new(),
+            artifact_requirements: Vec::new(),
+            artifact_capture: ArtifactCaptureStatus::Complete,
+            disposition: RouteExecutionDisposition::Executed,
+            duration_ns: "1".to_string(),
+            branch_elapsed_ns: None,
+            provenance: RecordedExecutionProvenanceV1 {
+                execution_scope: "isolated_project_workspace".to_string(),
+                command_argv_retained: false,
+                command_argument_count: 3,
+            },
+        }
+    }
+
+    fn receipt_candidate(
+        result: &RecordedRouteResultV1,
+        branch_elapsed_ns: &str,
+    ) -> ValidatedSelectionCandidateV1 {
+        let observation =
+            recorded_validated_selection_observation(result, ResultCodec::Text).unwrap();
+        ValidatedSelectionCandidateV1 {
+            route_id: result.route_id.clone(),
+            terminal_elapsed_ns: result.duration_ns.clone(),
+            branch_elapsed_ns: branch_elapsed_ns.to_string(),
+            observation_sha256: observation.sha256().unwrap(),
+            declared_output_sha256: observation.declared_output_sha256().unwrap(),
+            observation,
+            disposition: ValidatedSelectionDispositionV1::Eligible,
+        }
+    }
+
     #[test]
     fn captured_stream_preserves_arbitrary_bytes() {
         let stream = CapturedStreamV1::complete(vec![0, 0xff, b'\n']);
@@ -1571,6 +1894,160 @@ mod tests {
         );
         record.validate().unwrap();
         assert_eq!(record.integrity, RUN_RECORD_INTEGRITY_V1);
+        assert!(serde_json::to_value(&record)
+            .unwrap()
+            .get("validated_selection_receipt")
+            .is_none());
+    }
+
+    #[test]
+    fn terminal_record_binds_validated_selection_receipt_to_results() {
+        let seed = validated_project_seed();
+        let reference = recorded_text_result("reference", b"same");
+        let fast = recorded_text_result("fast", b"same");
+        let receipt = ValidatedSelectionReceiptV1::new(
+            "fixture",
+            seed.input.digest_sha256.clone(),
+            "main",
+            "reference",
+            vec![
+                receipt_candidate(&reference, "20"),
+                receipt_candidate(&fast, "10"),
+            ],
+            "fast",
+        )
+        .unwrap();
+        let mut route_results = vec![reference, fast];
+        for (result, candidate) in route_results.iter_mut().zip(&receipt.candidates) {
+            result.branch_elapsed_ns = Some(candidate.branch_elapsed_ns.clone());
+        }
+        let mut record = RunRecordV1::terminal(
+            "44".repeat(32),
+            1,
+            &seed,
+            31,
+            30,
+            RunDispositionV1::Succeeded,
+            CapturedStreamV1::default(),
+            CapturedStreamV1::default(),
+            None,
+            route_results.clone(),
+            route_result_references(&route_results),
+            RunTraceBindingV1::unavailable("compatibility engine has no checked trace"),
+            None,
+        );
+        record.validated_selection_receipt = Some(receipt);
+        record.validate().unwrap();
+
+        let mut wrong_result = record.clone();
+        wrong_result.route_results[0].stdout = CapturedStreamV1::complete(b"changed".to_vec());
+        assert!(wrong_result.validate().is_err());
+
+        let mut wrong_binding = record.clone();
+        wrong_binding.input.digest_sha256 = digest(b"different-bundle");
+        assert!(wrong_binding.validate().is_err());
+
+        let mut wrong_codec = record.clone();
+        wrong_codec.route_results[0].result_codec = Some(ResultCodec::Bytes);
+        assert!(wrong_codec.validate().is_err());
+
+        let mut shorter_than_terminal = record.clone();
+        shorter_than_terminal.route_results[1].duration_ns = "11".to_string();
+        assert!(shorter_than_terminal.validate().is_err());
+
+        let mut longer_than_run = record.clone();
+        longer_than_run.elapsed_nanos = 9;
+        assert!(longer_than_run.validate().is_err());
+
+        let mut missing_receipt = record;
+        missing_receipt.validated_selection_receipt = None;
+        assert!(missing_receipt.validate().is_err());
+
+        let mut infrastructure_failed = validated_project_seed();
+        infrastructure_failed.started_unix_nanos = 10;
+        let reference = recorded_text_result("reference", b"same");
+        let fast = recorded_text_result("fast", b"same");
+        let receipt = ValidatedSelectionReceiptV1::new(
+            "fixture",
+            infrastructure_failed.input.digest_sha256.clone(),
+            "main",
+            "reference",
+            vec![
+                receipt_candidate(&reference, "20"),
+                receipt_candidate(&fast, "10"),
+            ],
+            "fast",
+        )
+        .unwrap();
+        let mut route_results = vec![reference, fast];
+        for (result, candidate) in route_results.iter_mut().zip(&receipt.candidates) {
+            result.branch_elapsed_ns = Some(candidate.branch_elapsed_ns.clone());
+        }
+        let mut failed_record = RunRecordV1::terminal(
+            "55".repeat(32),
+            2,
+            &infrastructure_failed,
+            40,
+            30,
+            RunDispositionV1::InfrastructureFailed,
+            CapturedStreamV1::default(),
+            CapturedStreamV1::complete(b"sidecar failed".to_vec()),
+            None,
+            route_results.clone(),
+            route_result_references(&route_results),
+            RunTraceBindingV1::unavailable("compatibility engine has no checked trace"),
+            Some(RunFailureV1 {
+                stage: "trace_output".to_string(),
+                message: "sidecar failed".to_string(),
+            }),
+        );
+        failed_record.validated_selection_receipt = Some(receipt);
+        failed_record.validate().unwrap();
+        failed_record.validated_selection_receipt = None;
+        assert!(failed_record.validate().is_err());
+
+        let post_execution_without_results = RunRecordV1::terminal(
+            "66".repeat(32),
+            3,
+            &infrastructure_failed,
+            40,
+            30,
+            RunDispositionV1::InfrastructureFailed,
+            CapturedStreamV1::default(),
+            CapturedStreamV1::complete(b"sidecar failed".to_vec()),
+            None,
+            Vec::new(),
+            Vec::new(),
+            RunTraceBindingV1::unavailable("compatibility engine has no checked trace"),
+            Some(RunFailureV1 {
+                stage: "trace_output".to_string(),
+                message: "sidecar failed".to_string(),
+            }),
+        );
+        assert_eq!(
+            post_execution_without_results.validate().unwrap_err(),
+            "completed validated-selection execution has no selection receipt"
+        );
+
+        let setup_failure = RunRecordV1::terminal(
+            "77".repeat(32),
+            4,
+            &infrastructure_failed,
+            40,
+            30,
+            RunDispositionV1::InfrastructureFailed,
+            CapturedStreamV1::default(),
+            CapturedStreamV1::complete(b"capture setup failed".to_vec()),
+            None,
+            Vec::new(),
+            Vec::new(),
+            RunTraceBindingV1::unavailable("execution never began"),
+            Some(RunFailureV1 {
+                stage: "stream_observation_setup".to_string(),
+                message: "capture setup failed".to_string(),
+            }),
+        );
+        setup_failure.validate().unwrap();
     }
 
     #[test]

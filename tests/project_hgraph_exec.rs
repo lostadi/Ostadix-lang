@@ -2430,6 +2430,7 @@ fn unsupported_policy_kinds_fail_closed_with_one_or_many_alternatives() {
         RoutePolicy::All,
         RoutePolicy::VerifyEquivalent,
         RoutePolicy::BenchmarkAndSelect,
+        RoutePolicy::BenchmarkValidateAndSelect,
     ] {
         let token = policy.token();
         for alternative_count in [1, 2] {
@@ -2437,7 +2438,20 @@ fn unsupported_policy_kinds_fail_closed_with_one_or_many_alternatives() {
                 .path()
                 .join(format!("executed-{token}-{alternative_count}"));
             let bundle = unsupported_policy_bundle(policy.clone(), alternative_count, &marker);
-            let project = build_project_hgraph(&bundle, Some("application"), None).unwrap();
+            let project = match build_project_hgraph(&bundle, Some("application"), None) {
+                Ok(project) => project,
+                Err(error)
+                    if policy == RoutePolicy::BenchmarkValidateAndSelect
+                        && alternative_count == 1 =>
+                {
+                    assert!(error.contains("requires at least two declared alternatives"));
+                    assert!(!marker.exists());
+                    continue;
+                }
+                Err(error) => panic!(
+                    "unexpected planning failure for {token} with {alternative_count} alternative(s): {error}"
+                ),
+            };
             let error =
                 execute_project_hgraph(&bundle, &project, &RunOptions::default()).unwrap_err();
             let message = format!("{error:#}");

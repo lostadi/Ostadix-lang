@@ -7,11 +7,22 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 /// The on-disk/on-wire format version of a [`ProjectBundle`].
 pub const BUNDLE_FORMAT_VERSION: u32 = 2;
+
+/// Versioned observation contract used by validated route selection.
+pub const VALIDATED_SELECTION_EQUIVALENCE_V1: &str =
+    "ostadix.project-declared-output-equivalence/v1";
+
+/// Versioned decision rule used by validated route selection.
+pub const VALIDATED_SELECTION_RULE_V1: &str =
+    "ostadix.project-fastest-complete-branch-equivalent-declaration-tie/v1";
+
+/// Schema for an unsigned, content-addressable validated-selection receipt.
+pub const VALIDATED_SELECTION_RECEIPT_SCHEMA_V1: &str = "ostadix.project-validated-selection/v1";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // base64 helper for byte payloads inside JSON
@@ -332,9 +343,22 @@ pub enum RoutePolicy {
     VerifyEquivalent,
     /// Run all in parallel and select the fastest successful alternative.
     BenchmarkAndSelect,
+    /// Run all in parallel, treat the first declared alternative as the
+    /// reference, reject candidates whose declared outputs differ, and select
+    /// the fastest successful equivalent alternative.
+    BenchmarkValidateAndSelect,
 }
 
 impl RoutePolicy {
+    /// Whether the logical plan must contain an explicit declared-output
+    /// comparison step before selection.
+    pub const fn requires_declared_output_validation(&self) -> bool {
+        matches!(
+            self,
+            Self::VerifyEquivalent | Self::BenchmarkValidateAndSelect
+        )
+    }
+
     /// Parse a policy token without silently turning a typo into `default`.
     ///
     /// Manifests retain the compatibility-oriented [`Self::parse`] surface,
@@ -363,8 +387,12 @@ impl RoutePolicy {
             "benchmark_and_select" | "benchmarkandselect" | "benchmark" => {
                 Ok(RoutePolicy::BenchmarkAndSelect)
             }
+            "benchmark_validate_and_select"
+            | "benchmarkvalidateandselect"
+            | "benchmark_validate"
+            | "validated_benchmark" => Ok(RoutePolicy::BenchmarkValidateAndSelect),
             _ => Err(format!(
-                "unknown route policy `{token}`; expected explicit[:ROUTE], default, fallback, any_success, race_success, race_settle, all, verify_equivalent, or benchmark_and_select"
+                "unknown route policy `{token}`; expected explicit[:ROUTE], default, fallback, any_success, race_success, race_settle, all, verify_equivalent, benchmark_and_select, or benchmark_validate_and_select"
             )),
         }
     }
@@ -391,6 +419,7 @@ impl RoutePolicy {
             RoutePolicy::All => "all".to_string(),
             RoutePolicy::VerifyEquivalent => "verify_equivalent".to_string(),
             RoutePolicy::BenchmarkAndSelect => "benchmark_and_select".to_string(),
+            RoutePolicy::BenchmarkValidateAndSelect => "benchmark_validate_and_select".to_string(),
         }
     }
 
@@ -410,6 +439,679 @@ pub struct RouteSet {
     pub alternatives: Vec<String>,
     /// How to select among the alternatives.
     pub policy: RoutePolicy,
+}
+
+/// The declared-output dimension on which an optimization candidate differed
+/// from the reference route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidatedSelectionMismatchV1 {
+    ResultCodec,
+    JsonValue,
+    Stdout,
+    ArtifactManifest,
+}
+
+/// Stable, non-sensitive reason why declared artifact capture was incomplete.
+///
+/// Runtime artifact failures can contain host paths and operating-system error
+/// details.  A validated-selection receipt deliberately retains only this
+/// closed classification so an untrusted remote result cannot smuggle those
+/// strings into portable evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidatedArtifactCaptureFailureKindV1 {
+    Missing,
+    Unreadable,
+    ChangedDuringCapture,
+    UnsupportedFileType,
+    UnsupportedPathEncoding,
+    OutsideArtifactRoot,
+    ArtifactScanLimit,
+    ArtifactCountLimit,
+    SingleArtifactLimit,
+    AggregateArtifactLimit,
+    NotAttempted,
+}
+
+/// Credential-minimized artifact-capture state embedded in a validated
+/// selection observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ValidatedArtifactCaptureStatusV1 {
+    Complete,
+    Incomplete {
+        failure_kind: ValidatedArtifactCaptureFailureKindV1,
+    },
+}
+
+impl ValidatedArtifactCaptureStatusV1 {
+    pub const fn is_complete(self) -> bool {
+        matches!(self, Self::Complete)
+    }
+
+    /// Validate a runtime capture state against the declared requirements and
+    /// reduce it to the non-sensitive receipt representation.
+    pub fn from_capture(
+        capture: &ArtifactCaptureStatus,
+        requirements: &[String],
+    ) -> Result<Self, String> {
+        capture.validate()?;
+        for requirement in requirements {
+            validate_validated_selection_relative_path(requirement, "artifact requirement")?;
+        }
+        let ArtifactCaptureStatus::Incomplete { failure } = capture else {
+            return Ok(Self::Complete);
+        };
+
+        let validate_failure_path = |path: &str| {
+            // `.` is the runtime's stable label for an error while opening the
+            // artifact root itself.  It is never emitted into the receipt.
+            if path == "." {
+                Ok(())
+            } else {
+                validate_validated_selection_relative_path(path, "artifact failure path")
+            }
+        };
+        let failure_kind = match failure.as_ref() {
+            ArtifactCaptureFailure::Missing { requirement } => {
+                validate_validated_selection_relative_path(
+                    requirement,
+                    "missing artifact requirement",
+                )?;
+                if !requirements.iter().any(|declared| declared == requirement) {
+                    return Err(format!(
+                        "missing artifact requirement `{requirement}` was not declared"
+                    ));
+                }
+                ValidatedArtifactCaptureFailureKindV1::Missing
+            }
+            ArtifactCaptureFailure::Unreadable { path, .. } => {
+                validate_failure_path(path)?;
+                ValidatedArtifactCaptureFailureKindV1::Unreadable
+            }
+            ArtifactCaptureFailure::ChangedDuringCapture { path, .. } => {
+                validate_failure_path(path)?;
+                ValidatedArtifactCaptureFailureKindV1::ChangedDuringCapture
+            }
+            ArtifactCaptureFailure::UnsupportedFileType { path } => {
+                validate_failure_path(path)?;
+                ValidatedArtifactCaptureFailureKindV1::UnsupportedFileType
+            }
+            ArtifactCaptureFailure::UnsupportedPathEncoding { .. } => {
+                ValidatedArtifactCaptureFailureKindV1::UnsupportedPathEncoding
+            }
+            ArtifactCaptureFailure::OutsideArtifactRoot { path } => {
+                validate_failure_path(path)?;
+                ValidatedArtifactCaptureFailureKindV1::OutsideArtifactRoot
+            }
+            ArtifactCaptureFailure::ArtifactScanLimit { .. } => {
+                ValidatedArtifactCaptureFailureKindV1::ArtifactScanLimit
+            }
+            ArtifactCaptureFailure::ArtifactCountLimit { .. } => {
+                ValidatedArtifactCaptureFailureKindV1::ArtifactCountLimit
+            }
+            ArtifactCaptureFailure::SingleArtifactLimit { path, .. } => {
+                validate_failure_path(path)?;
+                ValidatedArtifactCaptureFailureKindV1::SingleArtifactLimit
+            }
+            ArtifactCaptureFailure::AggregateArtifactLimit { path, .. } => {
+                validate_failure_path(path)?;
+                ValidatedArtifactCaptureFailureKindV1::AggregateArtifactLimit
+            }
+            ArtifactCaptureFailure::NotAttempted { .. } => {
+                ValidatedArtifactCaptureFailureKindV1::NotAttempted
+            }
+        };
+        Ok(Self::Incomplete { failure_kind })
+    }
+}
+
+/// Receipt paths use a platform-neutral relative spelling even when execution
+/// occurs on Unix. Windows drive/UNC roots and either separator's traversal
+/// components are rejected, while an interior backslash can remain a literal
+/// Unix filename character.
+fn validate_validated_selection_relative_path(path: &str, label: &str) -> Result<(), String> {
+    let first = path.split('/').next().unwrap_or_default();
+    let first_bytes = first.as_bytes();
+    let windows_drive =
+        first_bytes.len() >= 2 && first_bytes[0].is_ascii_alphabetic() && first_bytes[1] == b':';
+    let windows_traversal = path
+        .split(['/', '\\'])
+        .any(|component| component == "." || component == "..");
+    if path.is_empty()
+        || path.contains('\0')
+        || path.starts_with('/')
+        || path.starts_with('\\')
+        || windows_drive
+        || windows_traversal
+        || path
+            .split('/')
+            .any(|component| component.is_empty() || component == "." || component == "..")
+    {
+        return Err(format!(
+            "validated-selection {label} must be a canonical portable relative path"
+        ));
+    }
+    Ok(())
+}
+
+/// Credential-minimized evidence used to compare one candidate with the
+/// reference without retaining raw output bytes, argv, environment values, or
+/// temporary workspace paths.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ValidatedSelectionObservationV1 {
+    pub result_codec: ResultCodec,
+    pub exit_code: Option<i32>,
+    pub stdout_capture: OutputCapture,
+    pub stderr_capture: OutputCapture,
+    /// SHA-256 of the canonical JSON value when `result_codec` is `Json` and
+    /// decoding succeeded.
+    pub json_value_sha256: Option<String>,
+    /// Canonically sorted declared artifact manifest.
+    pub artifacts: Vec<Artifact>,
+    /// Canonically sorted declared output requirements.
+    pub artifact_requirements: Vec<String>,
+    pub artifact_capture: ValidatedArtifactCaptureStatusV1,
+    pub execution_disposition: RouteExecutionDisposition,
+}
+
+impl ValidatedSelectionObservationV1 {
+    pub fn execution_succeeded(&self) -> bool {
+        self.exit_code == Some(0) && self.artifact_capture.is_complete()
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        fn validate_capture(capture: &OutputCapture, label: &str) -> Result<(), String> {
+            if capture.total_observed_bytes < capture.retained_bytes
+                || capture.truncated != (capture.total_observed_bytes > capture.retained_bytes)
+                || !is_lower_sha256(&capture.sha256)
+            {
+                return Err(format!(
+                    "validated-selection {label} capture metadata is noncanonical"
+                ));
+            }
+            if capture.total_observed_bytes == 0
+                && capture.sha256 != hex::encode(Sha256::digest([]))
+            {
+                return Err(format!(
+                    "validated-selection empty {label} capture has a nonempty-content digest"
+                ));
+            }
+            Ok(())
+        }
+
+        validate_capture(&self.stdout_capture, "stdout")?;
+        validate_capture(&self.stderr_capture, "stderr")?;
+        match (self.result_codec, &self.json_value_sha256) {
+            (ResultCodec::Json, Some(digest)) if is_lower_sha256(digest) => {}
+            (ResultCodec::Json, None) => {}
+            (ResultCodec::Json, Some(_)) => {
+                return Err(
+                    "validated-selection JSON value digest is not lowercase sha256".to_string(),
+                )
+            }
+            (_, None) => {}
+            (_, Some(_)) => {
+                return Err(
+                    "validated-selection non-JSON observation carries a JSON value digest"
+                        .to_string(),
+                )
+            }
+        }
+        if !self.artifact_capture.is_complete() && !self.artifacts.is_empty() {
+            return Err(
+                "validated-selection incomplete artifact evidence retains complete artifacts"
+                    .to_string(),
+            );
+        }
+        if !self.artifact_capture.is_complete() && self.artifact_requirements.is_empty() {
+            return Err(
+                "validated-selection incomplete artifact evidence has no declared requirements"
+                    .to_string(),
+            );
+        }
+        if self.exit_code == Some(0) && !self.artifact_capture.is_complete() {
+            return Err(
+                "validated-selection exit-zero observation has incomplete artifact evidence"
+                    .to_string(),
+            );
+        }
+        let mut previous_artifact: Option<(&str, u64, &str)> = None;
+        for artifact in &self.artifacts {
+            if validate_validated_selection_relative_path(&artifact.path, "artifact path").is_err()
+                || !is_lower_sha256(&artifact.content_hash)
+            {
+                return Err(
+                    "validated-selection artifact manifest contains invalid evidence".to_string(),
+                );
+            }
+            let key = (
+                artifact.path.as_str(),
+                artifact.bytes_len,
+                artifact.content_hash.as_str(),
+            );
+            if previous_artifact.is_some_and(|previous| previous.0 == key.0 || previous >= key) {
+                return Err(
+                    "validated-selection artifact manifest has a duplicate path or is not strictly sorted"
+                        .to_string(),
+                );
+            }
+            previous_artifact = Some(key);
+        }
+        let mut previous_requirement: Option<&str> = None;
+        for requirement in &self.artifact_requirements {
+            if validate_validated_selection_relative_path(requirement, "artifact requirement")
+                .is_err()
+                || previous_requirement.is_some_and(|previous| previous >= requirement.as_str())
+            {
+                return Err(
+                    "validated-selection artifact requirements are invalid or not strictly sorted"
+                        .to_string(),
+                );
+            }
+            previous_requirement = Some(requirement);
+        }
+        if self.artifact_capture.is_complete() {
+            for requirement in &self.artifact_requirements {
+                if !self
+                    .artifacts
+                    .iter()
+                    .any(|artifact| super::runtime::glob_match(requirement, &artifact.path))
+                {
+                    return Err(format!(
+                        "validated-selection complete artifact evidence has no artifact matching `{requirement}`"
+                    ));
+                }
+            }
+            for artifact in &self.artifacts {
+                if !self
+                    .artifact_requirements
+                    .iter()
+                    .any(|requirement| super::runtime::glob_match(requirement, &artifact.path))
+                {
+                    return Err(format!(
+                        "validated-selection artifact `{}` matches no declared requirement",
+                        artifact.path
+                    ));
+                }
+            }
+        }
+        if self.execution_disposition == RouteExecutionDisposition::GuardSkipped
+            && self.exit_code.is_some()
+        {
+            return Err(
+                "validated-selection skipped execution unexpectedly has an exit code".to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    /// The exact comparison dimension used by validated selection.
+    pub fn declared_output_mismatch(&self, other: &Self) -> Option<ValidatedSelectionMismatchV1> {
+        if self.result_codec != other.result_codec {
+            return Some(ValidatedSelectionMismatchV1::ResultCodec);
+        }
+        match self.result_codec {
+            ResultCodec::Json => {
+                if self.json_value_sha256.is_none()
+                    || self.json_value_sha256 != other.json_value_sha256
+                {
+                    return Some(ValidatedSelectionMismatchV1::JsonValue);
+                }
+            }
+            ResultCodec::Text | ResultCodec::Bytes => {
+                if self.stdout_capture.sha256 != other.stdout_capture.sha256
+                    || self.stdout_capture.total_observed_bytes
+                        != other.stdout_capture.total_observed_bytes
+                {
+                    return Some(ValidatedSelectionMismatchV1::Stdout);
+                }
+            }
+        }
+        if self.artifacts != other.artifacts {
+            return Some(ValidatedSelectionMismatchV1::ArtifactManifest);
+        }
+        None
+    }
+
+    pub fn sha256(&self) -> Result<String, String> {
+        self.validate()?;
+        let bytes = serde_json::to_vec(self).map_err(|error| {
+            format!("failed to encode validated-selection observation: {error}")
+        })?;
+        let mut hasher = Sha256::new();
+        hasher.update(b"ostadix.project-validated-selection-observation/v1\0");
+        hasher.update(bytes);
+        Ok(hex::encode(hasher.finalize()))
+    }
+
+    pub fn declared_output_sha256(&self) -> Result<String, String> {
+        self.validate()?;
+        #[derive(Serialize)]
+        struct DeclaredOutput<'a> {
+            result_codec: ResultCodec,
+            stdout_sha256: Option<&'a str>,
+            stdout_bytes: Option<u64>,
+            json_value_sha256: Option<&'a str>,
+            artifacts: &'a [Artifact],
+        }
+        let (stdout_sha256, stdout_bytes, json_value_sha256) = match self.result_codec {
+            ResultCodec::Json => (None, None, self.json_value_sha256.as_deref()),
+            ResultCodec::Text | ResultCodec::Bytes => (
+                Some(self.stdout_capture.sha256.as_str()),
+                Some(self.stdout_capture.total_observed_bytes),
+                None,
+            ),
+        };
+        let output = DeclaredOutput {
+            result_codec: self.result_codec,
+            stdout_sha256,
+            stdout_bytes,
+            json_value_sha256,
+            artifacts: &self.artifacts,
+        };
+        let bytes = serde_json::to_vec(&output)
+            .map_err(|error| format!("failed to encode declared-output evidence: {error}"))?;
+        let mut hasher = Sha256::new();
+        hasher.update(b"ostadix.project-declared-output/v1\0");
+        hasher.update(bytes);
+        Ok(hex::encode(hasher.finalize()))
+    }
+}
+
+/// Eligibility of one measured route under validated benchmark selection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ValidatedSelectionDispositionV1 {
+    Eligible,
+    RejectedExecution {
+        exit_code: Option<i32>,
+    },
+    RejectedOutput {
+        mismatch: ValidatedSelectionMismatchV1,
+    },
+}
+
+impl ValidatedSelectionDispositionV1 {
+    pub const fn is_eligible(&self) -> bool {
+        matches!(self, Self::Eligible)
+    }
+}
+
+/// One candidate observation bound into a validated-selection receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ValidatedSelectionCandidateV1 {
+    pub route_id: String,
+    /// Canonical unsigned decimal nanoseconds reported for the terminal route
+    /// attempt itself.
+    pub terminal_elapsed_ns: String,
+    /// Canonical unsigned decimal nanoseconds covering the complete candidate
+    /// branch call, including local materialization/prerequisites or remote
+    /// dispatch/retry/result retrieval.
+    pub branch_elapsed_ns: String,
+    /// Credential-minimized result evidence excluding timing and
+    /// temporary workspace paths.
+    pub observation: ValidatedSelectionObservationV1,
+    pub observation_sha256: String,
+    /// Digest whose preimage is exactly the declared-output comparison surface.
+    pub declared_output_sha256: String,
+    pub disposition: ValidatedSelectionDispositionV1,
+}
+
+/// Unsigned evidence that a route was selected by measured duration only
+/// after its declared outputs matched the reference route.
+///
+/// This is a local observation record, not a proof, capability grant, World
+/// receipt, or authorization to reuse the decision after inputs or runtimes
+/// change. The bundle digest binds the route commands and project inputs used
+/// by this exact execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ValidatedSelectionReceiptV1 {
+    pub schema: String,
+    pub project_name: String,
+    pub bundle_sha256: String,
+    pub target: String,
+    pub policy: String,
+    pub equivalence_contract: String,
+    pub selection_rule: String,
+    pub reference_route_id: String,
+    pub candidates: Vec<ValidatedSelectionCandidateV1>,
+    pub selected_route_id: String,
+}
+
+impl ValidatedSelectionReceiptV1 {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        project_name: impl Into<String>,
+        bundle_sha256: impl Into<String>,
+        target: impl Into<String>,
+        reference_route_id: impl Into<String>,
+        candidates: Vec<ValidatedSelectionCandidateV1>,
+        selected_route_id: impl Into<String>,
+    ) -> Result<Self, String> {
+        let receipt = Self {
+            schema: VALIDATED_SELECTION_RECEIPT_SCHEMA_V1.to_string(),
+            project_name: project_name.into(),
+            bundle_sha256: bundle_sha256.into(),
+            target: target.into(),
+            policy: RoutePolicy::BenchmarkValidateAndSelect.token(),
+            equivalence_contract: VALIDATED_SELECTION_EQUIVALENCE_V1.to_string(),
+            selection_rule: VALIDATED_SELECTION_RULE_V1.to_string(),
+            reference_route_id: reference_route_id.into(),
+            candidates,
+            selected_route_id: selected_route_id.into(),
+        };
+        receipt.validate()?;
+        Ok(receipt)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema != VALIDATED_SELECTION_RECEIPT_SCHEMA_V1
+            || self.policy != RoutePolicy::BenchmarkValidateAndSelect.token()
+            || self.equivalence_contract != VALIDATED_SELECTION_EQUIVALENCE_V1
+            || self.selection_rule != VALIDATED_SELECTION_RULE_V1
+        {
+            return Err("validated-selection receipt has unsupported coordinates".to_string());
+        }
+        for (value, label) in [
+            (&self.project_name, "project name"),
+            (&self.target, "selection target"),
+            (&self.reference_route_id, "reference route id"),
+            (&self.selected_route_id, "selected route id"),
+        ] {
+            if value.is_empty() || value.contains('\0') {
+                return Err(format!(
+                    "validated-selection {label} is empty or contains NUL"
+                ));
+            }
+        }
+        if !is_lower_sha256(&self.bundle_sha256) {
+            return Err("validated-selection bundle digest is not lowercase sha256".to_string());
+        }
+        if self.candidates.len() < 2 {
+            return Err(
+                "validated-selection receipt requires a reference and at least one candidate"
+                    .to_string(),
+            );
+        }
+        let reference = &self.candidates[0];
+        if reference.route_id != self.reference_route_id || !reference.disposition.is_eligible() {
+            return Err(
+                "validated-selection reference must be the first eligible candidate".to_string(),
+            );
+        }
+
+        let mut route_ids = BTreeSet::new();
+        let mut best: Option<(u128, usize, &str)> = None;
+        let reference_observation = &reference.observation;
+        for (index, candidate) in self.candidates.iter().enumerate() {
+            if candidate.route_id.is_empty()
+                || candidate.route_id.contains('\0')
+                || !route_ids.insert(candidate.route_id.as_str())
+            {
+                return Err(
+                    "validated-selection candidate route ids are empty, invalid, or repeated"
+                        .to_string(),
+                );
+            }
+            candidate.observation.validate()?;
+            if candidate.observation.sha256()? != candidate.observation_sha256 {
+                return Err(format!(
+                    "validated-selection candidate `{}` observation digest disagrees with its evidence",
+                    candidate.route_id
+                ));
+            }
+            if candidate.observation.declared_output_sha256()? != candidate.declared_output_sha256 {
+                return Err(format!(
+                    "validated-selection candidate `{}` declared-output digest disagrees with its evidence",
+                    candidate.route_id
+                ));
+            }
+            let parse_duration = |value: &str, dimension: &str| {
+                if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return Err(format!(
+                        "validated-selection candidate `{}` has an invalid {dimension} duration",
+                        candidate.route_id
+                    ));
+                }
+                let duration = value.parse::<u128>().map_err(|_| {
+                    format!(
+                        "validated-selection candidate `{}` has an invalid {dimension} duration",
+                        candidate.route_id
+                    )
+                })?;
+                if duration.to_string() != value {
+                    return Err(format!(
+                        "validated-selection candidate `{}` {dimension} duration is not canonical unsigned decimal",
+                        candidate.route_id
+                    ));
+                }
+                Ok(duration)
+            };
+            let terminal_duration = parse_duration(&candidate.terminal_elapsed_ns, "terminal")?;
+            let duration = parse_duration(&candidate.branch_elapsed_ns, "complete-branch")?;
+            if terminal_duration > duration {
+                return Err(format!(
+                    "validated-selection candidate `{}` terminal duration exceeds complete-branch duration",
+                    candidate.route_id
+                ));
+            }
+            let mismatch = reference_observation.declared_output_mismatch(&candidate.observation);
+            match &candidate.disposition {
+                ValidatedSelectionDispositionV1::Eligible
+                    if candidate.observation.execution_succeeded() && mismatch.is_none() => {}
+                ValidatedSelectionDispositionV1::RejectedExecution { exit_code }
+                    if !candidate.observation.execution_succeeded()
+                        && *exit_code == candidate.observation.exit_code => {}
+                ValidatedSelectionDispositionV1::RejectedOutput {
+                    mismatch: declared_mismatch,
+                } if candidate.observation.execution_succeeded()
+                    && mismatch.as_ref() == Some(declared_mismatch) => {}
+                _ => {
+                    return Err(format!(
+                        "validated-selection candidate `{}` disposition disagrees with its execution/output evidence",
+                        candidate.route_id
+                    ))
+                }
+            }
+            if candidate.disposition.is_eligible()
+                && best.as_ref().is_none_or(|(best_duration, best_index, _)| {
+                    (duration, index) < (*best_duration, *best_index)
+                })
+            {
+                best = Some((duration, index, candidate.route_id.as_str()));
+            }
+        }
+        let (_, _, expected_selected) = best
+            .ok_or_else(|| "validated-selection receipt has no eligible candidate".to_string())?;
+        if expected_selected != self.selected_route_id {
+            return Err(
+                "validated-selection winner is not the fastest eligible candidate".to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Content identity of the validated receipt's canonical compact JSON.
+    pub fn sha256(&self) -> Result<String, String> {
+        let bytes = self.canonical_bytes()?;
+        Ok(hex::encode(Sha256::digest(bytes)))
+    }
+
+    /// Exact bytes whose ordinary file SHA-256 is returned by [`Self::sha256`].
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, String> {
+        self.validate()?;
+        serde_json::to_vec(self)
+            .map_err(|error| format!("failed to encode validated-selection receipt: {error}"))
+    }
+}
+
+fn is_lower_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+/// Hash a JSON value after recursively sorting object keys. This gives equal
+/// decoded JSON values the same evidence identity regardless of source key
+/// order or insignificant whitespace.
+pub fn validated_selection_json_sha256(value: &serde_json::Value) -> Result<String, String> {
+    fn write_value(value: &serde_json::Value, output: &mut Vec<u8>) -> Result<(), String> {
+        match value {
+            serde_json::Value::Null => output.extend_from_slice(b"null"),
+            serde_json::Value::Bool(value) => {
+                output.extend_from_slice(if *value { b"true" } else { b"false" })
+            }
+            serde_json::Value::Number(value) => {
+                output.extend_from_slice(value.to_string().as_bytes())
+            }
+            serde_json::Value::String(value) => {
+                let encoded = serde_json::to_vec(value)
+                    .map_err(|error| format!("failed to encode canonical JSON string: {error}"))?;
+                output.extend_from_slice(&encoded);
+            }
+            serde_json::Value::Array(values) => {
+                output.push(b'[');
+                for (index, value) in values.iter().enumerate() {
+                    if index != 0 {
+                        output.push(b',');
+                    }
+                    write_value(value, output)?;
+                }
+                output.push(b']');
+            }
+            serde_json::Value::Object(values) => {
+                output.push(b'{');
+                let mut entries = values.iter().collect::<Vec<_>>();
+                entries.sort_unstable_by_key(|(key, _)| *key);
+                for (index, (key, value)) in entries.into_iter().enumerate() {
+                    if index != 0 {
+                        output.push(b',');
+                    }
+                    let encoded_key = serde_json::to_vec(key).map_err(|error| {
+                        format!("failed to encode canonical JSON object key: {error}")
+                    })?;
+                    output.extend_from_slice(&encoded_key);
+                    output.push(b':');
+                    write_value(value, output)?;
+                }
+                output.push(b'}');
+            }
+        }
+        Ok(())
+    }
+
+    let mut canonical = Vec::new();
+    write_value(value, &mut canonical)?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"ostadix.project-json-value/v1\0");
+    hasher.update(canonical);
+    Ok(hex::encode(hasher.finalize()))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -544,6 +1246,7 @@ impl ProjectBundle {
 /// Missing, unreadable, changing, unsupported, and over-limit declared
 /// outputs are rejected before this type is constructed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Artifact {
     /// Path relative to the execution workspace.
     pub path: String,
@@ -730,6 +1433,7 @@ impl ArtifactCaptureStatus {
 /// complete stream observed before the route became terminal. A truncated
 /// stream is therefore never confused with a complete short stream.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OutputCapture {
     /// Total bytes drained from the child pipe, including discarded suffixes.
     pub total_observed_bytes: u64,
@@ -984,5 +1688,276 @@ impl OExecutionResult {
                 "cwd": self.provenance.cwd.display().to_string(),
             },
         })
+    }
+}
+
+#[cfg(test)]
+mod validated_selection_tests {
+    use super::*;
+
+    fn observation(stdout: &[u8]) -> ValidatedSelectionObservationV1 {
+        ValidatedSelectionObservationV1 {
+            result_codec: ResultCodec::Text,
+            exit_code: Some(0),
+            stdout_capture: OutputCapture::complete(stdout),
+            stderr_capture: OutputCapture::complete(&[]),
+            json_value_sha256: None,
+            artifacts: Vec::new(),
+            artifact_requirements: Vec::new(),
+            artifact_capture: ValidatedArtifactCaptureStatusV1::Complete,
+            execution_disposition: RouteExecutionDisposition::Executed,
+        }
+    }
+
+    fn candidate(
+        route_id: &str,
+        branch_elapsed_ns: &str,
+        stdout: &[u8],
+        disposition: ValidatedSelectionDispositionV1,
+    ) -> ValidatedSelectionCandidateV1 {
+        let observation = observation(stdout);
+        ValidatedSelectionCandidateV1 {
+            route_id: route_id.to_string(),
+            terminal_elapsed_ns: "1".to_string(),
+            branch_elapsed_ns: branch_elapsed_ns.to_string(),
+            observation_sha256: observation.sha256().unwrap(),
+            declared_output_sha256: observation.declared_output_sha256().unwrap(),
+            observation,
+            disposition,
+        }
+    }
+
+    fn receipt() -> ValidatedSelectionReceiptV1 {
+        ValidatedSelectionReceiptV1::new(
+            "fixture",
+            "ab".repeat(32),
+            "main",
+            "reference",
+            vec![
+                candidate(
+                    "reference",
+                    "20",
+                    b"same",
+                    ValidatedSelectionDispositionV1::Eligible,
+                ),
+                candidate(
+                    "fast",
+                    "10",
+                    b"same",
+                    ValidatedSelectionDispositionV1::Eligible,
+                ),
+                candidate(
+                    "wrong",
+                    "1",
+                    b"wrong",
+                    ValidatedSelectionDispositionV1::RejectedOutput {
+                        mismatch: ValidatedSelectionMismatchV1::Stdout,
+                    },
+                ),
+            ],
+            "fast",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn validated_selection_receipt_is_internally_auditable() {
+        let receipt = receipt();
+        receipt.validate().unwrap();
+        assert_eq!(
+            receipt.candidates[0].declared_output_sha256,
+            receipt.candidates[1].declared_output_sha256
+        );
+        assert_ne!(
+            receipt.candidates[0].declared_output_sha256,
+            receipt.candidates[2].declared_output_sha256
+        );
+        assert_eq!(
+            receipt.sha256().unwrap(),
+            hex::encode(Sha256::digest(receipt.canonical_bytes().unwrap()))
+        );
+    }
+
+    #[test]
+    fn validated_artifact_capture_redacts_runtime_failure_details() {
+        let requirements = vec!["out/*.bin".to_string()];
+        let capture = ArtifactCaptureStatus::Incomplete {
+            failure: Box::new(ArtifactCaptureFailure::Unreadable {
+                path: "out/result.bin".to_string(),
+                operation: "read /private/credential".to_string(),
+                error_kind: "token=secret".to_string(),
+            }),
+        };
+
+        let evidence =
+            ValidatedArtifactCaptureStatusV1::from_capture(&capture, &requirements).unwrap();
+        assert_eq!(
+            evidence,
+            ValidatedArtifactCaptureStatusV1::Incomplete {
+                failure_kind: ValidatedArtifactCaptureFailureKindV1::Unreadable,
+            }
+        );
+        let json = serde_json::to_string(&evidence).unwrap();
+        assert!(!json.contains("private"));
+        assert!(!json.contains("secret"));
+        assert!(!json.contains("result.bin"));
+    }
+
+    #[test]
+    fn validated_artifact_capture_rejects_unbound_or_nonportable_paths() {
+        let undeclared = ArtifactCaptureStatus::Incomplete {
+            failure: Box::new(ArtifactCaptureFailure::Missing {
+                requirement: "other.bin".to_string(),
+            }),
+        };
+        assert!(ValidatedArtifactCaptureStatusV1::from_capture(
+            &undeclared,
+            &["declared.bin".to_string()]
+        )
+        .is_err());
+
+        let absolute_failure = ArtifactCaptureStatus::Incomplete {
+            failure: Box::new(ArtifactCaptureFailure::Unreadable {
+                path: "/home/user/.token".to_string(),
+                operation: "read".to_string(),
+                error_kind: "permission_denied".to_string(),
+            }),
+        };
+        assert!(ValidatedArtifactCaptureStatusV1::from_capture(
+            &absolute_failure,
+            &["out/*.bin".to_string()]
+        )
+        .is_err());
+
+        for requirement in ["C:/Users/user/result.bin", r"\\server\share\result.bin"] {
+            assert!(ValidatedArtifactCaptureStatusV1::from_capture(
+                &ArtifactCaptureStatus::Complete,
+                &[requirement.to_string()]
+            )
+            .is_err());
+        }
+
+        #[cfg(unix)]
+        ValidatedArtifactCaptureStatusV1::from_capture(
+            &ArtifactCaptureStatus::Complete,
+            &[r"a\b".to_string()],
+        )
+        .unwrap();
+
+        let mut impossible = observation(b"failed");
+        impossible.exit_code = Some(1);
+        impossible.artifact_capture = ValidatedArtifactCaptureStatusV1::Incomplete {
+            failure_kind: ValidatedArtifactCaptureFailureKindV1::Missing,
+        };
+        assert!(impossible.validate().is_err());
+
+        impossible.artifact_requirements = vec!["required.bin".to_string()];
+        impossible.exit_code = Some(0);
+        assert!(impossible.validate().is_err());
+    }
+
+    #[test]
+    fn validated_selection_receipt_rejects_tampered_decision_evidence() {
+        let mut noncanonical_duration = receipt();
+        noncanonical_duration.candidates[0].branch_elapsed_ns = "+20".to_string();
+        assert!(noncanonical_duration.validate().is_err());
+
+        let mut impossible_duration = receipt();
+        impossible_duration.candidates[0].terminal_elapsed_ns = "21".to_string();
+        assert!(impossible_duration.validate().is_err());
+
+        let mut false_eligibility = receipt();
+        false_eligibility.candidates[2].disposition = ValidatedSelectionDispositionV1::Eligible;
+        assert!(false_eligibility.validate().is_err());
+
+        let mut false_winner = receipt();
+        false_winner.selected_route_id = "reference".to_string();
+        assert!(false_winner.validate().is_err());
+
+        let mut changed_observation = receipt();
+        changed_observation.candidates[1].observation.stdout_capture =
+            OutputCapture::complete(b"tampered");
+        assert!(changed_observation.validate().is_err());
+
+        let mut rejected_reference = receipt();
+        rejected_reference.candidates[0].disposition =
+            ValidatedSelectionDispositionV1::RejectedOutput {
+                mismatch: ValidatedSelectionMismatchV1::Stdout,
+            };
+        assert!(rejected_reference.validate().is_err());
+
+        let mut one_candidate = receipt();
+        one_candidate.candidates.truncate(1);
+        one_candidate.selected_route_id = "reference".to_string();
+        assert!(one_candidate.validate().is_err());
+
+        let mut duplicate_artifact_path = receipt();
+        let observation = &mut duplicate_artifact_path.candidates[0].observation;
+        observation.artifact_requirements = vec!["dist/**".to_string()];
+        observation.artifacts = vec![
+            Artifact {
+                path: "dist/out.bin".to_string(),
+                content_hash: "11".repeat(32),
+                bytes_len: 1,
+            },
+            Artifact {
+                path: "dist/out.bin".to_string(),
+                content_hash: "22".repeat(32),
+                bytes_len: 2,
+            },
+        ];
+        assert!(observation.validate().is_err());
+
+        let mut undeclared_artifact = receipt();
+        let observation = &mut undeclared_artifact.candidates[0].observation;
+        observation.artifact_requirements = vec!["dist/**".to_string()];
+        observation.artifacts = vec![Artifact {
+            path: "other/out.bin".to_string(),
+            content_hash: "11".repeat(32),
+            bytes_len: 1,
+        }];
+        assert!(observation.validate().is_err());
+    }
+
+    #[test]
+    fn validated_selection_receipt_rejects_unknown_json_fields() {
+        let mut value = serde_json::to_value(receipt()).unwrap();
+        value["unexpected"] = serde_json::Value::Bool(true);
+        assert!(serde_json::from_value::<ValidatedSelectionReceiptV1>(value).is_err());
+
+        let mut value = serde_json::to_value(receipt()).unwrap();
+        value["candidates"][0]["unexpected"] = serde_json::Value::Bool(true);
+        assert!(serde_json::from_value::<ValidatedSelectionReceiptV1>(value).is_err());
+
+        let mut value = serde_json::to_value(receipt()).unwrap();
+        value["candidates"][0]["observation"]["stdout_capture"]["unexpected"] =
+            serde_json::Value::Bool(true);
+        assert!(serde_json::from_value::<ValidatedSelectionReceiptV1>(value).is_err());
+
+        let artifact = serde_json::json!({
+            "path": "out.bin",
+            "content_hash": "ab".repeat(32),
+            "bytes_len": 1,
+            "unexpected": true,
+        });
+        assert!(serde_json::from_value::<Artifact>(artifact).is_err());
+    }
+
+    #[test]
+    fn validated_selection_policy_spelling_is_canonical() {
+        for spelling in [
+            "benchmark_validate_and_select",
+            "benchmarkvalidateandselect",
+            "benchmark_validate",
+            "validated_benchmark",
+        ] {
+            let policy = RoutePolicy::parse_checked(spelling).unwrap();
+            assert_eq!(policy, RoutePolicy::BenchmarkValidateAndSelect);
+            assert_eq!(policy.token(), "benchmark_validate_and_select");
+        }
+        assert_eq!(
+            serde_json::to_string(&RoutePolicy::BenchmarkValidateAndSelect).unwrap(),
+            "\"BenchmarkValidateAndSelect\""
+        );
     }
 }

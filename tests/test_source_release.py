@@ -1282,6 +1282,8 @@ class SourceReleaseTests(unittest.TestCase):
             contents[path] = (PROJECT_ROOT / path).read_bytes()
         for path in release.CPU_RUNTIME_BENCHMARK_PATHS:
             contents[path] = (PROJECT_ROOT / path).read_bytes()
+        for path in release.REAL_WORLD_BENCHMARK_RELEASE_PATHS:
+            contents[path] = (PROJECT_ROOT / path).read_bytes()
         for path in release.OSTADIX_API_ROOT_MODULE_PATHS.values():
             contents.setdefault(path, "// fixture engine root module\n")
         for path in release.OSTADIX_API_RUNTIME_ASSET_PATHS:
@@ -1348,6 +1350,9 @@ class SourceReleaseTests(unittest.TestCase):
                     "scripts/ostadix_physical_evidence.py",
                     "scripts/ostadix_xorriso_reproducible.py",
                     "scripts/benchmark_hgraph_hosted.sh",
+                    "scripts/benchmark_real_world.sh",
+                    "benchmarks/real_world/timed_exec.py",
+                    "benchmarks/real_world/transcode_preview.sh",
                     "scripts/install-o-cli-wrapper.sh",
                     "scripts/smoke-execution-fabric-v1.sh",
                     "scripts/smoke-zero-config-lan-netns.sh",
@@ -1917,6 +1922,7 @@ class SourceReleaseTests(unittest.TestCase):
             )
             included.update(release.HOSTED_HGRAPH_BENCHMARK_RELEASE_PATHS)
             included.update(release.CPU_RUNTIME_BENCHMARK_PATHS)
+            included.update(release.REAL_WORLD_BENCHMARK_RELEASE_PATHS)
             included.update(release.OSTADIX_API_RELEASE_PATHS)
             included.update(release.OSTADIX_API_ROOT_MODULE_PATHS.values())
             excluded = {
@@ -1999,6 +2005,15 @@ class SourceReleaseTests(unittest.TestCase):
             self.assertEqual(modes["tests/fixtures/project_hgraph_tools/sh"], "100755")
             self.assertEqual(
                 modes["scripts/benchmark_hgraph_hosted.sh"], "100755"
+            )
+            self.assertEqual(
+                modes["scripts/benchmark_real_world.sh"], "100755"
+            )
+            self.assertEqual(
+                modes["benchmarks/real_world/transcode_preview.sh"], "100755"
+            )
+            self.assertEqual(
+                modes["benchmarks/real_world/timed_exec.py"], "100755"
             )
             checksums = archive.read(f"{prefix}/{release.CHECKSUMS_NAME}").decode()
             cargo_digest = hashlib.sha256(
@@ -2285,6 +2300,26 @@ class SourceReleaseTests(unittest.TestCase):
             r"TRANSCRIPT-2026-08-08-f216771\.log",
         ):
             self._build("missing-analyzer-bound-benchmark-evidence.zip")
+
+    def test_real_world_benchmark_is_a_required_release_closure(self) -> None:
+        self._commit()
+        self._git(
+            "rm",
+            "Olang_Mascot_little-o/little-o/qa/previews/failed.gif",
+            "benchmarks/real_world/README.md",
+            "benchmarks/real_world/video_previews.O",
+            "scripts/benchmark_real_world.sh",
+            "tests/test_benchmark_real_world.py",
+        )
+        self._git("commit", "-q", "-m", "remove real-world benchmark closure")
+
+        with self.assertRaisesRegex(
+            release.ReleaseError,
+            r"missing required path\(s\): .*failed\.gif.*README\.md.*"
+            r"video_previews\.O.*benchmark_real_world\.sh.*"
+            r"test_benchmark_real_world\.py",
+        ):
+            self._build("missing-real-world-benchmark.zip")
 
     def test_root_license_is_a_required_release_member(self) -> None:
         self._commit()

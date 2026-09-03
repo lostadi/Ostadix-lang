@@ -132,6 +132,43 @@ CPU_RUNTIME_BENCHMARK_PATHS = frozenset(
         "tests/test_benchmark_cpu_runtime.py",
     }
 )
+REAL_WORLD_BENCHMARK_INPUT_PATHS = frozenset(
+    {
+        "Olang_Mascot_little-o/little-o/references/reference-01.png",
+        "Olang_Mascot_little-o/little-o/references/canonical-base.png",
+        "assets/olang-logo.png",
+        *(
+            f"Olang_Mascot_little-o/little-o/qa/previews/{name}.gif"
+            for name in (
+                "failed",
+                "idle",
+                "jumping",
+                "review",
+                "running-left",
+                "running-right",
+                "running",
+                "waiting",
+                "waving",
+            )
+        ),
+    }
+)
+REAL_WORLD_BENCHMARK_PATHS = frozenset(
+    {
+        "benchmarks/real_world/README.md",
+        "benchmarks/real_world/asset_pipeline.O",
+        "benchmarks/real_world/ci_shards.O",
+        "benchmarks/real_world/timed_exec.py",
+        "benchmarks/real_world/transcode_preview.sh",
+        "benchmarks/real_world/video_previews.O",
+    }
+) | REAL_WORLD_BENCHMARK_INPUT_PATHS
+REAL_WORLD_BENCHMARK_RELEASE_PATHS = REAL_WORLD_BENCHMARK_PATHS | frozenset(
+    {
+        "scripts/benchmark_real_world.sh",
+        "tests/test_benchmark_real_world.py",
+    }
+)
 OSTADIX_API_RUNTIME_ASSET_PATHS = frozenset(
     {
         f"{OSTADIX_API_ROOT}/backends/{name}"
@@ -247,7 +284,12 @@ ALLOWED_EXACT_PATHS = frozenset(
         "okernel-multikernel/boot-and-test.sh",
         "okernel-multikernel/MULTIKERNEL_PERSONALITY_PROPOSAL.md",
     }
-) | HOSTED_HGRAPH_BENCHMARK_PATHS | CPU_RUNTIME_BENCHMARK_PATHS | OSTADIX_API_RELEASE_PATHS
+) | (
+    HOSTED_HGRAPH_BENCHMARK_PATHS
+    | CPU_RUNTIME_BENCHMARK_PATHS
+    | REAL_WORLD_BENCHMARK_PATHS
+    | OSTADIX_API_RELEASE_PATHS
+)
 
 ALLOWED_TOP_LEVEL_DIRECTORIES = frozenset(
     {
@@ -727,8 +769,11 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "tests/world_receipt.rs",
         "tests/world_value.rs",
     }
-) | HOSTED_HGRAPH_BENCHMARK_RELEASE_PATHS | OSTADIX_API_RELEASE_PATHS | frozenset(
-    OSTADIX_API_ROOT_MODULE_PATHS.values()
+) | (
+    HOSTED_HGRAPH_BENCHMARK_RELEASE_PATHS
+    | REAL_WORLD_BENCHMARK_RELEASE_PATHS
+    | OSTADIX_API_RELEASE_PATHS
+    | frozenset(OSTADIX_API_ROOT_MODULE_PATHS.values())
 )
 VALID_GIT_MODES = frozenset({"100644", "100755"})
 SAFE_PREFIX = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")

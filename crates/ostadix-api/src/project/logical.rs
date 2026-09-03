@@ -115,6 +115,7 @@ pub enum LogicalRoutePolicyV1 {
     All,
     VerifyEquivalent,
     BenchmarkAndSelect,
+    BenchmarkValidateAndSelect,
 }
 
 impl From<&RoutePolicy> for LogicalRoutePolicyV1 {
@@ -131,6 +132,7 @@ impl From<&RoutePolicy> for LogicalRoutePolicyV1 {
             RoutePolicy::All => Self::All,
             RoutePolicy::VerifyEquivalent => Self::VerifyEquivalent,
             RoutePolicy::BenchmarkAndSelect => Self::BenchmarkAndSelect,
+            RoutePolicy::BenchmarkValidateAndSelect => Self::BenchmarkValidateAndSelect,
         }
     }
 }
@@ -147,6 +149,7 @@ impl LogicalRoutePolicyV1 {
             Self::All => RoutePolicy::All,
             Self::VerifyEquivalent => RoutePolicy::VerifyEquivalent,
             Self::BenchmarkAndSelect => RoutePolicy::BenchmarkAndSelect,
+            Self::BenchmarkValidateAndSelect => RoutePolicy::BenchmarkValidateAndSelect,
         }
     }
 }
@@ -1217,15 +1220,19 @@ impl LogicalHGraphV1 {
                 "selection must be the terminal operation and sole logical root",
             ));
         }
-        if matches!(self.source.policy, LogicalRoutePolicyV1::VerifyEquivalent) {
+        if matches!(
+            self.source.policy,
+            LogicalRoutePolicyV1::VerifyEquivalent
+                | LogicalRoutePolicyV1::BenchmarkValidateAndSelect
+        ) {
             if comparisons != 1 {
                 return Err(invalid(
-                    "verify-equivalent policy requires one comparison operation",
+                    "output-validating policy requires one comparison operation",
                 ));
             }
         } else if comparisons != 0 {
             return Err(invalid(
-                "comparison operations are exclusive to verify-equivalent policy",
+                "comparison operations are exclusive to output-validating policies",
             ));
         }
         self.to_project_plan()?.validate().map_err(|error| {

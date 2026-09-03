@@ -16,12 +16,12 @@ use o_lang::project::materialize::{materialize, materialize_isolated};
 use o_lang::project::model::{
     ArtifactCaptureFailure, ArtifactCaptureStatus, FileRole, ProjectBundle, ProjectFile,
     ResultCodec, RouteFailureContinuation, RoutePolicy, RouteProvenance, RouteSet, RouteSpec,
-    BUNDLE_FORMAT_VERSION,
+    ValidatedSelectionDispositionV1, ValidatedSelectionMismatchV1, BUNDLE_FORMAT_VERSION,
 };
 use o_lang::project::runtime::{
     glob_match, is_cancellation_error, is_timeout_error, run_route, run_route_cancellable,
-    run_selection, ArtifactCaptureError, EnvironmentPolicy, GuardBehavior, ProcessTreePolicy,
-    RouteExecutionError, RunOptions,
+    run_selection, run_selection_observed, ArtifactCaptureError, EnvironmentPolicy, GuardBehavior,
+    ProcessTreePolicy, RouteExecutionError, RunOptions,
 };
 use o_lang::project::{assemble, discover, RouteGuard};
 use sha2::{Digest, Sha256};
@@ -948,6 +948,348 @@ fn project_runtime_benchmark_fails_when_nothing_succeeds() {
         err.to_string().contains("no alternative succeeded"),
         "got: {err}"
     );
+}
+
+#[test]
+fn project_runtime_validated_benchmark_selects_fastest_equivalent_candidate() {
+    let reference = shell_route("reference", "sleep 0.4; printf same");
+    let fastest = shell_route("fastest", "printf same");
+    let medium = shell_route("medium", "sleep 0.2; printf same");
+    let mut bundle = bundle_with_routes(vec![reference, fastest, medium]);
+    bundle.route_sets.push(RouteSet {
+        provides: "main".into(),
+        alternatives: vec!["reference".into(), "fastest".into(), "medium".into()],
+        policy: RoutePolicy::BenchmarkValidateAndSelect,
+    });
+
+    let execution =
+        run_selection_observed(&bundle, Some("main"), None, &RunOptions::default()).unwrap();
+    assert_eq!(execution.results.last().unwrap().route_id, "fastest");
+    let receipt = execution
+        .validated_selection_receipt
+        .expect("validated benchmark must emit a receipt");
+    receipt.validate().unwrap();
+    assert_eq!(receipt.reference_route_id, "reference");
+    assert_eq!(receipt.selected_route_id, "fastest");
+    assert_eq!(
+        receipt
+            .candidates
+            .iter()
+            .map(|candidate| candidate.route_id.as_str())
+            .collect::<Vec<_>>(),
+        ["reference", "fastest", "medium"]
+    );
+    assert!(receipt
+        .candidates
+        .iter()
+        .all(|candidate| candidate.disposition.is_eligible()));
+    assert_eq!(receipt.sha256().unwrap().len(), 64);
+}
+
+#[test]
+fn project_runtime_validated_benchmark_rejects_faster_divergent_output() {
+    let reference = shell_route("reference", "sleep 0.4; printf same");
+    let safe = shell_route("safe", "sleep 0.2; printf same");
+    let divergent = shell_route("divergent", "printf wrong");
+    let mut bundle = bundle_with_routes(vec![reference, safe, divergent]);
+    bundle.route_sets.push(RouteSet {
+        provides: "main".into(),
+        alternatives: vec!["reference".into(), "safe".into(), "divergent".into()],
+        policy: RoutePolicy::BenchmarkValidateAndSelect,
+    });
+
+    let execution =
+        run_selection_observed(&bundle, Some("main"), None, &RunOptions::default()).unwrap();
+    assert_ne!(execution.results.last().unwrap().route_id, "divergent");
+    let receipt = execution.validated_selection_receipt.unwrap();
+    assert_ne!(receipt.selected_route_id, "divergent");
+    assert!(matches!(
+        receipt.candidates[2].disposition,
+        ValidatedSelectionDispositionV1::RejectedOutput {
+            mismatch: ValidatedSelectionMismatchV1::Stdout
+        }
+    ));
+}
+
+#[test]
+fn project_runtime_validated_benchmark_falls_back_to_reference() {
+    let reference = shell_route("reference", "sleep 0.2; printf canonical");
+    let bad_a = shell_route("bad-a", "printf other-a");
+    let bad_b = shell_route("bad-b", "printf other-b");
+    let mut bundle = bundle_with_routes(vec![reference, bad_a, bad_b]);
+    bundle.route_sets.push(RouteSet {
+        provides: "main".into(),
+        alternatives: vec!["reference".into(), "bad-a".into(), "bad-b".into()],
+        policy: RoutePolicy::BenchmarkValidateAndSelect,
+    });
+
+    let execution =
+        run_selection_observed(&bundle, Some("main"), None, &RunOptions::default()).unwrap();
+    assert_eq!(execution.results.last().unwrap().route_id, "reference");
+    let receipt = execution.validated_selection_receipt.unwrap();
+    assert_eq!(receipt.selected_route_id, "reference");
+    assert!(receipt.candidates[1..].iter().all(|candidate| matches!(
+        candidate.disposition,
+        ValidatedSelectionDispositionV1::RejectedOutput { .. }
+    )));
+}
+
+#[test]
+fn project_runtime_validated_benchmark_checks_declared_artifacts() {
+    let mut reference = shell_route(
+        "reference",
+        "mkdir -p dist; printf left > dist/out.bin; printf same",
+    );
+    let mut safe = shell_route(
+        "safe",
+        "mkdir -p dist; printf left > dist/out.bin; printf same",
+    );
+    let mut divergent = shell_route(
+        "divergent",
+        "mkdir -p dist; printf rght > dist/out.bin; printf same",
+    );
+    for route in [&mut reference, &mut safe, &mut divergent] {
+        route.outputs = vec!["dist/out.bin".into()];
+    }
+    let mut bundle = bundle_with_routes(vec![reference, safe, divergent]);
+    bundle.route_sets.push(RouteSet {
+        provides: "main".into(),
+        alternatives: vec!["reference".into(), "safe".into(), "divergent".into()],
+        policy: RoutePolicy::BenchmarkValidateAndSelect,
+    });
+
+    let execution =
+        run_selection_observed(&bundle, Some("main"), None, &RunOptions::default()).unwrap();
+    assert_ne!(execution.results.last().unwrap().route_id, "divergent");
+    let receipt = execution.validated_selection_receipt.unwrap();
+    assert!(matches!(
+        receipt.candidates[2].disposition,
+        ValidatedSelectionDispositionV1::RejectedOutput {
+            mismatch: ValidatedSelectionMismatchV1::ArtifactManifest
+        }
+    ));
+}
+
+#[test]
+fn project_runtime_validated_benchmark_requires_successful_reference() {
+    let reference = shell_route("reference", "exit 7");
+    let candidate = shell_route("candidate", "printf same");
+    let mut bundle = bundle_with_routes(vec![reference, candidate]);
+    bundle.route_sets.push(RouteSet {
+        provides: "main".into(),
+        alternatives: vec!["reference".into(), "candidate".into()],
+        policy: RoutePolicy::BenchmarkValidateAndSelect,
+    });
+
+    let error =
+        run_selection_observed(&bundle, Some("main"), None, &RunOptions::default()).unwrap_err();
+    let message = format!("{error:#}");
+    assert!(message.contains("reference route `reference` must succeed"));
+    assert!(message.contains("Some(7)"));
+}
+
+#[test]
+fn project_runtime_validated_benchmark_rejects_failed_candidate() {
+    let reference = shell_route("reference", "printf same");
+    let failed = shell_route("failed", "exit 7");
+    let matching = shell_route("matching", "printf same");
+    let mut bundle = bundle_with_routes(vec![reference, failed, matching]);
+    bundle.route_sets.push(RouteSet {
+        provides: "main".into(),
+        alternatives: vec!["reference".into(), "failed".into(), "matching".into()],
+        policy: RoutePolicy::BenchmarkValidateAndSelect,
+    });
+
+    let execution =
+        run_selection_observed(&bundle, Some("main"), None, &RunOptions::default()).unwrap();
+    assert_ne!(execution.results.last().unwrap().route_id, "failed");
+    let receipt = execution.validated_selection_receipt.unwrap();
+    assert!(matches!(
+        receipt.candidates[1].disposition,
+        ValidatedSelectionDispositionV1::RejectedExecution { exit_code: Some(7) }
+    ));
+}
+
+#[test]
+fn project_runtime_validated_benchmark_classifies_json_mismatch() {
+    let mut reference = shell_route("reference", "printf '{\"x\":1,\"y\":2}'");
+    reference.result_codec = ResultCodec::Json;
+    let mut matching = shell_route("matching", "printf '{\"y\":2,\"x\":1}'");
+    matching.result_codec = ResultCodec::Json;
+    let mut divergent = shell_route("divergent", "printf '{\"x\":2,\"y\":2}'");
+    divergent.result_codec = ResultCodec::Json;
+    let mut bundle = bundle_with_routes(vec![reference, matching, divergent]);
+    bundle.route_sets.push(RouteSet {
+        provides: "main".into(),
+        alternatives: vec!["reference".into(), "matching".into(), "divergent".into()],
+        policy: RoutePolicy::BenchmarkValidateAndSelect,
+    });
+
+    let execution =
+        run_selection_observed(&bundle, Some("main"), None, &RunOptions::default()).unwrap();
+    assert_ne!(execution.results.last().unwrap().route_id, "divergent");
+    let receipt = execution.validated_selection_receipt.unwrap();
+    assert_eq!(
+        receipt.candidates[0].declared_output_sha256,
+        receipt.candidates[1].declared_output_sha256
+    );
+    assert!(matches!(
+        receipt.candidates[2].disposition,
+        ValidatedSelectionDispositionV1::RejectedOutput {
+            mismatch: ValidatedSelectionMismatchV1::JsonValue
+        }
+    ));
+}
+
+#[test]
+fn project_runtime_validated_benchmark_compares_binary_stdout_exactly() {
+    let mut reference = shell_route("reference", "printf '\\200'");
+    reference.result_codec = ResultCodec::Bytes;
+    let mut matching = shell_route("matching", "printf '\\200'");
+    matching.result_codec = ResultCodec::Bytes;
+    let mut divergent = shell_route("divergent", "printf '\\201'");
+    divergent.result_codec = ResultCodec::Bytes;
+    let mut bundle = bundle_with_routes(vec![reference, matching, divergent]);
+    bundle.route_sets.push(RouteSet {
+        provides: "main".into(),
+        alternatives: vec!["reference".into(), "matching".into(), "divergent".into()],
+        policy: RoutePolicy::BenchmarkValidateAndSelect,
+    });
+
+    let execution =
+        run_selection_observed(&bundle, Some("main"), None, &RunOptions::default()).unwrap();
+    assert_ne!(execution.results.last().unwrap().route_id, "divergent");
+    let receipt = execution.validated_selection_receipt.unwrap();
+    assert!(matches!(
+        receipt.candidates[2].disposition,
+        ValidatedSelectionDispositionV1::RejectedOutput {
+            mismatch: ValidatedSelectionMismatchV1::Stdout
+        }
+    ));
+}
+
+#[test]
+fn project_runtime_validated_benchmark_rejects_codec_mismatch() {
+    let reference = shell_route("reference", "printf '{\"x\":1}'");
+    let matching = shell_route("matching", "printf '{\"x\":1}'");
+    let mut wrong_codec = shell_route("wrong-codec", "printf '{\"x\":1}'");
+    wrong_codec.result_codec = ResultCodec::Json;
+    let mut bundle = bundle_with_routes(vec![reference, matching, wrong_codec]);
+    bundle.route_sets.push(RouteSet {
+        provides: "main".into(),
+        alternatives: vec!["reference".into(), "matching".into(), "wrong-codec".into()],
+        policy: RoutePolicy::BenchmarkValidateAndSelect,
+    });
+
+    let execution =
+        run_selection_observed(&bundle, Some("main"), None, &RunOptions::default()).unwrap();
+    assert_ne!(execution.results.last().unwrap().route_id, "wrong-codec");
+    let receipt = execution.validated_selection_receipt.unwrap();
+    assert!(matches!(
+        receipt.candidates[2].disposition,
+        ValidatedSelectionDispositionV1::RejectedOutput {
+            mismatch: ValidatedSelectionMismatchV1::ResultCodec
+        }
+    ));
+}
+
+#[test]
+fn project_runtime_validated_benchmark_rejects_invalid_json_reference() {
+    let mut reference = shell_route("reference", "printf not-json");
+    reference.result_codec = ResultCodec::Json;
+    let mut candidate = shell_route("candidate", "printf '{\"ok\":true}'");
+    candidate.result_codec = ResultCodec::Json;
+    let mut bundle = bundle_with_routes(vec![reference, candidate]);
+    bundle.route_sets.push(RouteSet {
+        provides: "main".into(),
+        alternatives: vec!["reference".into(), "candidate".into()],
+        policy: RoutePolicy::BenchmarkValidateAndSelect,
+    });
+
+    let error =
+        run_selection_observed(&bundle, Some("main"), None, &RunOptions::default()).unwrap_err();
+    assert!(format!("{error:#}").contains("did not produce valid, completely captured JSON"));
+}
+
+#[test]
+fn project_runtime_validated_benchmark_times_complete_candidate_branch() {
+    let prerequisite = shell_route("slow-prep", "sleep 0.4");
+    let mut reference = shell_route("reference", "printf same");
+    reference.prerequisites = vec!["slow-prep".into()];
+    let candidate = shell_route("candidate", "sleep 0.1; printf same");
+    let mut bundle = bundle_with_routes(vec![prerequisite, reference, candidate]);
+    bundle.route_sets.push(RouteSet {
+        provides: "main".into(),
+        alternatives: vec!["reference".into(), "candidate".into()],
+        policy: RoutePolicy::BenchmarkValidateAndSelect,
+    });
+
+    let execution =
+        run_selection_observed(&bundle, Some("main"), None, &RunOptions::default()).unwrap();
+    let reference_result = execution
+        .results
+        .iter()
+        .find(|result| result.route_id == "reference")
+        .unwrap();
+    let candidate_result = execution
+        .results
+        .iter()
+        .find(|result| result.route_id == "candidate")
+        .unwrap();
+    assert!(
+        reference_result.duration_ns < candidate_result.duration_ns,
+        "terminal-command timing should favor the instant reference command"
+    );
+    assert_eq!(execution.results.last().unwrap().route_id, "candidate");
+    let receipt = execution.validated_selection_receipt.unwrap();
+    let reference_branch = receipt.candidates[0]
+        .branch_elapsed_ns
+        .parse::<u128>()
+        .unwrap();
+    let candidate_branch = receipt.candidates[1]
+        .branch_elapsed_ns
+        .parse::<u128>()
+        .unwrap();
+    assert!(reference_branch > candidate_branch);
+}
+
+#[test]
+fn project_runtime_validated_benchmark_requires_a_real_comparison() {
+    let only = shell_route("only", "printf same");
+    let bundle = bundle_with_routes(vec![only]);
+    let error = run_selection_observed(
+        &bundle,
+        Some("only"),
+        Some(RoutePolicy::BenchmarkValidateAndSelect),
+        &RunOptions::default(),
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("requires at least two declared alternatives"));
+}
+
+#[test]
+fn project_runtime_validated_benchmark_rejects_nonportable_outputs_before_launch() {
+    let external = tempfile::tempdir().unwrap();
+    let marker = external.path().join("must-not-launch");
+    let mut reference = shell_route("reference", "printf launched > \"$MARKER\"");
+    let mut candidate = shell_route("candidate", "printf launched > \"$MARKER\"");
+    for route in [&mut reference, &mut candidate] {
+        route.outputs = vec!["C:/host/output.bin".to_string()];
+        route
+            .environment
+            .insert("MARKER".to_string(), marker.to_string_lossy().into_owned());
+    }
+    let mut bundle = bundle_with_routes(vec![reference, candidate]);
+    bundle.route_sets.push(RouteSet {
+        provides: "main".into(),
+        alternatives: vec!["reference".into(), "candidate".into()],
+        policy: RoutePolicy::BenchmarkValidateAndSelect,
+    });
+
+    let error =
+        run_selection_observed(&bundle, Some("main"), None, &RunOptions::default()).unwrap_err();
+    assert!(format!("{error:#}").contains("nonportable artifact requirements"));
+    assert!(!marker.exists(), "route launched before receipt preflight");
 }
 
 #[test]
