@@ -1,11 +1,12 @@
 //! Compiled intent-oriented front door for the repository-owned `o` command.
 //!
 //! The Bash dispatcher retains legacy command routing and evaluator fallthrough,
-//! but sends `run`, `plan`, `explain`, and `inspect` here so their grammar is
-//! defined once. Execution and planning call the library intent API directly;
+//! but sends `run`, `routes`, `optimize`, `plan`, `explain`, `inspect`, `object`,
+//! and `operation` here so their grammar is defined once. Execution and
+//! planning call the library intent API directly;
 //! this binary never shells out to `O`, `olangc`, `o-link`, or `o-node`.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 #[cfg(test)]
 use clap::CommandFactory;
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -15,8 +16,11 @@ use o_lang::boot_objects::{
 };
 use o_lang::computation::OComputationBuilderV1;
 use o_lang::computation_core::{
-    artifact_id_for_bytes, ComputationLineageId, ComputationTokenV1, DerivationInputV1,
-    DerivationRefV1, DerivationRelationV1, FacetIdV1, FacetKindV1, FacetRefV1, TransformIdentityV1,
+    artifact_id_for_bytes, verify_realization_set_v1, ComputationLineageId, ComputationTokenV1,
+    DerivationInputV1, DerivationRefV1, DerivationRelationV1, FacetIdV1, FacetKindV1, FacetRefV1,
+    OComputationErrorV1, OperationContractV1, OperationInterfaceV1, RealizationDescriptorV1,
+    RealizationSetV1, TransformIdentityV1, MAX_OPERATION_SEMANTIC_RECORD_BYTES_V1,
+    MAX_REALIZATION_SET_MEMBERS_V1,
 };
 use o_lang::evidence::{
     source_sha256, ExecutionIntentV1, ADMISSION_SCHEMA_V6, SCHEDULE_EXPLANATION_SCHEMA_V2,
@@ -57,14 +61,23 @@ use std::io::{self, IsTerminal, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd};
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const OPTIMIZE_SUMMARY_SCHEMA_V1: &str = "ostadix.optimize-summary/v1";
 const ROUTE_CATALOG_SCHEMA_V1: &str = "ostadix.route-catalog/v1";
-const OPERATIONAL_COMMANDS: &str = "Run highlights:\n  o run FILE.O --parallel auto          local HGraph workers only\n  o run PROJECT --parallel auto         mesh prefer with safe local fallback\n  o run PROJECT --mesh=required         authenticated remote placement required\n  o routes PROJECT                      inspect routes without executing them\n  o optimize PROJECT --route ROUTE_SET  measure and validate every alternative\n  o run PROJECT --selection-run RUN_ID  execute one exact validated winner\n  Mesh controls include --mesh-retries, --mesh-local-fallback, and --closed-registry.\n\nBoot-object commands:\n  o object root|list|stat|get|verify     typed read-only boot CAS\n\nOperational commands retained by the repository dispatcher:\n  node start|stop|status|restart|pair|list|use|profile|doctor|run|session ...\n  node-host <command> ...\n  registry <command> ...\n  info <command> ...\n  live <command> ...\n  receipt [ogit arguments]\n  kernel <command>\n  why FILE.O P<N> [olangc options]\n\nUnknown command forms retain historical evaluator behavior.";
+const OPERATION_INSPECTION_SCHEMA_V1: &str = "ostadix.operation-inspection/v1";
+const OPERATION_VERIFICATION_SCHEMA_V1: &str = "ostadix.operation-verification/v1";
+const MAX_OPERATION_RECORD_FILE_BYTES_V1: u64 = MAX_OPERATION_SEMANTIC_RECORD_BYTES_V1 as u64;
+const MAX_OPERATION_VALIDATION_DIAGNOSTIC_BYTES_V1: usize = 16 * 1024;
+const OPERATION_DIAGNOSTIC_TRUNCATION_SUFFIX: &str = "...[truncated]";
+/// Defense-in-depth ceiling for all raw records supplied to one verification.
+/// This permits sixteen maximum-sized semantic records while bounding aggregate
+/// metadata walks, reads, and retained decoded values independently of ARG_MAX.
+const MAX_OPERATION_VERIFICATION_TOTAL_BYTES_V1: u64 = 64 * 1024 * 1024;
+const OPERATIONAL_COMMANDS: &str = "Run highlights:\n  o run FILE.O --parallel auto          local HGraph workers only\n  o run PROJECT --parallel auto         mesh prefer with safe local fallback\n  o run PROJECT --mesh=required         authenticated remote placement required\n  o routes PROJECT                      inspect routes without executing them\n  o optimize PROJECT --route ROUTE_SET  measure and validate every alternative\n  o run PROJECT --selection-run RUN_ID  execute one exact validated winner\n  Mesh controls include --mesh-retries, --mesh-local-fallback, and --closed-registry.\n\nSemantic operation records:\n  o operation inspect KIND FILE         validate and inspect one inert record\n  o operation verify --contract FILE --interface FILE --descriptor FILE --set FILE\n                                        check exact referential consistency only\n\nBoot-object commands:\n  o object root|list|stat|get|verify     typed read-only boot CAS\n\nOperational commands retained by the repository dispatcher:\n  node start|stop|status|restart|pair|list|use|profile|doctor|run|session ...\n  node-host <command> ...\n  registry <command> ...\n  info <command> ...\n  live <command> ...\n  receipt [ogit arguments]\n  kernel <command>\n  why FILE.O P<N> [olangc options]\n\nUnknown command forms retain historical evaluator behavior.";
 #[derive(Debug, Parser)]
 #[command(
     name = "o",
@@ -107,6 +120,12 @@ enum IntentCommand {
     Computation(ComputationArgs),
     /// Inspect and read the typed, authority-free boot-object store.
     Object(ObjectArgs),
+    /// Inspect or cross-check inert semantic operation and realization records.
+    #[command(
+        long_about = "Inspect canonical semantic operation records or check their exact referential consistency. These commands do not resolve referenced artifacts, prove behavioral equivalence, plan, select, place, execute, recover, observe World state, or grant authority.",
+        after_long_help = "KIND is one of: contract, interface, descriptor, set. Input is validated JSON when its first non-whitespace byte is `{`; every other input must be strict canonical CBOR. Record kind is never inferred from a filename or embedded schema."
+    )]
+    Operation(OperationArgs),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -660,6 +679,85 @@ struct ObjectVerifyArgs {
 }
 
 #[derive(Debug, Args)]
+struct OperationArgs {
+    #[command(subcommand)]
+    command: OperationCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum OperationCommand {
+    /// Validate and inspect one inert semantic record.
+    #[command(
+        long_about = "Validate and inspect one explicitly typed operation or realization record without resolving any referenced artifact or performing cross-record consistency checks.",
+        after_long_help = "This command does not prove behavioral equivalence, derive the record from a compiler, evaluate target eligibility or costs, plan, select, place, dispatch, recover, observe World state, or grant authority."
+    )]
+    Inspect(OperationInspectArgs),
+    /// Check the exact contract, interface, descriptor, and set references.
+    #[command(
+        long_about = "Validate the supplied records and check the exact referential closure of one realization set. Every descriptor declared by the set must be supplied exactly once, and no extra descriptor is accepted. The CLI rejects more than 64 MiB of aggregate raw record bytes before decoding.",
+        after_long_help = "A passing check means referentially consistent declarations only. It does not resolve implementation, pipeline, fidelity, cost-model, or evidence artifacts; prove behavioral equivalence; establish eligibility; choose a winner; plan, place, dispatch, recover, observe World state; or grant authority."
+    )]
+    Verify(OperationVerifyArgs),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum OperationRecordKind {
+    Contract,
+    Interface,
+    Descriptor,
+    Set,
+}
+
+impl OperationRecordKind {
+    const fn token(self) -> &'static str {
+        match self {
+            Self::Contract => "contract",
+            Self::Interface => "interface",
+            Self::Descriptor => "descriptor",
+            Self::Set => "set",
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+struct OperationInspectArgs {
+    /// Explicit record kind: contract, interface, descriptor, or set.
+    #[arg(value_enum, value_name = "KIND")]
+    kind: OperationRecordKind,
+
+    /// Validated JSON or strict canonical-CBOR record.
+    #[arg(value_name = "FILE")]
+    file: PathBuf,
+
+    /// Emit one versioned machine-readable inspection envelope.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct OperationVerifyArgs {
+    /// OperationContractV1 JSON or canonical CBOR.
+    #[arg(long, value_name = "FILE")]
+    contract: PathBuf,
+
+    /// OperationInterfaceV1 JSON or canonical CBOR.
+    #[arg(long, value_name = "FILE")]
+    interface: PathBuf,
+
+    /// RealizationDescriptorV1 JSON or canonical CBOR; repeat for exact set closure.
+    #[arg(long = "descriptor", value_name = "FILE", required = true)]
+    descriptors: Vec<PathBuf>,
+
+    /// RealizationSetV1 JSON or canonical CBOR.
+    #[arg(long, value_name = "FILE")]
+    set: PathBuf,
+
+    /// Emit one versioned machine-readable verification envelope.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
 struct ComputationArgs {
     /// Exact .O source bytes described by the execution intent.
     #[arg(long, value_name = "PATH")]
@@ -743,6 +841,13 @@ fn main() {
                 eprint!("{error}");
                 std::process::exit(error.exit_code());
             }
+            if !informational && invocation_is_operation(&arguments) {
+                eprintln!(
+                    "{}",
+                    terminal_text_fragment(error.to_string().trim_end_matches('\n'))
+                );
+                std::process::exit(error.exit_code());
+            }
             error.exit();
         }
     };
@@ -771,6 +876,10 @@ fn invocation_json_presentation(arguments: &[OsString]) -> Option<RunPresentatio
 fn invocation_requests_route_catalog_json(arguments: &[OsString]) -> bool {
     arguments.get(1).is_some_and(|value| value == "routes")
         && arguments.iter().skip(2).any(|value| value == "--json")
+}
+
+fn invocation_is_operation(arguments: &[OsString]) -> bool {
+    arguments.get(1).is_some_and(|value| value == "operation")
 }
 
 fn emit_preflight_failure_summary(detail: &str, presentation: RunPresentation) -> Result<()> {
@@ -824,6 +933,7 @@ fn dispatch(command: IntentCommand) -> Result<i32> {
         IntentCommand::Inspect(args) => inspect_pending(&args),
         IntentCommand::Computation(args) => computation_artifact(&args),
         IntentCommand::Object(args) => object_command(&args),
+        IntentCommand::Operation(args) => operation_command(&args),
     }
 }
 
@@ -1701,6 +1811,640 @@ fn object_verify(store: &BootObjectStore, args: &ObjectVerifyArgs) -> Result<i32
         println!("stored_bytes={}", report.stored_bytes);
     }
     Ok(0)
+}
+
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum OperationInputEncodingV1 {
+    ValidatedJson,
+    CanonicalCbor,
+}
+
+impl OperationInputEncodingV1 {
+    const fn token(self) -> &'static str {
+        match self {
+            Self::ValidatedJson => "validated_json",
+            Self::CanonicalCbor => "canonical_cbor",
+        }
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct OperationNonclaimsV1 {
+    behavioral_equivalence: &'static str,
+    compiler_derivation: &'static str,
+    referenced_artifacts: &'static str,
+    validation_evidence: &'static str,
+    target_eligibility: &'static str,
+    cost_evaluation: &'static str,
+    planning: &'static str,
+    selection: &'static str,
+    placement: &'static str,
+    dispatch: &'static str,
+    recovery: &'static str,
+    world_state: &'static str,
+    authority: &'static str,
+}
+
+fn operation_nonclaims() -> OperationNonclaimsV1 {
+    OperationNonclaimsV1 {
+        behavioral_equivalence: "not_proven",
+        compiler_derivation: "not_claimed",
+        referenced_artifacts: "not_resolved",
+        validation_evidence: "not_verified",
+        target_eligibility: "not_evaluated",
+        cost_evaluation: "not_evaluated",
+        planning: "not_performed",
+        selection: "not_performed",
+        placement: "not_performed",
+        dispatch: "not_run",
+        recovery: "not_performed",
+        world_state: "not_observed",
+        authority: "none",
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct OperationInspectionV1 {
+    schema: &'static str,
+    status: &'static str,
+    kind: &'static str,
+    input_encoding: OperationInputEncodingV1,
+    record_schema: String,
+    id: String,
+    display_id: String,
+    record: serde_json::Value,
+    declared_interface_id: Option<String>,
+    declared_contract_id: Option<String>,
+    declared_descriptor_ids: Option<Vec<String>>,
+    referential_consistency: &'static str,
+    nonclaims: OperationNonclaimsV1,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct OperationVerificationInputEncodingsV1 {
+    contract: OperationInputEncodingV1,
+    interface: OperationInputEncodingV1,
+    set: OperationInputEncodingV1,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct VerifiedOperationDescriptorV1 {
+    id: String,
+    display_id: String,
+    input_encoding: OperationInputEncodingV1,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct OperationVerificationV1 {
+    schema: &'static str,
+    status: &'static str,
+    record_validation: &'static str,
+    referential_consistency: &'static str,
+    exact_descriptor_closure: &'static str,
+    contract_id: String,
+    contract_display_id: String,
+    interface_id: String,
+    interface_display_id: String,
+    descriptors: Vec<VerifiedOperationDescriptorV1>,
+    set_id: String,
+    set_display_id: String,
+    input_encodings: OperationVerificationInputEncodingsV1,
+    nonclaims: OperationNonclaimsV1,
+}
+
+enum DecodedOperationRecord {
+    Contract(OperationContractV1),
+    Interface(OperationInterfaceV1),
+    Descriptor(RealizationDescriptorV1),
+    Set(RealizationSetV1),
+}
+
+fn operation_command(args: &OperationArgs) -> Result<i32> {
+    match &args.command {
+        OperationCommand::Inspect(command) => operation_inspect(command),
+        OperationCommand::Verify(command) => operation_verify(command),
+    }
+}
+
+fn operation_inspect(args: &OperationInspectArgs) -> Result<i32> {
+    let (record, input_encoding) = decode_operation_record(args.kind, &args.file)?;
+    let inspection = operation_inspection(record, input_encoding)?;
+    if args.json {
+        println!("{}", serde_json::to_string(&inspection)?);
+    } else {
+        println!("Ostadix semantic operation record");
+        println!("schema={}", inspection.schema);
+        println!("status={}", inspection.status);
+        println!("kind={}", inspection.kind);
+        println!("input_encoding={}", inspection.input_encoding.token());
+        println!(
+            "record_schema={}",
+            quoted_terminal_text(&inspection.record_schema)
+        );
+        println!("id={}", terminal_text_fragment(&inspection.display_id));
+        if let Some(interface_id) = &inspection.declared_interface_id {
+            println!(
+                "declared_interface_id={}",
+                terminal_text_fragment(interface_id)
+            );
+        }
+        if let Some(contract_id) = &inspection.declared_contract_id {
+            println!(
+                "declared_contract_id={}",
+                terminal_text_fragment(contract_id)
+            );
+        }
+        if let Some(descriptor_ids) = &inspection.declared_descriptor_ids {
+            for descriptor_id in descriptor_ids {
+                println!(
+                    "declared_descriptor_id={}",
+                    terminal_text_fragment(descriptor_id)
+                );
+            }
+        }
+        println!(
+            "record_json={}",
+            terminal_text_fragment(&serde_json::to_string(&inspection.record)?)
+        );
+        println!(
+            "referential_consistency={}",
+            inspection.referential_consistency
+        );
+        emit_operation_nonclaims_human(&inspection.nonclaims);
+    }
+    Ok(0)
+}
+
+fn operation_inspection(
+    record: DecodedOperationRecord,
+    input_encoding: OperationInputEncodingV1,
+) -> Result<OperationInspectionV1> {
+    let (
+        kind,
+        record_schema,
+        id,
+        display_id,
+        record,
+        declared_interface_id,
+        declared_contract_id,
+        declared_descriptor_ids,
+    ) = match record {
+        DecodedOperationRecord::Contract(record) => {
+            let id = record.id().map_err(operation_validation_error)?;
+            (
+                OperationRecordKind::Contract.token(),
+                record.schema.clone(),
+                serialized_operation_id(&id)?,
+                id.to_string(),
+                serde_json::to_value(&record)?,
+                None,
+                None,
+                None,
+            )
+        }
+        DecodedOperationRecord::Interface(record) => {
+            let id = record.id().map_err(operation_validation_error)?;
+            let declared_contract_id = serialized_operation_id(&record.contract)?;
+            (
+                OperationRecordKind::Interface.token(),
+                record.schema.clone(),
+                serialized_operation_id(&id)?,
+                id.to_string(),
+                serde_json::to_value(&record)?,
+                None,
+                Some(declared_contract_id),
+                None,
+            )
+        }
+        DecodedOperationRecord::Descriptor(record) => {
+            let id = record.id().map_err(operation_validation_error)?;
+            let declared_interface_id = serialized_operation_id(&record.interface)?;
+            let declared_contract_id = serialized_operation_id(&record.contract)?;
+            (
+                OperationRecordKind::Descriptor.token(),
+                record.schema.clone(),
+                serialized_operation_id(&id)?,
+                id.to_string(),
+                serde_json::to_value(&record)?,
+                Some(declared_interface_id),
+                Some(declared_contract_id),
+                None,
+            )
+        }
+        DecodedOperationRecord::Set(record) => {
+            let id = record.id().map_err(operation_validation_error)?;
+            let declared_interface_id = serialized_operation_id(&record.interface)?;
+            let declared_contract_id = serialized_operation_id(&record.contract)?;
+            let declared_descriptor_ids = record
+                .realizations
+                .iter()
+                .map(serialized_operation_id)
+                .collect::<Result<Vec<_>>>()?;
+            (
+                OperationRecordKind::Set.token(),
+                record.schema.clone(),
+                serialized_operation_id(&id)?,
+                id.to_string(),
+                serde_json::to_value(&record)?,
+                Some(declared_interface_id),
+                Some(declared_contract_id),
+                Some(declared_descriptor_ids),
+            )
+        }
+    };
+    Ok(OperationInspectionV1 {
+        schema: OPERATION_INSPECTION_SCHEMA_V1,
+        status: "valid_record",
+        kind,
+        input_encoding,
+        record_schema,
+        id,
+        display_id,
+        record,
+        declared_interface_id,
+        declared_contract_id,
+        declared_descriptor_ids,
+        referential_consistency: "not_checked",
+        nonclaims: operation_nonclaims(),
+    })
+}
+
+fn operation_verify(args: &OperationVerifyArgs) -> Result<i32> {
+    ensure!(
+        args.descriptors.len() <= MAX_REALIZATION_SET_MEMBERS_V1,
+        "descriptor argument count {} exceeds {MAX_REALIZATION_SET_MEMBERS_V1}",
+        args.descriptors.len()
+    );
+    preflight_operation_verification_inputs(args)?;
+    let mut read_budget = OperationVerificationReadBudgetV1::default();
+    let (contract, contract_encoding) =
+        decode_operation_contract(&args.contract, Some(&mut read_budget))?;
+    let (interface, interface_encoding) =
+        decode_operation_interface(&args.interface, Some(&mut read_budget))?;
+    let (realization_set, set_encoding) =
+        decode_realization_set(&args.set, Some(&mut read_budget))?;
+    ensure!(
+        args.descriptors.len() == realization_set.realizations.len(),
+        "descriptor argument count {} does not match realization set member count {}",
+        args.descriptors.len(),
+        realization_set.realizations.len()
+    );
+    let mut descriptors = Vec::with_capacity(args.descriptors.len());
+    let mut descriptor_encodings = Vec::with_capacity(args.descriptors.len());
+    for path in &args.descriptors {
+        let (descriptor, encoding) = decode_realization_descriptor(path, Some(&mut read_budget))?;
+        descriptors.push(descriptor);
+        descriptor_encodings.push(encoding);
+    }
+
+    verify_realization_set_v1(&contract, &interface, &descriptors, &realization_set)
+        .map_err(operation_validation_error)?;
+
+    let contract_id = contract.id().map_err(operation_validation_error)?;
+    let interface_id = interface.id().map_err(operation_validation_error)?;
+    let set_id = realization_set.id().map_err(operation_validation_error)?;
+    let mut verified_descriptors = descriptors
+        .iter()
+        .zip(descriptor_encodings)
+        .map(|(descriptor, input_encoding)| {
+            let id = descriptor.id().map_err(operation_validation_error)?;
+            Ok(VerifiedOperationDescriptorV1 {
+                id: serialized_operation_id(&id)?,
+                display_id: id.to_string(),
+                input_encoding,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    verified_descriptors.sort_by(|left, right| left.id.cmp(&right.id));
+    let verification = OperationVerificationV1 {
+        schema: OPERATION_VERIFICATION_SCHEMA_V1,
+        status: "referentially_consistent",
+        record_validation: "pass",
+        referential_consistency: "pass",
+        exact_descriptor_closure: "pass",
+        contract_id: serialized_operation_id(&contract_id)?,
+        contract_display_id: contract_id.to_string(),
+        interface_id: serialized_operation_id(&interface_id)?,
+        interface_display_id: interface_id.to_string(),
+        descriptors: verified_descriptors,
+        set_id: serialized_operation_id(&set_id)?,
+        set_display_id: set_id.to_string(),
+        input_encodings: OperationVerificationInputEncodingsV1 {
+            contract: contract_encoding,
+            interface: interface_encoding,
+            set: set_encoding,
+        },
+        nonclaims: operation_nonclaims(),
+    };
+
+    if args.json {
+        println!("{}", serde_json::to_string(&verification)?);
+    } else {
+        println!("Ostadix semantic operation verification");
+        println!("schema={}", verification.schema);
+        println!("status={}", verification.status);
+        println!(
+            "contract_id={}",
+            terminal_text_fragment(&verification.contract_display_id)
+        );
+        println!(
+            "interface_id={}",
+            terminal_text_fragment(&verification.interface_display_id)
+        );
+        for descriptor in &verification.descriptors {
+            println!(
+                "descriptor_id={}\tinput_encoding={}",
+                terminal_text_fragment(&descriptor.display_id),
+                descriptor.input_encoding.token()
+            );
+        }
+        println!(
+            "set_id={}",
+            terminal_text_fragment(&verification.set_display_id)
+        );
+        println!("record_validation={}", verification.record_validation);
+        println!("Referential consistency: PASS");
+        println!(
+            "exact_descriptor_closure={}",
+            verification.exact_descriptor_closure
+        );
+        emit_operation_nonclaims_human(&verification.nonclaims);
+    }
+    Ok(0)
+}
+
+fn emit_operation_nonclaims_human(nonclaims: &OperationNonclaimsV1) {
+    println!(
+        "behavioral_equivalence={}",
+        nonclaims.behavioral_equivalence
+    );
+    println!("compiler_derivation={}", nonclaims.compiler_derivation);
+    println!("referenced_artifacts={}", nonclaims.referenced_artifacts);
+    println!("validation_evidence={}", nonclaims.validation_evidence);
+    println!("target_eligibility={}", nonclaims.target_eligibility);
+    println!("cost_evaluation={}", nonclaims.cost_evaluation);
+    println!("planning={}", nonclaims.planning);
+    println!("selection={}", nonclaims.selection);
+    println!("placement={}", nonclaims.placement);
+    println!("dispatch={}", nonclaims.dispatch);
+    println!("recovery={}", nonclaims.recovery);
+    println!("world_state={}", nonclaims.world_state);
+    println!("authority={}", nonclaims.authority);
+}
+
+#[derive(Default)]
+struct OperationVerificationReadBudgetV1 {
+    actual_bytes: u64,
+}
+
+impl OperationVerificationReadBudgetV1 {
+    fn account(&mut self, bytes: usize) -> Result<()> {
+        let bytes = u64::try_from(bytes).context("operation verification byte count overflowed")?;
+        self.actual_bytes = self
+            .actual_bytes
+            .checked_add(bytes)
+            .context("operation verification aggregate byte count overflowed")?;
+        ensure!(
+            self.actual_bytes <= MAX_OPERATION_VERIFICATION_TOTAL_BYTES_V1,
+            "operation verification exceeded its {}-byte aggregate raw-input budget while reading inputs (got at least {})",
+            MAX_OPERATION_VERIFICATION_TOTAL_BYTES_V1,
+            self.actual_bytes
+        );
+        Ok(())
+    }
+}
+
+fn preflight_operation_verification_inputs(args: &OperationVerifyArgs) -> Result<()> {
+    let mut declared_bytes = 0_u64;
+    let mut account_path = |path: &Path, label: &str| -> Result<()> {
+        let metadata = checked_operation_record_metadata(path, label)?;
+        declared_bytes = declared_bytes
+            .checked_add(metadata.len())
+            .context("operation verification aggregate byte count overflowed")?;
+        ensure!(
+            declared_bytes <= MAX_OPERATION_VERIFICATION_TOTAL_BYTES_V1,
+            "operation verification inputs exceed the {}-byte aggregate raw-input budget (declared at least {})",
+            MAX_OPERATION_VERIFICATION_TOTAL_BYTES_V1,
+            declared_bytes
+        );
+        Ok(())
+    };
+
+    account_path(&args.contract, "operation contract")?;
+    account_path(&args.interface, "operation interface")?;
+    account_path(&args.set, "realization set")?;
+    for path in &args.descriptors {
+        account_path(path, "realization descriptor")?;
+    }
+    Ok(())
+}
+
+fn decode_operation_record(
+    kind: OperationRecordKind,
+    path: &Path,
+) -> Result<(DecodedOperationRecord, OperationInputEncodingV1)> {
+    match kind {
+        OperationRecordKind::Contract => decode_operation_contract(path, None)
+            .map(|(record, encoding)| (DecodedOperationRecord::Contract(record), encoding)),
+        OperationRecordKind::Interface => decode_operation_interface(path, None)
+            .map(|(record, encoding)| (DecodedOperationRecord::Interface(record), encoding)),
+        OperationRecordKind::Descriptor => decode_realization_descriptor(path, None)
+            .map(|(record, encoding)| (DecodedOperationRecord::Descriptor(record), encoding)),
+        OperationRecordKind::Set => decode_realization_set(path, None)
+            .map(|(record, encoding)| (DecodedOperationRecord::Set(record), encoding)),
+    }
+}
+
+fn decode_operation_contract(
+    path: &Path,
+    read_budget: Option<&mut OperationVerificationReadBudgetV1>,
+) -> Result<(OperationContractV1, OperationInputEncodingV1)> {
+    decode_operation_file(
+        path,
+        "operation contract",
+        OperationContractV1::decode_json,
+        OperationContractV1::decode_canonical,
+        read_budget,
+    )
+}
+
+fn decode_operation_interface(
+    path: &Path,
+    read_budget: Option<&mut OperationVerificationReadBudgetV1>,
+) -> Result<(OperationInterfaceV1, OperationInputEncodingV1)> {
+    decode_operation_file(
+        path,
+        "operation interface",
+        OperationInterfaceV1::decode_json,
+        OperationInterfaceV1::decode_canonical,
+        read_budget,
+    )
+}
+
+fn decode_realization_descriptor(
+    path: &Path,
+    read_budget: Option<&mut OperationVerificationReadBudgetV1>,
+) -> Result<(RealizationDescriptorV1, OperationInputEncodingV1)> {
+    decode_operation_file(
+        path,
+        "realization descriptor",
+        RealizationDescriptorV1::decode_json,
+        RealizationDescriptorV1::decode_canonical,
+        read_budget,
+    )
+}
+
+fn decode_realization_set(
+    path: &Path,
+    read_budget: Option<&mut OperationVerificationReadBudgetV1>,
+) -> Result<(RealizationSetV1, OperationInputEncodingV1)> {
+    decode_operation_file(
+        path,
+        "realization set",
+        RealizationSetV1::decode_json,
+        RealizationSetV1::decode_canonical,
+        read_budget,
+    )
+}
+
+fn decode_operation_file<T>(
+    path: &Path,
+    label: &str,
+    decode_json: fn(&[u8]) -> std::result::Result<T, OComputationErrorV1>,
+    decode_canonical: fn(&[u8]) -> std::result::Result<T, OComputationErrorV1>,
+    read_budget: Option<&mut OperationVerificationReadBudgetV1>,
+) -> Result<(T, OperationInputEncodingV1)> {
+    let bytes = read_bounded_operation_record(path, label)?;
+    if let Some(read_budget) = read_budget {
+        read_budget.account(bytes.len())?;
+    }
+    let encoding = operation_input_encoding(&bytes).with_context(|| {
+        format!(
+            "failed to identify {} {}",
+            label,
+            quoted_terminal_text(&path.to_string_lossy())
+        )
+    })?;
+    let decoded = match encoding {
+        OperationInputEncodingV1::ValidatedJson => decode_json(&bytes),
+        OperationInputEncodingV1::CanonicalCbor => decode_canonical(&bytes),
+    }
+    .map_err(operation_validation_error)
+    .with_context(|| {
+        format!(
+            "failed to validate {} {}",
+            label,
+            quoted_terminal_text(&path.to_string_lossy())
+        )
+    })?;
+    Ok((decoded, encoding))
+}
+
+fn operation_input_encoding(bytes: &[u8]) -> Result<OperationInputEncodingV1> {
+    let first = bytes
+        .iter()
+        .copied()
+        .find(|byte| !byte.is_ascii_whitespace())
+        .context("record is empty or contains only whitespace")?;
+    Ok(if first == b'{' {
+        OperationInputEncodingV1::ValidatedJson
+    } else {
+        OperationInputEncodingV1::CanonicalCbor
+    })
+}
+
+fn read_bounded_operation_record(path: &Path, label: &str) -> Result<Vec<u8>> {
+    let safe_path = quoted_terminal_text(&path.to_string_lossy());
+    let before_open = checked_operation_record_metadata(path, label)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let file = options
+        .open(path)
+        .with_context(|| format!("failed to open {label} {safe_path}"))?;
+    let after_open = file
+        .metadata()
+        .with_context(|| format!("failed to inspect opened {label} {safe_path}"))?;
+    ensure!(
+        after_open.is_file(),
+        "{label} must be a regular non-symlink file: {safe_path}"
+    );
+    #[cfg(unix)]
+    ensure!(
+        before_open.dev() == after_open.dev() && before_open.ino() == after_open.ino(),
+        "{label} changed between inspection and open: {safe_path}"
+    );
+    ensure!(
+        after_open.len() <= MAX_OPERATION_RECORD_FILE_BYTES_V1,
+        "{label} exceeds {MAX_OPERATION_RECORD_FILE_BYTES_V1} bytes (got {})",
+        after_open.len()
+    );
+    let limit = MAX_OPERATION_RECORD_FILE_BYTES_V1
+        .checked_add(1)
+        .context("operation-record bounded-read limit overflowed")?;
+    let mut bytes = Vec::with_capacity(after_open.len() as usize);
+    file.take(limit)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read {label} {safe_path}"))?;
+    ensure!(
+        bytes.len() as u64 <= MAX_OPERATION_RECORD_FILE_BYTES_V1,
+        "{label} exceeded {MAX_OPERATION_RECORD_FILE_BYTES_V1} bytes while it was being read"
+    );
+    Ok(bytes)
+}
+
+fn checked_operation_record_metadata(path: &Path, label: &str) -> Result<fs::Metadata> {
+    let safe_path = quoted_terminal_text(&path.to_string_lossy());
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect {label} {safe_path} before opening it"))?;
+    ensure!(
+        metadata.file_type().is_file(),
+        "{label} must be a regular non-symlink file: {safe_path}"
+    );
+    ensure!(
+        metadata.len() <= MAX_OPERATION_RECORD_FILE_BYTES_V1,
+        "{label} exceeds {MAX_OPERATION_RECORD_FILE_BYTES_V1} bytes (got {})",
+        metadata.len()
+    );
+    Ok(metadata)
+}
+
+fn serialized_operation_id(id: &impl serde::Serialize) -> Result<String> {
+    serde_json::to_value(id)?
+        .as_str()
+        .map(ToOwned::to_owned)
+        .context("operation identity did not serialize as a string")
+}
+
+fn operation_validation_error(error: impl std::fmt::Display) -> anyhow::Error {
+    anyhow::Error::msg(bounded_terminal_text_fragment(
+        &error.to_string(),
+        MAX_OPERATION_VALIDATION_DIAGNOSTIC_BYTES_V1,
+    ))
+}
+
+fn bounded_terminal_text_fragment(value: &str, maximum: usize) -> String {
+    let mut output = String::with_capacity(maximum.min(value.len()));
+    for character in value.chars() {
+        let escaped = character.escape_default().to_string();
+        if output.len().saturating_add(escaped.len()) > maximum {
+            while output
+                .len()
+                .saturating_add(OPERATION_DIAGNOSTIC_TRUNCATION_SUFFIX.len())
+                > maximum
+            {
+                if output.pop().is_none() {
+                    break;
+                }
+            }
+            output.push_str(OPERATION_DIAGNOSTIC_TRUNCATION_SUFFIX);
+            return output;
+        }
+        output.push_str(&escaped);
+    }
+    output
 }
 
 fn resolve_object<'a>(index: &'a BootObjectIndex, selector: &str) -> Result<ObjectSelection<'a>> {
@@ -4583,6 +5327,41 @@ mod tests {
     }
 
     #[test]
+    fn verification_actual_byte_budget_is_exhausted_before_record_decoding() {
+        fn decoder_must_not_run(_bytes: &[u8]) -> std::result::Result<(), OComputationErrorV1> {
+            panic!("aggregate budget exhaustion must precede record decoding")
+        }
+
+        let temp = tempdir().unwrap();
+        let invalid_record = temp.path().join("invalid-record");
+        fs::write(&invalid_record, b"!!").unwrap();
+        let mut budget = OperationVerificationReadBudgetV1 {
+            actual_bytes: MAX_OPERATION_VERIFICATION_TOTAL_BYTES_V1 - 1,
+        };
+        let error = decode_operation_file(
+            &invalid_record,
+            "budget-ordering probe",
+            decoder_must_not_run,
+            decoder_must_not_run,
+            Some(&mut budget),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("aggregate raw-input budget"), "{error}");
+        assert!(error.contains("67108865"), "{error}");
+    }
+
+    #[test]
+    fn operation_validation_diagnostics_are_escaped_and_bounded() {
+        let hostile = format!("{}\n\u{1b}[31m", "x".repeat(32 * 1024));
+        let rendered = operation_validation_error(hostile).to_string();
+        assert!(rendered.len() <= MAX_OPERATION_VALIDATION_DIAGNOSTIC_BYTES_V1);
+        assert!(rendered.ends_with(OPERATION_DIAGNOSTIC_TRUNCATION_SUFFIX));
+        assert!(!rendered.contains('\n'));
+        assert!(!rendered.contains('\u{1b}'));
+    }
+
+    #[test]
     fn help_is_unified_and_missing_run_target_is_a_usage_error() {
         let help = Cli::command().render_long_help().to_string();
         for text in [
@@ -4593,6 +5372,9 @@ mod tests {
             "explain",
             "inspect",
             "object",
+            "operation",
+            "operation inspect KIND FILE",
+            "check exact referential consistency only",
             "root|list|stat|get|verify",
             "closed-registry",
             "node start|stop|status|restart",
@@ -4635,6 +5417,42 @@ mod tests {
             );
         }
         assert!(!routes_help.contains("Usage: o-cli"));
+
+        let operation_help = Cli::try_parse_from(["o-cli", "operation", "--help"]).unwrap_err();
+        assert_eq!(operation_help.kind(), ErrorKind::DisplayHelp);
+        let operation_help = operation_help.to_string();
+        for text in [
+            "Usage: o operation",
+            "contract, interface, descriptor, set",
+            "do not resolve referenced artifacts",
+            "prove behavioral equivalence",
+            "grant authority",
+        ] {
+            assert!(
+                operation_help.contains(text),
+                "operation help omitted {text:?}:\n{operation_help}"
+            );
+        }
+        assert!(!operation_help.contains("Usage: o-cli"));
+
+        let verify_help =
+            Cli::try_parse_from(["o-cli", "operation", "verify", "--help"]).unwrap_err();
+        assert_eq!(verify_help.kind(), ErrorKind::DisplayHelp);
+        let verify_help = verify_help.to_string();
+        for text in [
+            "Usage: o operation verify",
+            "referentially consistent declarations only",
+            "does not resolve implementation",
+            "choose a winner",
+            "64 MiB",
+            "--descriptor <FILE>",
+        ] {
+            assert!(
+                verify_help.contains(text),
+                "operation verify help omitted {text:?}:\n{verify_help}"
+            );
+        }
+        assert!(!verify_help.contains("Usage: o-cli"));
 
         let error = Cli::try_parse_from(["o", "run"]).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);

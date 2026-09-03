@@ -1,8 +1,8 @@
 # Unified Ostadix Intent Front Door V1
 
-`o run`, `o routes`, `o optimize`, `o plan`, `o explain`, and `o inspect` are
-routed by the repository-owned Bash dispatcher to the compiled `o-cli`
-orchestrator. The
+`o run`, `o routes`, `o optimize`, `o plan`, `o explain`, `o inspect`,
+`o object`, and `o operation` are routed by the repository-owned Bash dispatcher
+to the compiled `o-cli` orchestrator. The
 dispatcher remains necessary on case-insensitive macOS filesystems where `O`
 and `o` cannot be separate installed filenames. Direct `O`, `olangc`,
 `o-link`, node, registry, information, live, receipt, kernel, `o why`, and
@@ -24,6 +24,50 @@ project mesh `prefer`; `--mesh=required` is the explicit mandatory-remote
 spelling. Automatic and explicit mesh spellings conflict. No command in this
 front door starts `o-node`; mesh execution can use only already-running,
 authenticated peers and its configured retry/fallback policy.
+
+## Semantic-record inspection boundary
+
+`o operation` is a separate, non-executing front-door namespace for the
+experimental operation-realization V1 records:
+
+```text
+o operation inspect <contract|interface|descriptor|set> FILE [--json]
+o operation verify \
+    --contract FILE \
+    --interface FILE \
+    --descriptor FILE [--descriptor FILE ...] \
+    --set FILE \
+    [--json]
+```
+
+`inspect` validates one explicitly typed `OperationContractV1`,
+`OperationInterfaceV1`, `RealizationDescriptorV1`, or `RealizationSetV1`.
+References remain unresolved. `verify` requires the exact descriptors declared
+by the supplied set and checks interface-to-contract, descriptor-to-pair and
+port-coverage, set-to-interface/contract/descriptor, and unique-stable-name
+consistency. Human success says `Referential consistency: PASS`; JSON success
+reports `referentially_consistent` in an
+`ostadix.operation-verification/v1` envelope.
+
+The explicit kind or option chooses the record decoder. A first
+non-whitespace `{` selects bounded JSON; otherwise strict canonical CBOR is
+required. The CLI never infers kind from a filename or supplies an implicit
+bundle, catalog, registry, or path convention. Record failure exits 1; command
+usage failure exits 2.
+
+Every operation-record input file is capped at 4 MiB. `o operation verify`
+checked-sums the raw bytes of the contract, interface, every supplied
+descriptor, and set files, and rejects an aggregate input closure above 64 MiB.
+The realization set and supplied descriptor list are independently capped at
+65,536 members and must have exactly matching counts. The 64 MiB CLI resource
+limit is not part of any record schema or identity.
+
+This surface validates declarations and their exact references only. It does
+not resolve artifacts, derive an interface from source, plan or select a
+realization, prove behavioral equivalence, authenticate evidence, establish
+target eligibility, place or transfer work, schedule or execute it, observe or
+recover runtime state, or grant evidence, admission, capability, lease, or
+World authority. See `docs/OPERATION_REALIZATION_V1.md`.
 
 ## Optimization boundary
 

@@ -417,12 +417,14 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "docs/INFORMATION_KERNEL_V1.md",
         "docs/releases/v0.3.0.md",
         "docs/O_MACHINE_CONTRACT.md",
+        "docs/OPERATION_REALIZATION_V1.md",
         "docs/OSTADIX_BOOT.md",
         "docs/OSTADIX_BOOT_OBJECTS.md",
         "docs/OSTADIX_WORLD.md",
         "docs/SEMANTIC_CUSTODY.md",
         "docs/VERSIONING.md",
         "evidence/gates.toml",
+        "evidence/attribution-rewrite-2026-09-03.commit-map",
         "evidence/world_alpha_gates.toml",
         "evidence/world_contract_v1.toml",
         "evidence/world_contract_v2.toml",
@@ -733,6 +735,7 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "tests/test_o_cli_dispatch.py",
         "tests/unified_intent_acceptance.rs",
         "tests/o_cli_intent_blackbox.rs",
+        "tests/o_cli_operation_blackbox.rs",
         "tests/unified_plan_boundaries.rs",
         "tests/test_setup.py",
         "tests/test_contract_surfaces.py",
@@ -868,8 +871,19 @@ WORLD_CLAIM_POLICY_SHA256 = (
 WORLD_DERIVATION_HASH = (
     "sha256:3a017fee12f6cc7b3c9ef9ec099407f39b5bb143251c21b9937abe47409c9d06"
 )
-WORLD_VALIDATOR_SHA256 = (
-    "e3a5adab37962db94ccda38db9ac62570f6ba06dbb9995d16af233af63c8295f"
+WORLD_ATTRIBUTION_REWRITE_MAP_PATH = (
+    "evidence/attribution-rewrite-2026-09-03.commit-map"
+)
+WORLD_ATTRIBUTION_REWRITE_MAP_SHA256 = (
+    "861abe06048f9e3fc25ce95ab0ceb65d9b31b0d44460a83cba5df2949ceeb383"
+)
+WORLD_HISTORICAL_VALIDATOR_SHA256_BY_ATTESTATION = {
+    "evidence/world/g0-independent-engine-2026-08-17.toml": (
+        "e3a5adab37962db94ccda38db9ac62570f6ba06dbb9995d16af233af63c8295f"
+    ),
+}
+WORLD_CURRENT_VALIDATOR_SHA256 = (
+    "1f68cdb6a1f4cf418836d768fe5b24855008a5b7cadd23d88090f5b05d741ff9"
 )
 WORLD_REDERIVE_PAYLOAD_DOMAIN = "ostadix.world.evidence.rederive.v1"
 WORLD_WITNESS_PAYLOAD_DOMAIN = "ostadix.world.evidence.witness.v1"
@@ -2969,6 +2983,17 @@ def _validate_world_attestation_release_surface(
         for field in ("claim_rule_policy_sha256", "registry_semantics_sha256"):
             if HEX_DIGEST.fullmatch(str(attestation[field])) is None:
                 raise ReleaseError(f"{path}.{field} must be a SHA-256 digest")
+        expected_historical_validator = (
+            WORLD_HISTORICAL_VALIDATOR_SHA256_BY_ATTESTATION.get(path)
+        )
+        if (
+            expected_historical_validator is not None
+            and validator_digest != expected_historical_validator
+        ):
+            raise ReleaseError(
+                f"{path}.validator_sha256 differs from the trusted validator bytes "
+                "for this historical attestation"
+            )
         if schema_version == 3:
             derivation_hash = _required_string(
                 attestation["derivation_hash"], f"{path}.derivation_hash"
@@ -2978,7 +3003,7 @@ def _validate_world_attestation_release_surface(
             ) is None:
                 raise ReleaseError(f"{path}.derivation_hash must be a SHA-256 identifier")
             if current_attestation:
-                if validator_digest != WORLD_VALIDATOR_SHA256:
+                if validator_digest != WORLD_CURRENT_VALIDATOR_SHA256:
                     raise ReleaseError(
                         f"{path}.validator_sha256 differs from the trusted validator bytes"
                     )
@@ -3512,6 +3537,16 @@ def _validate_world_evidence_ledger_release_surface(
 def _validate_world_alpha_release_surface(
     files: dict[str, bytes], modes: dict[str, str]
 ) -> None:
+    rewrite_map = files.get(WORLD_ATTRIBUTION_REWRITE_MAP_PATH)
+    if (
+        rewrite_map is None
+        or modes.get(WORLD_ATTRIBUTION_REWRITE_MAP_PATH) != "100644"
+        or hashlib.sha256(rewrite_map).hexdigest()
+        != WORLD_ATTRIBUTION_REWRITE_MAP_SHA256
+    ):
+        raise ReleaseError(
+            f"{WORLD_ATTRIBUTION_REWRITE_MAP_PATH} differs from the trusted history-rewrite map"
+        )
     texts = {
         path: _sealed_world_alpha_text(files, modes, path)
         for path in SEALED_WORLD_ALPHA_SHA256
@@ -3520,7 +3555,7 @@ def _validate_world_alpha_release_surface(
     if (
         validator_path not in files
         or hashlib.sha256(files[validator_path]).hexdigest()
-        != WORLD_VALIDATOR_SHA256
+        != WORLD_CURRENT_VALIDATOR_SHA256
     ):
         raise ReleaseError(
             f"{validator_path} differs from the trusted World evidence validator bytes"

@@ -75,10 +75,10 @@ discovered `.O` examples. The in-checkout MCP server exposes 10 tools. Native
 release evidence contains 26 required portable QEMU gates and one supplemental
 hardware gate.
 
-The isolated current-master Rust audit recorded 1,351 passing tests and three
-ignored tests. The current-master portable native aggregate recorded 26 of 26
-required gates passing. The exact validation scope and the checked-in G0
-historical evidence continuity defect are recorded in
+The isolated audit of that pinned snapshot recorded 1,351 passing tests and
+three ignored tests. Its portable native aggregate recorded 26 of 26 required
+gates passing. The exact historical validation scope and the then-observed G0
+evidence continuity defect are recorded in
 [Validation at the audited master](#validation-at-the-audited-master) and
 [Exact implementation boundaries](#exact-implementation-boundaries).
 
@@ -409,7 +409,7 @@ let mut runtime = Runtime::new("/absolute/path/to/backends");
 let value: OValue = runtime.evaluate("text^(hello)_text")?;
 ```
 
-Direct engine users may import the 38 public runtime modules from
+Direct engine users may import the 41 public runtime modules from
 `ostadix_api`, including `parser`, `ir`, `hgraph`, `evidence`, `eval`,
 `execution_fabric`, `execution_fabric_authority`, `executor`, `hosted_remote`,
 `project`, and `world`. Historical
@@ -431,6 +431,7 @@ Choose the next path according to what you want to inspect:
 | Learn typed-parenthesis syntax | [Gentle introduction](#gentle-introduction) |
 | Build all supported local tools | [Full setup guide](#getting-started-full-setup-guide) |
 | Inspect source -> OIR -> HGraph -> observed-result custody | [Bounded semantic custody](docs/SEMANTIC_CUSTODY.md) |
+| Inspect operation and realization declarations | [Operation and realization records V1](docs/OPERATION_REALIZATION_V1.md) |
 | Run durable signed sessions | [Hosted V2 development quickstart](#hosted-v2-development-quickstart) |
 | Compile freestanding native code | [O-core native systems language](#o-core-native-systems-language) |
 | Run the repository gates | [Running the tests](#running-the-tests) |
@@ -443,6 +444,7 @@ Choose the next path according to what you want to inspect:
 | OIR, ExecutionPlan, Graph V2, Evidence/Admission V6, local executor | Supported core under hardening |
 | Explicit Graph V1 / Evidence and Admission V5 / Why V1 | Archival inspection and compatibility verification only |
 | Information Kernel V1 and backend-morphism V1 | Experimental local shadow surfaces; non-authorizing |
+| Operation contract/interface and realization descriptor/set V1 | Experimental canonical records and referential-consistency inspection only; non-executing and non-authorizing |
 | Hosted V2 durable sessions and direct-node placement | Experimental integration with dedicated lifecycle and recovery tests |
 | Authenticated pure Execution Fabric M3 | Experimental same-host, two-real-process proof; coordinator-only graph authority |
 | Project lifting, route execution, and live supervision | Experimental integration |
@@ -453,6 +455,40 @@ Experimental surfaces have executable implementations and tests. Their
 compatibility, operational, and distributed guarantees are still being
 hardened around the supported hosted core. See
 [claims and evidence](docs/CLAIMS.md) for the exact qualification boundary.
+
+### Experimental operation and realization records
+
+The independent engine defines four canonical, authority-free semantic records:
+`OperationContractV1`, `OperationInterfaceV1`,
+`RealizationDescriptorV1`, and `RealizationSetV1`. They give stable content
+identities to one declared logical operation, its named ports, and declarations
+of possible realizations without turning those declarations into executable
+objects.
+
+The lowercase front door can validate one record or check one exact supplied
+reference closure:
+
+```bash
+o operation inspect contract contract.json
+o operation inspect interface interface.cbor --json
+o operation inspect descriptor descriptor.cbor
+o operation inspect set realization-set.cbor --json
+
+o operation verify \
+  --contract contract.cbor \
+  --interface interface.cbor \
+  --descriptor realization-a.cbor \
+  --descriptor realization-b.json \
+  --set realization-set.cbor
+```
+
+`inspect` performs single-record validation and leaves references unresolved.
+`verify` checks only exact contract/interface/descriptor/set referential
+consistency. Neither command plans or selects a realization, proves behavioral
+equivalence or evidence authenticity, determines placement, executes or
+recovers work, or grants admission, capability, lease, or World authority. See
+the [V1 contract](docs/OPERATION_REALIZATION_V1.md) for canonical encoding,
+identity, exit status, and full nonclaims.
 
 ## Hosted Placement V6
 
@@ -2614,8 +2650,8 @@ products so every public command surface has an explicit home.
 | Binary | Location | What it does |
 |--------|----------|--------------|
 | `O` | `target/release/O` | Runs `.O` documents and provides the interactive REPL. |
-| `o-cli` | `target/release/o-cli` | Compiled intent orchestrator for validated `run`, read-only `routes`, evidence-gated `optimize`, static/live `plan`, verified `explain`, and strict JSON `inspect`. |
-| `o` | `scripts/o-cli.sh` through an installed wrapper | Routes `run`, `routes`, `optimize`, `plan`, `explain`, and `inspect` to `o-cli`; preserves the explicit `device` namespace, `why`, node, registry, information, live, receipt, and kernel tools; and retains evaluator compatibility for unknown command forms. |
+| `o-cli` | `target/release/o-cli` | Compiled intent orchestrator for validated `run`, read-only `routes`, evidence-gated `optimize`, static/live `plan`, verified `explain`, strict JSON `inspect`, typed read-only boot-CAS `object`, and experimental referential-only `operation` inspection and verification. |
+| `o` | `scripts/o-cli.sh` through an installed wrapper | Routes `run`, `routes`, `optimize`, `plan`, `explain`, `inspect`, `object`, and `operation` to `o-cli`; preserves the explicit `device` namespace, `why`, node, registry, information, live, receipt, and kernel tools; and retains evaluator compatibility for unknown command forms. |
 | `olangc` | `target/release/olangc` | Produces native hosted binaries, WASI modules, script execution, OIR dumps, or Graphviz DOT hypergraph export. |
 | `ocorec` | `target/release/ocorec` | Compiles `.oc` modules through AST, typed HIR, and SSA MIR to freestanding ELF64 objects for the primary x86_64 and bounded AArch64 targets. |
 | `o-link` | `target/release/o-link` | Recursively literal-links and runs a bare single directory; `--project` creates an inert route-preserving bundle. |
@@ -4140,8 +4176,8 @@ or command.
 `olangc --target ir` remains the direct compiler planner interface.
 `scripts/o-cli.sh` is the repository-owned lowercase dispatcher: `setup.sh`
 installs an `o` wrapper that delegates to it, and the dispatcher routes `run`,
-`routes`, `optimize`, `plan`, `explain`, and `inspect` to the compiled `o-cli`
-orchestrator. The
+`routes`, `optimize`, `plan`, `explain`, `inspect`, `object`, and `operation` to
+the compiled `o-cli` orchestrator. The
 orchestrator reuses the exact `olangc` planning renderers; static planning does
 not execute, discover peers, or open run history. Other command families and
 unknown arguments retain their historical compatibility behavior. Keep
@@ -4292,7 +4328,7 @@ Native computation
 ```text
 Ostadix-lang/
 ├── crates/ostadix-api/src/
-│   ├── lib.rs                  # 44 engine modules, 38 public
+│   ├── lib.rs                  # 47 engine modules, 41 public
 │   ├── parser.rs               # hosted typed-parenthesis parser
 │   ├── value.rs                # OValue and hosted wire protocol
 │   ├── ir.rs                   # OIR and ExecutionPlan
@@ -4309,7 +4345,7 @@ Ostadix-lang/
 │   ├── live_system/            # package CAS, policy, and supervisor oracle
 │   └── ocore/                  # native front end, IRs, codegen, capability bridge
 ├── src/
-│   ├── lib.rs                  # 38 public compatibility reexports
+│   ├── lib.rs                  # 41 public compatibility reexports
 │   ├── main.rs                 # O interpreter and REPL
 │   └── bin/                    # the other 14 declared root binaries
 ├── mcp/ostadix_lang_mcp_server/ # separate locked MCP crate with 10 tools

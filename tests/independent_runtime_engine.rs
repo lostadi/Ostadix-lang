@@ -26,6 +26,50 @@ fn compatibility_modules_preserve_the_engine_type_identities() {
         ostadix_api::computation_core::VerifiedOComputationV1
     );
     assert_same!(
+        o_lang::computation_core::OperationContractV1,
+        ostadix_api::computation_core::OperationContractV1
+    );
+    assert_same!(
+        o_lang::computation_core::OperationContractIdV1,
+        ostadix_api::computation_core::OperationContractIdV1
+    );
+    assert_same!(
+        o_lang::computation_core::OperationInterfaceV1,
+        ostadix_api::computation_core::OperationInterfaceV1
+    );
+    assert_same!(
+        o_lang::computation_core::OperationInterfaceIdV1,
+        ostadix_api::computation_core::OperationInterfaceIdV1
+    );
+    assert_same!(
+        o_lang::computation_core::RealizationDescriptorV1,
+        ostadix_api::computation_core::RealizationDescriptorV1
+    );
+    assert_same!(
+        o_lang::computation_core::RealizationDescriptorIdV1,
+        ostadix_api::computation_core::RealizationDescriptorIdV1
+    );
+    assert_same!(
+        o_lang::computation_core::RealizationSetV1,
+        ostadix_api::computation_core::RealizationSetV1
+    );
+    assert_same!(
+        o_lang::computation_core::RealizationSetIdV1,
+        ostadix_api::computation_core::RealizationSetIdV1
+    );
+    assert_same!(
+        o_lang::computation_core::OperationIdV1,
+        ostadix_api::computation_core::OperationIdV1
+    );
+    assert_same!(
+        o_lang::computation_core::RealizationIdV1,
+        ostadix_api::computation_core::RealizationIdV1
+    );
+    assert_same!(
+        o_lang::computation_core::SemanticArtifactRefV1,
+        ostadix_api::computation_core::SemanticArtifactRefV1
+    );
+    assert_same!(
         o_lang::evidence::EvidenceBundleV5,
         ostadix_api::evidence::EvidenceBundleV5
     );

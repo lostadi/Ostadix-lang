@@ -49,6 +49,7 @@ WORLD_EVIDENCE_EVENT_PATHS = {
     "evidence/world/g2-counter-wording-supersession-2026-08-03.toml",
 }
 WORLD_EVIDENCE_RELEASE_PATHS = set(WORLD_ATTESTATION_PATHS) | WORLD_EVIDENCE_EVENT_PATHS
+WORLD_EVIDENCE_RELEASE_PATHS.add(release.WORLD_ATTRIBUTION_REWRITE_MAP_PATH)
 for _attestation_path in WORLD_ATTESTATION_PATHS:
     _attestation = tomllib.loads(
         (PROJECT_ROOT / _attestation_path).read_text(encoding="utf-8")
@@ -802,6 +803,9 @@ class SourceReleaseTests(unittest.TestCase):
             "docs/O_MACHINE_CONTRACT.md": WORLD_NORMATIVE_BYTES[
                 "docs/O_MACHINE_CONTRACT.md"
             ],
+            "docs/OPERATION_REALIZATION_V1.md": (
+                "# Fixture operation-realization V1 contract\n"
+            ),
             "docs/OSTADIX_BOOT.md": "# Fixture OSTADIX boot contract\n",
             "docs/OSTADIX_BOOT_OBJECTS.md": "# Fixture OSTADIX boot objects\n",
             "docs/OSTADIX_WORLD.md": WORLD_NORMATIVE_BYTES[
@@ -829,6 +833,9 @@ class SourceReleaseTests(unittest.TestCase):
                 "alpine-workstation-package-fixture\n"
             ),
             "evidence/gates.toml": fixture_evidence_manifest(),
+            "evidence/attribution-rewrite-2026-09-03.commit-map": (
+                PROJECT_ROOT / "evidence/attribution-rewrite-2026-09-03.commit-map"
+            ).read_bytes(),
             "evidence/world_alpha_gates.toml": WORLD_NORMATIVE_BYTES[
                 "evidence/world_alpha_gates.toml"
             ],
@@ -1244,6 +1251,9 @@ class SourceReleaseTests(unittest.TestCase):
             "tests/test_o_cli_dispatch.py": "# fixture lowercase CLI dispatch tests\n",
             "tests/unified_intent_acceptance.rs": "#[test] fn unified_intent_acceptance_fixture() {}\n",
             "tests/o_cli_intent_blackbox.rs": "#[test] fn o_cli_intent_blackbox_fixture() {}\n",
+            "tests/o_cli_operation_blackbox.rs": (
+                "#[test] fn o_cli_operation_blackbox_fixture() {}\n"
+            ),
             "tests/unified_plan_boundaries.rs": "#[test] fn unified_plan_boundaries_fixture() {}\n",
             "tests/test_release_evidence.py": "# fixture release evidence tests\n",
             "tests/test_setup.py": "# fixture setup tests\n",
@@ -1552,6 +1562,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "docs/HOSTED_WORLD_REFERENCE_PROFILE.md",
                 "docs/KERNEL_WORLD_CONTRACT.md",
                 "docs/O_MACHINE_CONTRACT.md",
+                "docs/OPERATION_REALIZATION_V1.md",
                 "docs/OSTADIX_BOOT.md",
                 "docs/OSTADIX_BOOT_OBJECTS.md",
                 "docs/OSTADIX_WORLD.md",
@@ -1565,6 +1576,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "evidence/hosted_live_workstation_apk_packages.txt",
                 "evidence/foreign_kernel_lab.toml",
                 "evidence/gates.toml",
+                "evidence/attribution-rewrite-2026-09-03.commit-map",
                 "evidence/o_machine_contract_v1.toml",
                 "evidence/world_alpha_gates.toml",
                 "evidence/world_contract_v1.toml",
@@ -1875,6 +1887,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "tests/test_o_cli_dispatch.py",
                 "tests/unified_intent_acceptance.rs",
                 "tests/o_cli_intent_blackbox.rs",
+                "tests/o_cli_operation_blackbox.rs",
                 "tests/unified_plan_boundaries.rs",
                 "tests/test_release_evidence.py",
                 "tests/test_setup.py",
@@ -2739,6 +2752,38 @@ class SourceReleaseTests(unittest.TestCase):
         ):
             self.assertIn(path, message)
 
+    def test_attribution_rewrite_map_is_required_and_digest_pinned(self) -> None:
+        path = release.WORLD_ATTRIBUTION_REWRITE_MAP_PATH
+        self._commit()
+        self._git("rm", path)
+        self._git("commit", "-q", "-m", "remove attribution rewrite map")
+        self._assert_missing_required_paths(
+            "missing-attribution-rewrite-map.zip", (path,)
+        )
+
+        tampered = (PROJECT_ROOT / path).read_bytes() + b"tamper\n"
+        with self.assertRaisesRegex(
+            release.ReleaseError, "trusted history-rewrite map"
+        ):
+            release._validate_world_alpha_release_surface(
+                {path: tampered}, {path: "100644"}
+            )
+
+    def test_world_validator_has_distinct_historical_and_current_seals(self) -> None:
+        path = "evidence/world/g0-independent-engine-2026-08-17.toml"
+        attestation = tomllib.loads(
+            (PROJECT_ROOT / path).read_text(encoding="utf-8")
+        )
+        historical = release.WORLD_HISTORICAL_VALIDATOR_SHA256_BY_ATTESTATION[
+            path
+        ]
+        current = hashlib.sha256(
+            (PROJECT_ROOT / "scripts/world_alpha_evidence.py").read_bytes()
+        ).hexdigest()
+        self.assertEqual(attestation["validator_sha256"], historical)
+        self.assertEqual(release.WORLD_CURRENT_VALIDATOR_SHA256, current)
+        self.assertNotEqual(historical, current)
+
     def test_world_identity_cross_language_surface_is_required(self) -> None:
         self._commit()
         self._git(
@@ -3029,6 +3074,20 @@ class SourceReleaseTests(unittest.TestCase):
 
         self._assert_missing_required_paths(
             "missing-ocomputation-identity-spine.zip",
+            required,
+        )
+
+    def test_operation_realization_contract_is_required(self) -> None:
+        required = (
+            "docs/OPERATION_REALIZATION_V1.md",
+            "tests/o_cli_operation_blackbox.rs",
+        )
+        self._commit()
+        self._git("rm", *required)
+        self._git("commit", "-q", "-m", "remove operation-realization contract")
+
+        self._assert_missing_required_paths(
+            "missing-operation-realization-contract.zip",
             required,
         )
 
@@ -3453,7 +3512,14 @@ class SourceReleaseTests(unittest.TestCase):
         replacement_digest = hashlib.sha256(files[validator_path]).hexdigest()
         record = files[path].decode("utf-8")
         self.assertGreaterEqual(record.count(old_digest), 2)
-        files[path] = record.replace(old_digest, replacement_digest).encode("utf-8")
+        record = record.replace(old_digest, replacement_digest)
+        for source in attestation["source"]:
+            released_path = release._released_path_for_historical_source(
+                source["path"]
+            )
+            released_digest = hashlib.sha256(files[released_path]).hexdigest()
+            record = record.replace(source["sha256"], released_digest)
+        files[path] = record.encode("utf-8")
         with self.assertRaisesRegex(
             release.ReleaseError,
             "validator_sha256 differs from the trusted validator bytes",

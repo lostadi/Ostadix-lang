@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import re
 import subprocess
 import tempfile
 import unittest
@@ -30,6 +31,45 @@ class ContractSurfacesTests(unittest.TestCase):
         result = self.run_contracts("validate")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "contract-surfaces: ok")
+
+    def test_readme_engine_module_counts_match_the_public_surface(self) -> None:
+        engine_source = (ROOT / "crates/ostadix-api/src/lib.rs").read_text(
+            encoding="utf-8"
+        )
+        compatibility_source = (ROOT / "src/lib.rs").read_text(encoding="utf-8")
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+
+        root_modules = re.findall(
+            r"^(?:pub(?:\(crate\))?\s+)?mod\s+([a-z_][a-z0-9_]*);$",
+            engine_source,
+            re.MULTILINE,
+        )
+        public_modules = re.findall(
+            r"^pub mod\s+([a-z_][a-z0-9_]*);$", engine_source, re.MULTILINE
+        )
+        reexport = re.search(
+            r"pub use ostadix_api::\{(?P<modules>.*?)\};",
+            compatibility_source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(reexport)
+        compatibility_modules = re.findall(
+            r"[a-z_][a-z0-9_]*", reexport.group("modules")
+        )
+
+        self.assertEqual(set(compatibility_modules), set(public_modules))
+        self.assertIn(
+            f"Direct engine users may import the {len(public_modules)} public runtime modules",
+            readme,
+        )
+        self.assertIn(
+            f"# {len(root_modules)} engine modules, {len(public_modules)} public",
+            readme,
+        )
+        self.assertIn(
+            f"# {len(compatibility_modules)} public compatibility reexports",
+            readme,
+        )
 
     def test_rust_suite_projects_openssl_from_one_manifest(self) -> None:
         result = self.run_contracts("required-executables", "--suite", "rust-hosted")

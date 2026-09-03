@@ -18,6 +18,21 @@
 - `OValue` is the language-neutral value boundary (`crates/ostadix-api/src/value.rs`) used by the
   Rust hosted runtime, the C17 edition in `c_cpp/`, and the Python reference in
   `o_lang/`.
+- The independent engine's experimental operation-realization V1 surface
+  defines four bounded, canonical, authority-free records in
+  `crates/ostadix-api/src/computation_core.rs`:
+  `OperationContractV1`, `OperationInterfaceV1`,
+  `RealizationDescriptorV1`, and `RealizationSetV1`. Strict canonical-CBOR
+  decoding and bounded unknown-field-denying JSON decoding assign independent
+  domain-separated content identities. `o operation inspect` validates one
+  explicitly typed record without resolving its references; `o operation
+  verify` checks only exact contract/interface/descriptor/set referential
+  closure, port coverage, and unique stable realization names. A pass is not a
+  plan, selection, behavioral-equivalence result, proof, authenticated evidence,
+  target-eligibility or placement decision, execution or recovery event, or
+  grant of evidence, admission, capability, lease, or World authority. Empty
+  validation evidence is explicitly declaration-only. The complete boundary is
+  specified in `docs/OPERATION_REALIZATION_V1.md`.
 - The hosted process protocol uses a 4-byte big-endian length prefix followed
   by canonical CBOR encoding in `crates/ostadix-api/src/wire.rs`; maps are sorted by encoded key
   length and bytes before transmission.

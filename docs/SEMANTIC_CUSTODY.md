@@ -78,6 +78,49 @@ shadow result can therefore expose differences such as the compatibility
 solver's optimistic container classification without reducing current
 execution capacity.
 
+## Operation-description boundary
+
+Operation-realization V1 adds separate authority-free descriptive records.
+Their construction and reading progression is:
+
+```text
+OperationContractV1
+        -> OperationInterfaceV1
+        -> RealizationDescriptorV1...
+        -> RealizationSetV1
+```
+
+Those arrows are progression, not stored-reference direction. The actual
+checked back-references are:
+
+```text
+OperationInterfaceV1      -> OperationContractV1
+RealizationDescriptorV1   -> OperationInterfaceV1
+RealizationDescriptorV1   -> OperationContractV1
+RealizationSetV1          -> OperationInterfaceV1
+RealizationSetV1          -> OperationContractV1
+RealizationSetV1          -> RealizationDescriptorIdV1...
+```
+
+Each record has bounded canonical-CBOR bytes and an independently
+domain-separated typed record identity. An `OComputationManifestV1` facet uses
+the ordinary SHA-256 of those canonical bytes as its `content` identity; that
+raw facet digest is intentionally distinct from the typed record identity.
+`o operation inspect` validates one record while leaving its references
+unresolved. `o operation verify` requires one exact supplied closure and checks
+only interface-to-contract, descriptor-to-interface/contract, descriptor-port,
+and set-to-interface/contract/descriptor consistency. Empty validation evidence
+means declaration-only; nonempty evidence references are not resolved or
+authenticated.
+
+An `OComputationManifestV1` may name these bytes with the corresponding facet
+kinds and explicit derivations. Merely decoding a semantic record does not add
+it to a computation lineage, establish how it was derived, or make its claims
+true. Referential consistency is not planning, realization selection,
+behavioral equivalence, evidence authenticity, target eligibility, placement,
+execution, recovery, admission, capability, lease, or World authority. See
+`docs/OPERATION_REALIZATION_V1.md` for the complete V1 boundary.
+
 ## Executable artifact
 
 After building `O` and `olangc`, run:
@@ -128,5 +171,9 @@ their own authority, transport, and lifecycle contracts.
 - `OValue` is not synonymous with `PortableOValue`.
 - Hosted V2 currently executes prepared hosted fragments; it is not general
   graph migration or transparent fallback.
+- Operation-realization V1 records and `o operation inspect|verify` establish
+  descriptive identity and referential consistency only; they do not plan,
+  select, place, execute, recover, prove equivalence, authenticate evidence, or
+  grant authority.
 - O-core/native evidence is a related compiler/runtime chain, not evidence that
   every hosted operation passed through O-core.

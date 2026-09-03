@@ -422,6 +422,12 @@ require_fixed docs/CLAIMS.md \
 require_fixed docs/CLAIMS.md \
     'This is not O-core Mode 31,' \
     'the hosted PR6 corpus could be misread as native evidence'
+require_fixed docs/CLAIMS.md \
+    'verify` checks only exact contract/interface/descriptor/set referential' \
+    'the experimental operation verification surface lost its referential-only boundary'
+require_fixed docs/CLAIMS.md \
+    'grant of evidence, admission, capability, lease, or World authority.' \
+    'the experimental operation records could be misread as authorizing execution'
 require_fixed README.md \
     'World ResourceKey hosted repository-conformance gate' \
     'the executable hosted PR6 gate is missing from the public status'
@@ -460,6 +466,9 @@ require_fixed docs/HGRAPH_EXECUTOR_PLAN.md \
 require_fixed scripts/o-cli.sh \
     'exec "$OCLI_BIN" "$@"' \
     'the repository-owned intent commands no longer reach the compiled Ostadix front door'
+require_fixed scripts/o-cli.sh \
+    'inspect|object|operation)' \
+    'the repository dispatcher no longer routes the operation namespace to o-cli'
 require_fixed src/bin/o-cli.rs \
     'Plan(PlanArgs)' \
     'the compiled Ostadix front door no longer owns the plan grammar'
@@ -716,6 +725,21 @@ for coordinate in "${fabric_coordinates[@]}"; do
         "versioning omits M3 coordinate name $coordinate_name"
     require_fixed docs/VERSIONING.md "\`$coordinate_value\`" \
         "versioning omits M3 coordinate value $coordinate_value"
+done
+
+operation_coordinates=(
+    'OPERATION_CONTRACT_SCHEMA_V1|ostadix.operation-contract/v1'
+    'OPERATION_INTERFACE_SCHEMA_V1|ostadix.operation-interface/v1'
+    'REALIZATION_DESCRIPTOR_SCHEMA_V1|ostadix.realization-descriptor/v1'
+    'REALIZATION_SET_SCHEMA_V1|ostadix.realization-set/v1'
+)
+for coordinate in "${operation_coordinates[@]}"; do
+    coordinate_name=${coordinate%%|*}
+    coordinate_value=${coordinate#*|}
+    require_fixed docs/VERSIONING.md "\`$coordinate_name\`" \
+        "versioning omits operation-realization coordinate name $coordinate_name"
+    require_fixed docs/VERSIONING.md "\`$coordinate_value\`" \
+        "versioning omits operation-realization coordinate value $coordinate_value"
 done
 require_fixed docs/VERSIONING.md \
     '`crates/ostadix-api/src/execution_fabric/protocol.rs`' \

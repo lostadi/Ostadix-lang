@@ -9,6 +9,17 @@ Package SemVer is only one of the independent coordinates documented in
 
 ### Added
 
+- Experimental `OperationContractV1`, `OperationInterfaceV1`,
+  `RealizationDescriptorV1`, and `RealizationSetV1` records add four bounded,
+  canonical, independently domain-separated descriptions of one logical
+  operation and its declared realizations. `o operation inspect` validates one
+  explicitly typed JSON or canonical-CBOR record; `o operation verify` checks
+  one exact supplied referential closure. This surface is descriptive and
+  authority-free: it does not plan, select, prove behavioral equivalence,
+  authenticate evidence, determine placement, execute, recover, or authorize
+  work. `docs/OPERATION_REALIZATION_V1.md` defines the complete boundary and is
+  a required source-release member.
+
 - `o routes TARGET [--json] [--route-decl DECL]...` provides a read-only
   route-discovery UI for project directories and lifted project bundles. It
   reports ordered route IDs, kinds, result codecs, explicitly declared route
@@ -297,6 +308,10 @@ or a live World.
 Release entries must be dated and linked to the exact released commit or tag
 when a release is cut.
 
-[Unreleased]: https://github.com/lostadi/Ostadix-lang/compare/v0.3.0...HEAD
+After the 2026-09-03 attribution-only history rewrite, the immutable `v0.3.0`
+tag remains on its archival lineage. The Unreleased comparison therefore starts
+from its tree-identical rewritten commit recorded in the sealed provenance map.
+
+[Unreleased]: https://github.com/lostadi/Ostadix-lang/compare/2083d83f9eaaf4a88a277d348779b00967d50bc8...HEAD
 [0.3.0]: https://github.com/lostadi/Ostadix-lang/tree/v0.3.0
 [0.2.0]: https://github.com/lostadi/Ostadix-lang/tree/v0.2.0

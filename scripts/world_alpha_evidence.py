@@ -21,6 +21,12 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "evidence/world_alpha_gates.toml"
+ATTRIBUTION_REWRITE_MAP_PATH = "evidence/attribution-rewrite-2026-09-03.commit-map"
+EXPECTED_ATTRIBUTION_REWRITE_MAP_SHA256 = (
+    "861abe06048f9e3fc25ce95ab0ceb65d9b31b0d44460a83cba5df2949ceeb383"
+)
+EXPECTED_ATTRIBUTION_REWRITE_MAP_ROWS = 598
+ATTRIBUTION_REWRITE_MAP_HEADER = "old                                      new"
 
 EXPECTED_SCHEMA_VERSION = 4
 EXPECTED_CONSTITUTION_VERSION = 3
@@ -1397,6 +1403,9 @@ def _derive_claims(
 def _resolve_source_snapshot(
     root: Path, source_commit: str, source_digests: dict[str, str]
 ) -> str | None:
+    source_lineage_commit = _require_git_commit(
+        root, source_commit, "source snapshot commit"
+    )
     try:
         working_tree_matches = all(
             hashlib.sha256(
@@ -1441,7 +1450,7 @@ def _resolve_source_snapshot(
                 str(root),
                 "merge-base",
                 "--is-ancestor",
-                source_commit,
+                source_lineage_commit,
                 head_commit,
             ],
             check=False,
@@ -1454,8 +1463,8 @@ def _resolve_source_snapshot(
             if commit_matches(head_commit):
                 return head_commit
             return "content-addressed-working-tree"
-        if commit_matches(source_commit):
-            return source_commit
+        if commit_matches(source_lineage_commit):
+            return source_lineage_commit
         history = subprocess.run(
             ["git", "-C", str(root), "rev-list", "HEAD", "--topo-order"],
             check=False,
@@ -1473,7 +1482,7 @@ def _resolve_source_snapshot(
                     str(root),
                     "merge-base",
                     "--is-ancestor",
-                    source_commit,
+                    source_lineage_commit,
                     commit,
                 ],
                 check=False,
@@ -1496,7 +1505,77 @@ def _source_digest_matches(
     return _resolve_source_snapshot(root, source_commit, {source_text: digest}) is not None
 
 
-def _require_git_commit(root: Path, commit: str, location: str) -> None:
+def _load_attribution_rewrite_map(
+    root: Path, *, required: bool = False
+) -> dict[str, str]:
+    path = root / ATTRIBUTION_REWRITE_MAP_PATH
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        if required:
+            raise WorldEvidenceError(
+                f"required attribution rewrite map is missing: {ATTRIBUTION_REWRITE_MAP_PATH}"
+            )
+        return {}
+    except OSError as error:
+        raise WorldEvidenceError(
+            f"cannot read {ATTRIBUTION_REWRITE_MAP_PATH}: {error}"
+        ) from error
+    actual_digest = hashlib.sha256(raw).hexdigest()
+    if actual_digest != EXPECTED_ATTRIBUTION_REWRITE_MAP_SHA256:
+        raise WorldEvidenceError(
+            f"{ATTRIBUTION_REWRITE_MAP_PATH} differs from its trusted SHA-256 seal"
+        )
+    try:
+        text = raw.decode("ascii", "strict")
+    except UnicodeDecodeError as error:
+        raise WorldEvidenceError(
+            f"{ATTRIBUTION_REWRITE_MAP_PATH} must be ASCII"
+        ) from error
+    if not text.endswith("\n") or "\r" in text:
+        raise WorldEvidenceError(
+            f"{ATTRIBUTION_REWRITE_MAP_PATH} must use LF lines and end with LF"
+        )
+    lines = text.splitlines()
+    if not lines or lines[0] != ATTRIBUTION_REWRITE_MAP_HEADER:
+        raise WorldEvidenceError(
+            f"{ATTRIBUTION_REWRITE_MAP_PATH} header differs from the filter-repo format"
+        )
+    rows = lines[1:]
+    if len(rows) != EXPECTED_ATTRIBUTION_REWRITE_MAP_ROWS:
+        raise WorldEvidenceError(
+            f"{ATTRIBUTION_REWRITE_MAP_PATH} must contain exactly "
+            f"{EXPECTED_ATTRIBUTION_REWRITE_MAP_ROWS} mappings"
+        )
+    mappings: dict[str, str] = {}
+    seen_targets: set[str] = set()
+    previous_source = ""
+    for line_number, row in enumerate(rows, 2):
+        match = re.fullmatch(r"([0-9a-f]{40}) ([0-9a-f]{40})", row)
+        if match is None:
+            raise WorldEvidenceError(
+                f"{ATTRIBUTION_REWRITE_MAP_PATH}:{line_number} is not one strict mapping"
+            )
+        old, new = match.groups()
+        if old <= previous_source:
+            raise WorldEvidenceError(
+                f"{ATTRIBUTION_REWRITE_MAP_PATH} source IDs must be unique and sorted"
+            )
+        if new in seen_targets:
+            raise WorldEvidenceError(
+                f"{ATTRIBUTION_REWRITE_MAP_PATH} target IDs must be unique"
+            )
+        if old == new or old == "0" * 40 or new == "0" * 40:
+            raise WorldEvidenceError(
+                f"{ATTRIBUTION_REWRITE_MAP_PATH}:{line_number} must map two distinct commits"
+            )
+        mappings[old] = new
+        seen_targets.add(new)
+        previous_source = old
+    return mappings
+
+
+def _git_commit_exists(root: Path, commit: str) -> bool:
     try:
         result = subprocess.run(
             ["git", "-C", str(root), "cat-file", "-e", f"{commit}^{{commit}}"],
@@ -1504,10 +1583,65 @@ def _require_git_commit(root: Path, commit: str, location: str) -> None:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-    except OSError as error:
-        raise WorldEvidenceError(f"{location} cannot be verified as a Git commit") from error
-    if result.returncode != 0:
-        raise WorldEvidenceError(f"{location} does not resolve to a Git commit")
+    except OSError:
+        return False
+    return result.returncode == 0
+
+
+def _git_commit_tree(root: Path, commit: str) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "show", "-s", "--format=%T", commit],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0 or HEX_COMMIT.fullmatch(result.stdout.strip()) is None:
+        return None
+    return result.stdout.strip()
+
+
+def _git_is_head_ancestor(root: Path, commit: str) -> bool:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "merge-base", "--is-ancestor", commit, "HEAD"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        return False
+    return result.returncode == 0
+
+
+def _require_git_commit(root: Path, commit: str, location: str) -> str:
+    mappings = _load_attribution_rewrite_map(root)
+    replacement = mappings.get(commit)
+    if replacement is None:
+        if not _git_commit_exists(root, commit):
+            raise WorldEvidenceError(f"{location} does not resolve to a Git commit")
+        if not _git_is_head_ancestor(root, commit):
+            raise WorldEvidenceError(f"{location} is not an ancestor of HEAD")
+        return commit
+    if not _git_commit_exists(root, replacement):
+        raise WorldEvidenceError(
+            f"{location} mapped target does not resolve to a Git commit"
+        )
+    if not _git_is_head_ancestor(root, replacement):
+        raise WorldEvidenceError(
+            f"{location} mapped target is not an ancestor of HEAD"
+        )
+    if _git_commit_exists(root, commit):
+        old_tree = _git_commit_tree(root, commit)
+        new_tree = _git_commit_tree(root, replacement)
+        if old_tree is None or new_tree is None or old_tree != new_tree:
+            raise WorldEvidenceError(
+                f"{location} attribution rewrite does not preserve the Git tree"
+            )
+    return replacement
 
 
 def _validate_attestation(
@@ -2568,6 +2702,7 @@ def validated_gates(
             )
         return gates
 
+    _load_attribution_rewrite_map(root, required=True)
     active_evidence, _events = _active_evidence_ledger(
         root, class_ids, actual_semantics
     )

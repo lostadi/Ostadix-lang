@@ -62,11 +62,12 @@ c_cpp/O examples/hello.O backends
 - `crates/ostadix-api/src/nix_ops.rs` and `crates/ostadix-api/src/nixos_ops.rs` implement Nix and NixOS operations used by builtins.
 - `crates/ostadix-api/src/ocore/` contains the O-core lexer, parser, AST, HIR, type checker, MIR, codegen, driver, and capability bridge.
 - Binaries: `src/main.rs` is `O`; `src/bin/o-cli.rs` owns validated intent
-  `run`/`plan`/`explain`/`inspect`; `olangc.rs`, `ocorec.rs`, `olink.rs`
-  (`o-link`), `ounlink.rs` (`o-unlink`), `ogit.rs`, and `o-notebook.rs` provide
-  compiler, native, linker, Git, and notebook entry points. The Bash
-  `scripts/o-cli.sh` dispatcher remains the installed lowercase `o` front door
-  so macOS case-insensitivity cannot collapse `O` and `o`.
+  `run`, `routes`, `optimize`, `plan`, `explain`, `inspect`, `object`, and
+  `operation`; `olangc.rs`, `ocorec.rs`, `olink.rs` (`o-link`), `ounlink.rs`
+  (`o-unlink`), `ogit.rs`, and `o-notebook.rs` provide compiler, native,
+  linker, Git, and notebook entry points. The Bash `scripts/o-cli.sh`
+  dispatcher remains the installed lowercase `o` front door so macOS
+  case-insensitivity cannot collapse `O` and `o`.
 
 ## Environment semantics
 
