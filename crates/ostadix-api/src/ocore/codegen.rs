@@ -9,12 +9,20 @@ use super::mir::*;
 use super::{Diagnostic, Span};
 
 pub fn emit_assembly(hir: &HirProgram, mir: &MirProgram) -> Result<String, Diagnostic> {
+    emit_assembly_with_function_sections(hir, mir, false)
+}
+
+pub(crate) fn emit_assembly_with_function_sections(
+    hir: &HirProgram,
+    mir: &MirProgram,
+    function_sections: bool,
+) -> Result<String, Diagnostic> {
     let mut out = String::new();
     out.push_str(".intel_syntax noprefix\n");
     out.push_str(".file \"ocore\"\n");
     emit_statics(hir, &mut out)?;
     for function in &mir.functions {
-        FunctionCodegen::new(hir, function).emit(&mut out)?;
+        FunctionCodegen::new(hir, function).emit(&mut out, function_sections)?;
     }
     out.push_str(".section .note.GNU-stack,\"\",@progbits\n");
     Ok(out)
@@ -209,8 +217,16 @@ impl<'a> FunctionCodegen<'a> {
         }
     }
 
-    fn emit(&self, out: &mut String) -> Result<(), Diagnostic> {
-        let section = self.source.attrs.link_section.as_deref().unwrap_or(".text");
+    fn emit(&self, out: &mut String, function_sections: bool) -> Result<(), Diagnostic> {
+        let default_section =
+            function_sections.then(|| format!(".text.ocore_fn.{}", self.source.symbol));
+        let section = self
+            .source
+            .attrs
+            .link_section
+            .as_deref()
+            .or(default_section.as_deref())
+            .unwrap_or(".text");
         writeln!(out, ".section {section},\"ax\",@progbits").unwrap();
         let align = self.source.attrs.align.unwrap_or(16);
         writeln!(out, ".balign {align}").unwrap();
@@ -1372,6 +1388,8 @@ unsafe fn add_and_out(a: u64, b: u64) -> u64 {
         assert!(asm.contains("add_and_out:"));
         assert!(asm.contains("out dx, al"));
         assert!(asm.contains("ret"));
+        let sectioned = emit_assembly_with_function_sections(&hir, &mir, true).unwrap();
+        assert!(sectioned.contains(".section .text.ocore_fn.add_and_out"));
     }
 
     #[test]

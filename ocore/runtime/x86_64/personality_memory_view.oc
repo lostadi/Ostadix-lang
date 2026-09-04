@@ -758,6 +758,57 @@ pub unsafe fn write_byte(
     return finish(1);
 }
 
+// Pure readiness half of reply(). Composed transports call this before their
+// first irreversible action so every view identity, right, prefix, event, and
+// counter condition is resolved while the capability remains live.
+pub unsafe fn can_reply(
+    service_cspace: u64,
+    capability: u64,
+    committed_length: usize
+) -> bool {
+    if INITIALIZED == 0 || POISONED != 0 || !invariants_hold() {
+        return false;
+    }
+    let object: u64 = validate_for_owner(
+        service_cspace,
+        capability,
+        OBJECT_PERSONALITY_MEMORY_VIEW,
+        0
+    );
+    let slot: usize = checked_live_view(object);
+    if slot >= MAX_PERSONALITY_MEMORY_VIEWS
+        || SERVICE_CSPACES[slot] != service_cspace
+        || VIEW_CAPABILITIES[slot] != capability
+        || EVENT_SEQUENCE > MAX_COUNTER - 3
+        || TERMINAL_TRANSITIONS == MAX_COUNTER
+        || TERMINAL_WAKES == MAX_COUNTER
+        || REPLIES == MAX_COUNTER {
+        return false;
+    }
+    let mut required: u64 = RIGHT_MEMORY_VIEW_READ;
+    if direction_has_output(DIRECTIONS[slot] as u64) {
+        required = RIGHT_MEMORY_VIEW_COMMIT;
+        if committed_length > LENGTHS[slot] {
+            return false;
+        }
+        let mut offset: usize = 0;
+        while offset < committed_length {
+            if OUTPUT_WRITTEN[staging_index(slot, offset)] != 1 {
+                return false;
+            }
+            offset += 1;
+        }
+    } else if committed_length != 0 {
+        return false;
+    }
+    return validate_for_owner(
+        service_cspace,
+        capability,
+        OBJECT_PERSONALITY_MEMORY_VIEW,
+        required
+    ) == object;
+}
+
 // A reply closes the service's view capability and records only the declared,
 // fully written prefix. Copy-back remains deferred until exact caller re-entry.
 pub unsafe fn reply(

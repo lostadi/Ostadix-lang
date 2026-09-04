@@ -487,6 +487,8 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "ocore/kernel/build-x86_64-uefi-iso.sh",
         "ocore/kernel/build-x86_64-uefi-media.sh",
         "ocore/kernel/build.sh",
+        "ocore/kernel/capability_boot_test.oc",
+        "ocore/kernel/capability_boot_test_stub.oc",
         "ocore/kernel/main.oc",
         "ocore/kernel/m6_mode25_diagnostics.oc",
         "ocore/kernel/m6_mode25_diagnostics_stub.oc",

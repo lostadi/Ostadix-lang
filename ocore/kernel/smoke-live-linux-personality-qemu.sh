@@ -633,6 +633,9 @@ preflight = [
 ]
 observer_online = "M6 Linux unrelated observer ELF: online\n"
 g1_online = "M6 Linux personality daemon ELF g1: online\n"
+failure_matrix = (
+    "M6 Linux pre-reply failure matrix: PASS\n"
+)
 stdout_line = "o-core linux stdout\n"
 stderr_line = "o-core linux stderr\n"
 stdout_complete = "M6 Linux stdout bounded completion g1: PASS\n"
@@ -658,6 +661,7 @@ required = [
     *preflight,
     observer_online,
     g1_online,
+    failure_matrix,
     stdout_line,
     stdout_complete,
     g1_fault,
@@ -707,7 +711,7 @@ diagnostic_descriptions = {
     "M25D:D1": "Linux write dispatch unexpectedly reported consumed",
     "M25D:D2": "Linux write wait tag or commit invariant failed",
     "M25D:D3": "Linux write wait abort invariant failed",
-    "M25D:D4": "Linux stream accounting or emission failed",
+    "M25D:D4": "Linux pre-reply rollback, stream accounting, or emission failed",
     "M25D:D5": "generation-two publish transition failed",
     "M25D:F1": "terminal-continuation entry guard failed",
     "M25D:F2": "terminal capability or endpoint closure failed",
@@ -782,7 +786,8 @@ edges = [(startup, preflight[0]), *zip(preflight, preflight[1:])]
 edges.extend((preflight[-1], marker) for marker in (observer_online, g1_online))
 edges.extend(
     [
-        (g1_online, stdout_line),
+        (g1_online, failure_matrix),
+        (failure_matrix, stdout_line),
         (stdout_line, stdout_complete),
         (stdout_complete, g1_fault),
         (g1_fault, fault_contained),

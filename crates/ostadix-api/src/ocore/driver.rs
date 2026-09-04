@@ -68,6 +68,14 @@ pub struct CompileOutput {
 }
 
 pub fn compile(inputs: &[PathBuf], options: &CompileOptions) -> Result<CompileOutput, Diagnostic> {
+    compile_with_function_sections(inputs, options, false)
+}
+
+pub fn compile_with_function_sections(
+    inputs: &[PathBuf],
+    options: &CompileOptions,
+    function_sections: bool,
+) -> Result<CompileOutput, Diagnostic> {
     if inputs.is_empty() {
         return Err(driver_error("at least one .oc input is required"));
     }
@@ -109,8 +117,12 @@ pub fn compile(inputs: &[PathBuf], options: &CompileOptions) -> Result<CompileOu
     }
 
     let assembly = match options.target {
-        Target::X86_64UnknownNone => codegen::emit_assembly(&hir, &mir)?,
-        Target::Aarch64UnknownNone => codegen_aarch64::emit_assembly(&hir, &mir)?,
+        Target::X86_64UnknownNone => {
+            codegen::emit_assembly_with_function_sections(&hir, &mir, function_sections)?
+        }
+        Target::Aarch64UnknownNone => {
+            codegen_aarch64::emit_assembly_with_function_sections(&hir, &mir, function_sections)?
+        }
     };
     if options.emit == EmitKind::Assembly {
         write_text(&options.output, &assembly)?;

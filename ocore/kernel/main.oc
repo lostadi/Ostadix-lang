@@ -34,6 +34,7 @@ use kernel::world_value_semantics::start as start_world_value_semantics;
 use kernel::world_receipt_semantics::start as start_world_receipt_semantics;
 use kernel::world_project_receipt_semantics::start as start_world_project_receipt_semantics;
 use runtime::capability::init as capabilities_init;
+use kernel::capability_boot_test::run as capabilities_self_test;
 use runtime::capability::close_in_cspace;
 use runtime::capability::install_in_cspace;
 use runtime::capability::OBJECT_DEBUG;
@@ -300,7 +301,9 @@ pub unsafe fn kernel_main(boot_magic: u32, multiboot_info: usize) -> never {
         fail_closed();
     }
     scheduler_init();
-    if capabilities_init() == 0 || capabilities_init() != 0 {
+    if capabilities_init() == 0
+        || capabilities_init() != 0
+        || capabilities_self_test() == 0 {
         fail_closed();
     }
     if memory_objects_init() == 0 || memory_objects_init() != 0 {

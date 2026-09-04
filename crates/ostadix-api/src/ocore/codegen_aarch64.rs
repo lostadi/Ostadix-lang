@@ -20,11 +20,19 @@ use super::mir::*;
 use super::{Diagnostic, Span};
 
 pub fn emit_assembly(hir: &HirProgram, mir: &MirProgram) -> Result<String, Diagnostic> {
+    emit_assembly_with_function_sections(hir, mir, false)
+}
+
+pub(crate) fn emit_assembly_with_function_sections(
+    hir: &HirProgram,
+    mir: &MirProgram,
+    function_sections: bool,
+) -> Result<String, Diagnostic> {
     let mut out = String::new();
     out.push_str(".file \"ocore\"\n");
     emit_statics(hir, &mut out)?;
     for function in &mir.functions {
-        FunctionCodegen::new(hir, function).emit(&mut out)?;
+        FunctionCodegen::new(hir, function).emit(&mut out, function_sections)?;
     }
     out.push_str(".section .note.GNU-stack,\"\",@progbits\n");
     Ok(out)
@@ -219,7 +227,7 @@ impl<'a> FunctionCodegen<'a> {
         }
     }
 
-    fn emit(&self, out: &mut String) -> Result<(), Diagnostic> {
+    fn emit(&self, out: &mut String, function_sections: bool) -> Result<(), Diagnostic> {
         if self.source.attrs.naked {
             return Err(codegen_error(
                 "@naked functions are not implemented by the AArch64 backend",
@@ -241,7 +249,15 @@ impl<'a> FunctionCodegen<'a> {
             ));
         }
 
-        let section = self.source.attrs.link_section.as_deref().unwrap_or(".text");
+        let default_section =
+            function_sections.then(|| format!(".text.ocore_fn.{}", self.source.symbol));
+        let section = self
+            .source
+            .attrs
+            .link_section
+            .as_deref()
+            .or(default_section.as_deref())
+            .unwrap_or(".text");
         writeln!(out, ".section {section},\"ax\",@progbits").unwrap();
         let align = self.source.attrs.align.unwrap_or(16);
         writeln!(out, ".balign {align}").unwrap();
@@ -1155,6 +1171,13 @@ mod tests {
         emit_assembly(&hir, &mir)
     }
 
+    fn sectioned_assembly(source: &str) -> Result<String, Diagnostic> {
+        let ast = parser::parse("aarch64-test.oc", source)?;
+        let hir = typeck::check(&[("aarch64-test.oc".into(), ast)])?;
+        let mir = mir::lower(&hir)?;
+        emit_assembly_with_function_sections(&hir, &mir, true)
+    }
+
     #[test]
     fn emits_aapcs64_scalar_memory_calls_and_control_flow() {
         let asm = assembly(
@@ -1181,6 +1204,15 @@ unsafe fn exercise(pointer: *mut u64, left: u64, right: u64) -> u64 {
         assert!(asm.contains("cset x9, lo"));
         assert!(asm.contains("cbnz x9"));
         assert!(asm.contains("stp x29, x30"));
+    }
+
+    #[test]
+    fn emits_opt_in_function_sections() {
+        let asm = sectioned_assembly(
+            "module arm_sections; fn add(a: u64, b: u64) -> u64 { return a + b; }",
+        )
+        .unwrap();
+        assert!(asm.contains(".section .text.ocore_fn._O_arm_sections__add"));
     }
 
     #[test]

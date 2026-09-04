@@ -16,7 +16,9 @@ pub mod mir;
 pub mod parser;
 pub mod typeck;
 
-pub use driver::{compile, CompileOptions, CompileOutput, EmitKind, Target};
+pub use driver::{
+    compile, compile_with_function_sections, CompileOptions, CompileOutput, EmitKind, Target,
+};
 
 /// Byte range and source location attached to syntax and diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

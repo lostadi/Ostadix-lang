@@ -21,6 +21,13 @@ case "$PROBE_MODE" in
     ;;
 esac
 
+LINK_GC_FLAGS=()
+OCOREC_FUNCTION_SECTION_FLAGS=()
+if (( PROBE_MODE == 25 || PROBE_MODE == 26 )); then
+  LINK_GC_FLAGS=(--gc-sections)
+  OCOREC_FUNCTION_SECTION_FLAGS=(--function-sections)
+fi
+
 BOOT_INFO_ENABLED="${OCORE_BOOT_INFO_ENABLED:-}"
 if [[ -z "$BOOT_INFO_ENABLED" ]]; then
   BOOT_INFO_ENABLED=0
@@ -307,11 +314,17 @@ fi
 M6_SOURCE="$KERNEL_DIR/m6_stub.oc"
 M6_MODE25_DIAGNOSTICS_SOURCES=()
 BOUNDED_PERSONALITY_SOURCES=()
+CAPABILITY_BOOT_TEST_SOURCE="$KERNEL_DIR/capability_boot_test.oc"
 if (( PROBE_MODE == 18 || PROBE_MODE == 24 )); then
   M6_SOURCE="$KERNEL_DIR/m6.oc"
 fi
 if (( PROBE_MODE == 25 || PROBE_MODE == 26 )); then
   M6_SOURCE="$KERNEL_DIR/m6_linux.oc"
+  # These probes carry their own large transaction corpora and embedded
+  # images. Reachable production paths remain linked; the adapter makes the
+  # separately sectioned boot mutation corpus intentionally unreachable, and
+  # linker GC removes that corpus plus any other unreachable O-core helpers.
+  CAPABILITY_BOOT_TEST_SOURCE="$KERNEL_DIR/capability_boot_test_stub.oc"
 fi
 if (( PROBE_MODE == 25 )); then
   M6_MODE25_DIAGNOSTICS_SOURCES=(
@@ -434,12 +447,14 @@ fi
   "$WORLD_VALUE_SEMANTICS_SOURCE" \
   "$WORLD_RECEIPT_SEMANTICS_SOURCE" \
   "$WORLD_PROJECT_RECEIPT_SEMANTICS_SOURCE" \
+  "$CAPABILITY_BOOT_TEST_SOURCE" \
   "$SMP_PROBE_SOURCE" \
   "$KERNEL_DIR/scheduler_bridge.oc" \
   "$KERNEL_DIR/main.oc" \
   --target x86_64-unknown-none \
   --emit obj \
   --keep-asm \
+  ${OCOREC_FUNCTION_SECTION_FLAGS[@]+"${OCOREC_FUNCTION_SECTION_FLAGS[@]}"} \
   -o "$BUILD_DIR/kernel.o"
 
 clang -target x86_64-unknown-none-elf -c -x assembler-with-cpp \
@@ -526,6 +541,7 @@ LLD="$(find_lld)"
 case "$(basename "$LLD")" in
   rust-lld | lld)
     "$LLD" -flavor gnu -m elf_x86_64 -nostdlib \
+      ${LINK_GC_FLAGS[@]+"${LINK_GC_FLAGS[@]}"} \
       -z max-page-size=0x1000 \
       -T "$KERNEL_DIR/linker.ld" \
       -o "$BUILD_DIR/kernel.elf" \
@@ -533,6 +549,7 @@ case "$(basename "$LLD")" in
     ;;
   *)
     "$LLD" -m elf_x86_64 -nostdlib \
+      ${LINK_GC_FLAGS[@]+"${LINK_GC_FLAGS[@]}"} \
       -z max-page-size=0x1000 \
       -T "$KERNEL_DIR/linker.ld" \
       -o "$BUILD_DIR/kernel.elf" \

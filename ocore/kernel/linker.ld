@@ -33,6 +33,8 @@ SECTIONS
   .text : ALIGN(4K) {
     *(.text.boot)
     *(.text.kernel)
+    *(.text.capability_selftest)
+    *(.text.ocore_fn.*)
     *(.text)
   } :kernel_text
   . = ALIGN(4K);
