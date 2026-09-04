@@ -9,6 +9,7 @@
 //   olangc <input.O>                              # binary target (default)
 //   olangc <input.O> -o myprogram                 # explicit output name
 //   olangc <input.O> --target wasm                # wasm32-wasip1
+//   olangc <input.O> --target wasm --browser-bundle ./web
 //   olangc <input.O> --target wasm --materialize-only ./generated
 //   olangc <input.O> --target script              # run in-process
 //   olangc <input.O> --target ir                  # dump the lowered OIR
@@ -44,7 +45,11 @@
 //   program uses: Python for python^ blocks, Nix for nix^ blocks, etc.
 //
 // Target B ("wasm"):
-//   Generates the same hosted runtime project for wasm32-wasip1.
+//   Generates the same hosted runtime project for wasm32-wasip1. With
+//   --browser-bundle, it first parses and classifies the execution plan, then
+//   emits a no-clobber browser payload with a strict manifest and local WASI
+//   host. Plans needing shims or effectful requests require an explicitly
+//   supplied whole-program provider at run time.
 //
 // Target C ("script"):
 //   Parses, lowers to OIR, validates ExecutionPlan, and executes the plan
@@ -73,6 +78,7 @@ use clap::{Parser as ClapParser, ValueEnum};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -82,7 +88,7 @@ use o_lang::evidence::{
     admit_execution, analyze_execution, runtime_binding_from_adapter_bytes, ExecutionIntentV1,
 };
 use o_lang::execution_contract::Policy;
-use o_lang::ir::{OIrProgram, PlanNodeId};
+use o_lang::ir::{ExecutionMode, OIrProgram, PlanNodeId, PlanNodeKind};
 use o_lang::parser::Parser;
 use o_lang::shims::read_shims;
 use o_lang::value::OValue;
@@ -97,6 +103,40 @@ const WORKSPACE_CARGO_LOCK: &[u8] = include_bytes!("../../Cargo.lock");
 const WORKSPACE_RUST_TOOLCHAIN_TOML: &[u8] = include_bytes!("../../rust-toolchain.toml");
 const GENERATED_PACKAGE_NAME: &str = "ostadix-generated-runtime";
 const GENERATED_PACKAGE_VERSION: &str = "0.1.0";
+const BROWSER_BUNDLE_SCHEMA: &str = "ostadix.olang-browser-bundle/v1";
+const BROWSER_PROVIDER_SCHEMA: &str = "ostadix.olang-browser-provider/v1";
+const BROWSER_WASI_ABI: &str = "wasi_snapshot_preview1";
+const BROWSER_WASI_HOST_MJS: &str =
+    include_str!("../../apps/olang-browser-wasi/wasi-preview1-host.mjs");
+const BROWSER_RUNNER_MJS: &str = include_str!("../../apps/olang-browser-wasi/runner.mjs");
+const BROWSER_MAIN_MJS: &str = include_str!("../../apps/olang-browser-wasi/browser-main.mjs");
+const BROWSER_INDEX_HTML: &str = include_str!("../../apps/olang-browser-wasi/index.html");
+const BROWSER_WASI_IMPORTS: &[&str] = &[
+    "args_get",
+    "args_sizes_get",
+    "clock_time_get",
+    "environ_get",
+    "environ_sizes_get",
+    "fd_close",
+    "fd_fdstat_get",
+    "fd_filestat_get",
+    "fd_prestat_dir_name",
+    "fd_prestat_get",
+    "fd_read",
+    "fd_readdir",
+    "fd_seek",
+    "fd_write",
+    "path_filestat_get",
+    "path_open",
+    "path_readlink",
+    "path_remove_directory",
+    "path_rename",
+    "path_unlink_file",
+    "poll_oneoff",
+    "proc_exit",
+    "random_get",
+    "sched_yield",
+];
 const GENERATED_RUNTIME_DEPENDENCY_NAMES: &[&str] = &[
     "anyhow",
     "base64",
@@ -162,7 +202,8 @@ enum ScheduleExplanationFormat {
     about = "Compile or run a .O program",
     long_about = "\
 Compiles a .O source file into a native binary (--target binary, the default), \
-a wasm32-wasip1 module (--target wasm), executes in-process (--target script), \
+a wasm32-wasip1 module (--target wasm), packages a browser payload \
+(--target wasm --browser-bundle DIR), executes in-process (--target script), \
 prints the lowered OIR/ExecutionPlan/HGraph or project plan/HGraph (--target ir), \
 or emits the execution hypergraph as Graphviz DOT (--target dot). Binary \
 outputs embed the program source, compatibility adapters, and the Ostadix-lang \
@@ -191,6 +232,14 @@ struct Cli {
     /// available only for ordinary .O binary and wasm targets.
     #[arg(long, value_name = "DIR")]
     materialize_only: Option<PathBuf>,
+
+    /// Compile a wasm32-wasip1 module and package it with the dependency-free
+    /// browser WASI host, runner, source, compatibility manifest, and demo UI.
+    /// DIR must not already exist. Hosted/effectful plans require an explicit
+    /// whole-program provider at browser run time and are never instantiated
+    /// under synthetic local authority.
+    #[arg(long, value_name = "DIR")]
+    browser_bundle: Option<PathBuf>,
 
     /// Override or extend the bundled compatibility adapters with files from
     /// this directory. Files with names matching a bundled adapter replace it;
@@ -313,6 +362,17 @@ fn main() -> Result<()> {
 
     match cli.target {
         CompileTarget::Binary | CompileTarget::Wasm => {
+            if let Some(bundle_dir) = cli.browser_bundle.as_deref() {
+                let shims = read_shims(cli.shim_dir.as_deref())?;
+                return compile_browser_bundle(
+                    &cli.input,
+                    &source,
+                    &shims,
+                    bundle_dir,
+                    &cli.backend_grants,
+                );
+            }
+
             // Resolve output path: default to <input stem> in cwd.
             let mut output = match cli.output {
                 Some(p) => p,
@@ -411,6 +471,20 @@ fn main() -> Result<()> {
 }
 
 fn validate_admission_inspection(cli: &Cli) -> Result<()> {
+    if cli.browser_bundle.is_some() && cli.target != CompileTarget::Wasm {
+        bail!("--browser-bundle is available only with --target wasm");
+    }
+    if cli.browser_bundle.is_some() && cli.output.is_some() {
+        bail!(
+            "--output cannot be combined with --browser-bundle; the artifact is DIR/program.wasm"
+        );
+    }
+    if cli.browser_bundle.is_some() && cli.materialize_only.is_some() {
+        bail!("--materialize-only cannot be combined with --browser-bundle");
+    }
+    if cli.browser_bundle.is_some() && cli.keep_build_dir {
+        bail!("--keep-build-dir cannot be combined with --browser-bundle");
+    }
     if cli.materialize_only.is_some()
         && !matches!(cli.target, CompileTarget::Binary | CompileTarget::Wasm)
     {
@@ -525,6 +599,9 @@ fn compile_or_run_project(cli: &Cli, input_is_dir: bool, source: &str) -> Result
 
     if cli.materialize_only.is_some() {
         bail!("--materialize-only currently supports ordinary .O inputs only");
+    }
+    if cli.browser_bundle.is_some() {
+        bail!("--browser-bundle currently supports ordinary .O inputs only");
     }
     if cli.project_trace_out.is_some() && cli.target != CompileTarget::Script {
         bail!(
@@ -722,7 +799,7 @@ fn compile_project_to_binary(
         eprintln!("olangc: running cargo build --release --locked ...");
     }
 
-    let status = generated_cargo_command(build_dir)
+    let status = generated_cargo_command(build_dir)?
         .args(&cargo_args)
         .status()
         .context("failed to spawn cargo — is Rust/Cargo installed?")?;
@@ -1045,7 +1122,7 @@ fn compile_to_binary(
         eprintln!("olangc: running cargo build --release --locked ...");
     }
 
-    let status = generated_cargo_command(build_dir)
+    let status = generated_cargo_command(build_dir)?
         .args(&cargo_args)
         .status()
         .context("failed to spawn cargo — is Rust/Cargo installed?")?;
@@ -1070,6 +1147,368 @@ fn compile_to_binary(
 
     eprintln!("olangc: compiled → {}", dest.display());
     Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Browser WASI bundle
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct BrowserCompatibilityBlocker {
+    plan_node: usize,
+    code: String,
+    operation: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backend: Option<String>,
+    required_authorities: Vec<String>,
+    diagnostic: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct BrowserCompatibilityAssessment {
+    local_execution: bool,
+    class: String,
+    blockers: Vec<BrowserCompatibilityBlocker>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct BrowserBundleFile {
+    path: String,
+    bytes: u64,
+    sha256: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct BrowserBundlePlan {
+    path: String,
+    bytes: u64,
+    sha256: String,
+    nodes: usize,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct BrowserBundleAbi {
+    module: String,
+    imports: Vec<String>,
+    required_exports: Vec<String>,
+    local_capabilities: Vec<String>,
+    denied_capabilities: Vec<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct BrowserBundleProvider {
+    schema: String,
+    mode: String,
+    required: bool,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct BrowserBundleAdapter {
+    name: String,
+    file: BrowserBundleFile,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct BrowserBundleManifest {
+    schema: String,
+    source: BrowserBundleFile,
+    artifact: BrowserBundleFile,
+    assets: Vec<BrowserBundleFile>,
+    adapters: Vec<BrowserBundleAdapter>,
+    plan: BrowserBundlePlan,
+    compatibility: BrowserCompatibilityAssessment,
+    provider: BrowserBundleProvider,
+    backend_grants: Vec<String>,
+    abi: BrowserBundleAbi,
+}
+
+/// Parse and lower the exact source before Cargo is invoked, then classify the
+/// canonical plan. Inline O/text/HTML/Markdown/LaTeX/quote work stays local.
+/// A shim backend or an O request crosses a host authority boundary and must
+/// be delegated as a whole program; the synchronous evaluator cannot honestly
+/// pause and resume one operation through a browser callback.
+fn inspect_browser_compatibility(source: &str) -> Result<(BrowserCompatibilityAssessment, String)> {
+    let src = strip_shebang(source);
+    let registered = registered_backends();
+    let mut parser = Parser::new(&src, &registered);
+    let nodes = parser
+        .parse()
+        .context("failed to parse .O source for browser compatibility")?;
+    let program = OIrProgram::lower(&nodes);
+    let plan = program.plan();
+    plan.validate(program.nodes.len())
+        .map_err(anyhow::Error::msg)
+        .context("failed to validate .O execution plan for browser compatibility")?;
+
+    let mut blockers = Vec::new();
+    for node in &plan.nodes {
+        match &node.kind {
+            PlanNodeKind::Exec { lang, backend, .. }
+                if backend.execution == ExecutionMode::Shim =>
+            {
+                let backend_name = if backend.canonical.is_empty() {
+                    lang.clone()
+                } else {
+                    backend.canonical.clone()
+                };
+                let required_authorities = backend
+                    .required_authorities
+                    .iter()
+                    .map(|authority| authority.name().to_string())
+                    .collect::<Vec<_>>();
+                blockers.push(BrowserCompatibilityBlocker {
+                    plan_node: node.id.0,
+                    code: "shim-backend".to_string(),
+                    operation: "exec".to_string(),
+                    backend: Some(backend_name.clone()),
+                    required_authorities,
+                    diagnostic: format!(
+                        "P{} shim-backend backend={} operation=exec",
+                        node.id.0, backend_name
+                    ),
+                });
+            }
+            PlanNodeKind::Request { kind, .. } => {
+                let operation = kind.label().to_string();
+                blockers.push(BrowserCompatibilityBlocker {
+                    plan_node: node.id.0,
+                    code: "effectful-request".to_string(),
+                    operation: operation.clone(),
+                    backend: None,
+                    required_authorities: Vec::new(),
+                    diagnostic: format!("P{} effectful-request operation={operation}", node.id.0),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    let local_execution = blockers.is_empty();
+    Ok((
+        BrowserCompatibilityAssessment {
+            local_execution,
+            class: if local_execution {
+                "browser-local-wasi-preview1"
+            } else {
+                "requires-whole-program-provider"
+            }
+            .to_string(),
+            blockers,
+        },
+        plan.to_text(),
+    ))
+}
+
+fn compile_browser_bundle(
+    input_path: &Path,
+    source: &str,
+    shims: &[(String, Vec<u8>)],
+    bundle_dir: &Path,
+    backend_grants: &[String],
+) -> Result<()> {
+    if fs::symlink_metadata(bundle_dir).is_ok() {
+        bail!(
+            "--browser-bundle directory already exists: {}",
+            bundle_dir.display()
+        );
+    }
+
+    let (compatibility, plan_text) = inspect_browser_compatibility(source)?;
+    let build_dir = create_build_dir()?;
+    let temporary_wasm = build_dir.join("program.wasm");
+    eprintln!(
+        "olangc: building browser WASI payload in {}",
+        build_dir.display()
+    );
+    eprintln!("olangc: embedding {} shim script(s)", shims.len());
+
+    let build_result = compile_to_binary(
+        input_path,
+        source,
+        shims,
+        &build_dir,
+        &temporary_wasm,
+        true,
+        backend_grants,
+    );
+    if let Err(error) = build_result {
+        let _ = fs::remove_dir_all(&build_dir);
+        return Err(error);
+    }
+
+    let wasm = fs::read(&temporary_wasm).with_context(|| {
+        format!(
+            "failed to read compiled browser WASI artifact {}",
+            temporary_wasm.display()
+        )
+    });
+    let result = wasm.and_then(|wasm| {
+        write_browser_bundle(
+            bundle_dir,
+            source,
+            &wasm,
+            &plan_text,
+            compatibility.clone(),
+            shims,
+            backend_grants,
+        )
+    });
+    let _ = fs::remove_dir_all(&build_dir);
+    result?;
+
+    eprintln!(
+        "olangc: browser-bundle local-execution={} blockers={} dir={}",
+        if compatibility.local_execution {
+            "compatible"
+        } else {
+            "provider-required"
+        },
+        compatibility.blockers.len(),
+        bundle_dir.display()
+    );
+    for blocker in &compatibility.blockers {
+        eprintln!("olangc: browser blocker: {}", blocker.diagnostic);
+    }
+    Ok(())
+}
+
+fn browser_bundle_file(path: &str, bytes: &[u8]) -> BrowserBundleFile {
+    BrowserBundleFile {
+        path: path.to_string(),
+        bytes: bytes.len() as u64,
+        sha256: hex::encode(Sha256::digest(bytes)),
+    }
+}
+
+fn write_new_browser_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("failed to create browser bundle file {}", path.display()))?;
+    output
+        .write_all(bytes)
+        .with_context(|| format!("failed to write browser bundle file {}", path.display()))
+}
+
+fn write_browser_bundle(
+    bundle_dir: &Path,
+    source: &str,
+    wasm: &[u8],
+    plan_text: &str,
+    compatibility: BrowserCompatibilityAssessment,
+    shims: &[(String, Vec<u8>)],
+    backend_grants: &[String],
+) -> Result<()> {
+    if shims.is_empty()
+        || shims
+            .iter()
+            .any(|(name, _)| name.is_empty() || name.contains('\0'))
+        || shims.windows(2).any(|pair| pair[0].0 >= pair[1].0)
+    {
+        bail!("browser bundle adapters must be non-empty, uniquely name-sorted bytes");
+    }
+    create_browser_bundle_dir(bundle_dir)?;
+
+    let files: [(&str, &[u8]); 7] = [
+        ("program.wasm", wasm),
+        ("program.O", source.as_bytes()),
+        ("program.plan.txt", plan_text.as_bytes()),
+        ("wasi-preview1-host.mjs", BROWSER_WASI_HOST_MJS.as_bytes()),
+        ("runner.mjs", BROWSER_RUNNER_MJS.as_bytes()),
+        ("browser-main.mjs", BROWSER_MAIN_MJS.as_bytes()),
+        ("index.html", BROWSER_INDEX_HTML.as_bytes()),
+    ];
+
+    let write_result = (|| -> Result<()> {
+        fs::create_dir(bundle_dir.join("adapters")).with_context(|| {
+            format!(
+                "failed to create browser adapter directory {}",
+                bundle_dir.join("adapters").display()
+            )
+        })?;
+        for (path, bytes) in files {
+            write_new_browser_file(&bundle_dir.join(path), bytes)?;
+        }
+
+        let source_record = browser_bundle_file("program.O", source.as_bytes());
+        let artifact_record = browser_bundle_file("program.wasm", wasm);
+        let assets = [
+            ("browser-main.mjs", BROWSER_MAIN_MJS.as_bytes()),
+            ("index.html", BROWSER_INDEX_HTML.as_bytes()),
+            ("runner.mjs", BROWSER_RUNNER_MJS.as_bytes()),
+            ("wasi-preview1-host.mjs", BROWSER_WASI_HOST_MJS.as_bytes()),
+        ]
+        .into_iter()
+        .map(|(path, bytes)| browser_bundle_file(path, bytes))
+        .collect();
+        let mut adapters = Vec::with_capacity(shims.len());
+        for (index, (name, bytes)) in shims.iter().enumerate() {
+            let path = format!("adapters/{index:04}.shim");
+            write_new_browser_file(&bundle_dir.join(&path), bytes)?;
+            adapters.push(BrowserBundleAdapter {
+                name: name.clone(),
+                file: browser_bundle_file(&path, bytes),
+            });
+        }
+        let provider_required = !compatibility.local_execution;
+        let manifest = BrowserBundleManifest {
+            schema: BROWSER_BUNDLE_SCHEMA.to_string(),
+            source: source_record,
+            artifact: artifact_record,
+            assets,
+            adapters,
+            plan: BrowserBundlePlan {
+                path: "program.plan.txt".to_string(),
+                bytes: plan_text.len() as u64,
+                sha256: hex::encode(Sha256::digest(plan_text.as_bytes())),
+                nodes: plan_text
+                    .lines()
+                    .filter(|line| line.starts_with("node "))
+                    .count(),
+            },
+            compatibility,
+            provider: BrowserBundleProvider {
+                schema: BROWSER_PROVIDER_SCHEMA.to_string(),
+                mode: "whole-program".to_string(),
+                required: provider_required,
+            },
+            backend_grants: backend_grants.to_vec(),
+            abi: BrowserBundleAbi {
+                module: BROWSER_WASI_ABI.to_string(),
+                imports: BROWSER_WASI_IMPORTS
+                    .iter()
+                    .map(|name| (*name).to_string())
+                    .collect(),
+                required_exports: vec!["memory".to_string(), "_start".to_string()],
+                local_capabilities: vec![
+                    "args".to_string(),
+                    "environment".to_string(),
+                    "clock-realtime".to_string(),
+                    "clock-monotonic".to_string(),
+                    "crypto-random".to_string(),
+                    "stdin-eof".to_string(),
+                    "stdout-capture".to_string(),
+                    "stderr-capture".to_string(),
+                ],
+                denied_capabilities: vec![
+                    "filesystem-paths".to_string(),
+                    "preopened-directories".to_string(),
+                    "process-spawn".to_string(),
+                ],
+            },
+        };
+        let mut json = serde_json::to_vec_pretty(&manifest)
+            .context("failed to serialize browser bundle manifest")?;
+        json.push(b'\n');
+        write_new_browser_file(&bundle_dir.join("manifest.json"), &json)?;
+        Ok(())
+    })();
+
+    if write_result.is_err() {
+        let _ = fs::remove_dir_all(bundle_dir);
+    }
+    write_result
 }
 
 fn write_runtime_sources(src_dir: &Path) -> Result<()> {
@@ -2515,6 +2954,26 @@ fn create_materialization_dir(path: &Path) -> Result<()> {
     }
 }
 
+/// Reserve a caller-selected browser payload directory without reusing or
+/// overwriting any existing file, directory, or symlink.
+fn create_browser_bundle_dir(path: &Path) -> Result<()> {
+    match fs::create_dir(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            bail!(
+                "--browser-bundle directory already exists: {}",
+                path.display()
+            )
+        }
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to create --browser-bundle directory {}",
+                path.display()
+            )
+        }),
+    }
+}
+
 /// Derive a Cargo-compatible binary name from the output path.
 ///
 /// Cargo allows alphanumerics, hyphens, and underscores in binary names.
@@ -2561,8 +3020,102 @@ fn sanitize_program_filename(input_path: &Path) -> String {
 
 /// Create a generated-project Cargo invocation whose artifact location cannot
 /// be redirected by the caller's ambient `CARGO_TARGET_DIR`.
-fn generated_cargo_command(build_dir: &Path) -> Command {
-    let mut command = Command::new("cargo");
+fn pinned_toolchain_channel() -> Result<String> {
+    let toolchain: toml::Value =
+        toml::from_str(std::str::from_utf8(WORKSPACE_RUST_TOOLCHAIN_TOML)?)
+            .context("embedded rust-toolchain.toml is invalid")?;
+    toolchain
+        .get("toolchain")
+        .and_then(|value| value.get("channel"))
+        .and_then(toml::Value::as_str)
+        .filter(|channel| !channel.is_empty())
+        .map(str::to_string)
+        .context("embedded rust-toolchain.toml lacks a pinned channel")
+}
+
+fn rustup_tool_for_pinned_channel(tool: &str, channel: &str) -> Option<PathBuf> {
+    let rustup = which::which("rustup").ok()?;
+    let output = Command::new(rustup)
+        .args(["which", tool, "--toolchain", channel])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let selected = PathBuf::from(String::from_utf8(output.stdout).ok()?.trim());
+    selected.is_file().then_some(selected)
+}
+
+fn selected_generated_tool(environment: &str, tool: &str, channel: &str) -> Result<PathBuf> {
+    std::env::var_os(environment)
+        .map(PathBuf::from)
+        .or_else(|| rustup_tool_for_pinned_channel(tool, channel))
+        .or_else(|| which::which(tool).ok())
+        .with_context(|| format!("cannot locate {tool} for pinned Rust {channel}"))
+}
+
+fn generated_tool_version(tool: &Path, arguments: &[&str], channel: &str) -> Result<String> {
+    let output = Command::new(tool)
+        .args(arguments)
+        .env("RUSTUP_TOOLCHAIN", channel)
+        .output()
+        .with_context(|| format!("failed to run generated-build tool {}", tool.display()))?;
+    if !output.status.success() {
+        bail!(
+            "generated-build tool {} failed version check for pinned Rust {}",
+            tool.display(),
+            channel
+        );
+    }
+    String::from_utf8(output.stdout).with_context(|| {
+        format!(
+            "generated-build tool {} emitted non-UTF-8 version",
+            tool.display()
+        )
+    })
+}
+
+fn validate_generated_tool_versions(
+    channel: &str,
+    cargo_version: &str,
+    rustc_verbose: &str,
+) -> Result<()> {
+    let cargo_release = cargo_version.split_whitespace().nth(1);
+    let rustc_release = rustc_verbose
+        .lines()
+        .find_map(|line| line.strip_prefix("release: "));
+    if cargo_release != Some(channel) || rustc_release != Some(channel) {
+        bail!(
+            "generated build requires pinned Rust {channel}, selected cargo={} rustc={}",
+            cargo_version.trim(),
+            rustc_release.unwrap_or("<missing release>")
+        );
+    }
+    Ok(())
+}
+
+fn selected_generated_tools() -> Result<(PathBuf, PathBuf, String)> {
+    let channel = pinned_toolchain_channel()?;
+    let cargo = selected_generated_tool("CARGO", "cargo", &channel)?;
+    let rustc = selected_generated_tool("RUSTC", "rustc", &channel)?;
+    let cargo_version = generated_tool_version(&cargo, &["--version"], &channel)?;
+    let rustc_verbose = generated_tool_version(&rustc, &["-vV"], &channel)?;
+    validate_generated_tool_versions(&channel, &cargo_version, &rustc_verbose)?;
+    Ok((cargo, rustc, channel))
+}
+
+fn generated_cargo_command(build_dir: &Path) -> Result<Command> {
+    // Resolve both tools once from the caller's declared environment. Some
+    // package-manager Cargo builds prefer a sibling rustc even when a rustup
+    // proxy appears earlier on PATH; that can silently select a sysroot which
+    // lacks the pinned WASI standard library. An explicit RUSTC still wins.
+    let (cargo, rustc, channel) = selected_generated_tools()?;
+    eprintln!(
+        "olangc: generated build tools cargo={} rustc={}",
+        cargo.display(),
+        rustc.display()
+    );
+    let mut command = Command::new(cargo);
     command
         .current_dir(build_dir)
         // A caller-level target directory would put the artifact somewhere
@@ -2570,12 +3123,14 @@ fn generated_cargo_command(build_dir: &Path) -> Command {
         // independent AOT builds collide. Keep every generated build inside
         // its disposable project, then copy only the verified result out.
         .env("CARGO_TARGET_DIR", build_dir.join("target"))
+        .env("RUSTUP_TOOLCHAIN", channel)
         // Incremental state is tied to one disposable generated project and
         // cannot help a later AOT build. Disabling it also makes rustc output
         // eligible for a shared compiler cache.
-        .env("CARGO_INCREMENTAL", "0");
+        .env("CARGO_INCREMENTAL", "0")
+        .env("RUSTC", rustc);
 
-    command
+    Ok(command)
 }
 
 /// Platform-aware path to the binary produced by `cargo build --release`.
@@ -2610,6 +3165,148 @@ fn canonicalize_output(output: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_bundle_cli_is_wasm_only_and_does_not_accept_output_aliases() {
+        let valid = Cli::try_parse_from([
+            "olangc",
+            "demo.O",
+            "--target",
+            "wasm",
+            "--browser-bundle",
+            "browser-out",
+        ])
+        .unwrap();
+        validate_admission_inspection(&valid).unwrap();
+
+        let wrong_target =
+            Cli::try_parse_from(["olangc", "demo.O", "--browser-bundle", "browser-out"]).unwrap();
+        assert!(validate_admission_inspection(&wrong_target)
+            .unwrap_err()
+            .to_string()
+            .contains("available only with --target wasm"));
+
+        let output_conflict = Cli::try_parse_from([
+            "olangc",
+            "demo.O",
+            "--target",
+            "wasm",
+            "--browser-bundle",
+            "browser-out",
+            "--output",
+            "other.wasm",
+        ])
+        .unwrap();
+        assert!(validate_admission_inspection(&output_conflict)
+            .unwrap_err()
+            .to_string()
+            .contains("--output cannot be combined"));
+    }
+
+    #[test]
+    fn browser_compatibility_uses_the_parsed_plan_and_fails_closed_on_effects() {
+        let (inline, _) =
+            inspect_browser_compatibility("text^(OSTADIX OLANGC WASM EXECUTION PASS)_text")
+                .unwrap();
+        assert!(inline.local_execution);
+        assert!(inline.blockers.is_empty());
+
+        let (shim, _) = inspect_browser_compatibility("python^(print('hosted'))_python").unwrap();
+        assert!(!shim.local_execution);
+        assert_eq!(shim.blockers.len(), 1);
+        assert_eq!(shim.blockers[0].code, "shim-backend");
+        assert_eq!(shim.blockers[0].backend.as_deref(), Some("python"));
+        assert_eq!(
+            shim.blockers[0].diagnostic,
+            "P0 shim-backend backend=python operation=exec"
+        );
+
+        let (request, _) =
+            inspect_browser_compatibility("instantiate(nix_expr^(pkgs.hello)_nix_expr)").unwrap();
+        assert!(!request.local_execution);
+        assert!(request.blockers.iter().any(
+            |blocker| blocker.code == "effectful-request" && blocker.operation == "instantiate"
+        ));
+    }
+
+    #[test]
+    fn browser_bundle_writer_is_manifest_bound_deterministic_and_no_clobber() {
+        let root = tempfile::tempdir().unwrap();
+        let bundle = root.path().join("browser");
+        let source = "text^(bundle-pass)_text\n";
+        let wasm = b"not-a-real-wasm";
+        let shims = vec![("python_shim.py".to_string(), b"fixture shim\n".to_vec())];
+        let (compatibility, plan) = inspect_browser_compatibility(source).unwrap();
+        write_browser_bundle(&bundle, source, wasm, &plan, compatibility, &shims, &[]).unwrap();
+
+        for path in [
+            "program.wasm",
+            "program.O",
+            "program.plan.txt",
+            "wasi-preview1-host.mjs",
+            "runner.mjs",
+            "browser-main.mjs",
+            "index.html",
+            "adapters/0000.shim",
+            "manifest.json",
+        ] {
+            assert!(bundle.join(path).is_file(), "missing bundle file {path}");
+        }
+
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(bundle.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(manifest["schema"], BROWSER_BUNDLE_SCHEMA);
+        assert_eq!(manifest["source"]["bytes"], source.len());
+        assert_eq!(
+            manifest["source"]["sha256"],
+            hex::encode(Sha256::digest(source.as_bytes()))
+        );
+        assert_eq!(manifest["artifact"]["bytes"], wasm.len());
+        assert_eq!(
+            manifest["artifact"]["sha256"],
+            hex::encode(Sha256::digest(wasm))
+        );
+        assert_eq!(manifest["plan"]["path"], "program.plan.txt");
+        assert_eq!(manifest["plan"]["bytes"], plan.len());
+        assert_eq!(
+            manifest["plan"]["sha256"],
+            hex::encode(Sha256::digest(plan.as_bytes()))
+        );
+        assert_eq!(manifest["compatibility"]["local_execution"], true);
+        assert_eq!(manifest["provider"]["required"], false);
+        assert_eq!(manifest["adapters"][0]["name"], "python_shim.py");
+        assert_eq!(
+            manifest["adapters"][0]["file"]["sha256"],
+            hex::encode(Sha256::digest(b"fixture shim\n"))
+        );
+        assert_eq!(
+            manifest["abi"]["imports"].as_array().unwrap().len(),
+            BROWSER_WASI_IMPORTS.len()
+        );
+        assert_eq!(
+            manifest["abi"]["required_exports"],
+            serde_json::json!(["memory", "_start"])
+        );
+
+        let error = write_browser_bundle(
+            &bundle,
+            source,
+            b"replacement",
+            &plan,
+            BrowserCompatibilityAssessment {
+                local_execution: true,
+                class: "browser-local-wasi-preview1".to_string(),
+                blockers: Vec::new(),
+            },
+            &shims,
+            &[],
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("--browser-bundle directory already exists"));
+        assert_eq!(fs::read(bundle.join("program.wasm")).unwrap(), wasm);
+    }
 
     #[test]
     fn dot_reports_invalid_effect_declarations_without_panicking() {
@@ -3155,7 +3852,7 @@ mod tests {
     #[test]
     fn generated_cargo_command_pins_a_project_local_target_directory() {
         let build_dir = tempfile::tempdir().unwrap();
-        let command = generated_cargo_command(build_dir.path());
+        let command = generated_cargo_command(build_dir.path()).unwrap();
         let target_dir = command
             .get_envs()
             .find(|(key, _)| *key == "CARGO_TARGET_DIR")
@@ -3165,6 +3862,12 @@ mod tests {
 
         assert_eq!(command.get_current_dir(), Some(build_dir.path()));
         assert_eq!(Path::new(target_dir), expected);
+        assert!(
+            command
+                .get_envs()
+                .any(|(key, value)| key == "RUSTC" && value.is_some()),
+            "generated Cargo commands must bind the selected rustc"
+        );
         assert_eq!(
             command
                 .get_envs()
@@ -3173,6 +3876,24 @@ mod tests {
             Some(std::ffi::OsStr::new("0")),
             "disposable generated builds must not retain incremental state"
         );
+    }
+
+    #[test]
+    fn generated_tool_versions_must_match_the_embedded_pin() {
+        validate_generated_tool_versions(
+            "1.97.1",
+            "cargo 1.97.1 (fixture 2026-01-01)",
+            "rustc 1.97.1 (fixture)\nrelease: 1.97.1\nhost: fixture\n",
+        )
+        .unwrap();
+
+        let error = validate_generated_tool_versions(
+            "1.97.1",
+            "cargo 1.96.0 (fixture)",
+            "rustc 1.97.1 (fixture)\nrelease: 1.97.1\n",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("requires pinned Rust 1.97.1"));
     }
 
     #[test]

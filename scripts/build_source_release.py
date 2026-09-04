@@ -385,6 +385,8 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "CITATION.cff",
         "Cargo.lock",
         "Cargo.toml",
+        "apps/android-terminal/runtime/Cargo.lock",
+        "apps/android-terminal/runtime/Cargo.toml",
         "CHANGELOG.md",
         "CODE_OF_CONDUCT.md",
         "CONTRIBUTING.md",
@@ -395,16 +397,27 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "mcp/ostadix_lang_mcp_server/Cargo.toml",
         "mcp/ostadix_lang_mcp_server/README.md",
         "mcp/ostadix_lang_mcp_server/src/main.rs",
+        "fuzz/Cargo.lock",
+        "fuzz/Cargo.toml",
         "Ostadix-lang_Technical_Whitepaper.pdf",
         "README.md",
         "SECURITY.md",
         "boot-and-test.sh",
+        "apps/olang-browser-wasi/browser-main.mjs",
+        "apps/olang-browser-wasi/index.html",
+        "apps/olang-browser-wasi/runner.mjs",
+        "apps/olang-browser-wasi/test-bundle.mjs",
+        "apps/olang-browser-wasi/test-browser.mjs",
+        "apps/olang-browser-wasi/test-direct-wasm.mjs",
+        "apps/olang-browser-wasi/test-host.mjs",
+        "apps/olang-browser-wasi/wasi-preview1-host.mjs",
         "ci/architecture-roots.toml",
         "ci/required-jobs.toml",
         "ci/test-suites.toml",
         "rust-toolchain.toml",
         "setup.sh",
         "docs/HOSTED_PLACEMENT_V6.md",
+        "docs/OFFLINE_AI_BUILD_KIT.md",
         "docs/PROJECT_MESH_V1.md",
         "docs/UNIFIED_INTENT_FRONT_DOOR_V1.md",
         "docs/OIR_EXECUTION_FABRIC_V1.md",
@@ -535,6 +548,8 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "ocore/world/value.oc",
         "ocore/world/value_codec.oc",
         "scripts/smoke_ostadix_mcp.py",
+        "scripts/bootstrap_offline_kit.sh",
+        "scripts/build_offline_kit.py",
         "scripts/smoke-docker.sh",
         "scripts/smoke-execution-fabric-v1.sh",
         "scripts/smoke-zero-config-lan-netns.sh",
@@ -736,6 +751,9 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "tests/test_ostadix_hosted_live_vga_smoke.py",
         "tests/test_ostadix_ventoy_installer.py",
         "tests/test_ostadix_wasm_release.py",
+        "tests/test_offline_kit.py",
+        "tests/test_olang_browser_bundle.py",
+        "tests/qualify_offline_kit_recipient.py",
         "tests/test_ostadix_boot_iso.py",
         "tests/test_ostadix_boot_media.py",
         "tests/test_ostadix_boot_info_qemu.py",
@@ -790,6 +808,12 @@ REQUIRED_RELEASE_PATHS = frozenset(
     | frozenset(OSTADIX_API_ROOT_MODULE_PATHS.values())
 )
 VALID_GIT_MODES = frozenset({"100644", "100755"})
+REQUIRED_EXECUTABLE_RELEASE_PATHS = frozenset(
+    {
+        "scripts/bootstrap_offline_kit.sh",
+        "scripts/build_offline_kit.py",
+    }
+)
 SAFE_PREFIX = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 HEX_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 HEX_COMMIT = re.compile(r"[0-9a-f]{40,64}\Z")
@@ -1123,7 +1147,10 @@ def is_allowed_release_path(path: str) -> bool:
         return False
     if basename.endswith("~") or basename.startswith(".#"):
         return False
-    if basename.endswith(EXCLUDED_SUFFIXES):
+    # Browser bundles need one reviewed HTML launcher in the source closure.
+    # Keep the general generated-HTML exclusion intact rather than allowing
+    # arbitrary HTML anywhere under apps/.
+    if basename.endswith(EXCLUDED_SUFFIXES) and path != "apps/olang-browser-wasi/index.html":
         return False
     return True
 
@@ -1248,6 +1275,17 @@ def collect_source_entries(repo: Path, commit: str) -> list[SourceEntry]:
         )
     if len(paths) != len(selected):
         raise ReleaseError("Git tree contains duplicate release paths")
+    modes = {path: mode for path, mode, _oid in selected}
+    wrong_executable_modes = sorted(
+        path
+        for path in REQUIRED_EXECUTABLE_RELEASE_PATHS
+        if modes.get(path) != "100755"
+    )
+    if wrong_executable_modes:
+        raise ReleaseError(
+            "source release requires executable mode 100755 for: "
+            + ", ".join(wrong_executable_modes)
+        )
 
     entries = [
         SourceEntry(path=path, mode=mode, data=_git(repo, "cat-file", "blob", oid))

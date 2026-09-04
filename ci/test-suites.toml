@@ -108,6 +108,9 @@ required_executables = ["cc", "cmake", "make", "python3"]
 [suites.mcp]
 required_executables = ["python3"]
 
+[suites.offline-kit]
+required_executables = ["bash"]
+
 [suites.release-claims]
 required_executables = ["bash", "python3"]
 

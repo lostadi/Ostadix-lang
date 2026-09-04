@@ -215,6 +215,30 @@ O version --json
 `O version --json` reports the package, toolchain, admission, catalog, Hosted,
 and World schema coordinates compiled into that executable.
 
+### Offline AI build ZIPs
+
+The normal source archive pins source and Cargo resolution, but deliberately
+does not pretend that one native Rust compiler can run on every host. For an AI
+or another offline recipient, build a **per-host offline kit** instead. That ZIP
+contains the allowlisted repository source, Cargo, `rustc`, the complete pinned
+Cargo registry closure from all four released lockfiles, and the
+`wasm32-wasip1` standard library. After extraction, the recipient runs:
+
+```bash
+./bootstrap-offline.sh check
+./bootstrap-offline.sh all-supported
+./bootstrap-offline.sh wasm-std-check
+```
+
+The archive verifies its exact member hashes, rejects the wrong OS/architecture,
+uses a sealed kit-local Cargo home and target directory, and forces Cargo
+offline with `--frozen --locked`. `all-supported` builds the authoritative
+hosted Rust binaries and the separately locked MCP server. Android APKs,
+nightly fuzzing, O-core/QEMU media, the C17 edition, system linkers/SDKs, and
+hosted language runtimes have separate toolchain requirements and are not
+misrepresented as part of that profile. Build and redistribution instructions
+are in [Per-host offline AI build kit](docs/OFFLINE_AI_BUILD_KIT.md).
+
 ### Zero-configuration LAN execution
 
 Ordinary LAN use keeps transport and proof coordinates internal. On Unix-like
@@ -1197,6 +1221,10 @@ The base Rust build needs:
 - A C compiler and system linker
 - Python 3 for the `python^` compatibility bridge and Python-backed legacy adapters
 - Git and standard POSIX command-line tools
+
+The pinned `rust-toolchain.toml` also names `wasm32-wasip1`. A connected rustup
+checkout installs that target with Rust 1.97.1; an offline AI kit carries the
+same target's standard library and Cargo directly inside its host-specific ZIP.
 
 Each hosted backend uses the real local runtime named in the backend table.
 You only install the runtimes your `.O` program actually uses. Nix is needed
@@ -3894,7 +3922,7 @@ with `O`.
 | Target | Command | Result |
 |--------|---------|--------|
 | `binary` | `olangc app.O -o target/app` | Builds a native hosted executable containing the program and Rust O runtime. |
-| `wasm` | `olangc app.O --target wasm -o target/app.wasm` | Builds a `wasm32-wasip1` module. Compilation succeeds at the audited master; the produced program currently exits under Wasmtime on this host when it tries to locate `O`. |
+| `wasm` | `olangc app.O --target wasm -o target/app.wasm` | Builds a source-bound `wasm32-wasip1` command module. Inline-only plans execute through the WASI serial executor; shim-backed plans still require an admitted host provider. |
 | `script` | `olangc app.O --target script` | Parses and executes directly inside the `olangc` process. |
 | `ir` | `olangc app.O --target ir` | Prints lowered OIR, its ExecutionPlan, and its directed executable HGraph; for a directory or lifted project, prints the deterministic ProjectExecutionPlan and project HGraph. Nothing executes. |
 | `dot` | `olangc app.O --target dot` | Emits Graphviz DOT for an ordinary OIR HGraph or a directory/lifted-project HGraph. Pipe to `dot -Tsvg` for a scalable rendered graph. Nothing executes. |
@@ -3910,6 +3938,40 @@ serialized authority. Generated Cargo builds disable disposable incremental
 state. They honor an explicitly configured `RUSTC_WRAPPER` such as an absolute
 `sccache` path, so equivalent AOT work can be reused without silently selecting
 another executable or sharing generated target directories.
+
+#### Browser WASI payloads
+
+`--browser-bundle` turns one ordinary `.O` file into a self-contained browser
+directory instead of a bare module:
+
+```bash
+olangc examples/wasm_hello.O --target wasm \
+  --browser-bundle target/wasm-hello-browser
+python3 -m http.server --directory target/wasm-hello-browser 8000
+```
+
+Open `http://localhost:8000/`; module loading and `fetch` are not promised from
+`file://`. The directory contains the exact source, `program.wasm`, a
+dependency-free WASI Preview 1 browser host, runner, UI, and a manifest binding
+source, artifact, plan, ABI, compatibility decision, selected shim adapters
+(including `--shim-dir` overrides), and asset digests.
+Those asset digests prove bundle consistency after the runner is trusted; they
+cannot authenticate HTML and JavaScript that were replaced together with the
+manifest. Serve the directory through an authenticated origin or verify an
+externally authenticated archive/commit digest before publishing it.
+
+Every valid ordinary UTF-8 `.O` file is parsed and lowered before compilation.
+Invalid syntax fails before Cargo runs. A plan whose executable leaves are
+`InlineAst` or `InlineValue` runs locally with captured stdout/stderr, clocks,
+cryptographic randomness, empty stdin, and no preopened filesystem. A `Shim`
+backend such as Python, Nix, shell, or WebAssembly, and every effectful O
+request, is packaged but marked `requires-whole-program-provider`; the browser
+runner refuses local execution unless the caller explicitly supplies the
+versioned provider interface. The provider receives the exact digest-verified
+source, immutable manifest, and fresh byte copies of every selected adapter. It
+is responsible for its own authentication, authority, adapter execution,
+limits, and result integrity. Browser bundle v1 does not yet accept a project
+directory or lifted project.
 
 #### Public output forms
 

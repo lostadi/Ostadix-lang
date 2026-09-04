@@ -150,7 +150,16 @@ ctest --test-dir build/c_cpp-cmake
 # Documentation/release-claim guard
 bash scripts/check_release_claims.sh
 python3 -m unittest -v tests.test_source_release
+python3 -m unittest -v tests.test_offline_kit
+python3 -m unittest -v tests.test_olang_browser_bundle
+node apps/olang-browser-wasi/test-host.mjs
 ```
+
+The source-release gate covers the browser host assets embedded by `olangc`.
+The offline-kit suite uses fixture toolchains and vendor trees to test archive
+closure, determinism, host rejection, no-clobber extraction, and tamper
+detection without downloading dependencies. A real per-host kit additionally
+requires the union-vendor procedure in `docs/OFFLINE_AI_BUILD_KIT.md`.
 
 `smoke-project-hgraph.sh` is the composite hosted PR7 planning and generated
 project-adapter gate. Its planning phase uses a real fixture to prove exact
