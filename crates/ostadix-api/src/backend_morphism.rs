@@ -142,6 +142,7 @@ pub enum BackendMorphismRejectionKindV1 {
     IntegerOutOfRange,
     NonFiniteFloat,
     CurrentAdapterDoesNotBindContainers,
+    InvalidFidelityAssessment,
     LosslessLawViolation,
 }
 
@@ -171,6 +172,22 @@ impl BackendMorphismErrorV1 {
             message: message.into(),
         }
     }
+}
+
+fn validate_returned_fidelity(
+    spec: &BackendMorphismSpecV1,
+    direction: BackendMorphismDirectionV1,
+    fidelity: &FidelityAssessmentV2,
+) -> Result<(), BackendMorphismErrorV1> {
+    fidelity.validate().map_err(|error| {
+        BackendMorphismErrorV1::new(
+            spec,
+            direction,
+            BackendMorphismRejectionKindV1::InvalidFidelityAssessment,
+            "$",
+            format!("backend morphism returned invalid fidelity bounds: {error}"),
+        )
+    })
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -207,14 +224,38 @@ pub struct BackendMorphismAssessmentV1 {
     pub o_to_backend_input: BackendMorphismLegAssessmentV1,
     pub profiled_backend_output_to_o: BackendMorphismLegAssessmentV1,
     pub composed_fidelity: FidelityAssessmentV2,
-    /// Present only when the composed judgment claims `Lossless`.
+    /// Present only when the two valid legs compose to `Lossless`.
     pub lossless_law_holds: Option<bool>,
+    /// Present for a failed lossless law or malformed fidelity returned by a
+    /// public morphism implementation.
     pub law_error: Option<BackendMorphismErrorV1>,
 }
 
 impl BackendMorphismAssessmentV1 {
     pub fn is_supported(&self) -> bool {
-        !matches!(self.composed_fidelity, FidelityAssessmentV2::Unsupported)
+        let BackendMorphismLegAssessmentV1::Supported {
+            fidelity: projected,
+        } = &self.o_to_backend_input
+        else {
+            return false;
+        };
+        let BackendMorphismLegAssessmentV1::Supported { fidelity: injected } =
+            &self.profiled_backend_output_to_o
+        else {
+            return false;
+        };
+        let Ok(expected_composed) = projected.clone().try_then(injected.clone()) else {
+            return false;
+        };
+        let expected_lossless_law =
+            (expected_composed == FidelityAssessmentV2::Lossless).then_some(true);
+
+        self.composed_fidelity.validate().is_ok()
+            && projected.validate().is_ok()
+            && injected.validate().is_ok()
+            && self.composed_fidelity == expected_composed
+            && !matches!(self.composed_fidelity, FidelityAssessmentV2::Unsupported)
+            && self.lossless_law_holds == expected_lossless_law
             && self.law_error.is_none()
     }
 }
@@ -246,8 +287,30 @@ pub trait BackendMorphismV1 {
         value: &OValue,
     ) -> Result<BackendMorphismRoundTripV1, BackendMorphismErrorV1> {
         let projected = self.project(value)?;
+        validate_returned_fidelity(
+            self.spec(),
+            BackendMorphismDirectionV1::OValueToBackendInputProfile,
+            &projected.fidelity,
+        )?;
         let injected = self.inject(&projected.value)?;
-        let composed = projected.fidelity.clone().then(injected.fidelity.clone());
+        validate_returned_fidelity(
+            self.spec(),
+            BackendMorphismDirectionV1::ProfiledBackendOutputToOValue,
+            &injected.fidelity,
+        )?;
+        let composed = projected
+            .fidelity
+            .clone()
+            .try_then(injected.fidelity.clone())
+            .map_err(|error| {
+                BackendMorphismErrorV1::new(
+                    self.spec(),
+                    BackendMorphismDirectionV1::LosslessLaw,
+                    BackendMorphismRejectionKindV1::InvalidFidelityAssessment,
+                    "$",
+                    format!("could not compose backend fidelity bounds: {error}"),
+                )
+            })?;
         if composed == FidelityAssessmentV2::Lossless && injected.value != *value {
             return Err(BackendMorphismErrorV1::new(
                 self.spec(),
@@ -291,6 +354,29 @@ pub trait BackendMorphismV1 {
             }
         };
         let projection_fidelity = projected.fidelity.clone();
+        if let Err(error) = validate_returned_fidelity(
+            spec,
+            BackendMorphismDirectionV1::OValueToBackendInputProfile,
+            &projection_fidelity,
+        ) {
+            return BackendMorphismAssessmentV1 {
+                schema: spec.schema.to_owned(),
+                backend: spec.backend.to_owned(),
+                profile: spec.profile,
+                integration: spec.integration,
+                o_to_backend_input_boundary: spec.o_to_backend_input_boundary.to_owned(),
+                profiled_backend_output_to_o_boundary: spec
+                    .profiled_backend_output_to_o_boundary
+                    .to_owned(),
+                o_to_backend_input: BackendMorphismLegAssessmentV1::Rejected {
+                    error: error.clone(),
+                },
+                profiled_backend_output_to_o: BackendMorphismLegAssessmentV1::NotAttempted,
+                composed_fidelity: FidelityAssessmentV2::Unsupported,
+                lossless_law_holds: None,
+                law_error: Some(error),
+            };
+        }
         let injected = match self.inject(&projected.value) {
             Ok(injected) => injected,
             Err(error) => {
@@ -315,7 +401,65 @@ pub trait BackendMorphismV1 {
                 };
             }
         };
-        let composed_fidelity = projection_fidelity.clone().then(injected.fidelity.clone());
+        if let Err(error) = validate_returned_fidelity(
+            spec,
+            BackendMorphismDirectionV1::ProfiledBackendOutputToOValue,
+            &injected.fidelity,
+        ) {
+            return BackendMorphismAssessmentV1 {
+                schema: spec.schema.to_owned(),
+                backend: spec.backend.to_owned(),
+                profile: spec.profile,
+                integration: spec.integration,
+                o_to_backend_input_boundary: spec.o_to_backend_input_boundary.to_owned(),
+                profiled_backend_output_to_o_boundary: spec
+                    .profiled_backend_output_to_o_boundary
+                    .to_owned(),
+                o_to_backend_input: BackendMorphismLegAssessmentV1::Supported {
+                    fidelity: projection_fidelity,
+                },
+                profiled_backend_output_to_o: BackendMorphismLegAssessmentV1::Rejected {
+                    error: error.clone(),
+                },
+                composed_fidelity: FidelityAssessmentV2::Unsupported,
+                lossless_law_holds: None,
+                law_error: Some(error),
+            };
+        }
+        let composed_fidelity = match projection_fidelity
+            .clone()
+            .try_then(injected.fidelity.clone())
+        {
+            Ok(composed) => composed,
+            Err(bounds_error) => {
+                let error = BackendMorphismErrorV1::new(
+                    spec,
+                    BackendMorphismDirectionV1::LosslessLaw,
+                    BackendMorphismRejectionKindV1::InvalidFidelityAssessment,
+                    "$",
+                    format!("could not compose backend fidelity bounds: {bounds_error}"),
+                );
+                return BackendMorphismAssessmentV1 {
+                    schema: spec.schema.to_owned(),
+                    backend: spec.backend.to_owned(),
+                    profile: spec.profile,
+                    integration: spec.integration,
+                    o_to_backend_input_boundary: spec.o_to_backend_input_boundary.to_owned(),
+                    profiled_backend_output_to_o_boundary: spec
+                        .profiled_backend_output_to_o_boundary
+                        .to_owned(),
+                    o_to_backend_input: BackendMorphismLegAssessmentV1::Supported {
+                        fidelity: projection_fidelity,
+                    },
+                    profiled_backend_output_to_o: BackendMorphismLegAssessmentV1::Supported {
+                        fidelity: injected.fidelity,
+                    },
+                    composed_fidelity: FidelityAssessmentV2::Unsupported,
+                    lossless_law_holds: None,
+                    law_error: Some(error),
+                };
+            }
+        };
         let lossless_law_holds = (composed_fidelity == FidelityAssessmentV2::Lossless)
             .then_some(injected.value == *value);
         let law_error = matches!(lossless_law_holds, Some(false)).then(|| {
@@ -869,6 +1013,59 @@ fn concrete_structural(losses: impl IntoIterator<Item = AnnotationKind>) -> Fide
 mod tests {
     use super::*;
 
+    struct InvalidFidelityMorphism {
+        invalid_projection: bool,
+    }
+
+    fn invalid_fidelity_assessment() -> FidelityAssessmentV2 {
+        let definite = crate::value::Fidelity::structural([AnnotationKind::NumericPrecision])
+            .losses()
+            .unwrap()
+            .clone();
+        let possible = crate::value::Fidelity::structural([AnnotationKind::TypeTag])
+            .losses()
+            .unwrap()
+            .clone();
+        FidelityAssessmentV2::Structural {
+            definite: Some(definite),
+            possible,
+        }
+    }
+
+    impl BackendMorphismV1 for InvalidFidelityMorphism {
+        fn spec(&self) -> &'static BackendMorphismSpecV1 {
+            &PYTHON_SPEC_V1
+        }
+
+        fn inject(
+            &self,
+            _native: &BackendNativeValueV1,
+        ) -> Result<BackendMorphismValueV1<OValue>, BackendMorphismErrorV1> {
+            Ok(BackendMorphismValueV1 {
+                value: OValue::null(),
+                fidelity: if self.invalid_projection {
+                    FidelityAssessmentV2::Lossless
+                } else {
+                    invalid_fidelity_assessment()
+                },
+            })
+        }
+
+        fn project(
+            &self,
+            _value: &OValue,
+        ) -> Result<BackendMorphismValueV1<BackendNativeValueV1>, BackendMorphismErrorV1> {
+            Ok(BackendMorphismValueV1 {
+                value: BackendNativeValueV1::Null,
+                fidelity: if self.invalid_projection {
+                    invalid_fidelity_assessment()
+                } else {
+                    FidelityAssessmentV2::Lossless
+                },
+            })
+        }
+    }
+
     fn map(entries: Vec<(BackendNativeValueV1, BackendNativeValueV1)>) -> BackendNativeValueV1 {
         BackendNativeValueV1::Map { entries }
     }
@@ -889,6 +1086,71 @@ mod tests {
         assert!(BackendMorphismKernelV1::for_backend("java").is_none());
         assert!(BackendMorphismKernelV1::for_backend("html").is_none());
         assert!(BackendMorphismKernelV1::for_backend("unknown").is_none());
+    }
+
+    #[test]
+    fn public_morphism_implementers_cannot_panic_composition_with_invalid_bounds() {
+        for invalid_projection in [true, false] {
+            let morphism = InvalidFidelityMorphism { invalid_projection };
+            let error = morphism.round_trip(&OValue::null()).unwrap_err();
+            assert_eq!(
+                error.kind,
+                BackendMorphismRejectionKindV1::InvalidFidelityAssessment
+            );
+
+            let assessment = morphism.shadow_assess(&OValue::null());
+            assert_eq!(
+                assessment.composed_fidelity,
+                FidelityAssessmentV2::Unsupported
+            );
+            assert_eq!(
+                assessment.law_error.as_ref().map(|error| error.kind),
+                Some(BackendMorphismRejectionKindV1::InvalidFidelityAssessment)
+            );
+            if invalid_projection {
+                assert!(matches!(
+                    assessment.o_to_backend_input,
+                    BackendMorphismLegAssessmentV1::Rejected { .. }
+                ));
+                assert_eq!(
+                    assessment.profiled_backend_output_to_o,
+                    BackendMorphismLegAssessmentV1::NotAttempted
+                );
+            } else {
+                assert!(matches!(
+                    assessment.profiled_backend_output_to_o,
+                    BackendMorphismLegAssessmentV1::Rejected { .. }
+                ));
+            }
+        }
+
+        let mut directly_assembled = BackendMorphismKernelV1::Python.shadow_assess(&OValue::null());
+        assert!(directly_assembled.is_supported());
+        directly_assembled.composed_fidelity = invalid_fidelity_assessment();
+        assert!(!directly_assembled.is_supported());
+
+        let mut invalid_leg = BackendMorphismKernelV1::Python.shadow_assess(&OValue::null());
+        invalid_leg.o_to_backend_input = BackendMorphismLegAssessmentV1::Supported {
+            fidelity: invalid_fidelity_assessment(),
+        };
+        assert!(!invalid_leg.is_supported());
+
+        let mut missing_leg = BackendMorphismKernelV1::Python.shadow_assess(&OValue::null());
+        missing_leg.profiled_backend_output_to_o = BackendMorphismLegAssessmentV1::NotAttempted;
+        assert!(!missing_leg.is_supported());
+
+        let mut forged_composition =
+            serde_json::to_value(BackendMorphismKernelV1::Python.shadow_assess(&OValue::null()))
+                .unwrap();
+        forged_composition["composed_fidelity"] = serde_json::json!({"kind": "native_capsule"});
+        let forged_composition: BackendMorphismAssessmentV1 =
+            serde_json::from_value(forged_composition).unwrap();
+        assert!(!forged_composition.is_supported());
+
+        let mut false_law = BackendMorphismKernelV1::Python.shadow_assess(&OValue::null());
+        false_law.lossless_law_holds = Some(false);
+        false_law.law_error = None;
+        assert!(!false_law.is_supported());
     }
 
     #[test]

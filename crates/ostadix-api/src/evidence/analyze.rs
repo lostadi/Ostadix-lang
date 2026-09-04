@@ -19,7 +19,7 @@ use crate::runtime_exec::{
     capture_execution_manifest, capture_execution_manifest_with_current_executable,
     inspection_executable_manifest, ExecutableLeaseSet, ExecutableManifestV1,
 };
-use crate::value::{FidelityAssessmentV2, GroupMode};
+use crate::value::{AnnotationKind, FidelityAssessmentV2, GroupMode};
 
 use super::fact::{
     BackendArtifactStateV1, BackendArtifactV1, CapabilityDispositionV1, CostEstimateV1,
@@ -278,10 +278,14 @@ fn validate_fidelity_projection_v2(graph: &HGraph) -> Result<()> {
         if !matches!(&node.kind, HNodeKind::Value) {
             continue;
         }
-        let projected = node
-            .fidelity_assessment
-            .as_ref()
-            .map(FidelityAssessmentV2::possible_fidelity);
+        let projected = match node.fidelity_assessment.as_ref() {
+            Some(assessment) => {
+                Some(assessment.try_possible_fidelity().with_context(|| {
+                    format!("graph node {} has invalid V2 fidelity bounds", id.0)
+                })?)
+            }
+            None => None,
+        };
         if node.fidelity != projected {
             anyhow::bail!(
                 "graph node {} has a legacy fidelity projection inconsistent with its V2 assessment",
@@ -957,12 +961,39 @@ fn encode_fidelity_assessment_v2(
     hash: &mut CanonicalHasher,
     assessment: Option<&FidelityAssessmentV2>,
 ) {
+    #[derive(serde::Serialize)]
+    #[serde(tag = "kind", rename_all = "snake_case")]
+    enum DigestFidelityAssessmentV2<'a> {
+        Lossless,
+        Structural {
+            definite: Option<&'a BTreeSet<AnnotationKind>>,
+            possible: &'a BTreeSet<AnnotationKind>,
+        },
+        NativeCapsule,
+        Unsupported,
+    }
+
     match assessment {
         Some(assessment) => {
+            // Hashing remains total over a public HGraph, including malformed
+            // directly assembled intervals. Admission validates those bounds
+            // separately; using the raw shape here avoids a public-input panic
+            // without changing the digest of any valid assessment.
+            let digest_assessment = match assessment {
+                FidelityAssessmentV2::Lossless => DigestFidelityAssessmentV2::Lossless,
+                FidelityAssessmentV2::Structural { definite, possible } => {
+                    DigestFidelityAssessmentV2::Structural {
+                        definite: definite.as_ref().map(|losses| losses.as_set()),
+                        possible: possible.as_set(),
+                    }
+                }
+                FidelityAssessmentV2::NativeCapsule => DigestFidelityAssessmentV2::NativeCapsule,
+                FidelityAssessmentV2::Unsupported => DigestFidelityAssessmentV2::Unsupported,
+            };
             hash.tag("fidelity-assessment-v2");
             hash.field(
-                &serde_json::to_vec(assessment)
-                    .expect("serializing FidelityAssessmentV2 into memory cannot fail"),
+                &serde_json::to_vec(&digest_assessment)
+                    .expect("serializing the closed fidelity digest shape cannot fail"),
             );
         }
         None => hash.tag("no-fidelity-assessment-v2"),
@@ -1716,6 +1747,39 @@ mod tests {
     }
 
     #[test]
+    fn graph_v2_hashes_invalid_public_bounds_but_validation_rejects_them() {
+        use crate::value::{AnnotationKind, Fidelity};
+
+        let program = program_for_backend("python", 1);
+        let mut graph = crate::hgraph::from_oir::build_program(&program);
+        crate::hgraph::solve::solve_types(&mut graph).unwrap();
+        let valid_digest = graph_sha256_v2(&graph);
+        let definite = Fidelity::structural([AnnotationKind::NumericPrecision])
+            .losses()
+            .unwrap()
+            .clone();
+        let possible = Fidelity::structural([AnnotationKind::TypeTag])
+            .losses()
+            .unwrap()
+            .clone();
+        let node = graph
+            .nodes
+            .values_mut()
+            .find(|node| matches!(&node.kind, HNodeKind::Value))
+            .unwrap();
+        node.fidelity_assessment = Some(FidelityAssessmentV2::Structural {
+            definite: Some(definite),
+            possible,
+        });
+
+        let malformed_digest = graph_sha256_v2(&graph);
+        assert_eq!(malformed_digest.len(), 64);
+        assert_ne!(malformed_digest, valid_digest);
+        let error = graph.validate_execution_graph().unwrap_err();
+        assert!(error.contains("invalid fidelity bounds"), "{error}");
+    }
+
+    #[test]
     fn graph_v2_validator_rejects_legacy_projection_mismatch() {
         let program = program_for_backend("python", 1);
         let plan = program.plan();
@@ -1731,9 +1795,7 @@ mod tests {
 
         let error = validate_canonical_solved_graph_v2(&program, &plan, &graph).unwrap_err();
         assert!(
-            error
-                .to_string()
-                .contains("legacy fidelity projection inconsistent"),
+            format!("{error:#}").contains("legacy fidelity projection inconsistent"),
             "{error:#}"
         );
     }

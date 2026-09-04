@@ -125,7 +125,7 @@ O^(
     q = quote^(python^(6 * 7)_python)_quote      # q : OExpr
   )_python[0]
   python[0]^(
-    O.eval(q)                                    # -> 42 (OInt)
+    O.eval(q)                                    # -> 42 (Number/ONumber::Int)
   )_python[0]
 )_O
 ```
@@ -504,8 +504,10 @@ unknown hosted footprint.
 
 Graph V2 and Evidence/Admission V6 bind the complete canonical
 `FidelityAssessmentV2`, including absence versus an explicit unsupported
-assessment. Graph V1, Evidence/Admission V5, Schedule Explanation/Why V1, and
-Placement Fragment V1 are archival inspection coordinates. Package 0.3 and
+assessment. A present Graph V2 `fidelity_assessment` requires legacy
+`fidelity` to equal its conservative possible-loss projection. Graph V1,
+Evidence/Admission V5, Schedule Explanation/Why V1, and Placement Fragment V1
+are archival inspection coordinates. Package 0.3 and
 later MUST NOT convert, relabel, reconstruct, dispatch, or authorize them as
 current V2/V6 authority. `ExecutionIntentV1` remains deliberately bound to
 Graph V1 and the current Catalog V6 projection; matching intent still requires
@@ -520,85 +522,121 @@ inter-language data passing goes through this type - it is the runtime
 embodiment of the canonical intermediate form any lossless polyglot system
 must have.
 
+Using the Rust enum's variant names and public payload types, its schematic
+shape is:
+
 ```
-OValue  ::= ONull
-          | OBool   { value: bool }
-          | OInt    { value: int }
-          | OFloat  { value: float }
-          | OStr    { value: str }
-          | OHtml   { value: str }              -- trusted HTML fragment
-          | OStorePath { path: str }            -- Nix store path
-          | OList   { items: (OValue, …) }
-          | OMap    { pairs: ((str, OValue), …) }
-          | OScope  { bindings: {str: OValue} } -- detached lexical snapshot
-          | OBlob   { data: bytes, mime: str }
-          | OExpr   { src: str }               -- homoiconicity: quoted O source
-          | ONixExpr { body: str, fingerprint: str, deps: [OValue] }
-          | ODerivation { drv_path: str, outputs: [str] }
-          | ORequest { kind: RequestKind, source: OValue }
-          | OThunk   { body: str, fingerprint: str, deps: [OValue] }
-          | OSystem  { profile_path: str }
-          | OGroup   { mode: GroupMode, members: [OValue], fingerprint: str }
+OValue  ::= Null
+          | Bool       { v: bool }
+          | Number     { v: ONumber }
+          | Text       { v: OText }
+          | Char       { scalar: char }
+          | Html       { v: str }                -- trusted HTML fragment
+          | StorePath  { path: str }             -- Nix store path
+          | Expr       { src: str }              -- quoted O source
+          | List       { v: [OValue] }
+          | Map        { v: {str: OValue} }
+          | Seq        { kind: List | Tuple | Vector, items: [OValue] }
+          | Object     { fields: {str: OValue} }
+          | EntriesMap { entries: [(OValue, OValue)] }
+          | Set        { kind: Ordered | Unordered, items: [OValue] }
+          | Symbol     { v: OSymbol }
+          | Keyword    { v: OKeyword }
+          | Scope      { bindings: {str: OValue} } -- detached lexical snapshot
+          | Blob       { v: base64-str, mime: str }
+          | Bytes      { v: OBytes }
+          | Graph      { root: node_id, nodes: [GraphNode] }
+          | Native     { v: ONative }
+          | NixExpr    { body: str, deps: [OValue], fingerprint: str }
+          | Derivation { drv_path: str, outputs: [str], deps: [OValue] }
+          | Request    { kind: RequestKind, source: OValue, fingerprint: str }
+          | System     { profile_path: str }
+          | Capability { kind: CapabilityKind, identity: str,
+                         metadata: {str: OValue} }
+          | Snapshot   { kind: SnapshotKind, identity: str,
+                         state: {str: OValue} }
+          | Thunk      { body: str, deps: [OValue], fingerprint: str }
+          | Group      { mode: GroupMode, members: [OValue], fingerprint: str }
+          | Error      { msg: str }
+
+ONumber ::= Int         { v: bigint }
+          | Rational    { num: bigint, den: bigint }
+          | Decimal     { coeff: bigint, exp10: i64, special: option(DecimalSpecial) }
+          | BinaryFloat { format: F32 | F64, bits: bytes }
+          | BigFloat    { mantissa: bigint, exp2: i64,
+                          precision: option(u64), special: option(FloatSpecial) }
+          | Complex     { re: ONumber, im: ONumber }
+
+OText    ::= { utf8: str, encoding: option(str) }
+OBytes   ::= { bytes: bytes, media_type: option(str) }
+OSymbol  ::= { namespace: option(str), name: str }
+OKeyword ::= { namespace: option(str), name: str }
+GraphNode ::= Value { value: OValue } | Ref { target: node_id }
 ```
 
 `GroupMode` is one of `batch`, `all`, `any`, `race` - the execution topology
 of an `OGroup` (see §3.1).
-
-Two additional system-facing forms freeze the runtime boundary:
-
-```
-         | OCapability { kind: CapabilityKind, identity: str, metadata: {str: OValue} }
-         | OSnapshot   { kind: SnapshotKind, identity: str, state: {str: OValue} }
-```
 
 - `OCapability` is an authority-bearing handle to a privileged resource (file,
   memory region, device, clock, network endpoint, process, service, or system
   activation). A live capability identity is an opaque bearer resolved through
   a private session table. Metadata is descriptive and grants no authority.
 - `OSnapshot` is an inert observation of world state captured at a boundary
-  (for example a system generation, service state, or filesystem view). It is
-  the persistable counterpart to live references such as `OSystem`.
+  (for example a system generation, service state, or filesystem view), rather
+  than a live reference such as `OSystem`. Inertness alone does not establish
+  cache, replay, or boot-persistence eligibility: each predicate also requires
+  every nested state value to satisfy that predicate.
 
 The Rust runtime uses length-prefixed canonical CBOR on the wire; the logical
 message shape uses a `"t"` discriminant (shown below in JSON notation):
 
-| Tag           | Wire form                                    | Notes                                 |
-|---------------|----------------------------------------------|---------------------------------------|
-| `null`        | `{"t":"null"}`                               |                                       |
-| `bool`        | `{"t":"bool","v":true}`                      |                                       |
-| `int`         | `{"t":"int","v":42}`                         |                                       |
-| `float`       | `{"t":"float","v":3.14}`                     |                                       |
-| `str`         | `{"t":"str","v":"hello"}`                    |                                       |
-| `html`        | `{"t":"html","v":"<p>...</p>"}`              | Rust ext; trusted HTML fragment        |
-| `store_path`  | `{"t":"store_path","path":"/nix/store/..."}`  | Rust ext; Nix store path              |
-| `list`        | `{"t":"list","v":[...]}`                     |                                       |
-| `map`         | `{"t":"map","v":{...}}`                      |                                       |
-| `scope`       | `{"t":"scope","bindings":{...}}`             | Explicit lexical root for O.eval      |
-| `blob`        | `{"t":"blob","v":"<base64>","mime":"..."}`   |                                       |
-| `expr`        | `{"t":"expr","src":"<O source text>"}`       | Quoted O expression; send to O.eval   |
-| `nix_expr`    | `{"t":"nix_expr","body":"...","fp":"..."}`   | Rust ext; lazy Nix expression         |
-| `group`       | `{"t":"group","mode":"batch","members":[...],"fingerprint":"..."}` | Rust ext; coordination group |
-| `capability`  | `{"t":"capability","kind":"service","identity":"...","metadata":{...}}` | Authority-bearing system handle |
-| `snapshot`    | `{"t":"snapshot","kind":"system","identity":"...","state":{...}}` | Persistable captured state |
-| `error`       | `{"t":"error","msg":"..."}` | Rust ext; error outcome value (used in Batch results) |
+| Tag | Representative logical JSON form |
+|-----|----------------------------------|
+| `null`, `bool` | `{"t":"null"}`, `{"t":"bool","v":true}` |
+| `number` | `{"t":"number","v":{"kind":"int","v":"42"}}` |
+| `text`, `char` | `{"t":"text","v":{"utf8":"hello","encoding":"utf-8"}}`, `{"t":"char","scalar":"λ"}` |
+| `html`, `store_path`, `expr` | Tagged trusted HTML, store path, or quoted O source |
+| `list`, `map` | Compatibility sequence and string-keyed map projections |
+| `seq`, `object`, `entries_map`, `set` | Shape-preserving structural collections |
+| `symbol`, `keyword` | Namespace/name symbolic values |
+| `scope` | `{"t":"scope","bindings":{...}}` |
+| `blob`, `bytes` | MIME-bearing base64 blob or structural byte record |
+| `graph`, `native` | Shared-identity graph frame or native capsule |
+| `nix_expr`, `derivation`, `request` | Deferred Nix source, derivation, or computation request |
+| `system`, `capability`, `snapshot` | Live reference, authority-bearing handle, or captured state |
+| `thunk`, `group`, `error` | Deferred shim body, coordination topology, or captured failure |
+
+Legacy `int`, `float`, and `str` tags remain accepted at the hosted IPC
+boundary and normalize to canonical `number` and `text` values. Rust OValue
+serialization emits the canonical tags; compatibility adapters may still send
+accepted legacy forms.
 
 ### 3.0 Runtime-boundary contract
 
 The language/runtime contract distinguishes three classes of values:
 
-- **Pure values** - inert data that is serializable, replayable, and safe to
-  persist across boots (`ONull`, numbers, strings, lists, maps, blobs,
-  `OExpr`, `ONixExpr`, `ODerivation`, `OThunk`, `OSnapshot`, most `ORequest`s).
+- **Pure values** - inert scalar data and composites whose children are all
+  pure. Dependency-bearing values such as `ONixExpr`, `ODerivation`, and
+  `OThunk`, and state-bearing `OSnapshot`, inherit the strongest boundary of
+  their contents. `ONative` uses its declared native boundary.
 - **Referential values** - live handles into the world whose identity is stable
-  as a reference but whose observed state may change (`OSystem`).
-- **Effectful values** - authority-bearing, scope, or orchestration values whose meaning
-  depends on execution context (`OCapability`, `OScope`, `OGroup`, `OError`, and effectful
-  `ORequest`s such as `activate`).
+  as a reference but whose observed state may change (`OSystem`, referential
+  native values, and composites containing either).
+- **Effectful values** - authority-bearing, scope, request, orchestration, or
+  failure values whose meaning depends on execution context (`OCapability`,
+  `OScope`, every `ORequest`, `OGroup`, `OError`, effectful native values, and
+  composites containing them).
+
+`RuntimeBoundary` is not the cache/replay/persistence order. Those admissibility
+questions are decided separately by `is_cache_safe`, `is_replay_safe`, and
+`is_boot_persistable`; an effectful request may satisfy a bounded replay rule,
+while a snapshot containing a live reference is not automatically persistable.
 
 The runtime MUST preserve these invariants:
 
 1. Every `OValue` is wire-serializable.
-2. Only pure values are assumed replay-safe across time.
+2. Cache, replay, and persistence eligibility MUST be decided by their
+   dedicated predicates, never inferred from `RuntimeBoundary` alone.
 3. Referential values are hashable by handle identity, not by live state.
 4. Values that encode authority or world mutation MUST NOT be treated as
    boot-persistable system facts merely because they serialize.
@@ -849,31 +887,63 @@ class Backend:
   sequences) and `quote` (which captures without evaluating).
 
 `render_child` is a consumer projection, not the OValue lifting map. Its
-fidelity is classified as typed (`T`), structural with an erased O tag (`S`),
-human presentation (`P`), or opaque marker (`O`):
+fidelity is classified as typed (`T`), structural (`S`), human presentation
+(`P`), or opaque marker (`O`). Scalar rows enumerate every possible result; a
+slash marks a payload-dependent classification. Container rows give the
+starting classification before recursive child folding:
 
 | OValue family | Python | Nix | HTML | LaTeX | Markdown | Default |
 |---------------|--------|-----|------|-------|----------|---------|
-| Null, bool, number | T | T | P | P | P | S |
-| Text | S | T | P | P | P | S |
+| Null, bool | T | T | P | P | P | S |
+| Integer | T | T/S | P | P | P | S |
+| Decimal, binary float F64 | T/S | S | P | P | P | S |
+| Rational, binary float F32, BigFloat, complex | S | S | P | P | P | S |
+| Text | S | T/S | P | P | P | S |
 | Char, symbol, keyword | S | S | P | P | P | S |
 | Bytes with media type | S | S | P | P | P | S |
 | Bytes without media type | S | O | P | P | P | O |
-| HTML, store path, expr, derivation, system | T | S | P | P | P | O |
-| List, map, seq, set, object | T | T | P | P | P | S |
+| HTML, store path, expr, derivation, system | T | S | P | P | P | S |
+| Blob | S | S | P | P | P | S |
+| NixExpr, thunk | T | S | P | P | P | S |
+| List, map | T | T/S | P | P | P | S |
+| Tuple sequence | T | S | P | P | P | S |
+| List/vector sequence, set, object | S | S | P | P | P | S |
 | EntriesMap | S | S | P | P | P | S |
-| Scope | T | O | O | O | O | O |
-| Blob | S | S | P | P | P | O |
-| NixExpr | T | T | P | P | P | O |
-| Graph, native | T | O | O | O | O | O |
-| Thunk | T | O | O | O | O | O |
+| Scope, graph, native | T | O | O | O | O | O |
 | Error | T | O | P | P | P | O |
 | Request, capability, snapshot, group | T | O | O | O | O | O |
 
-Container fidelity MUST be no stronger than the least faithful child.
-Implementations MUST classify every OValue variant for every registered
-renderer. An opaque value MUST render an identifying marker rather than
-silently disappearing.
+`T` retains the value and its O-level type. For `S`, portable payload or
+structure survives, but O-level tags or auxiliary metadata may be erased. `P`
+is an intentional human-facing presentation, and `O` retains only an
+identifying marker or summary. Python Decimal is `T` only for a
+renderer-admitted exact Decimal shape within its portable bounds, and F64 is
+`T` only for an eight-byte payload; otherwise those forms are `S`. Nix integer
+is `T` only in the signed 64-bit range, and Nix Text is `T` only with explicit
+`utf-8` encoding metadata and no NUL; otherwise each is `S`. A Nix map starts
+at `S`, rather than `T`, when any key contains NUL; such keyed containers use
+an entries list with domain-separated Unicode code-point keys so
+otherwise-colliding payloads remain reconstructible.
+
+Every recursive container MUST then fold all child classifications, so its
+result is no stronger than its least faithfully rendered child; `EntriesMap`
+MUST fold both keys and values. Implementations MUST classify every OValue
+variant for every registered renderer. An opaque value MUST render an
+identifying marker rather than silently disappearing.
+
+`RenderFidelity` can be recomputed on demand as a renderer-local description of
+source projection. It is not stored in OIR, evidence, or admission records.
+Within a single renderer, nested values use the weaker reachable
+classification; the specification does not impose a global order between
+`Structural` and `Presentation`, which are not jointly reachable for any
+current renderer.
+
+This rendering vocabulary is distinct from `Fidelity` and
+`FidelityAssessmentV2`, which describe backend value crossings. No conversion,
+common `Crossing` carrier, or Galois connection between those domains is
+implemented. In particular, `RenderFidelity::Opaque` carries neither an exact
+`AnnotationKind` loss set nor an independent presentation intent, so deriving
+either would invent information that the renderer did not report.
 
 The Python renderer uses `OOpaqueValue` for O-specific tagged values with no
 native Python form. That handle MUST retain the complete wire object and MUST
@@ -918,9 +988,9 @@ output is one rendering of that tree.
 |--------------|---------|---------------------------------------------------------------|
 | `python`     | `py`    | Real execution via `backends/python_shim.py`. Persistent globals per env. Returns last expr. Supports `O.eval`/`O.quote`. |
 | `html`       |         | Inline: body returned as `OHtml`. `render_child` makes blobs into data URLs. |
-| `markdown`   | `md`    | Inline: body returned as `OStr`. Markup passthrough with value splicing. |
-| `latex`      | `tex`   | Inline: body returned as `OStr`. Passthrough with value splicing. |
-| `text`       | `plain` | Inline: body returned as `OStr`. Passthrough. |
+| `markdown`   | `md`    | Inline: body returned as `OText`. Markup passthrough with value splicing. |
+| `latex`      | `tex`   | Inline: body returned as `OText`. Passthrough with value splicing. |
+| `text`       | `plain` | Inline: body returned as `OText`. Passthrough. |
 | `O`          | `o`     | Inline: sequences children left-to-right; returns last non-null value. |
 | `quote`      |         | Inline: captures body as `OExpr` without evaluating. No subprocess. |
 | `nix`        |         | `backends/nix_shim.py`. Evaluates Nix expressions. |

@@ -1503,7 +1503,7 @@ fn render_operation_v2(out: &mut String, operation: &AdmittedOperationV2) {
         .as_ref()
         .map(|assessment| {
             serde_json::to_string(assessment)
-                .expect("serializing FidelityAssessmentV2 into memory cannot fail")
+                .unwrap_or_else(|error| format!("<invalid-fidelity-assessment:{error}>"))
         })
         .unwrap_or_else(|| "absent".to_string());
     writeln!(
@@ -3023,7 +3023,7 @@ mod tests {
     use crate::hgraph::{DomainFlags, ValueState};
     use crate::ir::{InvokeMode, OIr, OIrProgram, PlanNodeKind};
     use crate::parser::Parser;
-    use crate::value::{FidelityAssessmentV2, GroupMode};
+    use crate::value::{AnnotationKind, Fidelity, FidelityAssessmentV2, GroupMode};
 
     fn reader_writer_program(initial: &str) -> OIrProgram {
         OIrProgram {
@@ -3352,6 +3352,27 @@ mod tests {
         assert!(text.starts_with("; ExecutionAdmissionWhy oexec.admission-why/v2\n"));
         assert!(text.contains("fidelity-assessment="));
         assert!(text.contains("explicit Admission V6 and does not dispatch"));
+
+        let definite = Fidelity::structural([AnnotationKind::NumericPrecision])
+            .losses()
+            .unwrap()
+            .clone();
+        let possible = Fidelity::structural([AnnotationKind::TypeTag])
+            .losses()
+            .unwrap()
+            .clone();
+        let mut malformed_why = why;
+        malformed_why
+            .operation
+            .evidence
+            .type_contract
+            .output_fidelity_assessment = Some(FidelityAssessmentV2::Structural {
+            definite: Some(definite),
+            possible,
+        });
+        assert!(malformed_why
+            .to_text()
+            .contains("<invalid-fidelity-assessment:"));
     }
 
     #[test]

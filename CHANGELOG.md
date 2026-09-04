@@ -174,16 +174,40 @@ Package SemVer is only one of the independent coordinates documented in
   packaged engine rather than workspace-relative root sources. Registry
   publication order is reversed: publish and verify `ostadix-api` first, then
   publish its exact-version `o-lang` shell dependent.
+- `FidelityAssessmentV2` now exposes interval validation and allocation-free
+  concrete-membership checks. Generated laws bind its exact `Fidelity` point
+  embedding, sequential composition, conservative upper projection, and the
+  lossless/structural path hull. Invalid directly assembled bounds can no
+  longer be serialized; graph and solver boundaries also reject invalid bounds
+  or a mismatched conservative V1 projection. Render fidelity remains a
+  separate descriptive domain;
+  no conversion, common carrier, or Galois connection to `Fidelity` or
+  `FidelityAssessmentV2` is introduced. The render classifier's complete
+  six-renderer matrix now asserts classifications for one
+  representative of all 30 `OValue` variants. Targeted cases cover
+  payload-sensitive Python Decimal/F64 and Nix integer/text rendering,
+  collection subtype collapse, recursive child propagation, map-key rendering,
+  and media-less bytes, rather than only checking that each renderer emits
+  output.
 
 ### Fixed
 
 - Splice renderers and diagnostics now abbreviate public or deserialized
   fingerprints without panicking on short or non-ASCII input. The renderer
-  matrix covers all 30 `OValue` variants and classifies Nix summaries of
-  `Graph` and `Native`, plus `Bytes` values without a media type under Nix and
-  the default renderer, as opaque. Scheduler cache keys preserve canonical
-  lowercase SHA-256 filenames while mapping every noncanonical input to a
-  bounded domain-separated hash inside the cache directory.
+  classifier now limits Nix typed integers to the signed 64-bit range and typed
+  text to explicit UTF-8 metadata without NUL, and limits Python typed
+  Decimal/F64 values to renderer-admitted exact shapes. It classifies values
+  whose portable payload survives the default renderer as structural, while
+  retaining opaque classifications for Nix `Graph`/`Native`, media-less
+  `Bytes` under Nix and the default renderer, and explicit marker-only values.
+  Nix NUL-bearing strings now use a tagged code-point structure, and keyed
+  containers with such keys use entries form, avoiding source collisions.
+  Python checkpoint integers and rational parts now share the chunked decimal
+  codec used at the execution boundary, including values above CPython's
+  configurable decimal-digit ceiling.
+  Scheduler cache keys preserve canonical lowercase SHA-256 filenames while
+  mapping every noncanonical input to a bounded domain-separated hash inside
+  the cache directory.
 
 ### Release boundary
 

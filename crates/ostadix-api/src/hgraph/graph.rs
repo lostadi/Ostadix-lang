@@ -961,6 +961,20 @@ impl HGraph {
 
     fn validate_node_kinds(&self) -> Result<(), String> {
         for (id, node) in &self.nodes {
+            if let Some(assessment) = &node.fidelity_assessment {
+                assessment.validate().map_err(|error| {
+                    format!("value node {} has invalid fidelity bounds: {error}", id.0)
+                })?;
+                let projected = assessment.try_possible_fidelity().map_err(|error| {
+                    format!("value node {} has invalid fidelity bounds: {error}", id.0)
+                })?;
+                if node.fidelity.as_ref() != Some(&projected) {
+                    return Err(format!(
+                        "value node {} has a legacy fidelity projection inconsistent with its V2 assessment",
+                        id.0
+                    ));
+                }
+            }
             if !node.is_value() {
                 if node.value.is_some()
                     || !node.domain.is_empty()

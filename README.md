@@ -3649,7 +3649,7 @@ data, live references, and authority-bearing values.
 |--------|---------|
 | ONull | Absence of a result. |
 | OBool | Boolean true/false. |
-| ONumber | Supports arbitrary-precision integers, exact rationals, and binary floats; the legacy OInt alias is retained for wire compatibility. |
+| ONumber | Supports arbitrary-precision integers, exact rationals, decimal and binary floats, big floats, and complex numbers; legacy `int`/`float` wire tags normalize here. |
 | OText | Text with explicit encoding metadata. |
 | OChar | A single Unicode scalar value. |
 | OHtml | Trusted HTML fragment, kept distinct from escaped text. |
@@ -3670,17 +3670,19 @@ data, live references, and authority-bearing values.
 | OError | Captured failed outcome used by batch results. |
 | OSystem | Live reference to a system profile. |
 | OCapability | Authority-bearing reference to a resource. |
-| OSnapshot | Inert captured world state suitable for persistence. |
+| OSnapshot | Inert captured world state whose replay and persistence eligibility still depends on its nested values. |
 | ONative | Same-backend native capsule with explicit rehydration policy. |
 
 Legacy wire tags `int`, `float`, and `str` are still accepted for hosted IPC
-compatibility, but they deserialize into `ONumber` and `OText`. New runtime code
-emits the canonical variants.
+compatibility, but they deserialize into `ONumber` and `OText`. Rust OValue
+serialization emits the canonical variants; compatibility adapters may still
+send the accepted legacy forms.
 
 The runtime classifies values into three groups:
 
-- **Pure values** are serializable, replayable, cacheable when their contents
-  are cache-safe, and suitable for persistence.
+- **Pure values** expose no live-world reference or effect at this boundary.
+  Cache, replay, and persistence eligibility remain separate predicates; a
+  pure native capsule can still be unsafe to replay or persist.
 - **Referential values** name live world objects whose state can change.
   OSystem identity is the profile reference, not a frozen system state.
 - **Effectful values** carry authority, scope, or orchestration semantics.
@@ -3696,11 +3698,11 @@ Representative wire values are:
 
 ```json
 {"t":"null"}
-{"t":"int","v":42}
-{"t":"str","v":"hello"}
+{"t":"number","v":{"kind":"int","v":"42"}}
+{"t":"text","v":{"utf8":"hello","encoding":"utf-8"}}
 {"t":"blob","v":"<base64>","mime":"image/png"}
 {"t":"expr","src":"python^(6 * 7)_python"}
-{"t":"scope","bindings":{"answer":{"t":"int","v":42}}}
+{"t":"scope","bindings":{"answer":{"t":"number","v":{"kind":"int","v":"42"}}}}
 {"t":"nix_expr","body":"...","deps":[],"fingerprint":"..."}
 {"t":"request","kind":"instantiate","source":{"t":"nix_expr","body":"...","deps":[],"fingerprint":"..."},"fingerprint":"..."}
 {"t":"group","mode":"batch","members":[],"fingerprint":"..."}
@@ -3725,33 +3727,60 @@ the terminal carrier.
 The terminal-object statement applies to backend-to-OValue lifting, not to
 every `render_child` projection back into source. Rendering is deliberately
 consumer-specific and some consumers only have a presentation or marker for a
-value. The implemented matrix is:
+value. The implemented matrix is below. Scalar rows enumerate every possible
+result; a slash marks a payload-dependent classification. Container rows give
+the starting classification before recursive child folding.
 
 | OValue family | Python | Nix | HTML | LaTeX | Markdown | Default |
 |---------------|--------|-----|------|-------|----------|---------|
-| Null, bool, number | T | T | P | P | P | S |
-| Text | S | T | P | P | P | S |
+| Null, bool | T | T | P | P | P | S |
+| Integer | T | T/S | P | P | P | S |
+| Decimal, binary float F64 | T/S | S | P | P | P | S |
+| Rational, binary float F32, BigFloat, complex | S | S | P | P | P | S |
+| Text | S | T/S | P | P | P | S |
 | Char, symbol, keyword | S | S | P | P | P | S |
 | Bytes with media type | S | S | P | P | P | S |
 | Bytes without media type | S | O | P | P | P | O |
-| HTML, store path, expr, derivation, system | T | S | P | P | P | O |
-| Blob | S | S | P | P | P | O |
-| NixExpr | T | T | P | P | P | O |
-| List, map, seq, set, object | T | T | P | P | P | S |
+| HTML, store path, expr, derivation, system | T | S | P | P | P | S |
+| Blob | S | S | P | P | P | S |
+| NixExpr, thunk | T | S | P | P | P | S |
+| List, map | T | T/S | P | P | P | S |
+| Tuple sequence | T | S | P | P | P | S |
+| List/vector sequence, set, object | S | S | P | P | P | S |
 | EntriesMap | S | S | P | P | P | S |
-| Scope | T | O | O | O | O | O |
-| Graph, native | T | O | O | O | O | O |
-| Thunk | T | O | O | O | O | O |
+| Scope, graph, native | T | O | O | O | O | O |
 | Error | T | O | P | P | P | O |
 | Request, capability, snapshot, group | T | O | O | O | O | O |
 
-`T` means the consumer syntax preserves the O-level type, `S` means the
-payload or structure survives but its O tag does not, `P` means an intentional
-human-facing presentation, and `O` means an opaque marker or summary. Container
-fidelity is bounded by the least faithfully rendered child. The Rust
-`RenderFidelity` match and its exhaustive matrix test cover every current
-OValue variant and every renderer. Adding a value or renderer requires the
-classification to be updated.
+`T` means the consumer syntax preserves the value and its O-level type. `S`
+means portable payload or structure survives, but O-level tags or auxiliary
+metadata may be erased. `P` means an intentional human-facing presentation,
+and `O` means an opaque marker or summary. Python classifies a Decimal as `T`
+only for a renderer-admitted exact Decimal shape within its portable bounds,
+and an F64 as `T` only with an eight-byte payload; otherwise those forms are
+`S`. Nix classifies an integer as `T` only in the signed 64-bit range and Text
+as `T` only with explicit `utf-8` encoding metadata and no NUL; otherwise each
+is `S`. A Nix map starts at `S`, rather than `T`, when any key contains NUL;
+such keyed containers use an entries list with domain-separated Unicode
+code-point keys so otherwise-colliding payloads remain reconstructible.
+
+Every recursive container is folded with all child classifications;
+`EntriesMap` includes both keys and values. Thus a container can be weaker than
+the base cell shown in the table, including `O` when a child is opaque. The Rust
+`RenderFidelity` match and its exhaustive matrix test bind one representative
+of every current OValue variant to all six renderers. Targeted cases
+additionally exercise numeric payload validity and range, text encoding and
+escaping, collection subtypes and child propagation, map-key rendering, and
+media-less bytes. Adding a value or renderer requires both the classification
+and expected matrix to be updated.
+
+Render fidelity can be recomputed on demand as a source-projection description,
+not the backend-crossing `Fidelity` domain or its `FidelityAssessmentV2`
+interval extension. No conversion or Galois connection between those domains
+is implemented: an opaque render does not report an exact annotation-loss set,
+and presentation intent is not an independent field.
+On Graph V2, a present `fidelity_assessment` requires legacy `fidelity` to
+equal its conservative possible-loss projection.
 
 Python closes its non-native cells with `OOpaqueValue`, a lossless handle over
 the complete tagged wire value. It can pass requests, capabilities, snapshots,
@@ -5671,8 +5700,8 @@ stopped.
   `--backend-grant` and `cap=...` syntax still accepted for compatibility.
 - Policy-keyed hosted processes with Python audit enforcement and a macOS
   operating-system sandbox layer.
-- Exhaustive producer-to-consumer rendering fidelity classification for every
-  OValue variant and renderer.
+- A variant-complete 30-by-six renderer-fidelity matrix, plus targeted
+  payload, subtype, map-key, and recursive-container cases.
 - Byte-reproducible O-core object emission for identical modules across source
   directories, enforced by a named test and CI.
 - Raw-byte and structured adversarial parser properties plus a cargo-fuzz

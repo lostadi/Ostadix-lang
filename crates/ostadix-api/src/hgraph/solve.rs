@@ -66,6 +66,12 @@ impl fmt::Display for BudgetDiagnostics {
 #[derive(Debug, Error, PartialEq)]
 #[non_exhaustive]
 pub enum SolveError {
+    #[error("value node {node:?} has invalid fidelity bounds: {reason}")]
+    InvalidFidelityAssessment { node: NodeId, reason: String },
+    #[error(
+        "value node {node:?} has a legacy fidelity projection inconsistent with its V2 assessment"
+    )]
+    InconsistentFidelityProjection { node: NodeId },
     #[error(
         "DataFlow edge {edge:?} must have exactly one ordinary Value input and at least one ordinary Value output (found {value_inputs} input(s), {value_outputs} output(s), and {non_value_ports} missing or non-Value port(s))"
     )]
@@ -136,6 +142,7 @@ fn solve_types_with_limits(
     derived_pass_bound: usize,
     applied_pass_limit: usize,
 ) -> Result<(), SolveError> {
+    validate_fidelity_assessments(graph)?;
     validate_dataflow_constraints(graph)?;
     hydrate_fidelity_assessments(graph);
     let mut trace = SolveTrace::default();
@@ -162,6 +169,29 @@ fn solve_types_with_limits(
             }
             if !changed {
                 break;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_fidelity_assessments(graph: &HGraph) -> Result<(), SolveError> {
+    for (node, value) in &graph.nodes {
+        if let Some(assessment) = &value.fidelity_assessment {
+            assessment
+                .validate()
+                .map_err(|error| SolveError::InvalidFidelityAssessment {
+                    node: *node,
+                    reason: error.to_string(),
+                })?;
+            let projected = assessment.try_possible_fidelity().map_err(|error| {
+                SolveError::InvalidFidelityAssessment {
+                    node: *node,
+                    reason: error.to_string(),
+                }
+            })?;
+            if value.fidelity.as_ref() != Some(&projected) {
+                return Err(SolveError::InconsistentFidelityProjection { node: *node });
             }
         }
     }

@@ -504,6 +504,67 @@ mod tests {
     }
 
     #[test]
+    fn solver_rejects_invalid_fidelity_bounds_before_mutation() {
+        let mut graph = HGraph::default();
+        let definite = Fidelity::structural([AnnotationKind::NumericPrecision]);
+        let possible = Fidelity::structural([AnnotationKind::TypeTag]);
+        let (Fidelity::Structural { lost: definite }, Fidelity::Structural { lost: possible }) =
+            (definite, possible)
+        else {
+            unreachable!("nonempty loss sets construct structural fidelity")
+        };
+        let node = graph.add_node(HNode {
+            fidelity_assessment: Some(FidelityAssessmentV2::Structural {
+                definite: Some(definite),
+                possible,
+            }),
+            ..HNode::fresh()
+        });
+
+        let before = graph.node(node).unwrap().clone();
+        let error = solve::solve_types(&mut graph).unwrap_err();
+        assert!(matches!(
+            error,
+            solve::SolveError::InvalidFidelityAssessment {
+                node: error_node,
+                ..
+            } if error_node == node
+        ));
+        assert_eq!(
+            graph.node(node),
+            Some(&before),
+            "invalid bounds must fail before solver mutation"
+        );
+    }
+
+    #[test]
+    fn solver_rejects_inconsistent_v1_projection_before_mutation() {
+        for fidelity in [None, Some(Fidelity::Lossless)] {
+            let mut graph = HGraph::default();
+            let node = graph.add_node(HNode {
+                fidelity_assessment: Some(FidelityAssessmentV2::Unsupported),
+                fidelity,
+                ..HNode::fresh()
+            });
+
+            let before = graph.node(node).unwrap().clone();
+            assert_eq!(
+                solve::solve_types(&mut graph).unwrap_err(),
+                solve::SolveError::InconsistentFidelityProjection { node },
+            );
+            assert_eq!(
+                graph.node(node),
+                Some(&before),
+                "inconsistent V1/V2 projections must fail before solver mutation"
+            );
+            assert!(graph
+                .validate_execution_graph()
+                .unwrap_err()
+                .contains("legacy fidelity projection inconsistent"));
+        }
+    }
+
+    #[test]
     fn dataflow_rejects_missing_value_output() {
         let mut graph = HGraph::default();
         let input = graph.add_node(HNode::fresh());

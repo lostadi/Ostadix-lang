@@ -199,11 +199,16 @@ pub(crate) fn renderer_inputs_statically_preparable(oir: &OIr) -> bool {
             backend.canonical.as_str(),
             "html" | "markdown" | "text" | "latex"
         )
-        && body.iter().all(|child| match child {
-            OIr::Text(_) | OIr::Store { .. } => true,
-            OIr::Exec { .. } => renderer_inputs_statically_preparable(child),
-            OIr::Load(_) | OIr::Invoke { .. } => false,
-        })
+        && body.iter().all(renderer_input_statically_preparable)
+}
+
+fn renderer_input_statically_preparable(input: &OIr) -> bool {
+    match input {
+        OIr::Text(_) => true,
+        OIr::Store { expr, .. } => renderer_input_statically_preparable(expr),
+        OIr::Exec { .. } => renderer_inputs_statically_preparable(input),
+        OIr::Load(_) | OIr::Invoke { .. } => false,
+    }
 }
 
 /// Hard effect/failure predicate shared by evidence and runtime verification.
@@ -234,5 +239,50 @@ pub(crate) fn effect_contract_worker_safe(summary: &EffectSummary, oir: &OIr) ->
                 && !summary.clock
         }
         _ => summary.is_verified_pure_infallible(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::backend_catalog::BackendRegistry;
+
+    use super::*;
+
+    fn exec(lang: &str, body: Vec<OIr>) -> OIr {
+        OIr::Exec {
+            lang: lang.into(),
+            env_id: 0,
+            attr: None,
+            backend: BackendRegistry::global().interface_for(lang),
+            body,
+        }
+    }
+
+    fn store(expr: OIr) -> OIr {
+        OIr::Store {
+            name: "answer".into(),
+            expr: Box::new(expr),
+        }
+    }
+
+    #[test]
+    fn trusted_renderer_recurses_through_store_expressions() {
+        let safe = exec("html", vec![store(OIr::Text("42".into()))]);
+        assert!(renderer_inputs_statically_preparable(&safe));
+
+        let scope_dependent = exec("html", vec![store(OIr::Load("answer".into()))]);
+        assert!(!renderer_inputs_statically_preparable(&scope_dependent));
+
+        let foreign_execution = exec(
+            "html",
+            vec![store(exec("python", vec![OIr::Text("6 * 7".into())]))],
+        );
+        assert!(!renderer_inputs_statically_preparable(&foreign_execution));
+
+        let nested_renderer = exec(
+            "html",
+            vec![store(exec("markdown", vec![OIr::Text("safe".into())]))],
+        );
+        assert!(renderer_inputs_statically_preparable(&nested_renderer));
     }
 }

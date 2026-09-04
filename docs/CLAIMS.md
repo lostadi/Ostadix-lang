@@ -666,14 +666,27 @@
   2^63 and preserve the JavaScript 2^53 behavior.
 - The stratified solver stores `FidelityAssessmentV2`, separating losses that
   occur for every represented value (`definite`) from losses possible for at
-  least one represented value (`possible`). Sequential crossings union both
-  bounds; mutually exclusive abstract paths intersect definite losses and
-  union possible losses. The compatibility `Fidelity` projection reports all
-  possible losses, so a V1 consumer cannot receive an optimistic answer.
+  least one represented value (`possible`). Sequential crossings used by the
+  solver union both bounds. The currently uncalled `join_paths` operation is a
+  tested conservative hull for lossless/structural alternatives: it intersects
+  definite losses and unions possible losses, but it is not evidence that the
+  production solver currently merges alternative paths. The compatibility
+  `Fidelity` projection reports all possible losses, so a V1 consumer cannot
+  receive an optimistic answer.
 - Structural fidelity loss is non-empty by construction. A legacy serialized
   empty structural set normalizes to `Lossless`, so semantically identical
-  states cannot retain two evidence encodings. Composition is covered by
-  identity, idempotence, commutativity, and associativity checks.
+  states cannot retain two evidence encodings. The concrete `Fidelity` point
+  embedding into `FidelityAssessmentV2`, sequential composition, interval
+  concretization membership, conservative upper projection, and the
+  lossless/structural path hull are covered by generated algebraic checks.
+- `RenderFidelity` is a separate, on-demand description of source-splice
+  projection, not crossing evidence or an admission result. Its matrix binds a
+  representative of all 30 current `OValue` variants to all six renderers;
+  targeted cases cover payload-conditional Python Decimal/F64 and Nix
+  integer/text behavior, collection subtypes, recursive child propagation,
+  map-key rendering, and media-less bytes. There is no implemented conversion,
+  common carrier, or Galois connection between `RenderFidelity`, `Fidelity`,
+  and `FidelityAssessmentV2`.
 - `BackendMorphismV1` is an additive shadow kernel, not an admission claim. Its
   Python profile is bounded to recursive acyclic plain data; it rejects
   cycles/shared references, non-string or duplicate map keys, excessive depth,

@@ -2238,6 +2238,92 @@ mod tests {
     }
 
     #[test]
+    fn exec_python_huge_numbers_bypass_decimal_digit_limits() -> Result<()> {
+        use crate::backend_catalog::SpliceRenderer;
+        use crate::eval_core::render_with;
+        use crate::value::ONumber;
+
+        let mut process = spawn_python_shim()?;
+        let digits = "9".repeat(5_000);
+        let decimal_coefficient = num_bigint::BigInt::parse_bytes(digits.as_bytes(), 10).unwrap();
+        let hex_digits = "f".repeat(5_000);
+        let integer_value =
+            OValue::big_int(num_bigint::BigInt::parse_bytes(hex_digits.as_bytes(), 16).unwrap());
+        let integer_source = render_with(SpliceRenderer::Python, &integer_value);
+
+        let integer = process.exec(
+            &format!("int = None\n__oval_result__ = {integer_source}"),
+            HashMap::new(),
+        )?;
+        assert_eq!(integer, integer_value.clone());
+
+        let decimal_value = OValue::number(ONumber::Decimal {
+            coeff: decimal_coefficient,
+            exp10: 0,
+            special: None,
+        });
+        let decimal_source = render_with(SpliceRenderer::Python, &decimal_value);
+        let decimal = process.exec(
+            &format!("__oval_result__ = {decimal_source}"),
+            HashMap::new(),
+        )?;
+        assert_eq!(decimal, decimal_value);
+
+        let bindings = HashMap::from([("huge".to_string(), integer_value)]);
+        assert_eq!(
+            process.exec(
+                &format!("__oval_result__ = huge == {integer_source}"),
+                bindings,
+            )?,
+            OValue::bool_(true),
+        );
+
+        process.shutdown(backend_shutdown_timeout())?;
+        Ok(())
+    }
+
+    #[test]
+    fn python_scope_with_invalid_nested_numbers_round_trips_without_crashing() -> Result<()> {
+        use crate::backend_catalog::SpliceRenderer;
+        use crate::eval_core::render_with;
+        use crate::value::{FloatFormat, ONumber};
+
+        let scope = OValue::scope(HashMap::from([
+            (
+                "zero_denominator".to_string(),
+                OValue::number(ONumber::Rational {
+                    num: 1.into(),
+                    den: 0.into(),
+                }),
+            ),
+            (
+                "malformed_float".to_string(),
+                OValue::number(ONumber::BinaryFloat {
+                    format: FloatFormat::F64,
+                    bits: vec![0],
+                }),
+            ),
+            (
+                "malformed_blob".to_string(),
+                OValue::Blob {
+                    v: "a".to_string(),
+                    mime: "application/octet-stream".to_string(),
+                },
+            ),
+        ]));
+        let source = render_with(SpliceRenderer::Python, &scope);
+        let mut process = spawn_python_shim()?;
+
+        assert_eq!(
+            process.exec(&format!("__oval_result__ = {source}"), HashMap::new())?,
+            scope,
+        );
+
+        process.shutdown(backend_shutdown_timeout())?;
+        Ok(())
+    }
+
+    #[test]
     fn exec_python_bytes_result_uses_structural_bytes() -> Result<()> {
         let mut process = spawn_python_shim()?;
 
@@ -2354,6 +2440,39 @@ mod tests {
         assert_eq!(receipt.checkpoint_sha256, checkpoint.checkpoint_sha256()?);
         assert_eq!(
             target.exec("__oval_result__ = x is y and x[0] is x", HashMap::new())?,
+            OValue::bool_(true)
+        );
+        target.shutdown(backend_shutdown_timeout())?;
+        Ok(())
+    }
+
+    #[test]
+    fn python_checkpoint_restore_preserves_unbounded_integers_and_fractions() -> Result<()> {
+        let mut source = spawn_python_shim()?;
+        source.exec(
+            concat!(
+                "huge = 10 ** 5000\n",
+                "ratio = __import__('fractions').Fraction(huge, 3)\n",
+                "__oval_result__ = 'ready'",
+            ),
+            HashMap::new(),
+        )?;
+        let checkpoint = source.checkpoint(1024 * 1024)?;
+        source.shutdown(backend_shutdown_timeout())?;
+
+        let mut target = spawn_python_shim()?;
+        target.restore(checkpoint)?;
+        assert_eq!(
+            target.exec(
+                concat!(
+                    "__oval_result__ = (\n",
+                    "    huge == 10 ** 5000\n",
+                    "    and ratio.numerator == huge\n",
+                    "    and ratio.denominator == 3\n",
+                    ")",
+                ),
+                HashMap::new(),
+            )?,
             OValue::bool_(true)
         );
         target.shutdown(backend_shutdown_timeout())?;

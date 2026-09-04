@@ -282,6 +282,25 @@ enum FidelityAssessmentDeserializeV2 {
 }
 
 impl FidelityAssessmentV2 {
+    /// Validate the interval invariant for a fidelity assessment.
+    ///
+    /// Values created by [`Self::structural`] or deserialized through the wire
+    /// format are always valid. This check remains public because the named
+    /// fields of the additive V2 enum are part of the existing Rust API and can
+    /// still be assembled directly by downstream callers.
+    pub fn validate(&self) -> Result<(), FidelityBoundsError> {
+        if let Self::Structural {
+            definite: Some(definite),
+            possible,
+        } = self
+        {
+            if !definite.as_set().is_subset(possible.as_set()) {
+                return Err(FidelityBoundsError::DefiniteOutsidePossible);
+            }
+        }
+        Ok(())
+    }
+
     pub fn structural(
         definite: impl IntoIterator<Item = AnnotationKind>,
         possible: impl IntoIterator<Item = AnnotationKind>,
@@ -300,6 +319,13 @@ impl FidelityAssessmentV2 {
         })
     }
 
+    /// Embed one concrete V1 fidelity judgment as an exact V2 point interval.
+    ///
+    /// This exact point embedding is written `alpha` in the fidelity docs:
+    /// structural loss set `L` becomes the interval `[L, L]`, while the three
+    /// non-structural cases remain singleton points. The embedding and its
+    /// tested composition law do not, by themselves, assert a full Galois
+    /// connection.
     pub fn from_concrete(fidelity: Fidelity) -> Self {
         match fidelity {
             Fidelity::Lossless => Self::Lossless,
@@ -309,6 +335,35 @@ impl FidelityAssessmentV2 {
             },
             Fidelity::NativeCapsule => Self::NativeCapsule,
             Fidelity::Unsupported => Self::Unsupported,
+        }
+    }
+
+    /// Return whether a concrete V1 judgment belongs to this assessment's
+    /// concretization.
+    ///
+    /// This predicate is the operational form of `f in gamma(a)`. Enumerating
+    /// `gamma(a)` would require an exponential powerset, so callers test
+    /// membership instead. A structural interval `[D, P]` contains exactly
+    /// the canonical concrete loss sets `L` for which `D subset L subset P`;
+    /// canonical [`Fidelity::Lossless`] represents the empty `L`.
+    /// Directly assembled invalid assessments have an empty concretization.
+    pub fn concretization_contains(&self, concrete: &Fidelity) -> bool {
+        if self.validate().is_err() {
+            return false;
+        }
+
+        match (self, concrete) {
+            (Self::Lossless, Fidelity::Lossless)
+            | (Self::NativeCapsule, Fidelity::NativeCapsule)
+            | (Self::Unsupported, Fidelity::Unsupported) => true,
+            (Self::Structural { definite, .. }, Fidelity::Lossless) => definite.is_none(),
+            (Self::Structural { definite, possible }, Fidelity::Structural { lost }) => {
+                definite
+                    .as_ref()
+                    .is_none_or(|required| required.as_set().is_subset(lost.as_set()))
+                    && lost.as_set().is_subset(possible.as_set())
+            }
+            _ => false,
         }
     }
 
@@ -326,10 +381,30 @@ impl FidelityAssessmentV2 {
         }
     }
 
-    /// Compose two crossings on one execution path. A loss established or
-    /// possible at either crossing remains established or possible after the
-    /// complete path.
+    /// Checked composition of two crossings on one execution path.
+    ///
+    /// A loss established or possible at either crossing remains established
+    /// or possible after the complete path. Both operands are validated first
+    /// because the public V2 enum fields remain directly constructible for
+    /// source compatibility.
+    pub fn try_then(self, next: Self) -> std::result::Result<Self, FidelityBoundsError> {
+        self.validate()?;
+        next.validate()?;
+        Ok(self.then_valid(next))
+    }
+
+    /// Compose two valid crossings on one execution path.
+    ///
+    /// # Panics
+    ///
+    /// Panics when either directly assembled operand violates the interval
+    /// invariant. Prefer [`Self::try_then`] at an untrusted API boundary.
     pub fn then(self, next: Self) -> Self {
+        self.try_then(next)
+            .expect("fidelity composition requires valid interval bounds")
+    }
+
+    fn then_valid(self, next: Self) -> Self {
         use FidelityAssessmentV2::*;
         match (self, next) {
             (Unsupported, _) | (_, Unsupported) => Unsupported,
@@ -356,10 +431,32 @@ impl FidelityAssessmentV2 {
         }
     }
 
-    /// Merge mutually exclusive abstract alternatives. Only losses common to
-    /// every alternative remain definite; a loss possible on either side
-    /// remains possible for the merged abstraction.
+    /// Checked path merge for valid fidelity assessments.
+    ///
+    /// For structural/lossless operands, only losses common to both paths stay
+    /// definite and losses possible on either path stay possible; this is the
+    /// interval hull. Across non-structural classes, `Unsupported` and
+    /// `NativeCapsule` are absorbing severity maxima, not concretization
+    /// unions. This method therefore must not justify a success-selecting
+    /// `any` or `race` result without evidence identifying the winning path.
+    pub fn try_join_paths(self, other: Self) -> std::result::Result<Self, FidelityBoundsError> {
+        self.validate()?;
+        other.validate()?;
+        Ok(self.join_paths_valid(other))
+    }
+
+    /// Merge two valid paths using [`Self::try_join_paths`]'s semantics.
+    ///
+    /// # Panics
+    ///
+    /// Panics when either directly assembled operand violates the interval
+    /// invariant. Prefer [`Self::try_join_paths`] at an untrusted API boundary.
     pub fn join_paths(self, other: Self) -> Self {
+        self.try_join_paths(other)
+            .expect("fidelity path merge requires valid interval bounds")
+    }
+
+    fn join_paths_valid(self, other: Self) -> Self {
         use FidelityAssessmentV2::*;
         match (self, other) {
             (Unsupported, _) | (_, Unsupported) => Unsupported,
@@ -378,23 +475,38 @@ impl FidelityAssessmentV2 {
         }
     }
 
-    /// Conservative V1 projection used only by compatibility evidence. It
-    /// reports every possible loss so old consumers never receive an
+    /// Checked conservative V1 projection used by compatibility evidence.
+    /// It reports every possible loss so old consumers never receive an
     /// optimistic answer.
-    pub fn possible_fidelity(&self) -> Fidelity {
-        match self {
+    pub fn try_possible_fidelity(&self) -> std::result::Result<Fidelity, FidelityBoundsError> {
+        self.validate()?;
+        Ok(match self {
             Self::Lossless => Fidelity::Lossless,
             Self::Structural { possible, .. } => {
                 Fidelity::structural(possible.as_set().iter().cloned())
             }
             Self::NativeCapsule => Fidelity::NativeCapsule,
             Self::Unsupported => Fidelity::Unsupported,
-        }
+        })
     }
 
-    /// Return a concrete V1 judgment only when uncertainty has collapsed.
-    pub fn concrete_fidelity(&self) -> Option<Fidelity> {
-        match self {
+    /// Conservative V1 projection of a valid assessment.
+    ///
+    /// # Panics
+    ///
+    /// Panics for a directly assembled invalid interval. Prefer
+    /// [`Self::try_possible_fidelity`] at an untrusted API boundary.
+    pub fn possible_fidelity(&self) -> Fidelity {
+        self.try_possible_fidelity()
+            .expect("fidelity projection requires valid interval bounds")
+    }
+
+    /// Checked exact projection to V1 when uncertainty has collapsed.
+    pub fn try_concrete_fidelity(
+        &self,
+    ) -> std::result::Result<Option<Fidelity>, FidelityBoundsError> {
+        self.validate()?;
+        Ok(match self {
             Self::Structural {
                 definite: Some(definite),
                 possible,
@@ -403,7 +515,19 @@ impl FidelityAssessmentV2 {
             }
             Self::Structural { .. } => None,
             other => Some(other.possible_fidelity()),
-        }
+        })
+    }
+
+    /// Return a concrete V1 judgment only when a valid assessment's
+    /// uncertainty has collapsed.
+    ///
+    /// # Panics
+    ///
+    /// Panics for a directly assembled invalid interval. Prefer
+    /// [`Self::try_concrete_fidelity`] at an untrusted API boundary.
+    pub fn concrete_fidelity(&self) -> Option<Fidelity> {
+        self.try_concrete_fidelity()
+            .expect("exact fidelity projection requires valid interval bounds")
     }
 
     fn loss_bounds(&self) -> (BTreeSet<AnnotationKind>, BTreeSet<AnnotationKind>) {
@@ -428,6 +552,7 @@ impl Serialize for FidelityAssessmentV2 {
     where
         S: serde::Serializer,
     {
+        self.validate().map_err(serde::ser::Error::custom)?;
         match self {
             Self::Lossless => FidelityAssessmentSerializeV2::Lossless,
             Self::Structural { definite, possible } => FidelityAssessmentSerializeV2::Structural {
@@ -1394,7 +1519,8 @@ impl SnapshotKind {
 /// Runtime boundary classification for an O value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeBoundary {
-    /// Pure data: serializable, replayable, and safe to persist across boots.
+    /// No live-world reference or effect is exposed by the value boundary.
+    /// Cache, replay, and persistence eligibility remain separate predicates.
     Pure,
     /// A live reference into the world; stable as a handle, but not a snapshot.
     Referential,
@@ -3453,7 +3579,107 @@ pub enum OValueError {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
+
+    macro_rules! exhaustive_ovalue_cases {
+        ($( $pattern:pat => ($value:expr, $tag:expr) ),+ $(,)?) => {{
+            fn compile_time_exhaustiveness_guard(value: &OValue) {
+                match value {
+                    $( $pattern => (), )+
+                }
+            }
+
+            vec![
+                $(
+                    {
+                        let value = $value;
+                        assert!(matches!(&value, $pattern));
+                        compile_time_exhaustiveness_guard(&value);
+                        (value, $tag)
+                    }
+                ),+
+            ]
+        }};
+    }
+
+    fn annotation_kind_strategy() -> impl Strategy<Value = AnnotationKind> {
+        prop_oneof![
+            9 => (0_u8..=8).prop_map(|kind| match kind {
+                0 => AnnotationKind::TypeTag,
+                1 => AnnotationKind::NumericPrecision,
+                2 => AnnotationKind::NumericExactness,
+                3 => AnnotationKind::Encoding,
+                4 => AnnotationKind::Ordering,
+                5 => AnnotationKind::Identity,
+                6 => AnnotationKind::Constraint,
+                7 => AnnotationKind::Capability,
+                _ => AnnotationKind::Presentation,
+            }),
+            2 => ("[a-z]{1,8}", "[a-z_]{1,16}").prop_map(|(lang, label)| {
+                AnnotationKind::BackendSpecific { lang, label }
+            }),
+        ]
+    }
+
+    fn fidelity_strategy() -> impl Strategy<Value = Fidelity> {
+        prop_oneof![
+            Just(Fidelity::Lossless),
+            Just(Fidelity::NativeCapsule),
+            Just(Fidelity::Unsupported),
+            proptest::collection::btree_set(annotation_kind_strategy(), 1..=11)
+                .prop_map(Fidelity::structural),
+        ]
+    }
+
+    fn structural_assessment_strategy() -> impl Strategy<Value = FidelityAssessmentV2> {
+        (
+            proptest::collection::btree_set(annotation_kind_strategy(), 0..=11),
+            proptest::collection::btree_set(annotation_kind_strategy(), 0..=11),
+        )
+            .prop_map(|(definite, extra_possible)| {
+                let mut possible = definite.clone();
+                possible.extend(extra_possible);
+                FidelityAssessmentV2::structural(definite, possible).unwrap()
+            })
+    }
+
+    fn fidelity_assessment_strategy() -> impl Strategy<Value = FidelityAssessmentV2> {
+        prop_oneof![
+            Just(FidelityAssessmentV2::NativeCapsule),
+            Just(FidelityAssessmentV2::Unsupported),
+            structural_assessment_strategy(),
+        ]
+    }
+
+    fn structural_assessment_with_witness_strategy(
+    ) -> impl Strategy<Value = (FidelityAssessmentV2, Fidelity)> {
+        (
+            proptest::collection::btree_set(annotation_kind_strategy(), 0..=11),
+            proptest::collection::btree_set(annotation_kind_strategy(), 0..=11),
+            proptest::collection::btree_set(annotation_kind_strategy(), 0..=11),
+        )
+            .prop_map(|(definite, witness_extra, possible_extra)| {
+                let mut witness = definite.clone();
+                witness.extend(witness_extra);
+                let mut possible = witness.clone();
+                possible.extend(possible_extra);
+                (
+                    FidelityAssessmentV2::structural(definite, possible).unwrap(),
+                    Fidelity::structural(witness),
+                )
+            })
+    }
+
+    fn fidelity_assessment_with_witness_strategy(
+    ) -> impl Strategy<Value = (FidelityAssessmentV2, Fidelity)> {
+        prop_oneof![
+            Just((FidelityAssessmentV2::NativeCapsule, Fidelity::NativeCapsule,)),
+            Just((FidelityAssessmentV2::Unsupported, Fidelity::Unsupported,)),
+            structural_assessment_with_witness_strategy(),
+        ]
+    }
 
     #[test]
     fn fingerprint_preview_is_bounded_and_utf8_safe() {
@@ -3506,6 +3732,8 @@ mod tests {
             // serde_json serializes it as null. Custom serializer needed (tracked).
             OValue::str_("hello, world"),
             OValue::text("hello, text"),
+            OValue::html("<b>trusted</b>"),
+            OValue::store_path("/nix/store/example"),
             OValue::bytes(
                 b"abc".to_vec(),
                 Some("application/octet-stream".to_string()),
@@ -3550,6 +3778,14 @@ mod tests {
                 ],
             ),
             OValue::native(sample_native()),
+            OValue::nix_expr("1 + 1", vec![OValue::int(1)]),
+            OValue::derivation(
+                "/nix/store/example.drv",
+                vec!["out".to_string()],
+                vec![OValue::int(1)],
+            ),
+            OValue::request(RequestKind::Instantiate, OValue::nix_expr("1", Vec::new())),
+            OValue::system("/nix/var/nix/profiles/system"),
             // OExpr round-trips its src string.
             OValue::Expr {
                 src: "python^(6 * 7)_python".to_string(),
@@ -3565,9 +3801,11 @@ mod tests {
                 "generation-42",
                 HashMap::from([("kernel".to_string(), OValue::str_("6.9.0"))]),
             ),
+            OValue::thunk("40 + 2", vec![OValue::int(42)]),
             // Group round-trips mode + members + fingerprint.
             OValue::group(GroupMode::Batch, vec![OValue::int(1), OValue::int(2)]),
             OValue::group(GroupMode::Race, vec![OValue::str_("a")]),
+            OValue::error("captured failure"),
         ];
 
         for original in &cases {
@@ -3581,6 +3819,40 @@ mod tests {
                 original, json, decoded
             );
         }
+    }
+
+    #[test]
+    fn canonical_number_text_and_control_wire_shapes_are_pinned() {
+        assert_eq!(
+            serde_json::to_string(&OValue::int(42)).unwrap(),
+            r#"{"t":"number","v":{"kind":"int","v":"42"}}"#,
+        );
+        assert_eq!(
+            serde_json::to_string(&OValue::text("hello")).unwrap(),
+            r#"{"t":"text","v":{"utf8":"hello","encoding":"utf-8"}}"#,
+        );
+        assert_eq!(
+            serde_json::to_string(&OValue::Derivation {
+                drv_path: "/nix/store/example.drv".to_string(),
+                outputs: vec!["out".to_string()],
+                deps: vec![],
+            })
+            .unwrap(),
+            r#"{"t":"derivation","drv_path":"/nix/store/example.drv","outputs":["out"],"deps":[]}"#,
+        );
+        assert_eq!(
+            serde_json::to_string(&OValue::Request {
+                kind: RequestKind::Instantiate,
+                source: Box::new(OValue::null()),
+                fingerprint: "fp".to_string(),
+            })
+            .unwrap(),
+            r#"{"t":"request","kind":"instantiate","source":{"t":"null"},"fingerprint":"fp"}"#,
+        );
+        assert_eq!(
+            serde_json::to_string(&OValue::error("boom")).unwrap(),
+            r#"{"t":"error","msg":"boom"}"#,
+        );
     }
 
     /// OWireCommand and OWireResponse must also round-trip cleanly,
@@ -3667,47 +3939,39 @@ mod tests {
     /// wire protocol `t` tag — they must stay in sync.
     #[test]
     fn type_names_match_wire_tags() {
-        let cases = vec![
-            (OValue::null(), "null"),
-            (OValue::bool_(true), "bool"),
-            (OValue::int(0), "number"),
-            (OValue::float(0.0), "number"),
-            (OValue::big_int(0), "number"),
-            (OValue::str_(""), "text"),
-            (OValue::text(""), "text"),
-            (OValue::bytes(Vec::<u8>::new(), None), "bytes"),
-            (OValue::char_('a'), "char"),
-            (OValue::list(vec![]), "list"),
-            (OValue::map(HashMap::new()), "map"),
-            (OValue::seq(SeqKind::List, vec![]), "seq"),
-            (OValue::object(BTreeMap::new()), "object"),
-            (OValue::entries_map(vec![]), "entries_map"),
-            (OValue::set(SetKind::Ordered, vec![]), "set"),
-            (OValue::symbol("s"), "symbol"),
-            (OValue::keyword("k"), "keyword"),
-            (OValue::scope(HashMap::new()), "scope"),
-            (OValue::blob(&[], ""), "blob"),
-            (OValue::graph(0, vec![]), "graph"),
-            (OValue::native(sample_native()), "native"),
-            (
-                OValue::Expr {
-                    src: "x".to_string(),
-                },
-                "expr",
-            ),
-            (
-                OValue::capability(CapabilityKind::File, "/etc/hosts", HashMap::new()),
-                "capability",
-            ),
-            (
-                OValue::snapshot(SnapshotKind::Service, "svc:sshd", HashMap::new()),
-                "snapshot",
-            ),
-            (
-                OValue::group(GroupMode::Batch, vec![OValue::int(1)]),
-                "group",
-            ),
-        ];
+        let cases = exhaustive_ovalue_cases!(
+            OValue::Null => (OValue::null(), "null"),
+            OValue::Bool { .. } => (OValue::bool_(true), "bool"),
+            OValue::Number { .. } => (OValue::int(0), "number"),
+            OValue::Text { .. } => (OValue::text(""), "text"),
+            OValue::Char { .. } => (OValue::char_('a'), "char"),
+            OValue::Html { .. } => (OValue::html(""), "html"),
+            OValue::StorePath { .. } => (OValue::store_path("/nix/store/example"), "store_path"),
+            OValue::Expr { .. } => (OValue::Expr { src: "x".to_string() }, "expr"),
+            OValue::List { .. } => (OValue::list(vec![]), "list"),
+            OValue::Map { .. } => (OValue::map(HashMap::new()), "map"),
+            OValue::Seq { .. } => (OValue::seq(SeqKind::List, vec![]), "seq"),
+            OValue::Object { .. } => (OValue::object(BTreeMap::new()), "object"),
+            OValue::EntriesMap { .. } => (OValue::entries_map(vec![]), "entries_map"),
+            OValue::Set { .. } => (OValue::set(SetKind::Ordered, vec![]), "set"),
+            OValue::Symbol { .. } => (OValue::symbol("s"), "symbol"),
+            OValue::Keyword { .. } => (OValue::keyword("k"), "keyword"),
+            OValue::Scope { .. } => (OValue::scope(HashMap::new()), "scope"),
+            OValue::Blob { .. } => (OValue::blob(&[], ""), "blob"),
+            OValue::Bytes { .. } => (OValue::bytes(Vec::<u8>::new(), None), "bytes"),
+            OValue::Graph { .. } => (OValue::graph(0, vec![]), "graph"),
+            OValue::Native { .. } => (OValue::native(sample_native()), "native"),
+            OValue::NixExpr { .. } => (OValue::nix_expr("1", vec![]), "nix_expr"),
+            OValue::Derivation { .. } => (OValue::derivation("/nix/store/example.drv", vec!["out".into()], vec![]), "derivation"),
+            OValue::Request { .. } => (OValue::request(RequestKind::Instantiate, OValue::nix_expr("1", vec![])), "request"),
+            OValue::System { .. } => (OValue::system("/nix/var/nix/profiles/system"), "system"),
+            OValue::Capability { .. } => (OValue::capability(CapabilityKind::File, "/etc/hosts", HashMap::new()), "capability"),
+            OValue::Snapshot { .. } => (OValue::snapshot(SnapshotKind::Service, "svc:sshd", HashMap::new()), "snapshot"),
+            OValue::Thunk { .. } => (OValue::thunk("42", vec![]), "thunk"),
+            OValue::Group { .. } => (OValue::group(GroupMode::Batch, vec![OValue::int(1)]), "group"),
+            OValue::Error { .. } => (OValue::error("failure"), "error"),
+        );
+        assert_eq!(cases.len(), 30);
         for (val, expected_tag) in cases {
             assert_eq!(val.type_name(), expected_tag);
             let json: serde_json::Value =
@@ -3867,6 +4131,46 @@ mod tests {
     }
 
     #[test]
+    fn fidelity_v2_rejects_serializing_a_directly_assembled_invalid_interval() {
+        let definite = Fidelity::structural([AnnotationKind::NumericPrecision])
+            .losses()
+            .unwrap()
+            .clone();
+        let possible = Fidelity::structural([AnnotationKind::TypeTag])
+            .losses()
+            .unwrap()
+            .clone();
+        let invalid = FidelityAssessmentV2::Structural {
+            definite: Some(definite),
+            possible,
+        };
+
+        assert_eq!(
+            invalid.validate(),
+            Err(FidelityBoundsError::DefiniteOutsidePossible)
+        );
+        assert!(!invalid.concretization_contains(&Fidelity::Lossless));
+        assert_eq!(
+            invalid.clone().try_then(FidelityAssessmentV2::Lossless),
+            Err(FidelityBoundsError::DefiniteOutsidePossible)
+        );
+        assert_eq!(
+            FidelityAssessmentV2::Lossless.try_join_paths(invalid.clone()),
+            Err(FidelityBoundsError::DefiniteOutsidePossible)
+        );
+        assert_eq!(
+            invalid.try_possible_fidelity(),
+            Err(FidelityBoundsError::DefiniteOutsidePossible)
+        );
+        assert_eq!(
+            invalid.try_concrete_fidelity(),
+            Err(FidelityBoundsError::DefiniteOutsidePossible)
+        );
+        let error = serde_json::to_string(&invalid).unwrap_err();
+        assert!(error.to_string().contains("subset"), "{error}");
+    }
+
+    #[test]
     fn fidelity_v2_structural_definite_compatibility_normalizes_canonically() {
         let expected = FidelityAssessmentV2::structural([], [AnnotationKind::TypeTag]).unwrap();
         let canonical = r#"{"kind":"structural","definite":null,"possible":[{"kind":"type_tag"}]}"#;
@@ -3952,6 +4256,184 @@ mod tests {
             decoded.concrete_fidelity(),
             Some(assessment.possible_fidelity())
         );
+    }
+
+    #[test]
+    fn fidelity_v2_concretization_membership_obeys_structural_bounds() {
+        let assessment = FidelityAssessmentV2::structural(
+            [AnnotationKind::TypeTag],
+            [AnnotationKind::TypeTag, AnnotationKind::NumericPrecision],
+        )
+        .unwrap();
+
+        assert!(
+            assessment.concretization_contains(&Fidelity::structural([AnnotationKind::TypeTag,]))
+        );
+        assert!(assessment.concretization_contains(&Fidelity::structural([
+            AnnotationKind::TypeTag,
+            AnnotationKind::NumericPrecision,
+        ])));
+        assert!(!assessment.concretization_contains(&Fidelity::Lossless));
+        assert!(!assessment
+            .concretization_contains(&Fidelity::structural([AnnotationKind::NumericPrecision,])));
+        assert!(!assessment.concretization_contains(&Fidelity::NativeCapsule));
+
+        let maybe_lossy =
+            FidelityAssessmentV2::structural([], [AnnotationKind::NumericPrecision]).unwrap();
+        assert!(maybe_lossy.concretization_contains(&Fidelity::Lossless));
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 128,
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn fidelity_composition_obeys_generated_semilattice_laws(
+            first in fidelity_strategy(),
+            second in fidelity_strategy(),
+            third in fidelity_strategy(),
+        ) {
+            prop_assert_eq!(
+                first.clone().compose(second.clone()),
+                second.clone().compose(first.clone()),
+            );
+            prop_assert_eq!(
+                first.clone().compose(second.clone()).compose(third.clone()),
+                first.clone().compose(second.compose(third)),
+            );
+            prop_assert_eq!(first.clone().compose(first.clone()), first.clone());
+            prop_assert_eq!(first.clone().compose(Fidelity::Lossless), first);
+        }
+
+        #[test]
+        fn fidelity_v2_abstraction_preserves_sequential_composition(
+            first in fidelity_strategy(),
+            second in fidelity_strategy(),
+        ) {
+            let concrete = FidelityAssessmentV2::from_concrete(
+                first.clone().compose(second.clone()),
+            );
+            let abstracted = FidelityAssessmentV2::from_concrete(first)
+                .then(FidelityAssessmentV2::from_concrete(second));
+
+            prop_assert_eq!(concrete, abstracted);
+        }
+
+        #[test]
+        fn fidelity_v2_point_abstraction_has_singleton_concretization(
+            concrete in fidelity_strategy(),
+            candidate in fidelity_strategy(),
+        ) {
+            let abstracted = FidelityAssessmentV2::from_concrete(concrete.clone());
+
+            prop_assert!(abstracted.concretization_contains(&concrete));
+            prop_assert_eq!(
+                abstracted.concretization_contains(&candidate),
+                concrete == candidate,
+            );
+            prop_assert_eq!(abstracted.concrete_fidelity(), Some(concrete.clone()));
+            prop_assert_eq!(abstracted.possible_fidelity(), concrete);
+        }
+
+        #[test]
+        fn fidelity_v2_path_join_obeys_semilattice_laws(
+            first in fidelity_assessment_strategy(),
+            second in fidelity_assessment_strategy(),
+            third in fidelity_assessment_strategy(),
+        ) {
+            prop_assert_eq!(
+                first.clone().join_paths(second.clone()),
+                second.clone().join_paths(first.clone()),
+            );
+            prop_assert_eq!(
+                first.clone().join_paths(second.clone()).join_paths(third.clone()),
+                first.clone().join_paths(second.join_paths(third)),
+            );
+            prop_assert_eq!(first.clone().join_paths(first.clone()), first);
+        }
+
+        #[test]
+        fn fidelity_v2_structural_path_join_is_the_exact_interval_hull(
+            first in structural_assessment_strategy(),
+            second in structural_assessment_strategy(),
+        ) {
+            let (first_definite, mut first_possible) = first.loss_bounds();
+            let (second_definite, second_possible) = second.loss_bounds();
+            let expected_definite = first_definite
+                .intersection(&second_definite)
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            first_possible.extend(second_possible);
+            let expected = FidelityAssessmentV2::structural(
+                expected_definite,
+                first_possible,
+            ).unwrap();
+
+            prop_assert_eq!(first.join_paths(second), expected);
+        }
+
+        #[test]
+        fn fidelity_v2_structural_path_join_contains_both_input_concretizations(
+            (first, first_witness) in structural_assessment_with_witness_strategy(),
+            (second, second_witness) in structural_assessment_with_witness_strategy(),
+        ) {
+            let joined = first.join_paths(second);
+
+            prop_assert!(joined.concretization_contains(&first_witness));
+            prop_assert!(joined.concretization_contains(&second_witness));
+        }
+
+        #[test]
+        fn fidelity_v2_then_obeys_monoid_laws(
+            first in fidelity_assessment_strategy(),
+            second in fidelity_assessment_strategy(),
+            third in fidelity_assessment_strategy(),
+        ) {
+            prop_assert_eq!(
+                first.clone().then(second.clone()).then(third.clone()),
+                first.clone().then(second.then(third)),
+            );
+            prop_assert_eq!(
+                first.clone().then(FidelityAssessmentV2::Lossless),
+                first.clone(),
+            );
+            prop_assert_eq!(
+                FidelityAssessmentV2::Lossless.then(first.clone()),
+                first,
+            );
+        }
+
+        #[test]
+        fn fidelity_v2_then_is_sound_for_concrete_members(
+            (first, first_witness) in fidelity_assessment_with_witness_strategy(),
+            (second, second_witness) in fidelity_assessment_with_witness_strategy(),
+        ) {
+            prop_assert!(first.concretization_contains(&first_witness));
+            prop_assert!(second.concretization_contains(&second_witness));
+
+            let abstract_composition = first.then(second);
+            let concrete_composition = first_witness.compose(second_witness);
+            prop_assert!(
+                abstract_composition.concretization_contains(&concrete_composition),
+            );
+        }
+
+        #[test]
+        fn fidelity_v2_possible_projection_preserves_sequential_composition(
+            first in fidelity_assessment_strategy(),
+            second in fidelity_assessment_strategy(),
+        ) {
+            let projected_composition = first
+                .clone()
+                .possible_fidelity()
+                .compose(second.clone().possible_fidelity());
+            let composed_projection = first.then(second).possible_fidelity();
+
+            prop_assert_eq!(composed_projection, projected_composition);
+        }
     }
 
     #[test]

@@ -47,6 +47,35 @@ crossing: render fidelity, capability transfer, wire serialization, and World
 portability are separate checks. `BackendMorphism` is a law-bearing extension
 point; its unversioned declaration alone establishes no backend claim.
 
+The implemented relationship is specifically between concrete `Fidelity` and
+`FidelityAssessmentV2`. `from_concrete` is an exact point embedding: a concrete
+structural loss set `L` becomes the interval `[L, L]`, and the three
+non-structural cases remain singleton points. For concrete judgments `a` and
+`b`, generated properties establish
+`from_concrete(a.compose(b)) == from_concrete(a).then(from_concrete(b))`.
+`concretization_contains` implements membership in the corresponding interval
+without materializing its potentially exponential powerset, and generated
+witnesses establish that `then` conservatively contains concrete sequential
+composition. The compatibility upper projection is also compositional and is
+a left inverse on point embeddings.
+
+Structural intervals created through the checked constructor or wire decoder
+enforce `definite` as a subset of `possible`; serialization rejects an invalid
+interval assembled directly through the existing public enum fields.
+`join_paths` is a tested, conservative all-observable merge, but no production
+solver path currently calls it. Its concretization-as-hull claim is restricted
+to lossless/structural intervals: `NativeCapsule` and `Unsupported` are
+absorbing severity classes rather than a representation of cross-class
+disjunction.
+
+`RenderFidelity` is separate. It classifies a source-splice renderer as typed,
+structural, presentational, or opaque and can be recomputed descriptively on
+demand; it is not currently recorded or enforced by admission. Some
+typed/structural distinctions are payload-conditional for Python Decimal/F64
+and Nix integer/text/map values, and recursive containers fold child
+classifications within one renderer. No implemented conversion or Galois
+connection relates it to `Fidelity` or `FidelityAssessmentV2`.
+
 `BackendMorphismV1` adds a bounded semantic kernel for the current Python,
 JavaScript, and Rust adapters. It reports O-to-backend-input and profiled
 backend-output-to-O fidelity as distinct legs, composes them, checks the

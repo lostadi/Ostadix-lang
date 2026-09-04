@@ -236,8 +236,9 @@ freestanding systems language, multikernel research.
         evaluator in the grammar, so heterogeneous source remains structurally
         visible in one recursive program tree.
   \item \textbf{Typed inter-language state.} \ovalue{} gives every evaluator a
-        common algebra for values, requests, groups, scopes, capabilities, and
-        fidelity.
+        common algebra for values, requests, groups, scopes, and capabilities;
+        separate judgments describe modeled value crossings and renderer
+        projections.
   \item \textbf{State-complete graph execution.} \oir{} and \hgraph{}
         represent values, completion, actor mutation, and world effects as
         explicit dependencies.
@@ -367,9 +368,10 @@ persistent actor identities. &
 One program tree can contain native Python, SQL, Nix, shell, markup, and other
 language regions. \\
 Typed exchange &
-\ovalue{}, canonical CBOR, renderer contracts, and composed fidelity states. &
-Values retain explicit meaning and conversion history while crossing
-evaluators. \\
+\ovalue{}, canonical CBOR, renderer contracts, and boundary-specific fidelity
+judgments. &
+The exchange boundary preserves tagged meaning; modeled value crossings and
+renderer projections receive separate judgments. \\
 Graph semantics &
 \oir{}, validated plans, hyperedges, completion tokens, and versioned resource
 states. &
@@ -1574,7 +1576,10 @@ control objects, and error information across runtimes.
 \end{tikzpicture}
 \caption{Every producer lifts into one inspectable algebra. The receiving
 backend then projects that value into its own source domain. Value conversion
-and source rendering retain distinct, composable fidelity judgments.}
+and source rendering retain distinct boundary-specific fidelity judgments;
+value-crossing judgments expose the public cross-boundary composition
+operation, while render-fidelity combination is confined to recursive child
+folding within one renderer.}
 \label{fig:ovalue-hub}
 \end{figure}
 
@@ -1708,9 +1713,27 @@ Capability kinds are \texttt{file}, \texttt{memory\_region}, \texttt{device},
 
 Conversions carry one of four fidelity states:
 \texttt{Lossless}, an accumulated set of structural losses,
-\texttt{NativeCapsule}, or \texttt{Unsupported}. Composition terminates at a
-fixpoint and preserves the weakest accumulated guarantee.
-\src{crates/ostadix-api/src/value.rs}{155--547}
+\texttt{NativeCapsule}, or \texttt{Unsupported}. Composition unions structural
+loss sets and selects the absorbing severity classes; its idempotence permits
+the HGraph solver to converge at a fixpoint.
+\src{crates/ostadix-api/src/value.rs}{587--685}
+
+\texttt{FidelityAssessmentV2} refines the structural case to an interval of
+definite and possible loss sets, with the checked invariant
+$D \subseteq P$. Its \texttt{from\_concrete} operation is an exact point
+embedding of a V1 judgment; concretization is exposed as a membership test
+rather than an exponential powerset. Sequential composition unions both
+bounds. The structural/lossless path join is the interval hull, while
+\texttt{NativeCapsule} and \texttt{Unsupported} remain absorbing severity
+classes rather than cross-class disjunctions. These implemented laws do not by
+themselves establish a Galois connection.
+\src{crates/ostadix-api/src/value.rs}{234--585}
+
+\texttt{RenderFidelity} can be recomputed on demand as a separate description
+of source projection. It combines classifications only while recursively
+folding children within one renderer. No conversion, common carrier, or Galois
+connection relates it to \texttt{Fidelity} or \texttt{FidelityAssessmentV2}.
+\src{crates/ostadix-api/src/eval_core.rs}{250--481}
 
 \texttt{BackendMorphismV1} defines bounded Python, JavaScript, and Rust
 crossing profiles with explicit input projection, output injection, rejection
@@ -1722,9 +1745,9 @@ mode, making profile divergences inspectable while the established admission,
 rendering, and dispatch paths retain their current authority.
 \src{crates/ostadix-api/src/backend_morphism.rs}{1--7}
 \src{crates/ostadix-api/src/backend_morphism.rs}{19--40}
-\src{crates/ostadix-api/src/backend_morphism.rs}{126--271}
-\src{crates/ostadix-api/src/backend_morphism.rs}{365--404}
-\src{crates/ostadix-api/src/hgraph/solve.rs}{874--881}
+\src{crates/ostadix-api/src/backend_morphism.rs}{126--330}
+\src{crates/ostadix-api/src/backend_morphism.rs}{332--499}
+\src{crates/ostadix-api/src/hgraph/solve.rs}{866--912}
 
 \subsection{Representation-sensitive identity}
 
@@ -4020,8 +4043,9 @@ each inventory to defining source and the command that exposes it.
 \begin{itemize}
   \item A structural polyglot syntax with exact language-tagged nesting,
         persistent environments, bindings, calls, quotation, and scopes.
-  \item A rich typed interchange algebra with explicit fidelity metadata and a
-        canonical CBOR wire protocol capped at 128 MiB per frame.
+  \item A rich typed interchange algebra, separate explicit crossing-fidelity
+        assessments, and a canonical CBOR wire protocol capped at 128 MiB per
+        frame.
   \item Uniform hosted lowering through \oir{}, a validated plan, and a
         state-complete \hgraph{}.
   \item Deterministic graph settlement with explicit resource/effect

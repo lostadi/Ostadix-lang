@@ -35,6 +35,37 @@ _current_o_scope_wire = {}
 _INT64_MIN = -(2 ** 63)
 _INT64_MAX = 2 ** 63 - 1
 PYTHON_GRAPH_CODEC_V1 = "ostadix.python-graph/v1"
+_DECIMAL_CHUNK_DIGITS = 256
+_DECIMAL_CHUNK_BASE = 10 ** _DECIMAL_CHUNK_DIGITS
+
+
+def _decimal_text_to_int(text):
+    """Parse an arbitrary decimal integer without CPython's digit ceiling."""
+    text = str(text)
+    negative = text.startswith("-")
+    digits = text[1:] if negative else text
+    if not digits or not digits.isascii() or not digits.isdigit():
+        raise ValueError("invalid decimal integer")
+    value = 0
+    for offset in range(0, len(digits), _DECIMAL_CHUNK_DIGITS):
+        chunk = digits[offset : offset + _DECIMAL_CHUNK_DIGITS]
+        value = value * (10 ** len(chunk)) + int(chunk)
+    return -value if negative else value
+
+
+def _int_to_decimal_text(value):
+    """Format an arbitrary integer without CPython's digit ceiling."""
+    if value == 0:
+        return "0"
+    negative = value < 0
+    value = abs(value)
+    chunks = []
+    while value:
+        value, remainder = divmod(value, _DECIMAL_CHUNK_BASE)
+        chunks.append(remainder)
+    text = str(chunks.pop())
+    text += "".join(f"{chunk:0{_DECIMAL_CHUNK_DIGITS}d}" for chunk in reversed(chunks))
+    return f"-{text}" if negative else text
 
 def dump_generated_python(source):
     try:
@@ -254,25 +285,53 @@ def oval_to_py(v):
     if t == "scope":
         wire_bindings = v.get("bindings", {})
         return OScopeValue(
-            {k: oval_to_py(x) for k, x in wire_bindings.items()},
+            {k: _scope_binding_to_py(x) for k, x in wire_bindings.items()},
             wire_bindings,
         )
     if t == "blob":
-        return base64.b64decode(v.get("v", ""))
+        try:
+            return base64.b64decode(v.get("v", ""), validate=True)
+        except (TypeError, ValueError):
+            return OOpaqueValue(v)
     if t == "expr":
         return OExprValue(v.get("src", ""))
 
     return OOpaqueValue(v)
 
 
+def _scope_binding_to_py(value):
+    """Keep malformed nested public values inert while retaining scope wire."""
+    try:
+        return oval_to_py(value)
+    except Exception:
+        return OOpaqueValue(value)
+
+
 def oval_number_to_py(n):
     kind = n.get("kind")
     if kind == "int":
-        return int(n.get("v", "0"))
+        try:
+            return _decimal_text_to_int(n.get("v", "0"))
+        except ValueError:
+            return OOpaqueValue({"t": "number", "v": n})
     if kind == "rational":
-        return fractions.Fraction(int(n.get("num", "0")), int(n.get("den", "1")))
+        try:
+            numerator = _decimal_text_to_int(n.get("num", "0"))
+            denominator = _decimal_text_to_int(n.get("den", "1"))
+            if denominator == 0:
+                return OOpaqueValue({"t": "number", "v": n})
+            return fractions.Fraction(numerator, denominator)
+        except ValueError:
+            return OOpaqueValue({"t": "number", "v": n})
     if kind == "decimal":
         special = n.get("special")
+        try:
+            coeff = _decimal_text_to_int(n.get("coeff", "0"))
+            exponent = int(n.get("exp10", 0))
+        except (TypeError, ValueError):
+            return OOpaqueValue({"t": "number", "v": n})
+        if special is not None and (coeff != 0 or exponent != 0):
+            return OOpaqueValue({"t": "number", "v": n})
         if special == "nan":
             return decimal.Decimal("NaN")
         if special == "pos_inf":
@@ -283,26 +342,45 @@ def oval_number_to_py(n):
             return decimal.Decimal("0")
         if special == "neg_zero":
             return decimal.Decimal("-0")
-        return decimal.Decimal(int(n.get("coeff", "0"))).scaleb(int(n.get("exp10", 0)))
+        if special is not None:
+            return OOpaqueValue({"t": "number", "v": n})
+        literal = f"{n.get('coeff', '0')}e{exponent}"
+        try:
+            return decimal.Decimal(literal)
+        except (decimal.InvalidOperation, ValueError):
+            return OOpaqueValue({"t": "number", "v": n})
     if kind == "binary_float":
-        bits = bytes(n.get("bits", []))
-        if n.get("format") == "f32":
+        try:
+            bits = bytes(n.get("bits", []))
+        except (TypeError, ValueError):
+            return OOpaqueValue({"t": "number", "v": n})
+        if n.get("format") == "f32" and len(bits) == 4:
             return struct.unpack(">f", bits)[0]
-        return struct.unpack(">d", bits)[0]
+        if n.get("format") == "f64" and len(bits) == 8:
+            return struct.unpack(">d", bits)[0]
+        return OOpaqueValue({"t": "number", "v": n})
     if kind == "complex":
-        return complex(
-            oval_number_to_py(n.get("re", {"kind": "int", "v": "0"})),
-            oval_number_to_py(n.get("im", {"kind": "int", "v": "0"})),
-        )
+        real = oval_number_to_py(n.get("re", {"kind": "int", "v": "0"}))
+        imaginary = oval_number_to_py(n.get("im", {"kind": "int", "v": "0"}))
+        if isinstance(real, OOpaqueValue) or isinstance(imaginary, OOpaqueValue):
+            return OOpaqueValue({"t": "number", "v": n})
+        try:
+            return complex(real, imaginary)
+        except (OverflowError, TypeError, ValueError):
+            return OOpaqueValue({"t": "number", "v": n})
     return OOpaqueValue({"t": "number", "v": n})
 
 
 def py_number_to_oval_payload(x):
     if isinstance(x, int):
-        return {"kind": "int", "v": str(x)}
+        return {"kind": "int", "v": _int_to_decimal_text(x)}
 
     if isinstance(x, fractions.Fraction):
-        return {"kind": "rational", "num": str(x.numerator), "den": str(x.denominator)}
+        return {
+            "kind": "rational",
+            "num": _int_to_decimal_text(x.numerator),
+            "den": _int_to_decimal_text(x.denominator),
+        }
 
     if isinstance(x, decimal.Decimal):
         if x.is_nan():
@@ -319,10 +397,10 @@ def py_number_to_oval_payload(x):
                 "special": "neg_zero" if x.is_signed() else "pos_zero",
             }
         sign, digits, exponent = x.as_tuple()
-        coeff = int("".join(str(digit) for digit in digits) or "0")
-        if sign:
-            coeff = -coeff
-        return {"kind": "decimal", "coeff": str(coeff), "exp10": int(exponent), "special": None}
+        coeff = "".join(str(digit) for digit in digits).lstrip("0") or "0"
+        if sign and coeff != "0":
+            coeff = f"-{coeff}"
+        return {"kind": "decimal", "coeff": coeff, "exp10": int(exponent), "special": None}
 
     if isinstance(x, float):
         return {
@@ -520,7 +598,7 @@ class _PythonGraphEncoder:
         if type(value) is bool:
             return {"kind": "bool", "value": value}
         if type(value) is int:
-            return {"kind": "int", "value": str(value)}
+            return {"kind": "int", "value": _int_to_decimal_text(value)}
         if type(value) is float:
             return {
                 "kind": "float64",
@@ -542,8 +620,8 @@ class _PythonGraphEncoder:
         if type(value) is fractions.Fraction:
             return {
                 "kind": "fraction",
-                "numerator": str(value.numerator),
-                "denominator": str(value.denominator),
+                "numerator": _int_to_decimal_text(value.numerator),
+                "denominator": _int_to_decimal_text(value.denominator),
             }
         if type(value) is complex:
             return {
@@ -645,7 +723,7 @@ class _PythonGraphDecoder:
         if kind == "bool":
             return bool(encoded["value"])
         if kind == "int":
-            return int(encoded["value"])
+            return _decimal_text_to_int(encoded["value"])
         if kind == "float64":
             return struct.unpack(">d", bytes(encoded["bits"]))[0]
         if kind == "str":
@@ -656,7 +734,8 @@ class _PythonGraphDecoder:
             return decimal.Decimal(encoded["value"])
         if kind == "fraction":
             return fractions.Fraction(
-                int(encoded["numerator"]), int(encoded["denominator"])
+                _decimal_text_to_int(encoded["numerator"]),
+                _decimal_text_to_int(encoded["denominator"]),
             )
         if kind == "complex":
             return complex(
