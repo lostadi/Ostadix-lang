@@ -75,7 +75,6 @@ pub unsafe fn kernel_timer_dispatch(frame: *mut u64) -> usize {
             index += 1;
         }
     }
-    outb(0x20, 0x20);
     if frame as usize == 0 {
         return 0;
     }
@@ -98,9 +97,26 @@ unsafe fn remap_pic() -> void {
 
 unsafe fn configure_pit() -> void {
     let divisor: u16 = 1193;
-    outb(0x43, 0x36);
+    // Channel 0, low/high byte, interrupt-on-terminal-count one-shot.
+    outb(0x43, 0x30);
     outb(0x40, (divisor & 0xff) as u8);
     outb(0x40, (divisor >> 8) as u8);
+}
+
+// Assembly calls this after either the selected return frame has passed every
+// validation or the timer dispatcher has selected management completion.
+// Starting the next one-shot interval there, with interrupts still masked,
+// prevents scheduler and return-validation work from consuming the next
+// nominal one-millisecond execution budget. Ticks are service-paced, not a
+// wall-clock guarantee under arbitrarily accelerated virtual time.
+@export
+@no_mangle
+pub unsafe fn kernel_timer_rearm() -> void {
+    // Retire the completed IRQ before lowering channel 0's OUT signal and
+    // starting its next count. If host execution pauses between these two
+    // operations, the already-terminal one-shot cannot accumulate timer debt.
+    outb(0x20, 0x20);
+    configure_pit();
 }
 
 pub unsafe fn init() -> void {

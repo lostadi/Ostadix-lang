@@ -394,6 +394,7 @@ percpu_entry:
 .extern kernel_validate_user_return
 .extern kernel_process_exit_continue
 .extern kernel_timer_dispatch
+.extern kernel_timer_rearm
 .extern kernel_scheduler_complete_continue
 .extern kernel_scheduler_syscall
 #if OCORE_BOOT_INFO_ENABLED == 1
@@ -1944,7 +1945,7 @@ ocore_syscall_entry:
   mov rdi, rsp
   call kernel_scheduler_syscall
   test rax, rax
-  jz .timer_scheduler_complete
+  jz .scheduler_complete
   mov rbx, rax
   mov rdi, qword ptr [rbx + 136]
   mov rsi, qword ptr [rbx + 160]
@@ -2051,6 +2052,10 @@ ocore_timer_interrupt_entry:
   jz .fatal_exception
   OCORE_PROJECT_ASYNC_USER_RFLAGS rbx
 .timer_frame_validated:
+  // Begin the next one-shot PIT interval only after scheduler and frame
+  // validation work is complete. RBX is callee-saved and still names the exact
+  // frame selected above; the saved frame itself absorbs other clobbers.
+  call kernel_timer_rearm
   mov rsp, rbx
 
   // The selected frame, rather than the interrupted frame, decides whether
@@ -2079,6 +2084,8 @@ ocore_timer_interrupt_entry:
   iretq
 
 .timer_scheduler_complete:
+  call kernel_timer_rearm
+.scheduler_complete:
   call ocore_restore_management_context
   lea rsp, [rip + stack_top]
   and rsp, -16

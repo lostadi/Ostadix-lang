@@ -28,11 +28,12 @@ const OP_CRASH: u64 = 5;
 const OP_UNSUPPORTED: u64 = 0x7f;
 const PONG: u64 = 0x4d36_4150_4f4e_4701;
 
-// The PIT runs at roughly 1 kHz. A 16-tick success-path deadline made ordinary
-// corpus calls depend on the host delivering several TCG context switches in
-// about 16 ms; expiry then made both principals stop before a diagnostic marker.
-// Keep successful calls bounded but leave ample scheduling headroom. The
-// separate OP_HOLD_TIMEOUT request below retains its exact six-tick deadline.
+// The service-paced PIT has a nominal one-millisecond interval, but rearms only
+// after the prior timer-return transaction. A 16-tick success-path deadline
+// therefore made ordinary corpus calls depend on several TCG context switches
+// in roughly 16 ms or more; expiry then made both principals stop before a
+// diagnostic marker. Keep successful calls bounded but leave ample scheduling
+// headroom. The separate OP_HOLD_TIMEOUT request retains its six-tick deadline.
 const CORPUS_TIMEOUT_TICKS: u64 = 10_000;
 
 @link_section(".rodata")

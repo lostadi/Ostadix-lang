@@ -23,8 +23,8 @@ esac
 
 LINK_GC_FLAGS=()
 OCOREC_FUNCTION_SECTION_FLAGS=()
-if (( PROBE_MODE == 18 || PROBE_MODE == 24 || PROBE_MODE == 25 || PROBE_MODE == 26 )); then
-  # The four M6 live-personality probes carry the largest reachable kernels.
+if (( PROBE_MODE == 24 || PROBE_MODE == 25 || PROBE_MODE == 26 )); then
+  # These three M6 live-personality probes carry the largest reachable kernels.
   # Keep the fixed bootstrap reserve intact by discarding only unreachable,
   # separately sectioned helpers; ordinary builds retain monolithic .text.
   LINK_GC_FLAGS=(--gc-sections)
@@ -371,11 +371,12 @@ M2_SOURCE="$KERNEL_DIR/m2.oc"
 M3_SOURCE="$KERNEL_DIR/m3.oc"
 M3_LIVE_SOURCE="$KERNEL_DIR/m3_live.oc"
 M4_SOURCE="$KERNEL_DIR/m4.oc"
-if (( PROBE_MODE == 25 || PROBE_MODE == 26 || PROBE_MODE == 28 || PROBE_MODE == 29 || PROBE_MODE == 30 || PROBE_MODE == 31 || PROBE_MODE == 32 )); then
-  # Modes 25, 26, and 31 enter only kernel::m6, while Modes 28--30 and 32 enter
-  # only their World codec oracles. Keep historical probes fail-closed without
-  # linking their unreachable harness bodies, preserving the hard bootstrap
-  # headroom assertion.
+if (( PROBE_MODE == 18 || PROBE_MODE == 25 || PROBE_MODE == 26 || PROBE_MODE == 28 || PROBE_MODE == 29 || PROBE_MODE == 30 || PROBE_MODE == 31 || PROBE_MODE == 32 )); then
+  # Modes 18, 25, 26, and 31 enter only kernel::m6, while Modes 28--30 and 32
+  # enter only their World codec oracles. Keep historical probes fail-closed
+  # without linking their unreachable harness bodies, preserving the hard
+  # bootstrap headroom assertion. Mode 18 intentionally retains monolithic
+  # text so its scheduler layout remains comparable to the established probe.
   M1_SOURCE="$KERNEL_DIR/m1_mode25_stub.oc"
   M2_SOURCE="$KERNEL_DIR/m2_mode25_stub.oc"
   M3_SOURCE="$KERNEL_DIR/m3_mode25_stub.oc"
