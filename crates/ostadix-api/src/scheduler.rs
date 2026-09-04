@@ -28,7 +28,8 @@
 //   changing the public API.
 //
 // Cache layout:
-//   {cache_dir}/{fingerprint}.json — one JSON file per cached result.
+//   {cache_dir}/{cache-key}.json — canonical lowercase SHA-256 fingerprints
+//   stay verbatim; other public/wire keys use a domain-separated hash.
 //   Writes use atomic rename (tmp → final) to avoid partial-write corruption.
 //   The default cache dir is $XDG_CACHE_HOME/o-lang/sched, falling back to
 //   ~/.cache/o-lang/sched or $TMPDIR/o-lang-cache/sched.
@@ -45,12 +46,28 @@ use std::sync::{mpsc, Arc};
 use std::thread;
 
 use anyhow::{anyhow, bail, Context, Result};
+use sha2::{Digest, Sha256};
 
 use crate::nix_ops;
-use crate::value::{OValue, RequestKind};
+use crate::value::{fingerprint_preview, OValue, RequestKind};
 
 type EvalRequestCallback<'a> = dyn FnMut(&OValue) -> Result<OValue> + 'a;
 type SharedNixLease = Arc<Result<crate::runtime_exec::RuntimeCommandLease, String>>;
+
+fn cache_file_stem(fingerprint: &str) -> String {
+    let is_canonical = fingerprint.len() == 64
+        && fingerprint
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'));
+    if is_canonical {
+        return fingerprint.to_string();
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"ostadix/scheduler-cache-key/v1\0");
+    hasher.update(fingerprint.as_bytes());
+    format!("~sha256-{}", hex::encode(hasher.finalize()))
+}
 
 fn capture_shared_nix_lease() -> SharedNixLease {
     Arc::new(
@@ -75,7 +92,9 @@ fn require_shared_nix_lease(
 
 /// Persistent on-disk cache for Request execution results.
 ///
-/// Layout: `{dir}/{fingerprint}.json` — one file per cached result.
+/// Layout: `{dir}/{cache-key}.json` — one file per cached result. Canonical
+/// lowercase SHA-256 fingerprints retain their historical filename; every
+/// other public/wire key is mapped to a bounded domain-separated hash.
 /// Serialization: serde_json for readable cache files. Backend IPC uses
 /// canonical CBOR frames over the same OValue schema.
 ///
@@ -114,7 +133,9 @@ impl DiskCache {
 
     /// Look up `fingerprint` in the cache. Returns `None` on miss or any error.
     pub fn get(&self, fingerprint: &str) -> Option<OValue> {
-        let path = self.dir.join(format!("{fingerprint}.json"));
+        let path = self
+            .dir
+            .join(format!("{}.json", cache_file_stem(fingerprint)));
         let bytes = fs::read(&path).ok()?;
         serde_json::from_slice(&bytes).ok()
     }
@@ -124,9 +145,10 @@ impl DiskCache {
     /// Uses an atomic write-then-rename sequence. Errors are printed to stderr
     /// and silently swallowed — a cache write failure must never abort a build.
     pub fn put(&self, fingerprint: &str, value: &OValue) {
-        let fp_short = &fingerprint[..fingerprint.len().min(8)];
-        let path = self.dir.join(format!("{fingerprint}.json"));
-        let tmp = self.dir.join(format!("{fingerprint}.json.tmp"));
+        let fp_short = fingerprint_preview(fingerprint);
+        let file_stem = cache_file_stem(fingerprint);
+        let path = self.dir.join(format!("{file_stem}.json"));
+        let tmp = self.dir.join(format!("{file_stem}.json.tmp"));
 
         match serde_json::to_vec(value) {
             Err(e) => {
@@ -213,7 +235,7 @@ fn resolve_source(req: &OValue, resolved: &HashMap<String, OValue>) -> Result<OV
         OValue::Request { source, .. } => match source.as_ref() {
             OValue::Request { fingerprint, .. } => {
                 resolved.get(fingerprint).cloned().ok_or_else(|| {
-                    let short = &fingerprint[..fingerprint.len().min(8)];
+                    let short = fingerprint_preview(fingerprint);
                     anyhow!("scheduler: dep {short} not yet resolved (BUG: should be ready)")
                 })
             }
@@ -503,7 +525,7 @@ impl AutonomousScheduler {
                     match result.with_context(|| {
                         format!(
                             "autonomous scheduler: request {} failed",
-                            &fp[..fp.len().min(8)]
+                            fingerprint_preview(&fp)
                         )
                     }) {
                         Ok(value) => {
@@ -540,7 +562,7 @@ impl AutonomousScheduler {
                          but no eval_fn callback was provided (fp: {}). \
                          This is a bug — Eval requests should be excluded from \
                          the autonomous buffer.",
-                        &fp[..fp.len().min(8)]
+                        fingerprint_preview(&fp)
                     )
                 };
                 // Eval results are stored only in mem_cache (the Evaluator's
@@ -580,7 +602,7 @@ impl AutonomousScheduler {
         results.get(&fp).cloned().ok_or_else(|| {
             anyhow!(
                 "scheduler: root request {} not in results",
-                &fp[..fp.len().min(8)]
+                fingerprint_preview(&fp)
             )
         })
     }
@@ -629,6 +651,66 @@ mod tests {
         cache.put("abc123", &val);
         let got = cache.get("abc123").expect("cache should have hit");
         assert_eq!(got, val);
+    }
+
+    #[test]
+    fn disk_cache_accepts_a_unicode_fingerprint() {
+        let dir = tmp_cache_dir("unicode-fingerprint");
+        let cache = DiskCache::new(dir).unwrap();
+        let fingerprint = "aαβγδ";
+        let value = OValue::int(42);
+
+        cache.put(fingerprint, &value);
+
+        assert_eq!(cache.get(fingerprint), Some(value));
+    }
+
+    #[test]
+    fn disk_cache_confines_path_bearing_fingerprints() {
+        let dir = tmp_cache_dir("path-bearing-fingerprint");
+        let outside = dir
+            .parent()
+            .unwrap()
+            .join("o-lang-sched-test-path-escape.json");
+        let _ = fs::remove_file(&outside);
+        let cache = DiskCache::new(dir).unwrap();
+        let fingerprint = "../o-lang-sched-test-path-escape";
+        let value = OValue::int(42);
+
+        cache.put(fingerprint, &value);
+
+        assert_eq!(cache.get(fingerprint), Some(value));
+        assert!(!outside.exists());
+    }
+
+    #[test]
+    fn disk_cache_distinguishes_case_folded_noncanonical_fingerprints() {
+        let lower_stem = cache_file_stem("abc");
+        let upper_stem = cache_file_stem("ABC");
+        assert_ne!(lower_stem, upper_stem);
+        assert!(lower_stem.starts_with("~sha256-"));
+        assert!(upper_stem.starts_with("~sha256-"));
+
+        let dir = tmp_cache_dir("case-folded-fingerprints");
+        let cache = DiskCache::new(dir).unwrap();
+
+        cache.put("abc", &OValue::int(1));
+        cache.put("ABC", &OValue::int(2));
+
+        assert_eq!(cache.get("abc"), Some(OValue::int(1)));
+        assert_eq!(cache.get("ABC"), Some(OValue::int(2)));
+    }
+
+    #[test]
+    fn disk_cache_preserves_the_canonical_fingerprint_filename() {
+        let dir = tmp_cache_dir("canonical-fingerprint");
+        let cache = DiskCache::new(dir.clone()).unwrap();
+        let fingerprint = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        cache.put(fingerprint, &OValue::int(42));
+
+        assert!(dir.join(format!("{fingerprint}.json")).is_file());
+        assert_eq!(cache.get(fingerprint), Some(OValue::int(42)));
     }
 
     #[test]

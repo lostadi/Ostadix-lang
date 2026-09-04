@@ -854,14 +854,18 @@ human presentation (`P`), or opaque marker (`O`):
 
 | OValue family | Python | Nix | HTML | LaTeX | Markdown | Default |
 |---------------|--------|-----|------|-------|----------|---------|
-| Null, bool, int, float, string | T | T | P | P | P | S |
-| HTML, store path | T | S | P | P | P | O |
-| List, map | T | T | P | P | P | S |
+| Null, bool, number | T | T | P | P | P | S |
+| Text | S | T | P | P | P | S |
+| Char, symbol, keyword | S | S | P | P | P | S |
+| Bytes with media type | S | S | P | P | P | S |
+| Bytes without media type | S | O | P | P | P | O |
+| HTML, store path, expr, derivation, system | T | S | P | P | P | O |
+| List, map, seq, set, object | T | T | P | P | P | S |
+| EntriesMap | S | S | P | P | P | S |
 | Scope | T | O | O | O | O | O |
 | Blob | S | S | P | P | P | O |
-| Expr | T | S | P | P | P | O |
 | NixExpr | T | T | P | P | P | O |
-| Derivation, system | T | S | P | P | P | O |
+| Graph, native | T | O | O | O | O | O |
 | Thunk | T | O | O | O | O | O |
 | Error | T | O | P | P | P | O |
 | Request, capability, snapshot, group | T | O | O | O | O | O |

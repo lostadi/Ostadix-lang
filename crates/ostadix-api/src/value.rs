@@ -25,6 +25,20 @@ use num_traits::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+/// Return the first eight Unicode scalar values of a fingerprint for diagnostics.
+///
+/// Runtime-generated fingerprints are hexadecimal SHA-256 strings, but public
+/// `OValue` variants and wire input can carry arbitrary strings. Keeping the
+/// preview UTF-8-aware prevents diagnostics and renderers from panicking on
+/// short or non-ASCII input.
+pub(crate) fn fingerprint_preview(fingerprint: &str) -> &str {
+    let end = fingerprint
+        .char_indices()
+        .nth(8)
+        .map_or(fingerprint.len(), |(index, _)| index);
+    &fingerprint[..end]
+}
+
 mod bigint_json {
     use std::{fmt, result::Result, str::FromStr};
 
@@ -3064,7 +3078,7 @@ impl OValue {
                 kind, fingerprint, ..
             } => {
                 let k = Self::kind_tag(kind);
-                format!("<request:{} fp={}>", k, &fingerprint[..8])
+                format!("<request:{} fp={}>", k, fingerprint_preview(fingerprint))
             }
 
             // A Thunk has the same splice shape as a NixExpr: its body is
@@ -3087,7 +3101,7 @@ impl OValue {
                     "<group:{} n={} fp={}>",
                     mode.name(),
                     members.len(),
-                    &fingerprint[..8]
+                    fingerprint_preview(fingerprint)
                 )
             }
 
@@ -3223,7 +3237,12 @@ impl fmt::Display for OValue {
             OValue::NixExpr {
                 fingerprint, deps, ..
             } => {
-                write!(f, "<nix_expr fp={} deps={}>", &fingerprint[..8], deps.len())
+                write!(
+                    f,
+                    "<nix_expr fp={} deps={}>",
+                    fingerprint_preview(fingerprint),
+                    deps.len()
+                )
             }
             OValue::Derivation {
                 drv_path, outputs, ..
@@ -3239,12 +3258,17 @@ impl fmt::Display for OValue {
                 kind, fingerprint, ..
             } => {
                 let k = Self::kind_tag(kind);
-                write!(f, "<request {} fp={}>", k, &fingerprint[..8])
+                write!(f, "<request {} fp={}>", k, fingerprint_preview(fingerprint))
             }
             OValue::Thunk {
                 fingerprint, deps, ..
             } => {
-                write!(f, "<thunk fp={} deps={}>", &fingerprint[..8], deps.len())
+                write!(
+                    f,
+                    "<thunk fp={} deps={}>",
+                    fingerprint_preview(fingerprint),
+                    deps.len()
+                )
             }
             OValue::Group {
                 mode,
@@ -3256,7 +3280,7 @@ impl fmt::Display for OValue {
                     "<group {} n={} fp={}>",
                     mode.name(),
                     members.len(),
-                    &fingerprint[..8]
+                    fingerprint_preview(fingerprint)
                 )
             }
             OValue::System { profile_path } => {
@@ -3430,6 +3454,14 @@ pub enum OValueError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fingerprint_preview_is_bounded_and_utf8_safe() {
+        assert_eq!(fingerprint_preview(""), "");
+        assert_eq!(fingerprint_preview("short"), "short");
+        assert_eq!(fingerprint_preview("0123456789"), "01234567");
+        assert_eq!(fingerprint_preview("αβγδεζηθικ"), "αβγδεζηθ");
+    }
 
     fn sample_native() -> ONative {
         ONative {

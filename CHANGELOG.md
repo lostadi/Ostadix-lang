@@ -175,6 +175,16 @@ Package SemVer is only one of the independent coordinates documented in
   publication order is reversed: publish and verify `ostadix-api` first, then
   publish its exact-version `o-lang` shell dependent.
 
+### Fixed
+
+- Splice renderers and diagnostics now abbreviate public or deserialized
+  fingerprints without panicking on short or non-ASCII input. The renderer
+  matrix covers all 30 `OValue` variants and classifies Nix summaries of
+  `Graph` and `Native`, plus `Bytes` values without a media type under Nix and
+  the default renderer, as opaque. Scheduler cache keys preserve canonical
+  lowercase SHA-256 filenames while mapping every noncanonical input to a
+  bounded domain-separated hash inside the cache directory.
+
 ### Release boundary
 
 This post-v0.3 extraction is a next-release source-contract change. Both Rust

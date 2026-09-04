@@ -17,7 +17,9 @@ use crate::capability::BackendSandboxPolicy;
 use crate::evidence::AdmittedExecution;
 use crate::execution_contract::Policy;
 use crate::ir::{ExecutionPlan, InvokeMode, OIr, PlanEdgeKind, PlanNodeId, PlanNodeKind};
-use crate::value::{DecimalSpecial, FloatFormat, FloatSpecial, ONumber, OValue, SeqKind};
+use crate::value::{
+    fingerprint_preview, DecimalSpecial, FloatFormat, FloatSpecial, ONumber, OValue, SeqKind,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionTrace {
@@ -335,12 +337,9 @@ pub fn render_fidelity(renderer: SpliceRenderer, val: &OValue) -> RenderFidelity
             Seq { items, .. } | Set { items, .. } => container_fidelity(renderer, items, Typed),
             Object { fields } => container_fidelity(renderer, fields.values(), Typed),
             EntriesMap { entries } => entry_container_fidelity(renderer, entries, Structural),
-            Char { .. }
-            | Bytes { .. }
-            | Symbol { .. }
-            | Keyword { .. }
-            | Graph { .. }
-            | Native { .. } => Structural,
+            Char { .. } | Symbol { .. } | Keyword { .. } => Structural,
+            Bytes { v } if v.media_type.is_some() => Structural,
+            Bytes { .. } | Graph { .. } | Native { .. } => Opaque,
             Html { .. }
             | StorePath { .. }
             | Blob { .. }
@@ -394,9 +393,10 @@ pub fn render_fidelity(renderer: SpliceRenderer, val: &OValue) -> RenderFidelity
             | Number { .. }
             | Text { .. }
             | Char { .. }
-            | Bytes { .. }
             | Symbol { .. }
             | Keyword { .. } => Structural,
+            Bytes { v } if v.media_type.is_some() => Structural,
+            Bytes { .. } => Opaque,
             List { v } => container_fidelity(renderer, v, Structural),
             Map { v } => container_fidelity(renderer, v.values(), Structural),
             Seq { items, .. } | Set { items, .. } => {
@@ -525,7 +525,7 @@ fn render_nix(val: &OValue) -> String {
             // will reject loudly. {lazy} Eval requests should have been
             // auto-forced before reaching here; {defer} should have errored;
             // Instantiate/Realise have no sensible Nix-context splice form.
-            format!("\"<request fp={}>\"", &fingerprint[..8])
+            format!("\"<request fp={}>\"", fingerprint_preview(fingerprint))
         }
         // A Thunk in a Nix context renders as its body, parenthesised. Same
         // treatment as NixExpr — if the lang matches Nix syntax, this is
@@ -539,7 +539,11 @@ fn render_nix(val: &OValue) -> String {
         OValue::Group {
             mode, fingerprint, ..
         } => {
-            format!("\"<group:{} fp={}>\"", mode.name(), &fingerprint[..8])
+            format!(
+                "\"<group:{} fp={}>\"",
+                mode.name(),
+                fingerprint_preview(fingerprint)
+            )
         }
 
         // A System in a Nix context renders as its profile path as a string
@@ -1037,7 +1041,7 @@ fn render_html(val: &OValue) -> String {
         OValue::Request { fingerprint, .. } => {
             format!(
                 "<code class=\"o-request\" data-fp=\"{}\">&lt;request&gt;</code>",
-                html_escape(&fingerprint[..8]),
+                html_escape(fingerprint_preview(fingerprint)),
             )
         }
         OValue::Thunk {
@@ -1045,7 +1049,7 @@ fn render_html(val: &OValue) -> String {
         } => {
             format!(
                 "<code class=\"o-thunk\" data-fp=\"{}\">{}</code>",
-                html_escape(&fingerprint[..8]),
+                html_escape(fingerprint_preview(fingerprint)),
                 html_escape(body),
             )
         }
@@ -1088,7 +1092,7 @@ fn render_html(val: &OValue) -> String {
             format!(
                 "<code class=\"o-group\" data-mode=\"{}\" data-fp=\"{}\">&lt;group n={}&gt;</code>",
                 html_escape(mode.name()),
-                html_escape(&fingerprint[..8]),
+                html_escape(fingerprint_preview(fingerprint)),
                 members.len(),
             )
         }
@@ -1208,7 +1212,10 @@ fn render_latex(val: &OValue) -> String {
             format!("\\texttt{{{}}}", drv_path.replace("_", "\\_"))
         }
         OValue::Request { fingerprint, .. } => {
-            format!("\\texttt{{<request fp={}>}}", &fingerprint[..8])
+            format!(
+                "\\texttt{{<request fp={}>}}",
+                fingerprint_preview(fingerprint)
+            )
         }
         OValue::Thunk { body, .. } => {
             format!("\\texttt{{{}}}", body.replace("_", "\\_"))
@@ -1239,7 +1246,7 @@ fn render_latex(val: &OValue) -> String {
                 "\\texttt{{<group:{} n={} fp={}>}}",
                 mode.name(),
                 members.len(),
-                &fingerprint[..8]
+                fingerprint_preview(fingerprint)
             )
         }
         OValue::Expr { src } => {
@@ -1292,7 +1299,7 @@ fn render_markdown(val: &OValue) -> String {
         OValue::NixExpr { body, .. } => format!("`{}`", body),
         OValue::Derivation { drv_path, .. } => format!("`{}`", drv_path),
         OValue::Request { fingerprint, .. } => {
-            format!("`<request fp={}>`", &fingerprint[..8])
+            format!("`<request fp={}>`", fingerprint_preview(fingerprint))
         }
         OValue::Thunk { body, .. } => {
             format!("`{}`", body)
@@ -1315,7 +1322,7 @@ fn render_markdown(val: &OValue) -> String {
                 "`<group:{} n={} fp={}>`",
                 mode.name(),
                 members.len(),
-                &fingerprint[..8]
+                fingerprint_preview(fingerprint)
             )
         }
         OValue::Expr { src } => {

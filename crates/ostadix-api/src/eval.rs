@@ -60,7 +60,9 @@ use crate::process::{BackendLaunchContext, ExecStep, ProcessRegistry};
 use crate::scheduler::AutonomousScheduler;
 #[cfg(test)]
 use crate::value::ONumber;
-use crate::value::{BackendAuthority, CapabilityKind, GroupMode, OValue, RequestKind};
+use crate::value::{
+    fingerprint_preview, BackendAuthority, CapabilityKind, GroupMode, OValue, RequestKind,
+};
 
 /// Stable evidence projection of the built-in authority policy. The random
 /// bearer that realizes this policy remains process-local and is checked at
@@ -1518,7 +1520,7 @@ impl Evaluator {
                 Some(result) => Ok(result),
                 None => {
                     let fp = match v {
-                        OValue::Request { fingerprint, .. } => &fingerprint[..8],
+                        OValue::Request { fingerprint, .. } => fingerprint_preview(fingerprint),
                         _ => "?",
                     };
                     bail!(
@@ -1597,7 +1599,7 @@ impl Evaluator {
                     anyhow::anyhow!(
                         "autonomous: scheduler failed to materialize \
                              request fp={}; cache miss after flush",
-                        &fingerprint[..8]
+                        fingerprint_preview(fingerprint)
                     )
                 }),
             },
@@ -3770,6 +3772,31 @@ impl<'a> crate::executor::Coordinator<'a> {
 mod tests {
     use super::*;
 
+    macro_rules! exhaustive_cases {
+        ($ty:ty; $( $pattern:pat => $value:expr ),+ $(,)?) => {{
+            fn compile_time_exhaustiveness_guard(value: &$ty) {
+                match value {
+                    $( $pattern => (), )+
+                }
+            }
+
+            vec![
+                $(
+                    {
+                        let value: $ty = $value;
+                        assert!(
+                            matches!(&value, $pattern),
+                            "representative does not match {}",
+                            stringify!($pattern)
+                        );
+                        compile_time_exhaustiveness_guard(&value);
+                        value
+                    }
+                ),+
+            ]
+        }};
+    }
+
     #[test]
     fn evaluator_retains_idle_graph_workers_and_resizes_on_demand() {
         let mut default_evaluator = Evaluator::new(PathBuf::from("/tmp"));
@@ -3933,53 +3960,176 @@ mod tests {
     }
 
     #[test]
-    fn rendering_fidelity_matrix_covers_every_ovalue_variant() {
-        use crate::value::SnapshotKind;
+    fn renderer_matrix_covers_every_ovalue_variant_without_unexpected_erasure() {
+        use std::collections::BTreeMap;
 
-        let values = vec![
-            OValue::Null,
-            OValue::bool_(true),
-            OValue::int(1),
-            OValue::float(1.5),
-            OValue::str_("text"),
-            OValue::html("<b>text</b>"),
-            OValue::store_path("/nix/store/example"),
-            OValue::Expr { src: "42".into() },
-            OValue::list(vec![OValue::int(1)]),
-            OValue::map(HashMap::from([("key".into(), OValue::int(1))])),
-            OValue::scope(HashMap::from([("x".into(), OValue::int(1))])),
-            OValue::blob(b"data", "application/octet-stream"),
-            OValue::nix_expr("1 + 1", vec![]),
-            OValue::derivation("/nix/store/example.drv", vec!["out".into()], vec![]),
-            OValue::request(RequestKind::Instantiate, OValue::nix_expr("1", vec![])),
-            OValue::system("/nix/var/nix/profiles/system"),
-            OValue::capability(CapabilityKind::Service, "opaque", HashMap::new()),
-            OValue::snapshot(SnapshotKind::System, "generation", HashMap::new()),
-            OValue::thunk("42", vec![]),
-            OValue::group(GroupMode::Batch, vec![]),
-            OValue::error("failed"),
-        ];
-        let renderers = [
-            SpliceRenderer::Python,
-            SpliceRenderer::Nix,
-            SpliceRenderer::Html,
-            SpliceRenderer::Latex,
-            SpliceRenderer::Markdown,
-            SpliceRenderer::Default,
-        ];
+        use crate::value::{
+            GraphNode, NativeBoundary, NativeCodecSafety, NativeIdentity, OBytes, ONative,
+            RehydratePolicy, SeqKind, SetKind, SnapshotKind,
+        };
 
-        assert_eq!(values.len(), 21, "update the matrix when OValue grows");
-        for renderer in renderers {
+        let values = exhaustive_cases!(OValue;
+            OValue::Null => OValue::null(),
+            OValue::Bool { .. } => OValue::bool_(true),
+            OValue::Number { .. } => OValue::int(1),
+            OValue::Text { .. } => OValue::text("text"),
+            OValue::Char { .. } => OValue::char_('λ'),
+            OValue::Html { .. } => OValue::html("<b>text</b>"),
+            OValue::StorePath { .. } => OValue::store_path("/nix/store/example"),
+            OValue::Expr { .. } => OValue::Expr { src: "42".into() },
+            OValue::List { .. } => OValue::list(vec![OValue::int(1)]),
+            OValue::Map { .. } => OValue::map(HashMap::from([("key".into(), OValue::int(1))])),
+            OValue::Seq { .. } => OValue::seq(SeqKind::Tuple, vec![OValue::int(1)]),
+            OValue::Object { .. } => OValue::object(BTreeMap::from([("key".into(), OValue::int(1))])),
+            OValue::EntriesMap { .. } => OValue::entries_map(vec![(OValue::text("key"), OValue::int(1))]),
+            OValue::Set { .. } => OValue::set(SetKind::Ordered, vec![OValue::int(1)]),
+            OValue::Symbol { .. } => OValue::symbol("answer"),
+            OValue::Keyword { .. } => OValue::keyword("required"),
+            OValue::Scope { .. } => OValue::scope(HashMap::from([("x".into(), OValue::int(1))])),
+            OValue::Blob { .. } => OValue::blob(b"data", "application/octet-stream"),
+            OValue::Bytes { .. } => OValue::bytes(b"data".to_vec(), Some("application/octet-stream".into())),
+            OValue::Graph { .. } => OValue::graph(
+                0,
+                vec![GraphNode::Value {
+                    value: Box::new(OValue::int(1)),
+                }],
+            ),
+            OValue::Native { .. } => OValue::native(ONative {
+                lang: "python".into(),
+                implementation: Some("cpython".into()),
+                version: Some("3.14".into()),
+                type_name: "decimal.Decimal".into(),
+                identity: NativeIdentity {
+                    stable: Some("decimal:1.25".into()),
+                    live: None,
+                },
+                codec: "repr".into(),
+                payload: Some(OBytes {
+                    bytes: b"Decimal('1.25')".to_vec(),
+                    media_type: Some("text/x-python-repr".into()),
+                }),
+                boundary: NativeBoundary::Pure,
+                safety: NativeCodecSafety::SourceBacked,
+                capabilities: vec![],
+                metadata: BTreeMap::new(),
+                rehydrate: RehydratePolicy::Portable,
+            }),
+            OValue::NixExpr { .. } => OValue::nix_expr("1 + 1", vec![]),
+            OValue::Derivation { .. } => OValue::derivation(
+                "/nix/store/example.drv",
+                vec!["out".into()],
+                vec![],
+            ),
+            OValue::Request { .. } => OValue::request(
+                RequestKind::Instantiate,
+                OValue::nix_expr("1", vec![]),
+            ),
+            OValue::System { .. } => OValue::system("/nix/var/nix/profiles/system"),
+            OValue::Capability { .. } => OValue::capability(
+                CapabilityKind::Service,
+                "opaque",
+                HashMap::new(),
+            ),
+            OValue::Snapshot { .. } => OValue::snapshot(
+                SnapshotKind::System,
+                "generation",
+                HashMap::new(),
+            ),
+            OValue::Thunk { .. } => OValue::thunk("42", vec![]),
+            OValue::Group { .. } => OValue::group(GroupMode::Batch, vec![]),
+            OValue::Error { .. } => OValue::error("failed"),
+        );
+        let renderers = exhaustive_cases!(SpliceRenderer;
+            SpliceRenderer::Python => SpliceRenderer::Python,
+            SpliceRenderer::Html => SpliceRenderer::Html,
+            SpliceRenderer::Latex => SpliceRenderer::Latex,
+            SpliceRenderer::Markdown => SpliceRenderer::Markdown,
+            SpliceRenderer::Nix => SpliceRenderer::Nix,
+            SpliceRenderer::Default => SpliceRenderer::Default,
+        );
+
+        assert_eq!(values.len(), 30);
+        assert_eq!(renderers.len(), 6);
+        assert_eq!(
+            values
+                .iter()
+                .map(OValue::type_name)
+                .collect::<HashSet<_>>()
+                .len(),
+            values.len(),
+            "the matrix must contain one representative per OValue variant"
+        );
+
+        for renderer in renderers.iter().copied() {
             for value in &values {
                 let rendered = render_with(renderer, value);
                 let _classification = render_fidelity(renderer, value);
-                assert!(
-                    !rendered.is_empty() || matches!(value, OValue::Null),
-                    "{renderer:?} silently erased {}",
-                    value.type_name()
+                let intentionally_empty = matches!(value, OValue::Null)
+                    && matches!(
+                        renderer,
+                        SpliceRenderer::Html | SpliceRenderer::Latex | SpliceRenderer::Markdown
+                    );
+                assert_eq!(
+                    rendered.is_empty(),
+                    intentionally_empty,
+                    "unexpected erasure behavior for {renderer:?} over {}",
+                    value.type_name(),
                 );
             }
         }
+
+        let graph = values
+            .iter()
+            .find(|value| matches!(value, OValue::Graph { .. }))
+            .unwrap();
+        let native = values
+            .iter()
+            .find(|value| matches!(value, OValue::Native { .. }))
+            .unwrap();
+        for value in [graph, native] {
+            assert_eq!(
+                render_fidelity(SpliceRenderer::Python, value),
+                RenderFidelity::Typed
+            );
+            for renderer in [
+                SpliceRenderer::Nix,
+                SpliceRenderer::Html,
+                SpliceRenderer::Latex,
+                SpliceRenderer::Markdown,
+                SpliceRenderer::Default,
+            ] {
+                assert_eq!(
+                    render_fidelity(renderer, value),
+                    RenderFidelity::Opaque,
+                    "{renderer:?} only retains a summary for {}",
+                    value.type_name(),
+                );
+            }
+        }
+
+        let bytes_with_media_type = values
+            .iter()
+            .find(|value| matches!(value, OValue::Bytes { .. }))
+            .unwrap();
+        assert_eq!(
+            render_fidelity(SpliceRenderer::Nix, bytes_with_media_type),
+            RenderFidelity::Structural
+        );
+        assert_eq!(
+            render_fidelity(SpliceRenderer::Default, bytes_with_media_type),
+            RenderFidelity::Structural
+        );
+        let bytes_without_media_type = OValue::bytes(b"data".to_vec(), None);
+        assert_eq!(
+            render_fidelity(SpliceRenderer::Nix, &bytes_without_media_type),
+            RenderFidelity::Opaque,
+            "a length-only Bytes marker does not retain the payload"
+        );
+        assert_eq!(
+            render_fidelity(SpliceRenderer::Default, &bytes_without_media_type),
+            RenderFidelity::Opaque,
+            "a length-only Bytes marker does not retain the payload"
+        );
 
         assert_eq!(
             render_fidelity(SpliceRenderer::Python, &OValue::int(1)),
@@ -4004,6 +4154,45 @@ mod tests {
             RenderFidelity::Structural,
             "container fidelity must be bounded by its least faithful child"
         );
+    }
+
+    #[test]
+    fn renderers_accept_short_unicode_fingerprints() {
+        let values = [
+            OValue::Request {
+                kind: RequestKind::Instantiate,
+                source: Box::new(OValue::null()),
+                fingerprint: "短".into(),
+            },
+            OValue::Thunk {
+                body: "42".into(),
+                deps: vec![],
+                fingerprint: "é".into(),
+            },
+            OValue::Group {
+                mode: GroupMode::Batch,
+                members: vec![],
+                fingerprint: "🔒".into(),
+            },
+        ];
+        let renderers = exhaustive_cases!(SpliceRenderer;
+            SpliceRenderer::Python => SpliceRenderer::Python,
+            SpliceRenderer::Html => SpliceRenderer::Html,
+            SpliceRenderer::Latex => SpliceRenderer::Latex,
+            SpliceRenderer::Markdown => SpliceRenderer::Markdown,
+            SpliceRenderer::Nix => SpliceRenderer::Nix,
+            SpliceRenderer::Default => SpliceRenderer::Default,
+        );
+
+        for renderer in renderers {
+            for value in &values {
+                assert!(
+                    !render_with(renderer, value).is_empty(),
+                    "{renderer:?} erased {} with a short fingerprint",
+                    value.type_name(),
+                );
+            }
+        }
     }
 
     #[test]
