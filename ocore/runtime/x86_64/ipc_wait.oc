@@ -15,10 +15,13 @@ use runtime::process::is_live as process_is_live;
 use runtime::thread::current_handle as current_thread_handle;
 use runtime::thread::is_live as thread_is_live;
 use runtime::thread::process_for;
+use runtime::thread::queue_invariants_hold as thread_queue_invariants_hold;
+use runtime::thread::runnable_count as thread_runnable_count;
 use runtime::thread::set_saved_result;
 use runtime::thread::sleep_epoch;
 use runtime::thread::state as thread_state;
 use runtime::thread::wake_blocked;
+use runtime::thread::wake_count as thread_wake_count;
 use runtime::thread::wake_deadline;
 use runtime::thread::wake_epoch;
 use runtime::thread::MAX_THREADS;
@@ -325,6 +328,43 @@ pub unsafe fn abort(request: u64) -> u64 {
     return 1;
 }
 
+// Read-only readiness for composed terminal transactions. The exact wait
+// generation, endpoint waiter, blocked TCB/frame, wake counter, and runnable
+// queue are all checked before a caller revokes any subordinate authority.
+pub unsafe fn can_complete(
+    request: u64,
+    endpoint: u64,
+    kind: u64,
+    thread: u64,
+    result: u64,
+    reason: u64
+) -> bool {
+    if !wait_kind_valid(kind)
+        || result == 0
+        || (reason != WAKE_REASON_IPC && reason != WAKE_REASON_CANCELLED)
+        || !invariants_hold()
+        || !thread_queue_invariants_hold()
+        || thread_runnable_count() >= MAX_THREADS
+        || thread_wake_count(thread) == 0xffff_ffff {
+        return false;
+    }
+    let slot: usize = checked_request(request);
+    if slot >= MAX_THREADS
+        || STATES[slot] != WAIT_COMMITTED
+        || ENDPOINTS[slot] != endpoint
+        || KINDS[slot] as u64 != kind
+        || THREADS[slot] != thread
+        || (reason == WAKE_REASON_IPC
+            && WAKES == 0xffff_ffff_ffff_ffff)
+        || (reason == WAKE_REASON_CANCELLED
+            && CANCEL_WAKES == 0xffff_ffff_ffff_ffff)
+        || !committed_epoch_matches(slot)
+        || !waiter_matches(endpoint, kind, thread) {
+        return false;
+    }
+    return true;
+}
+
 unsafe fn finish_committed_slot(
     slot: usize,
     result: u64,
@@ -379,10 +419,14 @@ pub unsafe fn complete(
     }
     let slot: usize = thread_index(thread);
     if slot >= MAX_THREADS
-        || STATES[slot] != WAIT_COMMITTED
-        || ENDPOINTS[slot] != endpoint
-        || KINDS[slot] as u64 != kind
-        || THREADS[slot] != thread {
+        || !can_complete(
+            make_handle(slot),
+            endpoint,
+            kind,
+            thread,
+            result,
+            reason
+        ) {
         return 0;
     }
     return finish_committed_slot(slot, result, reason);

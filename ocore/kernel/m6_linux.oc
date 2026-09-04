@@ -105,13 +105,17 @@ use runtime::personality::PERSONALITY_PLAN9_9P2000;
 use runtime::linux_fd_table::active_count as linux_fd_active_count;
 use runtime::linux_fd_table::authorize_write as authorize_linux_write;
 use runtime::linux_fd_table::creation_count as linux_fd_creation_count;
+use runtime::linux_fd_table::denial_count as linux_fd_denial_count;
+use runtime::linux_fd_table::lookup_count as linux_fd_lookup_count;
 use runtime::linux_fd_table::revocation_count as linux_fd_revocation_count;
 use runtime::linux_fd_table::stale_denial_count as linux_fd_stale_denial_count;
+use runtime::linux_fd_table::use_count as linux_fd_use_count;
 use runtime::linux_personality::classify_syscall as classify_linux_syscall;
 use runtime::linux_personality::complete_write as complete_linux_write;
 use runtime::linux_personality::denial_count as linux_denial_count;
 use runtime::linux_personality::enosys_count as linux_enosys_count;
 use runtime::linux_personality::exit_group_count as linux_exit_group_count;
+use runtime::linux_personality::inject_write_failure_once as inject_linux_write_failure;
 use runtime::linux_personality::init as linux_personality_init;
 use runtime::linux_personality::invariants_hold as linux_invariants_hold;
 use runtime::linux_personality::make_write_request_frame;
@@ -124,6 +128,8 @@ use runtime::linux_personality::stdout_byte as linux_stdout_byte;
 use runtime::linux_personality::stdout_length as linux_stdout_length;
 use runtime::linux_personality::write_byte_count as linux_write_byte_count;
 use runtime::linux_personality::write_call_count as linux_write_call_count;
+use runtime::linux_personality::write_failure_seen_mask as linux_write_failure_seen_mask;
+use runtime::linux_personality::LINUX_WRITE_FAILURE_STAGE_COUNT;
 use runtime::linux_personality::LINUX_ACTION_BOUNDED_WRITE;
 use runtime::linux_personality::LINUX_ACTION_DIRECT_EXIT_GROUP;
 use runtime::linux_personality::LINUX_ACTION_RETURN;
@@ -150,7 +156,9 @@ use runtime::personality_rpc::aborted_dispatch_count as rpc_aborted_dispatch_cou
 use runtime::personality_rpc::dispatch_prepare_count as rpc_prepare_count;
 use runtime::personality_rpc::dispatch_prepare_abort_count as rpc_prepare_abort_count;
 use runtime::personality_rpc::duplicate_reply_count as rpc_duplicate_count;
+use runtime::personality_rpc::denial_count as rpc_denial_count;
 use runtime::personality_rpc::late_reply_count as rpc_late_count;
+use runtime::personality_rpc::publish_count as rpc_publish_count;
 use runtime::personality_rpc::reply_count as rpc_reply_count;
 use runtime::personality_rpc::replacement_count as rpc_replacement_count;
 use runtime::personality_rpc::request_count as rpc_request_count;
@@ -185,6 +193,7 @@ use runtime::personality_bounded_rpc::unmap_request as unmap_bounded_request;
 use runtime::personality_bounded_rpc::commit_resume as commit_bounded_resume;
 use runtime::personality_bounded_rpc::dispatch_or_consume as dispatch_bounded_call;
 use runtime::personality_bounded_rpc::expire as expire_bounded_requests;
+use runtime::personality_bounded_rpc::inject_reply_failure_once as inject_bounded_reply_failure;
 use runtime::personality_bounded_rpc::init as bounded_rpc_init;
 use runtime::personality_bounded_rpc::invariants_hold as bounded_rpc_invariants_hold;
 use runtime::personality_bounded_rpc::lookup_view as lookup_bounded_view;
@@ -200,9 +209,11 @@ use runtime::personality_bounded_rpc::terminal_count as bounded_terminal_count;
 use runtime::personality_bounded_rpc::charged_bytes as bounded_charged_bytes;
 use runtime::personality_bounded_rpc::consumed_count as bounded_consumed_count;
 use runtime::personality_bounded_rpc::dispatch_count as bounded_dispatch_count;
+use runtime::personality_bounded_rpc::denial_count as bounded_denial_count;
 use runtime::personality_bounded_rpc::lookup_count as bounded_lookup_count;
 use runtime::personality_bounded_rpc::next_live_deadline as bounded_next_deadline;
 use runtime::personality_bounded_rpc::reply_count as bounded_reply_count;
+use runtime::personality_bounded_rpc::reply_failure_seen_mask as bounded_reply_failure_seen_mask;
 use runtime::personality_bounded_rpc::cancellation_count as bounded_cancel_count;
 use runtime::personality_bounded_rpc::timeout_count as bounded_timeout_count;
 use runtime::personality_bounded_rpc::service_death_count as bounded_death_count;
@@ -215,6 +226,7 @@ use runtime::personality_bounded_rpc::allocation_failure_arm_count as bounded_al
 use runtime::personality_bounded_rpc::allocation_failure_count as bounded_allocation_failure_count;
 use runtime::personality_bounded_rpc::allocation_rollback_proof_count as bounded_allocation_rollback_proof_count;
 use runtime::personality_bounded_rpc::wait_rollback_proof_count as bounded_wait_rollback_proof_count;
+use runtime::personality_bounded_rpc::BOUNDED_REPLY_FAILURE_STAGE_COUNT;
 use runtime::delegated_resource::active_count as active_delegated_resource_count;
 use runtime::delegated_resource::creation_count as delegated_resource_creation_count;
 use runtime::delegated_resource::revocation_count as delegated_resource_revocation_count;
@@ -448,6 +460,8 @@ static LINUX_PRIVATE_MESSAGE: [u8; 49] =
     b"M6 Linux private-before-health publication: PASS\n";
 static LINUX_ARMED_MESSAGE: [u8; 42] =
     b"M6 Linux bounded write personality: armed\n";
+static LINUX_WRITE_FAILURE_MESSAGE: [u8; 40] =
+    b"M6 Linux pre-reply failure matrix: PASS\n";
 static LINUX_ENOSYS_MESSAGE: [u8; 36] =
     b"M6 Linux exact -ENOSYS return: PASS\n";
 static LINUX_EXIT_MESSAGE: [u8; 37] =
@@ -580,6 +594,7 @@ static mut LINUX_G1_REQUEST: u64 = 0;
 static mut LINUX_REBIND_BARRIER: u8 = 0;
 static mut LINUX_EXIT_REQUESTED: u64 = 0;
 static mut LINUX_EXIT_RECORDED: u64 = 0;
+static mut LINUX_WRITE_FAILURE_REGRESSION_DONE: u8 = 0;
 static mut LINUX_STDOUT_OBJECT: u64 = 0;
 static mut LINUX_STDERR_OBJECT: u64 = 0;
 static mut LINUX_G1_STDOUT_OBJECT: u64 = 0;
@@ -1549,6 +1564,81 @@ pub unsafe fn kernel_m6_linux_syscall(
     return control;
 }
 
+// Every value in this sum is monotonic during one live completion attempt.
+// Equality therefore proves that none of the write path's observable Linux,
+// fd, bounded-bridge, or outer-RPC counters changed; the request-state check
+// below separately proves that no terminal transition was published.
+unsafe fn linux_write_observable_sum() -> u64 {
+    return linux_stdout_length() as u64
+        + linux_stderr_length() as u64
+        + linux_write_call_count()
+        + linux_write_byte_count()
+        + linux_denial_count()
+        + linux_enosys_count()
+        + linux_exit_group_count()
+        + linux_fd_lookup_count()
+        + linux_fd_use_count()
+        + linux_fd_denial_count()
+        + linux_fd_stale_denial_count()
+        + bounded_dispatch_count()
+        + bounded_lookup_count()
+        + bounded_reply_count()
+        + bounded_denial_count()
+        + bounded_consumed_count()
+        + rpc_dispatch_count()
+        + rpc_reply_count()
+        + rpc_terminal_count()
+        + rpc_terminal_wake_count()
+        + rpc_denial_count()
+        + rpc_consumed_count()
+        + rpc_publish_count();
+}
+
+// Exercise every formerly post-reply failure using the exact live request and
+// view. Each one-shot stage must abort before publication, preserve the whole
+// observable sum, and leave the same request waiting for the real retry.
+unsafe fn linux_write_failure_regression(
+    request: u64,
+    view: u64,
+    fd: u64,
+    count: u64
+) -> bool {
+    let before: u64 = linux_write_observable_sum();
+    let mut linux_seen: u64 = linux_write_failure_seen_mask();
+    let mut stage: u64 = 1;
+    while stage <= LINUX_WRITE_FAILURE_STAGE_COUNT {
+        if inject_linux_write_failure(stage) != 1
+            || complete_linux_write(request, view, fd, count as usize) != 0 {
+            return false;
+        }
+        linux_seen |= 1 << (stage - 1) as usize;
+        if linux_write_failure_seen_mask() != linux_seen
+            || linux_write_observable_sum() != before
+            || personality_request_state(request) != RPC_STATE_WAITING {
+            return false;
+        }
+        stage += 1;
+    }
+    let mut bridge_seen: u64 = bounded_reply_failure_seen_mask();
+    stage = 1;
+    while stage <= BOUNDED_REPLY_FAILURE_STAGE_COUNT {
+        if inject_bounded_reply_failure(stage) != 1
+            || complete_linux_write(request, view, fd, count as usize) != 0 {
+            return false;
+        }
+        bridge_seen |= 1 << (stage - 1) as usize;
+        if bounded_reply_failure_seen_mask() != bridge_seen
+            || linux_write_observable_sum() != before
+            || personality_request_state(request) != RPC_STATE_WAITING {
+            return false;
+        }
+        stage += 1;
+    }
+    return linux_invariants_hold()
+        && personality_rpc_invariants_hold()
+        && bounded_rpc_invariants_hold();
+}
+
 @export
 @no_mangle
 pub unsafe fn kernel_m6_linux_complete(
@@ -1572,6 +1662,20 @@ pub unsafe fn kernel_m6_linux_complete(
     }
     let stdout_before: usize = linux_stdout_length();
     let stderr_before: usize = linux_stderr_length();
+    if ACTIVE_MODE == MODE_LINUX_PERSONALITY
+        && supervision_generation(SUPERVISION) == 1
+        && LINUX_WRITE_FAILURE_REGRESSION_DONE == 0 {
+        if !linux_write_failure_regression(
+            request,
+            view,
+            fd,
+            count
+        ) {
+            mode25_diagnostic_halt(MODE25_DIAG_D4);
+        }
+        LINUX_WRITE_FAILURE_REGRESSION_DONE = 1;
+        write((&LINUX_WRITE_FAILURE_MESSAGE[0]), 40);
+    }
     if complete_linux_write(request, view, fd, count as usize) != 1 {
         return ERR_PERSONALITY_STALE;
     }
@@ -2177,6 +2281,7 @@ pub unsafe fn kernel_m6_phase_one_ready() -> u64 {
                 != SUPERVISION_STATE_RESTART_REQUESTED
             || LINUX_G1_REQUEST == 0
             || LINUX_REBIND_BARRIER != 1
+            || LINUX_WRITE_FAILURE_REGRESSION_DONE != 1
             || linux_write_call_count() != 1
             || linux_stdout_length() != 20
             || linux_stderr_length() != 0
@@ -2352,6 +2457,7 @@ pub unsafe fn kernel_m6_final_ready() -> u64 {
         }
         if linux_write_call_count() != 2
             || linux_write_byte_count() != 40
+            || LINUX_WRITE_FAILURE_REGRESSION_DONE != 1
             || linux_stdout_length() != 20
             || linux_stderr_length() != 20
             || linux_enosys_count() != 1
@@ -2809,6 +2915,7 @@ pub unsafe fn start(mode: u64, native_domain: u64) -> never {
     LINUX_REBIND_BARRIER = 0;
     LINUX_EXIT_REQUESTED = 0;
     LINUX_EXIT_RECORDED = 0;
+    LINUX_WRITE_FAILURE_REGRESSION_DONE = 0;
     LINUX_STDOUT_OBJECT = 0;
     LINUX_STDERR_OBJECT = 0;
     LINUX_G1_STDOUT_OBJECT = 0;

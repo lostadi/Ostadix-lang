@@ -241,10 +241,14 @@ Mode 25's `smoke-live-linux-personality-qemu.sh` is a separate bounded-copy
 foreign-ABI slice. One exact static Linux x86-64 ELF issues stdout and stderr
 `write` calls through 20-byte `IN` views; a successful generation-1 terminal
 remains charged and consumable across daemon fault/replacement after its view
-authority closes. The gate also covers exact `-ENOSYS`, `exit_group(42)`, stale
-generation-1 lookup denial, unrelated-observer survival, cleanup, and a later
-timer. It does not exercise output views, partial effects, mapping mutation,
-signals, streaming, or an arbitrary executable/syscall corpus.
+authority closes. Before that terminal publication, the gate injects seven
+Linux-adapter and four bounded-bridge preparation failures against the same
+request and requires unchanged observable accounting plus a still-`WAITING`
+request after each failure; the subsequent retry must succeed exactly once.
+The gate also covers exact `-ENOSYS`, `exit_group(42)`, stale generation-1
+lookup denial, unrelated-observer survival, cleanup, and a later timer. It does
+not exercise output views, partial effects, mapping mutation, signals,
+streaming, or an arbitrary executable/syscall corpus.
 
 ## 10. Complete acceptance gate
 

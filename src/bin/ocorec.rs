@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use clap::{Parser, ValueEnum};
-use o_lang::ocore::{compile, CompileOptions, EmitKind, Target};
+use o_lang::ocore::{compile_with_function_sections, CompileOptions, EmitKind, Target};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum Emit {
@@ -38,6 +38,10 @@ struct Cli {
     /// Retain generated assembly next to an object output.
     #[arg(long)]
     keep_asm: bool,
+
+    /// Place ordinary functions in separate ELF sections for linker GC.
+    #[arg(long)]
+    function_sections: bool,
 }
 
 fn main() {
@@ -65,7 +69,7 @@ fn main() {
         output,
         keep_assembly: cli.keep_asm,
     };
-    match compile(&cli.inputs, &options) {
+    match compile_with_function_sections(&cli.inputs, &options, cli.function_sections) {
         Ok(result) => {
             if result.output.as_path() != std::path::Path::new("-") {
                 eprintln!("ocorec: wrote {}", result.output.display());

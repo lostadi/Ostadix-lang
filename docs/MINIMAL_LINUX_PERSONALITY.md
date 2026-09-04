@@ -65,6 +65,14 @@ bounded stdout/stderr transcript only after the generation-bound bridge reply
 succeeds. A stale request therefore cannot publish new output. The bridge owns
 saved-`RAX` completion; the foreign binary does not retry the syscall.
 
+Completion is split into preparation, one reply-publication point, and a
+deterministic no-fail commit. Preparation validates fd lookup/use accounting,
+transcript and counter capacity, the prospective Linux state, memory-view
+closure readiness, bridge reply capacity, and outer-RPC wake readiness before
+any authority is closed. After publication, an impossible postcondition is a
+fail-stop invariant catastrophe rather than an ordinary failure that could
+invite a duplicate retry.
+
 At the generation-1 daemon crash, the successful stdout reply is already
 terminal and its daemon-side view capability is closed. The lifecycle path
 withdraws that service and revokes the exact `(service process, service
@@ -115,6 +123,10 @@ Run the live slice from the repository root with:
 The gate independently pins the complete four-file OVFS image and the embedded
 8,520-byte `/bin/linux-minimal.elf` payload. It rejects user-principal symbols
 linked into the kernel, then requires real static-ELF load and CPL3 execution,
+seven one-shot Linux preparation failures and four one-shot bounded-bridge
+preparation failures against the same live request, unchanged observable
+accounting and `WAITING` state after every injected failure, one successful
+retry,
 the exact `o-core linux stdout\n` and `o-core linux stderr\n` streams exactly
 once and in program order, unknown-syscall `-ENOSYS`, and direct
 `exit_group(42)`. Generation 1 completes stdout and then faults deliberately;

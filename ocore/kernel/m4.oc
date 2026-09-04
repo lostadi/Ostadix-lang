@@ -10,6 +10,7 @@ use runtime::address_space::loaded_protections_hold;
 use runtime::address_space::loaded_stack_pointer;
 use runtime::address_space::root_cr3;
 use runtime::capability::close_for_owner as close_capability_for_owner;
+use runtime::capability::cspace_child_refs;
 use runtime::capability::cspace_handle_for_slot;
 use runtime::capability::install_for_owner as install_capability_for_owner;
 use runtime::capability::invariants_hold as capability_invariants_hold;
@@ -28,6 +29,8 @@ use runtime::domain_namespace::init as namespaces_init;
 use runtime::domain_namespace::invariants_hold as namespace_invariants_hold;
 use runtime::domain_namespace::process_refs as namespace_process_refs;
 use runtime::domain_namespace::release_quiescent_processes;
+use runtime::domain_namespace::service_refs as namespace_service_refs;
+use runtime::domain_namespace::unbind_process;
 use runtime::elf_loader::commit_count;
 use runtime::elf_loader::ELF_ERROR_MALFORMED;
 use runtime::elf_loader::ELF_ERROR_OVERLAP;
@@ -78,12 +81,18 @@ use runtime::scheduler::failed as scheduler_failed;
 use runtime::scheduler::SCHEDULER_COMPLETION_LOADED;
 use runtime::serial::write;
 use runtime::service_registry::denied_lookups;
+use runtime::service_registry::binding_is_reapable;
+use runtime::service_registry::binding_is_usable;
+use runtime::service_registry::binding_storage_valid;
 use runtime::service_registry::init as service_registry_init;
 use runtime::service_registry::invariants_hold as service_invariants_hold;
 use runtime::service_registry::lookup as service_lookup;
 use runtime::service_registry::publish as publish_service;
+use runtime::service_registry::quiescent_invariants_hold as service_quiescent_invariants_hold;
+use runtime::service_registry::reap_stale as reap_stale_service;
 use runtime::service_registry::successful_lookups;
 use runtime::service_registry::teardown_namespace as teardown_service_namespace;
+use runtime::service_registry::unpublish as unpublish_service;
 use runtime::thread::init as threads_init;
 use runtime::thread::install_loaded as install_loaded_thread;
 use runtime::thread::is_live as thread_is_live;
@@ -432,6 +441,8 @@ pub unsafe fn start(mode: u64, native_domain: u64) -> never {
         OBJECT_ENDPOINT,
         RIGHT_ENDPOINT_SEND
     );
+    let service_refs_before: u32 = namespace_service_refs(NAMESPACE);
+    let consumer_refs_before: u32 = cspace_child_refs(CSPACES[0]);
     SERVICE_BINDING = publish_service(
         NAMESPACE,
         SERVICE_ID,
@@ -447,6 +458,11 @@ pub unsafe fn start(mode: u64, native_domain: u64) -> never {
     if SERVICE_ENDPOINT == 0
         || SERVICE_CAP == 0
         || SERVICE_BINDING == 0
+        || !binding_storage_valid(SERVICE_BINDING)
+        || !binding_is_usable(SERVICE_BINDING)
+        || binding_is_reapable(SERVICE_BINDING)
+        || namespace_service_refs(NAMESPACE) != service_refs_before + 1
+        || cspace_child_refs(CSPACES[0]) != consumer_refs_before + 1
         || service_lookup(
             NAMESPACE,
             SERVICE_ID,
@@ -475,7 +491,144 @@ pub unsafe fn start(mode: u64, native_domain: u64) -> never {
         || denied != 0
         || successful_lookups() != 1
         || denied_lookups() != 1
-        || !service_invariants_hold() {
+        || !service_invariants_hold()
+        || !service_quiescent_invariants_hold() {
+        fail_closed();
+    }
+
+    // Provider removal invalidates discovery authority but not the retained
+    // registry record.  The structurally valid stale record must deny lookup,
+    // emit no capability, and remain available for one exact reap.
+    if unbind_process(NAMESPACE, PROCESSES[1]) == 0
+        || namespace_process_refs(NAMESPACE) != 1
+        || !binding_storage_valid(SERVICE_BINDING)
+        || binding_is_usable(SERVICE_BINDING)
+        || !binding_is_reapable(SERVICE_BINDING)
+        || !service_invariants_hold()
+        || service_quiescent_invariants_hold() {
+        fail_closed();
+    }
+    resolved = SERVICE_CAP;
+    if service_lookup(
+        NAMESPACE,
+        SERVICE_ID,
+        SERVICE_PROTOCOL,
+        CSPACES[0],
+        OBJECT_ENDPOINT,
+        RIGHT_ENDPOINT_SEND,
+        (&mut resolved)
+    ) != 0
+        || resolved != 0
+        || successful_lookups() != 1
+        || denied_lookups() != 2
+        || reap_stale_service(SERVICE_BINDING) != 1
+        || reap_stale_service(SERVICE_BINDING) != 0
+        || binding_storage_valid(SERVICE_BINDING)
+        || binding_is_usable(SERVICE_BINDING)
+        || binding_is_reapable(SERVICE_BINDING)
+        || namespace_service_refs(NAMESPACE) != service_refs_before
+        || cspace_child_refs(CSPACES[0]) != consumer_refs_before
+        || !service_invariants_hold()
+        || !service_quiescent_invariants_hold()
+        || bind_process(NAMESPACE, PROCESSES[1]) == 0
+        || namespace_process_refs(NAMESPACE) != 2
+        || !namespace_invariants_hold() {
+        fail_closed();
+    }
+
+    // Reuse the exact registry slot under its next generation. The old handle
+    // must remain stale even though the logical service tuple is published
+    // again, and the second withdrawal must restore both retained references.
+    let rebound_binding: u64 = publish_service(
+        NAMESPACE,
+        SERVICE_ID,
+        SERVICE_PROTOCOL,
+        PROCESSES[1],
+        CSPACES[0],
+        SERVICE_CAP,
+        OBJECT_ENDPOINT,
+        RIGHT_ENDPOINT_SEND
+    );
+    resolved = 0;
+    if rebound_binding == 0
+        || rebound_binding == SERVICE_BINDING
+        || binding_storage_valid(SERVICE_BINDING)
+        || !binding_is_usable(rebound_binding)
+        || namespace_service_refs(NAMESPACE) != service_refs_before + 1
+        || cspace_child_refs(CSPACES[0]) != consumer_refs_before + 1
+        || service_lookup(
+            NAMESPACE,
+            SERVICE_ID,
+            SERVICE_PROTOCOL,
+            CSPACES[0],
+            OBJECT_ENDPOINT,
+            RIGHT_ENDPOINT_SEND,
+            (&mut resolved)
+        ) != 1
+        || resolved != SERVICE_CAP
+        || successful_lookups() != 2
+        || denied_lookups() != 2
+        || unpublish_service(rebound_binding) != 1
+        || unpublish_service(rebound_binding) != 0
+        || namespace_service_refs(NAMESPACE) != service_refs_before
+        || cspace_child_refs(CSPACES[0]) != consumer_refs_before
+        || !service_invariants_hold()
+        || !service_quiescent_invariants_hold() {
+        fail_closed();
+    }
+
+    // Capability revocation is another legitimate route into the stale
+    // lifecycle. The retained record remains structurally valid so its exact
+    // namespace and CSpace references can still be released.
+    let revoked_capability: u64 = install_capability_for_owner(
+        CSPACES[0],
+        3,
+        SERVICE_ENDPOINT,
+        OBJECT_ENDPOINT,
+        RIGHT_ENDPOINT_SEND
+    );
+    let revoked_binding: u64 = publish_service(
+        NAMESPACE,
+        SERVICE_ID,
+        SERVICE_PROTOCOL,
+        PROCESSES[1],
+        CSPACES[0],
+        revoked_capability,
+        OBJECT_ENDPOINT,
+        RIGHT_ENDPOINT_SEND
+    );
+    if revoked_capability == 0
+        || revoked_binding == 0
+        || close_capability_for_owner(
+            CSPACES[0],
+            revoked_capability
+        ) != 1
+        || !binding_storage_valid(revoked_binding)
+        || binding_is_usable(revoked_binding)
+        || !binding_is_reapable(revoked_binding)
+        || !service_invariants_hold()
+        || service_quiescent_invariants_hold() {
+        fail_closed();
+    }
+    resolved = SERVICE_CAP;
+    if service_lookup(
+        NAMESPACE,
+        SERVICE_ID,
+        SERVICE_PROTOCOL,
+        CSPACES[0],
+        OBJECT_ENDPOINT,
+        RIGHT_ENDPOINT_SEND,
+        (&mut resolved)
+    ) != 0
+        || resolved != 0
+        || successful_lookups() != 2
+        || denied_lookups() != 3
+        || reap_stale_service(revoked_binding) != 1
+        || reap_stale_service(revoked_binding) != 0
+        || namespace_service_refs(NAMESPACE) != service_refs_before
+        || cspace_child_refs(CSPACES[0]) != consumer_refs_before
+        || !service_invariants_hold()
+        || !service_quiescent_invariants_hold() {
         fail_closed();
     }
     write((&SERVICE_MESSAGE[0]), 35);

@@ -1,11 +1,16 @@
 module runtime::service_registry;
 
 use runtime::capability::cspace_child_refs;
+use runtime::capability::capability_handle_shape_valid;
+use runtime::capability::capability_metadata_shape_valid;
 use runtime::capability::cspace_is_live;
 use runtime::capability::cspace_is_valid_owner;
 use runtime::capability::inspect_for_owner;
+use runtime::capability::generation_is_live;
 use runtime::capability::release_cspace;
 use runtime::capability::retain_cspace;
+use runtime::capability::retire_or_advance;
+use runtime::capability::GENERATION_RETIRED;
 use runtime::domain_namespace::contains_process;
 use runtime::domain_namespace::invariants_hold as namespace_invariants_hold;
 use runtime::domain_namespace::is_live as namespace_is_live;
@@ -15,6 +20,7 @@ use runtime::domain_namespace::release_service as release_namespace_service;
 use runtime::domain_namespace::retain_service as retain_namespace_service;
 use runtime::domain_namespace::service_refs as namespace_service_refs;
 use runtime::domain_namespace::MAX_DOMAIN_NAMESPACES;
+use runtime::process::can_issue_operations as process_can_issue_operations;
 use runtime::process::is_live as process_is_live;
 
 pub const MAX_SERVICE_BINDINGS: usize = 16;
@@ -65,6 +71,7 @@ unsafe fn checked_service(handle: u64) -> usize {
     let slot: usize = service_index(handle);
     if slot >= MAX_SERVICE_BINDINGS
         || STATES[slot] != SERVICE_LIVE
+        || !generation_is_live(GENERATIONS[slot])
         || GENERATIONS[slot] != service_generation(handle) {
         return MAX_SERVICE_BINDINGS;
     }
@@ -85,10 +92,10 @@ unsafe fn clear_slot(slot: usize) -> void {
 
 unsafe fn retire_or_reuse(slot: usize) -> void {
     clear_slot(slot);
-    if GENERATIONS[slot] == 0xffff_ffff {
+    GENERATIONS[slot] = retire_or_advance(GENERATIONS[slot]);
+    if GENERATIONS[slot] == GENERATION_RETIRED {
         STATES[slot] = SERVICE_RETIRED;
     } else {
-        GENERATIONS[slot] += 1;
         STATES[slot] = SERVICE_EMPTY;
     }
 }
@@ -134,6 +141,7 @@ pub unsafe fn publish(
         || name_id == 0
         || protocol_version == 0
         || !process_is_live(provider_process)
+        || !process_can_issue_operations(provider_process)
         || !contains_process(namespace, provider_process)
         || !cspace_is_live(consumer_cspace)
         || capability == 0
@@ -195,10 +203,40 @@ pub unsafe fn publish(
     return make_handle(free_slot);
 }
 
-pub unsafe fn binding_is_live(service: u64) -> bool {
+// Storage validity is deliberately weaker than usability.  A provider may be
+// removed from its namespace or cease to be live before the binding is reaped;
+// the retained namespace and CSpace references keep that intermediate record
+// structurally coherent so cleanup can still consume it exactly once.
+pub unsafe fn binding_storage_valid(service: u64) -> bool {
     let slot: usize = checked_service(service);
     if slot >= MAX_SERVICE_BINDINGS
+        || !namespace_is_valid_owner(NAMESPACES[slot])
+        || service_index(NAMESPACES[slot]) >= MAX_DOMAIN_NAMESPACES
+        || namespace_service_refs(NAMESPACES[slot]) == 0
+        || NAME_IDS[slot] == 0
+        || PROTOCOL_VERSIONS[slot] == 0
+        || PROVIDER_PROCESSES[slot] == 0
+        || !cspace_is_valid_owner(CONSUMER_CSPACES[slot])
+        || cspace_child_refs(CONSUMER_CSPACES[slot]) == 0
+        || !capability_handle_shape_valid(CAPABILITIES[slot])
+        || OBJECT_IDS[slot] == 0
+        || !capability_metadata_shape_valid(
+            OBJECT_TYPES[slot],
+            RIGHTS[slot]
+        ) {
+        return false;
+    }
+    return true;
+}
+
+pub unsafe fn binding_is_usable(service: u64) -> bool {
+    let slot: usize = checked_service(service);
+    if slot >= MAX_SERVICE_BINDINGS
+        || !binding_storage_valid(service)
         || !namespace_is_live(NAMESPACES[slot])
+        || !process_is_live(PROVIDER_PROCESSES[slot])
+        || !process_can_issue_operations(PROVIDER_PROCESSES[slot])
+        || !contains_process(NAMESPACES[slot], PROVIDER_PROCESSES[slot])
         || !cspace_is_live(CONSUMER_CSPACES[slot]) {
         return false;
     }
@@ -215,6 +253,16 @@ pub unsafe fn binding_is_live(service: u64) -> bool {
     return actual_type == OBJECT_TYPES[slot]
         && object_id == OBJECT_IDS[slot]
         && actual_rights == RIGHTS[slot];
+}
+
+pub unsafe fn binding_is_reapable(service: u64) -> bool {
+    return binding_storage_valid(service) && !binding_is_usable(service);
+}
+
+// Compatibility spelling for callers that already interpret "live" as
+// authority to use the published capability.
+pub unsafe fn binding_is_live(service: u64) -> bool {
+    return binding_is_usable(service);
 }
 
 // Metadata lookup itself grants no authority. The only success output is the
@@ -252,7 +300,7 @@ pub unsafe fn lookup(
             && CONSUMER_CSPACES[slot] == consumer_cspace {
             if OBJECT_TYPES[slot] != required_object_type
                 || (RIGHTS[slot] & required_rights) != required_rights
-                || !binding_is_live(make_handle(slot)) {
+                || !binding_is_usable(make_handle(slot)) {
                 DENIED_LOOKUPS += 1;
                 return 0;
             }
@@ -269,10 +317,7 @@ pub unsafe fn lookup(
 pub unsafe fn unpublish(service: u64) -> u64 {
     let slot: usize = checked_service(service);
     if slot >= MAX_SERVICE_BINDINGS
-        || !namespace_is_valid_owner(NAMESPACES[slot])
-        || !cspace_is_valid_owner(CONSUMER_CSPACES[slot])
-        || namespace_service_refs(NAMESPACES[slot]) == 0
-        || cspace_child_refs(CONSUMER_CSPACES[slot]) == 0 {
+        || !binding_storage_valid(service) {
         return 0;
     }
     if release_namespace_service(NAMESPACES[slot]) == 0 {
@@ -288,7 +333,7 @@ pub unsafe fn unpublish(service: u64) -> u64 {
 }
 
 pub unsafe fn reap_stale(service: u64) -> u64 {
-    if binding_is_live(service) {
+    if !binding_is_reapable(service) {
         return 0;
     }
     return unpublish(service);
@@ -302,8 +347,7 @@ pub unsafe fn can_teardown_namespace(namespace: u64) -> bool {
     let mut slot: usize = 0;
     while slot < MAX_SERVICE_BINDINGS {
         if STATES[slot] == SERVICE_LIVE && NAMESPACES[slot] == namespace {
-            if !cspace_is_valid_owner(CONSUMER_CSPACES[slot])
-                || cspace_child_refs(CONSUMER_CSPACES[slot]) == 0 {
+            if !binding_storage_valid(make_handle(slot)) {
                 return false;
             }
             count += 1;
@@ -346,11 +390,11 @@ pub unsafe fn invariants_hold() -> bool {
     let mut slot: usize = 0;
     while slot < MAX_SERVICE_BINDINGS {
         let state: u8 = STATES[slot];
-        if GENERATIONS[slot] == 0 {
-            return false;
-        }
         if state == SERVICE_EMPTY || state == SERVICE_RETIRED {
-            if (state == SERVICE_RETIRED && GENERATIONS[slot] != 0xffff_ffff)
+            if (state == SERVICE_EMPTY
+                    && !generation_is_live(GENERATIONS[slot]))
+                || (state == SERVICE_RETIRED
+                    && GENERATIONS[slot] != GENERATION_RETIRED)
                 || NAMESPACES[slot] != 0
                 || NAME_IDS[slot] != 0
                 || PROTOCOL_VERSIONS[slot] != 0
@@ -365,17 +409,8 @@ pub unsafe fn invariants_hold() -> bool {
         } else if state == SERVICE_LIVE {
             let namespace: u64 = NAMESPACES[slot];
             let namespace_slot: usize = service_index(namespace);
-            if !namespace_is_valid_owner(namespace)
-                || namespace_slot >= MAX_DOMAIN_NAMESPACES
-                || NAME_IDS[slot] == 0
-                || PROTOCOL_VERSIONS[slot] == 0
-                || !process_is_live(PROVIDER_PROCESSES[slot])
-                || !contains_process(namespace, PROVIDER_PROCESSES[slot])
-                || !cspace_is_valid_owner(CONSUMER_CSPACES[slot])
-                || CAPABILITIES[slot] == 0
-                || OBJECT_IDS[slot] == 0
-                || OBJECT_TYPES[slot] == 0
-                || RIGHTS[slot] == 0 {
+            if namespace_slot >= MAX_DOMAIN_NAMESPACES
+                || !binding_storage_valid(make_handle(slot)) {
                 return false;
             }
             namespace_counts[namespace_slot] += 1;
@@ -404,6 +439,24 @@ pub unsafe fn invariants_hold() -> bool {
             return false;
         }
         namespace_slot += 1;
+    }
+    return true;
+}
+
+// Quiescent callers require the stronger claim that every stored binding can
+// presently be used.  The structural invariant above intentionally remains
+// true during the serialized unbind -> deny -> reap transition.
+pub unsafe fn quiescent_invariants_hold() -> bool {
+    if !invariants_hold() {
+        return false;
+    }
+    let mut slot: usize = 0;
+    while slot < MAX_SERVICE_BINDINGS {
+        if STATES[slot] == SERVICE_LIVE
+            && !binding_is_usable(make_handle(slot)) {
+            return false;
+        }
+        slot += 1;
     }
     return true;
 }

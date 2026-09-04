@@ -472,6 +472,12 @@ jobs:
         run: ./boot-and-test.sh smoke
       # END GENERATED: REQUIRED_QEMU_EVIDENCE_CI
 
+      - name: Prove Mode 18 progress at shift-1 virtual timer cadence
+        env:
+          OCORE_M6A_QEMU_ICOUNT: shift=1,align=off,sleep=off
+          OCORE_M6A_TIMEOUT_SECONDS: "60"
+        run: ocore/kernel/smoke-personality-qemu.sh
+
       - name: Upload bounded BootInfo diagnostics on failure
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

@@ -1,12 +1,18 @@
 module runtime::linux_personality;
 
-use runtime::linux_fd_table::authorize_write;
+use runtime::linux_fd_table::commit_prepared_write_accounting_nofail;
+use runtime::linux_fd_table::denial_accounting_has_capacity as fd_denial_accounting_has_capacity;
 use runtime::linux_fd_table::init as fd_table_init;
 use runtime::linux_fd_table::invariants_hold as fd_invariants_hold;
-use runtime::linux_fd_table::lookup_write_object;
+use runtime::linux_fd_table::lookup_accounting_has_capacity;
 use runtime::linux_fd_table::open_standard_streams;
+use runtime::linux_fd_table::prepare_authorize_write;
+use runtime::linux_fd_table::prepare_write_object;
 use runtime::linux_fd_table::revoke_process;
 use runtime::linux_fd_table::revoke_service_generation;
+use runtime::linux_fd_table::use_accounting_has_capacity;
+use runtime::linux_fd_table::LINUX_FD_STDERR;
+use runtime::linux_fd_table::LINUX_FD_STDOUT;
 use runtime::linux_fd_table::LINUX_FD_SINK_STDERR;
 use runtime::linux_fd_table::LINUX_FD_SINK_STDOUT;
 use runtime::personality_bounded_rpc::read_byte as bounded_read_byte;
@@ -36,6 +42,17 @@ pub const LINUX_NEG_ENOSYS: u64 = 0xffff_ffff_ffff_ffda;
 pub const MAX_LINUX_WRITE_BYTES: usize = 128;
 pub const MAX_LINUX_TRANSCRIPT_BYTES: usize = 128;
 
+// Test-only one-shot preparation failures, in commit order. Production state
+// is never changed to model exhaustion.
+const WRITE_FAILURE_FD_LOOKUP_CAPACITY: u64 = 1;
+const WRITE_FAILURE_FD_USE_CAPACITY: u64 = 2;
+const WRITE_FAILURE_TRANSCRIPT_CAPACITY: u64 = 3;
+const WRITE_FAILURE_WRITE_CALLS_CAPACITY: u64 = 4;
+const WRITE_FAILURE_WRITE_BYTES_CAPACITY: u64 = 5;
+const WRITE_FAILURE_DENIALS_CAPACITY: u64 = 6;
+const WRITE_FAILURE_PROSPECTIVE_INVARIANT: u64 = 7;
+pub const LINUX_WRITE_FAILURE_STAGE_COUNT: u64 = 7;
+
 // Preparatory live-adapter frame for one Linux write. The generic bounded
 // request owns the exact pointer and length independently; this frame binds
 // the syscall number, Linux fd, and count so a daemon cannot substitute any
@@ -54,6 +71,8 @@ static mut WRITE_BYTES: u64 = 0;
 static mut EXIT_GROUP_CALLS: u64 = 0;
 static mut ENOSYS_CALLS: u64 = 0;
 static mut DENIALS: u64 = 0;
+static mut WRITE_FAILURE_TEST_ARMED: u64 = 0;
+static mut WRITE_FAILURE_TEST_CONSUMED: u64 = 0;
 static mut INITIALIZED: u8 = 0;
 static mut POISONED: u8 = 0;
 const MAX_COUNTER: u64 = 0xffff_ffff_ffff_ffff;
@@ -104,31 +123,12 @@ unsafe fn count_denial() -> void {
     }
 }
 
-unsafe fn append(sink: u64, length: usize) -> bool {
-    let mut index: usize = 0;
-    if sink == LINUX_FD_SINK_STDOUT {
-        if STDOUT_LENGTH > MAX_LINUX_TRANSCRIPT_BYTES - length {
-            return false;
-        }
-        while index < length {
-            STDOUT_BYTES[STDOUT_LENGTH + index] = SCRATCH[index];
-            index += 1;
-        }
-        STDOUT_LENGTH += length;
-        return true;
+unsafe fn fail_stop() -> never {
+    POISONED = 1;
+    disable_interrupts();
+    loop {
+        halt();
     }
-    if sink == LINUX_FD_SINK_STDERR {
-        if STDERR_LENGTH > MAX_LINUX_TRANSCRIPT_BYTES - length {
-            return false;
-        }
-        while index < length {
-            STDERR_BYTES[STDERR_LENGTH + index] = SCRATCH[index];
-            index += 1;
-        }
-        STDERR_LENGTH += length;
-        return true;
-    }
-    return false;
 }
 
 unsafe fn has_capacity(sink: u64, length: usize) -> bool {
@@ -142,6 +142,52 @@ unsafe fn has_capacity(sink: u64, length: usize) -> bool {
         return STDERR_LENGTH <= MAX_LINUX_TRANSCRIPT_BYTES - length;
     }
     return false;
+}
+
+unsafe fn take_write_failure(stage: u64) -> bool {
+    if WRITE_FAILURE_TEST_ARMED != stage {
+        return false;
+    }
+    WRITE_FAILURE_TEST_ARMED = 0;
+    WRITE_FAILURE_TEST_CONSUMED |= 1 << (stage - 1) as usize;
+    return true;
+}
+
+// Every branch here selects a prevalidated deterministic mutation. Impossible
+// postconditions fail-stop; they never become an ordinary retryable result.
+unsafe fn commit_write_nofail(
+    sink: u64,
+    length: usize,
+    result: u64
+) -> void {
+    if result == length as u64 && length != 0 {
+        if sink != LINUX_FD_SINK_STDOUT
+            && sink != LINUX_FD_SINK_STDERR {
+            fail_stop();
+        }
+        let mut index: usize = 0;
+        while index < length {
+            if sink == LINUX_FD_SINK_STDOUT {
+                STDOUT_BYTES[STDOUT_LENGTH + index] = SCRATCH[index];
+            } else {
+                STDERR_BYTES[STDERR_LENGTH + index] = SCRATCH[index];
+            }
+            index += 1;
+        }
+        if sink == LINUX_FD_SINK_STDOUT {
+            STDOUT_LENGTH += length;
+        } else {
+            STDERR_LENGTH += length;
+        }
+        WRITE_CALLS += 1;
+        WRITE_BYTES += length as u64;
+    } else if result != 0 {
+        DENIALS += 1;
+    }
+    clear_scratch();
+    if !invariants_hold() {
+        fail_stop();
+    }
 }
 
 pub fn make_write_request_frame(linux_fd: u64, length: usize) -> u64 {
@@ -188,6 +234,8 @@ pub unsafe fn init() -> u64 {
     EXIT_GROUP_CALLS = 0;
     ENOSYS_CALLS = 0;
     DENIALS = 0;
+    WRITE_FAILURE_TEST_ARMED = 0;
+    WRITE_FAILURE_TEST_CONSUMED = 0;
     POISONED = 0;
     INITIALIZED = 1;
     if !invariants_hold() {
@@ -301,74 +349,154 @@ pub unsafe fn complete_write(
         return 0;
     }
 
-    let object: u64 = lookup_write_object(
+    let object: u64 = prepare_write_object(
         owner_process,
         service_process,
         service_generation,
         linux_fd
     );
+    let mut fd_denial_stale: bool = object == 0
+        && (linux_fd == LINUX_FD_STDOUT
+            || linux_fd == LINUX_FD_STDERR);
     if object != 0 {
-        sink = authorize_write(
+        if take_write_failure(WRITE_FAILURE_FD_LOOKUP_CAPACITY)
+            || !lookup_accounting_has_capacity() {
+            clear_scratch();
+            return 0;
+        }
+        sink = prepare_authorize_write(
             object,
             owner_process,
             service_process,
             service_generation,
             linux_fd
         );
+        if sink != 0
+            && (take_write_failure(WRITE_FAILURE_FD_USE_CAPACITY)
+                || !use_accounting_has_capacity()) {
+            clear_scratch();
+            return 0;
+        }
+        if sink == 0 {
+            fd_denial_stale = true;
+        }
+    }
+    if sink == 0
+        && !fd_denial_accounting_has_capacity(fd_denial_stale) {
+        clear_scratch();
+        return 0;
     }
     if sink != 0 {
         if length == 0 {
             result = 0;
-        } else if length > MAX_LINUX_WRITE_BYTES
-            || !has_capacity(sink, length) {
-            result = LINUX_NEG_EAGAIN;
         } else {
-            clear_scratch();
-            let mut offset: usize = 0;
-            let mut readable: bool = true;
-            while offset < length && readable {
-                let mut byte: u8 = 0;
-                if bounded_read_byte(
-                    view_capability,
-                    offset,
-                    (&mut byte)
-                ) != 1 {
-                    readable = false;
-                } else {
-                    SCRATCH[offset] = byte;
-                    offset += 1;
-                }
+            if take_write_failure(WRITE_FAILURE_TRANSCRIPT_CAPACITY) {
+                clear_scratch();
+                return 0;
             }
-            if readable {
-                result = length as u64;
+            if length > MAX_LINUX_WRITE_BYTES
+                || !has_capacity(sink, length) {
+                result = LINUX_NEG_EAGAIN;
             } else {
                 clear_scratch();
-                result = LINUX_NEG_EFAULT;
+                let mut offset: usize = 0;
+                let mut readable: bool = true;
+                while offset < length && readable {
+                    let mut byte: u8 = 0;
+                    if bounded_read_byte(
+                        view_capability,
+                        offset,
+                        (&mut byte)
+                    ) != 1 {
+                        readable = false;
+                    } else {
+                        SCRATCH[offset] = byte;
+                        offset += 1;
+                    }
+                }
+                if readable {
+                    result = length as u64;
+                } else {
+                    clear_scratch();
+                    result = LINUX_NEG_EFAULT;
+                }
             }
         }
     }
 
-    // Reply is the linearization point. No transcript byte becomes externally
-    // visible if the generation-bound request loses its authority first.
-    if bounded_reply(request, view_capability, 0, result) != 1 {
-        clear_scratch();
-        count_denial();
-        return 0;
-    }
     if result == length as u64 && length != 0 {
-        if !append(sink, length)
-            || WRITE_CALLS == MAX_COUNTER
-            || WRITE_BYTES > MAX_COUNTER - length as u64 {
-            POISONED = 1;
+        if take_write_failure(WRITE_FAILURE_WRITE_CALLS_CAPACITY)
+            || WRITE_CALLS == MAX_COUNTER {
+            clear_scratch();
             return 0;
         }
-        WRITE_CALLS += 1;
-        WRITE_BYTES += length as u64;
-    } else if result != 0 {
-        count_denial();
+        if take_write_failure(WRITE_FAILURE_WRITE_BYTES_CAPACITY)
+            || WRITE_BYTES > MAX_COUNTER - length as u64 {
+            clear_scratch();
+            return 0;
+        }
     }
-    clear_scratch();
-    return finish(1);
+    // Reserve denial headroom before publication; a published Linux error is
+    // the only path that consumes it.
+    if take_write_failure(WRITE_FAILURE_DENIALS_CAPACITY)
+        || (result != 0
+            && (length == 0 || result != length as u64)
+            && DENIALS == MAX_COUNTER) {
+        clear_scratch();
+        return 0;
+    }
+    if take_write_failure(WRITE_FAILURE_PROSPECTIVE_INVARIANT) {
+        clear_scratch();
+        return 0;
+    }
+    // The current equality invariant plus the guarded equal-length increments
+    // to transcript and WRITE_BYTES is the compact prospective-state algebra.
+    if !invariants_hold() {
+        clear_scratch();
+        POISONED = 1;
+        return 0;
+    }
+
+    // Reply is the linearization point. Every fallible adapter check and every
+    // post-state value is resolved above while the request remains live.
+    if bounded_reply(request, view_capability, 0, result) != 1 {
+        clear_scratch();
+        return 0;
+    }
+    commit_prepared_write_accounting_nofail(
+        object != 0,
+        sink != 0,
+        sink == 0,
+        fd_denial_stale
+    );
+    commit_write_nofail(sink, length, result);
+    return 1;
+}
+
+// Arm each formerly post-publication failure class at most once. The hook is
+// accepted only before the first transcript commit and never perturbs a real
+// capacity counter.
+pub unsafe fn inject_write_failure_once(stage: u64) -> u64 {
+    if !preflight()
+        || stage == 0
+        || stage > LINUX_WRITE_FAILURE_STAGE_COUNT
+        || WRITE_FAILURE_TEST_ARMED != 0
+        || (WRITE_CALLS
+            | WRITE_BYTES
+            | STDOUT_LENGTH as u64
+            | STDERR_LENGTH as u64) != 0 {
+        return 0;
+    }
+    let bit: u64 = 1 << (stage - 1) as usize;
+    if (WRITE_FAILURE_TEST_CONSUMED & bit) != 0 {
+        return 0;
+    }
+    WRITE_FAILURE_TEST_ARMED = stage;
+    return 1;
+}
+
+pub unsafe fn write_failure_seen_mask() -> u64 {
+    return WRITE_FAILURE_TEST_CONSUMED;
 }
 
 pub unsafe fn service_generation_died(
@@ -417,6 +545,8 @@ pub unsafe fn invariants_hold() -> bool {
         || !fd_invariants_hold()
         || STDOUT_LENGTH > MAX_LINUX_TRANSCRIPT_BYTES
         || STDERR_LENGTH > MAX_LINUX_TRANSCRIPT_BYTES
+        || WRITE_FAILURE_TEST_ARMED > LINUX_WRITE_FAILURE_STAGE_COUNT
+        || WRITE_FAILURE_TEST_CONSUMED > 0x7f
         || WRITE_BYTES
             != STDOUT_LENGTH as u64 + STDERR_LENGTH as u64 {
         return false;

@@ -15,6 +15,7 @@ use runtime::capability::live_slots_for_owner;
 use runtime::endpoint::message_count as endpoint_message_count;
 use runtime::personality_memory_view::cancel as cancel_view;
 use runtime::personality_memory_view::abort_create as abort_created_view;
+use runtime::personality_memory_view::can_reply as can_reply_view;
 use runtime::personality_memory_view::can_consume_terminal as can_consume_view;
 use runtime::personality_memory_view::cap_close_sequence;
 use runtime::personality_memory_view::capability_for;
@@ -126,11 +127,17 @@ use runtime::delegated_resource::DELEGATED_RESOURCE_STATE_REVOKED;
 // request-correlated daemon lookup below.
 pub const MAX_BOUNDED_PERSONALITY_REQUESTS: usize = 4;
 
+pub const BOUNDED_REPLY_FAILURE_STAGE_COUNT: u64 = 4;
+
 const BOUNDED_EMPTY: u8 = 0;
 const BOUNDED_LIVE: u8 = 1;
 const BOUNDED_TERMINAL: u8 = 2;
 const BOUNDED_RETIRED: u8 = 3;
 const MAX_COUNTER: u64 = 0xffff_ffff_ffff_ffff;
+const REPLY_FAILURE_VIEW_READINESS: u64 = 1;
+const REPLY_FAILURE_BRIDGE_CAPACITY: u64 = 2;
+const REPLY_FAILURE_OUTER_READINESS: u64 = 3;
+const REPLY_FAILURE_PREPARED_INVARIANT: u64 = 4;
 
 static mut STATES: [u8; 4] = [0; 4];
 static mut GENERATIONS: [u32; 4] = [0; 4];
@@ -170,6 +177,8 @@ static mut ALLOCATION_FAILURES: u64 = 0;
 static mut ALLOCATION_ROLLBACK_PROOFS: u64 = 0;
 static mut WAIT_ROLLBACK_PROOFS: u64 = 0;
 static mut FAIL_NEXT_ALLOCATION: u8 = 0;
+static mut REPLY_FAILURE_TEST_ARMED: u64 = 0;
+static mut REPLY_FAILURE_TEST_SEEN: u64 = 0;
 static mut INITIALIZED: u8 = 0;
 static mut POISONED: u8 = 0;
 
@@ -225,6 +234,17 @@ unsafe fn deny(result: u64) -> u64 {
     }
     DENIALS += 1;
     return result;
+}
+
+// Test-only one-shot failures model each preparation class without perturbing
+// the live request, view authority, or operational accounting.
+unsafe fn take_reply_failure(stage: u64) -> bool {
+    if REPLY_FAILURE_TEST_ARMED != stage {
+        return false;
+    }
+    REPLY_FAILURE_TEST_ARMED = 0;
+    REPLY_FAILURE_TEST_SEEN |= 1 << ((stage - 1) as usize);
+    return true;
 }
 
 unsafe fn record_for_request(request: u64) -> usize {
@@ -287,6 +307,17 @@ unsafe fn finish(result: u64) -> u64 {
     return result;
 }
 
+// Once a view capability is closed, an ordinary error return would invite a
+// retry against a partially or fully published result. Such a condition is a
+// kernel invariant catastrophe, not a recoverable personality disposition.
+unsafe fn fail_stop() -> never {
+    POISONED = 1;
+    disable_interrupts();
+    loop {
+        halt();
+    }
+}
+
 unsafe fn terminalize_record(slot: usize, kind: u64) -> bool {
     if slot >= MAX_BOUNDED_PERSONALITY_REQUESTS
         || STATES[slot] != BOUNDED_LIVE {
@@ -339,6 +370,8 @@ pub unsafe fn init() -> u64 {
     ALLOCATION_ROLLBACK_PROOFS = 0;
     WAIT_ROLLBACK_PROOFS = 0;
     FAIL_NEXT_ALLOCATION = 0;
+    REPLY_FAILURE_TEST_ARMED = 0;
+    REPLY_FAILURE_TEST_SEEN = 0;
     POISONED = 0;
     INITIALIZED = 1;
     if !invariants_hold() {
@@ -801,33 +834,71 @@ pub unsafe fn reply(
         || RESOURCES[slot] != 0 {
         return deny(ERR_PERSONALITY_STALE);
     }
+    if !can_reply_view(
+        SERVICE_CSPACES[slot],
+        capability,
+        committed_length
+    ) {
+        return deny(ERR_PERSONALITY_FAILED);
+    }
+    if take_reply_failure(REPLY_FAILURE_VIEW_READINESS) {
+        return ERR_PERSONALITY_FAILED;
+    }
+    if REPLIES == MAX_COUNTER {
+        return deny(ERR_PERSONALITY_FAILED);
+    }
+    if take_reply_failure(REPLY_FAILURE_BRIDGE_CAPACITY) {
+        return ERR_PERSONALITY_FAILED;
+    }
     let outer_ready: u64 = can_reply_rpc(request, caller, result);
     if outer_ready != 1 {
         return deny(outer_ready);
     }
+    if take_reply_failure(REPLY_FAILURE_OUTER_READINESS) {
+        return ERR_PERSONALITY_FAILED;
+    }
+    if !invariants_hold() {
+        POISONED = 1;
+        return ERR_PERSONALITY_FAILED;
+    }
+    if take_reply_failure(REPLY_FAILURE_PREPARED_INVARIANT) {
+        return ERR_PERSONALITY_FAILED;
+    }
+
+    // The view close below is the first irreversible action. Syscall entry
+    // masks interrupts in the current single-CPU contract, so the complete
+    // readiness proof above remains stable. Nothing below may return failure.
     if reply_view(
         SERVICE_CSPACES[slot],
         capability,
         committed_length
     ) != 1 {
-        return deny(ERR_PERSONALITY_UNSUPPORTED);
+        fail_stop();
+    }
+    if view_committed_length(VIEWS[slot]) != committed_length {
+        fail_stop();
     }
     if !terminalize_record(slot, MEMORY_VIEW_TERMINAL_REPLY) {
-        POISONED = 1;
-        return ERR_PERSONALITY_FAILED;
+        fail_stop();
     }
-    if reply_rpc(request, caller, result) != 1
-        || rpc_state(request) != RPC_STATE_TERMINAL
+    if reply_rpc(request, caller, result) != 1 {
+        fail_stop();
+    }
+    if rpc_state(request) != RPC_STATE_TERMINAL
+        || rpc_terminal_result(request) != result
+        || thread_saved_result(CALLER_THREADS[slot]) != ERR_IPC_RETRY
+        || thread_wake_reason(CALLER_THREADS[slot]) != WAKE_REASON_IPC
         || !terminal_pair_valid(
             MEMORY_VIEW_TERMINAL_REPLY,
             rpc_terminal_kind(request)
-        )
-        || REPLIES == MAX_COUNTER {
-        POISONED = 1;
-        return ERR_PERSONALITY_FAILED;
+        ) {
+        fail_stop();
     }
     REPLIES += 1;
-    return finish(1);
+    if !invariants_hold() {
+        fail_stop();
+    }
+    return 1;
 }
 
 pub unsafe fn cancel(request: u64) -> u64 {
@@ -1423,7 +1494,9 @@ pub unsafe fn invariants_hold() -> bool {
         || ALLOCATION_FAILURE_ARMS
             != ALLOCATION_FAILURES + FAIL_NEXT_ALLOCATION as u64
         || ALLOCATION_FAILURES != ALLOCATION_ROLLBACK_PROOFS
-        || WAIT_ROLLBACK_PROOFS != rpc_wait_failure_count() {
+        || WAIT_ROLLBACK_PROOFS != rpc_wait_failure_count()
+        || REPLY_FAILURE_TEST_ARMED > BOUNDED_REPLY_FAILURE_STAGE_COUNT
+        || REPLY_FAILURE_TEST_SEEN > 0x0f {
         return false;
     }
     let mut slot: usize = 0;
@@ -1657,6 +1730,28 @@ pub unsafe fn inject_allocation_failure_once() -> u64 {
     FAIL_NEXT_ALLOCATION = 1;
     ALLOCATION_FAILURE_ARMS += 1;
     return finish(1);
+}
+
+// Arm one pre-close preparation failure. The stage is consumed only after its
+// real readiness check succeeds, so retrying the same request exercises the
+// unchanged live transaction rather than a synthetic counter mutation.
+pub unsafe fn inject_reply_failure_once(stage: u64) -> u64 {
+    if !preflight()
+        || stage == 0
+        || stage > BOUNDED_REPLY_FAILURE_STAGE_COUNT
+        || REPLY_FAILURE_TEST_ARMED != 0 {
+        return 0;
+    }
+    let bit: u64 = 1 << ((stage - 1) as usize);
+    if (REPLY_FAILURE_TEST_SEEN & bit) != 0 {
+        return 0;
+    }
+    REPLY_FAILURE_TEST_ARMED = stage;
+    return finish(1);
+}
+
+pub unsafe fn reply_failure_seen_mask() -> u64 {
+    return REPLY_FAILURE_TEST_SEEN;
 }
 
 // Request-correlated metadata for bounded personality adapters.  Keeping

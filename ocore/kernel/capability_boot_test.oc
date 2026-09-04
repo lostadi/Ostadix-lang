@@ -1,0 +1,9 @@
+module kernel::capability_boot_test;
+
+use runtime::capability::self_test;
+
+// Keep the full capability mutation corpus reachable in ordinary and
+// service-lifecycle probe kernels.
+pub unsafe fn run() -> u64 {
+    return self_test();
+}

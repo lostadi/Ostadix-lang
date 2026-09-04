@@ -988,6 +988,12 @@ class SourceReleaseTests(unittest.TestCase):
             "ocore/kernel/build-x86_64-uefi-iso.sh": "#!/bin/sh\nexit 0\n",
             "ocore/kernel/build-x86_64-uefi-media.sh": "#!/bin/sh\nexit 0\n",
             "ocore/kernel/build.sh": "#!/bin/sh\nexit 0\n",
+            "ocore/kernel/capability_boot_test.oc": (
+                "module kernel::capability_boot_test;\n"
+            ),
+            "ocore/kernel/capability_boot_test_stub.oc": (
+                "module kernel::capability_boot_test;\n"
+            ),
             "ocore/kernel/main.oc": "module kernel::main;\n",
             "ocore/kernel/m6_mode25_diagnostics.oc": (
                 "module kernel::m6_mode25_diagnostics;\n"
@@ -1705,6 +1711,8 @@ class SourceReleaseTests(unittest.TestCase):
                 "ocore/kernel/build-x86_64-uefi-iso.sh",
                 "ocore/kernel/build-x86_64-uefi-media.sh",
                 "ocore/kernel/build.sh",
+                "ocore/kernel/capability_boot_test.oc",
+                "ocore/kernel/capability_boot_test_stub.oc",
                 "ocore/kernel/main.oc",
                 "ocore/kernel/m6_mode25_diagnostics.oc",
                 "ocore/kernel/m6_mode25_diagnostics_stub.oc",
@@ -2749,6 +2757,8 @@ class SourceReleaseTests(unittest.TestCase):
             "docs/OSTADIX_BOOT.md",
             "ocore/kernel/build-x86_64-uefi-iso.sh",
             "ocore/kernel/build-x86_64-uefi-media.sh",
+            "ocore/kernel/capability_boot_test.oc",
+            "ocore/kernel/capability_boot_test_stub.oc",
             "ocore/kernel/resolve-x86_64-ovmf-code.sh",
             "ocore/kernel/run-x86_64-uefi-iso-qemu.sh",
             "ocore/kernel/run-x86_64-uefi-media-qemu.sh",
