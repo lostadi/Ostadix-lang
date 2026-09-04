@@ -41,6 +41,7 @@ COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates/ostadix-api ./crates/ostadix-api
 COPY src ./src
 COPY backends ./backends
+COPY apps/olang-browser-wasi ./apps/olang-browser-wasi
 
 # olangc embeds the runtime sources, Cargo.lock, and shim scripts at compile
 # time (include_str!/include_bytes!), so everything above must be present.

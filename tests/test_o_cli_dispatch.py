@@ -225,6 +225,12 @@ class LowercaseCliDispatchTests(unittest.TestCase):
         self.assertIn(expected, dockerfile)
         self.assertIn(expected, capacity_host)
 
+    def test_docker_builder_copies_olangc_browser_asset_closure(self) -> None:
+        dockerfile = (PROJECT_ROOT / "Dockerfile").read_text(encoding="utf-8")
+        self.assertIn(
+            "COPY apps/olang-browser-wasi ./apps/olang-browser-wasi", dockerfile
+        )
+
 
 class KernelCapacityCliDispatchTests(unittest.TestCase):
     def setUp(self) -> None:
