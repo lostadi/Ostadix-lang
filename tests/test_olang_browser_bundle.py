@@ -43,6 +43,21 @@ EXPECTED_IMPORTS = [
 
 
 class OlangBrowserBundleTests(unittest.TestCase):
+    def test_browser_harness_readiness_deadlines_and_cleanup(self) -> None:
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("Node.js is not installed")
+        completed = subprocess.run(
+            [node, str(APP / "test-browser-harness.mjs")],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("browser harness tests: PASS", completed.stdout)
+
     def test_dependency_free_node_host_contract(self) -> None:
         node = shutil.which("node")
         if node is None:
