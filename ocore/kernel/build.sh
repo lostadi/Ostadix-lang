@@ -23,7 +23,10 @@ esac
 
 LINK_GC_FLAGS=()
 OCOREC_FUNCTION_SECTION_FLAGS=()
-if (( PROBE_MODE == 25 || PROBE_MODE == 26 )); then
+if (( PROBE_MODE == 18 || PROBE_MODE == 24 || PROBE_MODE == 25 || PROBE_MODE == 26 )); then
+  # The four M6 live-personality probes carry the largest reachable kernels.
+  # Keep the fixed bootstrap reserve intact by discarding only unreachable,
+  # separately sectioned helpers; ordinary builds retain monolithic .text.
   LINK_GC_FLAGS=(--gc-sections)
   OCOREC_FUNCTION_SECTION_FLAGS=(--function-sections)
 fi
