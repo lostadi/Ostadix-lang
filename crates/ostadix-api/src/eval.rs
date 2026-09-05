@@ -413,6 +413,7 @@ pub struct Evaluator {
 
     /// Deterministic lifecycle trace for the most recent OIR execution.
     last_execution_trace: Option<ExecutionTrace>,
+    crossing_observations: bool,
 
     /// Digest-bound pre-execution decision that authorized the most recent
     /// graph run (or was compiled for the serial differential oracle).
@@ -809,6 +810,7 @@ impl Evaluator {
             autonomous_buffer: Vec::new(),
             last_execution_plan: None,
             last_execution_trace: None,
+            crossing_observations: false,
             last_execution_admission: None,
             last_hgraph_schedule: None,
             activation_authorities: HashMap::new(),
@@ -944,6 +946,14 @@ impl Evaluator {
     /// The node-level execution trace from the most recent document.
     pub fn last_execution_trace(&self) -> Option<&ExecutionTrace> {
         self.last_execution_trace.as_ref()
+    }
+
+    /// Retain directional adapter observations alongside the graph trace.
+    /// Disabled by default so ordinary execution does not hash payloads merely
+    /// for diagnostics. Unsupported profiles remain executable.
+    pub fn with_crossing_observations(mut self) -> Self {
+        self.crossing_observations = true;
+        self
     }
 
     /// Evidence-bound admission compiled before the most recent execution.
@@ -3711,6 +3721,10 @@ impl GraphEvaluationHost for Evaluator {
         Evaluator::install_execution_trace(self, trace);
     }
 
+    fn crossing_observations_enabled(&self) -> bool {
+        self.crossing_observations
+    }
+
     fn flush_autonomous_buffer(&mut self) -> Result<()> {
         Evaluator::flush_autonomous_buffer(self)
     }
@@ -6406,6 +6420,44 @@ mod tests {
             "default backend authority should allow bash dispatch to reach the shim layer, got: {error}"
         );
         assert!(!error.contains("names no live capability"));
+    }
+
+    #[test]
+    fn crossing_evidence_does_not_claim_adapter_receipt_before_reentrancy_check() {
+        use crate::backend_morphism::RuntimeCrossingStateV1;
+        if which::which("python3").is_err() {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("must-not-run");
+        let path = serde_json::to_string(&marker.to_string_lossy()).unwrap();
+        let shim_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("backends");
+        let mut evaluator = Evaluator::new(shim_dir).with_crossing_observations();
+        evaluator.suspended_actors.insert(("python".to_owned(), 7));
+        let program = OIrProgram {
+            nodes: vec![OIr::Exec {
+                backend: BackendRegistry::global().interface_for("python"),
+                lang: "python".to_owned(),
+                env_id: 7,
+                attr: None,
+                body: vec![OIr::Text(format!(
+                    "__import__('pathlib').Path({path}).write_text('unexpected')"
+                ))],
+            }],
+        };
+        let error = evaluator
+            .eval_ir_program_graph_with_scope(&program, &mut HashMap::new())
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("reentrant deadlock"));
+        assert!(!marker.exists());
+        let records = &evaluator.last_execution_trace().unwrap().backend_crossings;
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].input_boundary,
+            "prepared-ovalue-adapter-bindings"
+        );
+        assert_eq!(records[0].state, RuntimeCrossingStateV1::Failed);
+        assert!(records[0].result.is_none() && !records[0].published);
     }
 
     #[test]

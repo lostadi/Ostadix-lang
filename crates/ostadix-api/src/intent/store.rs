@@ -20,8 +20,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use super::record::{
-    validate_lower_hex_64, RunAttemptSeedV1, RunContentKindV1, RunContentRefV1, RunRecordV1,
-    RunTraceAttachmentV1, RunTraceBindingV1,
+    validate_lower_hex_64, RecordedOperationPlanV1, RunAttemptSeedV1, RunContentKindV1,
+    RunContentRefV1, RunRecordV1, RunTraceAttachmentV1, RunTraceBindingV1,
 };
 
 pub const MAX_RUN_ATTEMPTS_V1: usize = 128;
@@ -142,6 +142,47 @@ impl RunStoreV1 {
     /// completed exact preflight.  The running index is durable before this
     /// function returns.
     pub fn begin(&self, seed: RunAttemptSeedV1) -> Result<RunLeaseV1, RunStoreErrorV1> {
+        if seed.operation_decision.is_some() || seed.operation_plan_ref.is_some() {
+            return Err(RunStoreErrorV1::Invalid(
+                "original operation snapshot must be supplied to begin_with_operation_plan"
+                    .to_string(),
+            ));
+        }
+        self.begin_inner(seed, None)
+    }
+
+    /// Publish the neutral original planner snapshot before returning a running
+    /// lease. The compact seed retains only its verified content address.
+    pub fn begin_with_operation_plan(
+        &self,
+        mut seed: RunAttemptSeedV1,
+        snapshot: &RecordedOperationPlanV1,
+    ) -> Result<RunLeaseV1, RunStoreErrorV1> {
+        let decision = seed.operation_decision.as_ref().ok_or_else(|| {
+            RunStoreErrorV1::Invalid(
+                "original planner snapshot requires a frozen operation decision".to_string(),
+            )
+        })?;
+        snapshot
+            .validate_for_decision(decision)
+            .map_err(RunStoreErrorV1::Invalid)?;
+        if snapshot.execution.is_some() || seed.operation_plan_ref.is_some() {
+            return Err(RunStoreErrorV1::Invalid("pre-execution snapshot must contain no execution observation or caller-assigned reference".to_string()));
+        }
+        let bytes = canonical_bytes(snapshot)?;
+        seed.operation_plan_ref = Some(RunContentRefV1 {
+            kind: RunContentKindV1::Record,
+            sha256: domain_digest(RunContentKindV1::Record.domain(), &bytes),
+            bytes_len: bytes.len() as u64,
+        });
+        self.begin_inner(seed, Some(bytes))
+    }
+
+    fn begin_inner(
+        &self,
+        seed: RunAttemptSeedV1,
+        snapshot_bytes: Option<Vec<u8>>,
+    ) -> Result<RunLeaseV1, RunStoreErrorV1> {
         seed.validate().map_err(RunStoreErrorV1::Invalid)?;
         with_global_lock(&self.root, || {
             let sequence = read_sequence(&self.root)?
@@ -162,7 +203,7 @@ impl RunStoreV1 {
             validate_attempt_index_storage_size(&prospective)?;
 
             reconcile_orphans_locked(&self.root)?;
-            prune_locked(&self.root, 1, &[], None)?;
+            prune_locked(&self.root, 1, seed.operation_plan_ref.as_slice(), None)?;
 
             let attempts = load_attempts(&self.root)?;
             let active = attempts
@@ -189,6 +230,10 @@ impl RunStoreV1 {
             };
             let attempt_path = attempt_path(&self.root, &index);
             let result = (|| {
+                if let (Some(reference), Some(bytes)) = (&seed.operation_plan_ref, &snapshot_bytes)
+                {
+                    publish_object_bytes(&self.root, reference, bytes)?;
+                }
                 write_sequence(&self.root, sequence)?;
                 write_canonical_atomic(&self.root, &attempt_path, &index)?;
                 sync_directory(&self.root.join("attempts"))
@@ -278,6 +323,20 @@ impl RunLeaseV1 {
         trace: Option<RunTraceAttachmentV1>,
     ) -> Result<FinalizedRunV1, RunStoreErrorV1> {
         validate_record_matches_attempt(record, &self.attempt)?;
+        if let Some(original) = read_original_operation_plan(&self.root, &self.attempt.seed)? {
+            let mut terminal = record.operation_plan.clone().ok_or_else(|| {
+                RunStoreErrorV1::Invalid(
+                    "terminal run omitted its durable original planner snapshot".to_string(),
+                )
+            })?;
+            terminal.execution = None;
+            if terminal != original {
+                return Err(RunStoreErrorV1::Invalid(
+                    "terminal planner snapshot differs from the durable pre-execution snapshot"
+                        .to_string(),
+                ));
+            }
+        }
 
         let mut staged = Vec::new();
         if let Some(trace) = trace {
@@ -356,13 +415,14 @@ impl RunLeaseV1 {
     }
 
     fn finalize_incomplete(&mut self, detail: &str) -> Result<RunContentRefV1, RunStoreErrorV1> {
-        let record = RunRecordV1::recording_incomplete(
+        let mut record = RunRecordV1::recording_incomplete(
             self.attempt.run_id.clone(),
             self.attempt.sequence,
             &self.attempt.seed,
             unix_nanos_now()?,
             detail,
         );
+        record.operation_plan = read_original_operation_plan(&self.root, &self.attempt.seed)?;
         record.validate().map_err(RunStoreErrorV1::Invalid)?;
         let object = stage_object(
             &self.root,
@@ -528,13 +588,16 @@ impl RunStoreReaderV1 {
         let attempts = load_attempts(&self.root)?;
         let stored = select_attempt(attempts, selector)?;
         match stored.index.state {
-            AttemptStateV1::Running { seed } => Ok(RunInspectionV1::Running {
-                attempt: Box::new(RunAttemptV1 {
-                    run_id: stored.index.run_id,
-                    sequence: stored.index.sequence,
-                    seed: *seed,
-                }),
-            }),
+            AttemptStateV1::Running { seed } => {
+                read_original_operation_plan(&self.root, &seed)?;
+                Ok(RunInspectionV1::Running {
+                    attempt: Box::new(RunAttemptV1 {
+                        run_id: stored.index.run_id,
+                        sequence: stored.index.sequence,
+                        seed: *seed,
+                    }),
+                })
+            }
             AttemptStateV1::Terminal {
                 record,
                 referenced_objects,
@@ -1028,6 +1091,7 @@ fn validate_record_matches_attempt(
         || record.input != attempt.seed.input
         || record.intent != attempt.seed.intent
         || record.plan != attempt.seed.plan
+        || record.operation_decision != attempt.seed.operation_decision
         || record.started_unix_nanos != attempt.seed.started_unix_nanos
     {
         return Err(RunStoreErrorV1::Invalid(
@@ -1073,12 +1137,22 @@ fn reconcile_orphans_locked(root: &Path) -> Result<(), RunStoreErrorV1> {
             continue;
         }
 
-        let record = RunRecordV1::interrupted(
+        let mut record = RunRecordV1::interrupted(
             stored.index.run_id.clone(),
             stored.index.sequence,
             seed,
             unix_nanos_now()?,
         );
+        record.operation_plan = read_original_operation_plan(root, seed)?;
+        if seed.operation_decision.is_some() && record.operation_plan.is_none() {
+            record
+                .failure
+                .as_mut()
+                .expect("interrupted record has failure detail")
+                .message
+                .push_str("; legacy decision-only attempt has no durable original planner payload");
+        }
+        record.validate().map_err(RunStoreErrorV1::Invalid)?;
         let bytes = canonical_bytes(&record)?;
         let reference = RunContentRefV1 {
             kind: RunContentKindV1::Record,
@@ -1218,7 +1292,10 @@ fn prune_locked(
         if active.saturating_add(reserve_attempts) > MAX_RUN_ATTEMPTS_V1 {
             return Err(RunStoreErrorV1::ActiveCapacity { active });
         }
-        let referenced = referenced_object_inventory(root, &attempts)?;
+        // Reserve the post-commit inventory: the protected running attempt is
+        // replaced by these terminal objects, so its old snapshot is no longer
+        // an additional live reference. Other attempts still pin shared bytes.
+        let referenced = referenced_object_inventory(root, &attempts, protected_run_id)?;
         let mut required = referenced.values().try_fold(0_u64, |total, reference| {
             total
                 .checked_add(reference.bytes_len)
@@ -1266,16 +1343,20 @@ fn prune_locked(
 fn referenced_object_inventory(
     root: &Path,
     attempts: &[StoredAttempt],
+    replaced_attempt: Option<&str>,
 ) -> Result<BTreeMap<(RunContentKindV1, String), RunContentRefV1>, RunStoreErrorV1> {
     let mut objects = BTreeMap::new();
     for attempt in attempts {
-        let AttemptStateV1::Terminal {
-            referenced_objects, ..
-        } = &attempt.index.state
-        else {
+        if replaced_attempt == Some(attempt.index.run_id.as_str()) {
             continue;
+        }
+        let references = match &attempt.index.state {
+            AttemptStateV1::Running { seed } => seed.operation_plan_ref.as_slice(),
+            AttemptStateV1::Terminal {
+                referenced_objects, ..
+            } => referenced_objects.as_slice(),
         };
-        for reference in referenced_objects {
+        for reference in references {
             let path = object_path(root, reference);
             validate_object_metadata(&path, reference.bytes_len)?;
             let key = (reference.kind, reference.sha256.clone());
@@ -1294,7 +1375,9 @@ fn referenced_object_inventory(
 
 fn cleanup_unreferenced_objects_locked(root: &Path) -> Result<(), RunStoreErrorV1> {
     let attempts = load_attempts(root)?;
-    let referenced = referenced_object_inventory(root, &attempts)?;
+    // Deletion always uses the actually published indices. In particular, a
+    // superseded snapshot stays durable until the terminal index is committed.
+    let referenced = referenced_object_inventory(root, &attempts, None)?;
     for kind in [RunContentKindV1::Record, RunContentKindV1::Trace] {
         let directory = root.join("objects").join(kind.directory());
         let entries =
@@ -1397,6 +1480,33 @@ fn publish_object_bytes(
         let _ = fs::remove_file(&staged.temporary);
     }
     result
+}
+
+fn read_original_operation_plan(
+    root: &Path,
+    seed: &RunAttemptSeedV1,
+) -> Result<Option<RecordedOperationPlanV1>, RunStoreErrorV1> {
+    let Some(reference) = &seed.operation_plan_ref else {
+        return Ok(None);
+    };
+    seed.validate().map_err(RunStoreErrorV1::Invalid)?;
+    let bytes = read_object(root, reference)?;
+    // Its own closed schema distinguishes a planner snapshot from terminal
+    // RunRecordV1 objects sharing the generic private records namespace.
+    let snapshot: RecordedOperationPlanV1 = decode_canonical(&bytes)?;
+    snapshot
+        .validate_for_decision(
+            seed.operation_decision
+                .as_ref()
+                .expect("validated snapshot seed has decision"),
+        )
+        .map_err(RunStoreErrorV1::Invalid)?;
+    if snapshot.execution.is_some() {
+        return Err(RunStoreErrorV1::Invalid(
+            "durable pre-execution snapshot contains an execution observation".to_string(),
+        ));
+    }
+    Ok(Some(snapshot))
 }
 
 fn read_object(root: &Path, reference: &RunContentRefV1) -> Result<Vec<u8>, RunStoreErrorV1> {
@@ -1750,7 +1860,232 @@ mod tests {
                 ..PlanIdentitiesV1::default()
             },
             started_unix_nanos: 1,
+            operation_decision: None,
+            operation_plan_ref: None,
         }
+    }
+
+    fn legacy_operation_seed() -> RunAttemptSeedV1 {
+        use crate::intent::record::{OperationRunDecisionV1, OPERATION_RUN_DECISION_SCHEMA_V1};
+        let mut old_seed = seed("legacy-operation");
+        old_seed.input.kind = RunInputKindV1::ProjectDirectory;
+        old_seed.intent.engine = "project_compatibility".to_string();
+        old_seed.intent.target = Some("main".to_string());
+        old_seed.intent.selected_route = Some("main".to_string());
+        old_seed.intent.route_policy = Some("explicit:main".to_string());
+        old_seed.plan = PlanIdentitiesV1 {
+            hgraph_sha256: Some(sha(b"graph")),
+            deployment_sha256: Some(sha(b"route-deployment")),
+            ..PlanIdentitiesV1::default()
+        };
+        old_seed.operation_decision = Some(OperationRunDecisionV1 {
+            schema: OPERATION_RUN_DECISION_SCHEMA_V1.to_string(),
+            planning_request_id: sha(b"request"),
+            deployment_plan_id: sha(b"operation-deployment"),
+            selected_candidate_sha256: sha(b"candidate"),
+            planning_request_content_sha256: sha(b"request-content"),
+            deployment_plan_content_sha256: sha(b"deployment-content"),
+            bundle_sha256: old_seed.input.digest_sha256.clone(),
+            route: "main".to_string(),
+            route_plan_sha256: sha(b"graph"),
+            route_deployment_sha256: sha(b"route-deployment"),
+            project_execution_contract: "strict".to_string(),
+            project_scheduling_contract: "serial_host_world_v1".to_string(),
+            route_pipeline_sha256: sha(b"pipeline"),
+            implementation: "main.py".to_string(),
+            implementation_sha256: sha(b"implementation"),
+        });
+        old_seed.validate().unwrap();
+        old_seed
+    }
+
+    #[test]
+    fn new_operation_requires_snapshot_but_legacy_decision_only_index_reconciles() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("runs-v1");
+        let store = RunStoreV1::open_at(&root).unwrap();
+        let old_seed = legacy_operation_seed();
+        let before = snapshot_tree(&root);
+        assert!(store
+            .begin(old_seed.clone())
+            .err()
+            .expect("decision-only new lease unexpectedly admitted")
+            .to_string()
+            .contains("begin_with_operation_plan"));
+        assert_eq!(snapshot_tree(&root), before);
+        let index = AttemptIndexV1 {
+            schema: ATTEMPT_INDEX_SCHEMA_V1.to_string(),
+            run_id: sha(b"saved-legacy-operation"),
+            sequence: 1,
+            state: AttemptStateV1::Running {
+                seed: Box::new(old_seed.clone()),
+            },
+        };
+        let saved_bytes = canonical_bytes(&index).unwrap();
+        with_global_lock(&root, || {
+            write_new_private_synced(&attempt_path(&root, &index), &saved_bytes)?;
+            sync_directory(&root.join("attempts"))
+        })
+        .unwrap();
+        RunStoreV1::open_at(&root).unwrap();
+        let (record, _) = RunStoreReaderV1::open_existing(&root)
+            .unwrap()
+            .read_terminal(RunSelectorV1::RunId(index.run_id), false)
+            .unwrap();
+        assert_eq!(record.disposition, RunDispositionV1::Interrupted);
+        assert_eq!(record.operation_decision, old_seed.operation_decision);
+        assert!(record.operation_plan.is_none());
+        assert!(record
+            .failure
+            .unwrap()
+            .message
+            .contains("legacy decision-only"));
+    }
+
+    fn operation_snapshot_fixture() -> (RunAttemptSeedV1, RecordedOperationPlanV1) {
+        use crate::intent::record::{
+            operation_record_content_sha256, OPERATION_RUN_PLAN_SCHEMA_V1,
+        };
+        let mut seed = legacy_operation_seed();
+        let snapshot = RecordedOperationPlanV1 {
+            schema: OPERATION_RUN_PLAN_SCHEMA_V1.to_string(),
+            request: serde_json::json!({"padding": "x".repeat(1024 * 1024)}),
+            deployment: serde_json::json!({"operations": [{"selection": "candidate"}]}),
+            selected_candidate: serde_json::json!("candidate"),
+            execution: None,
+        };
+        let decision = seed.operation_decision.as_mut().unwrap();
+        decision.planning_request_content_sha256 =
+            operation_record_content_sha256(&snapshot.request);
+        decision.deployment_plan_content_sha256 =
+            operation_record_content_sha256(&snapshot.deployment);
+        decision.selected_candidate_sha256 =
+            operation_record_content_sha256(&snapshot.selected_candidate);
+        snapshot.validate_for_decision(decision).unwrap();
+        (seed, snapshot)
+    }
+
+    // Sparse sizing fixture, analogous to install_sparse_terminal: its lease
+    // remains locked so maintenance only reads immutable reference metadata.
+    fn install_sparse_active_snapshot(root: &Path, bytes_len: u64) -> File {
+        let (run_id, lease_path, lease) = create_unique_lease(root).unwrap();
+        FileExt::lock_exclusive(&lease).unwrap();
+        let reference = RunContentRefV1 {
+            kind: RunContentKindV1::Record,
+            sha256: sha(b"active-ballast"),
+            bytes_len,
+        };
+        let path = object_path(root, &reference);
+        let object = open_private_file(&path, true, true).unwrap();
+        object.set_len(bytes_len).unwrap();
+        object.sync_all().unwrap();
+        let mut seed = legacy_operation_seed();
+        seed.operation_plan_ref = Some(reference);
+        let index = AttemptIndexV1 {
+            schema: ATTEMPT_INDEX_SCHEMA_V1.to_string(),
+            run_id,
+            sequence: 100,
+            state: AttemptStateV1::Running {
+                seed: Box::new(seed),
+            },
+        };
+        with_global_lock(root, || {
+            write_canonical_atomic(root, &attempt_path(root, &index), &index)?;
+            sync_directory(&root.join("attempts"))
+        })
+        .unwrap();
+        assert!(lease_path.exists());
+        lease
+    }
+
+    #[test]
+    fn operation_snapshot_replacement_fits_near_quota_and_preserves_shared_refs() {
+        for finish in ["exact", "incomplete", "orphan"] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("runs-v1");
+            let store = RunStoreV1::open_at(&root).unwrap();
+            let (seed, snapshot) = operation_snapshot_fixture();
+            let lease = store.begin_with_operation_plan(seed, &snapshot).unwrap();
+            let attempt = lease.attempt().clone();
+            let reference = attempt.seed.operation_plan_ref.as_ref().unwrap();
+            let snapshot_path = object_path(&root, reference);
+            let _ballast = install_sparse_active_snapshot(
+                &root,
+                MAX_RUN_OBJECT_BYTES_V1 - reference.bytes_len - 512 * 1024,
+            );
+            let mut terminal = RunRecordV1::interrupted(
+                attempt.run_id.clone(),
+                attempt.sequence,
+                &attempt.seed,
+                2,
+            );
+            terminal.operation_plan = Some(snapshot.clone());
+            match finish {
+                "exact" => {
+                    lease.finalize(terminal, None).unwrap();
+                }
+                "incomplete" => {
+                    terminal.operation_decision = None;
+                    assert!(lease.finalize(terminal, None).is_err());
+                }
+                "orphan" => {
+                    drop(lease);
+                    RunStoreV1::open_at(&root).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let (record, _) = RunStoreReaderV1::open_existing(&root)
+                .unwrap()
+                .read_terminal(RunSelectorV1::RunId(attempt.run_id), false)
+                .unwrap();
+            assert_eq!(record.operation_plan.as_ref(), Some(&snapshot), "{finish}");
+            assert_eq!(
+                record.disposition,
+                if finish == "incomplete" {
+                    RunDispositionV1::RecordingIncomplete
+                } else {
+                    RunDispositionV1::Interrupted
+                }
+            );
+            assert!(
+                !snapshot_path.exists(),
+                "unshared replaced snapshot was not collected after {finish}"
+            );
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let store = RunStoreV1::open_at(temp.path().join("runs-v1")).unwrap();
+        let (seed, snapshot) = operation_snapshot_fixture();
+        let first = store
+            .begin_with_operation_plan(seed.clone(), &snapshot)
+            .unwrap();
+        let second = store.begin_with_operation_plan(seed, &snapshot).unwrap();
+        let reference = first.attempt.seed.operation_plan_ref.as_ref().unwrap();
+        assert_eq!(
+            second.attempt.seed.operation_plan_ref.as_ref(),
+            Some(reference)
+        );
+        let snapshot_path = object_path(store.root(), reference);
+        let mut terminal = RunRecordV1::interrupted(
+            first.attempt.run_id.clone(),
+            first.attempt.sequence,
+            &first.attempt.seed,
+            2,
+        );
+        terminal.operation_plan = Some(snapshot.clone());
+        first.finalize(terminal, None).unwrap();
+        assert!(
+            snapshot_path.exists(),
+            "another live attempt lost its shared initial snapshot"
+        );
+        let second_id = second.attempt.run_id.clone();
+        drop(second);
+        RunStoreV1::open_at(store.root()).unwrap();
+        let (record, _) = RunStoreReaderV1::open_existing(store.root())
+            .unwrap()
+            .read_terminal(RunSelectorV1::RunId(second_id), false)
+            .unwrap();
+        assert_eq!(record.operation_plan, Some(snapshot));
+        assert!(!snapshot_path.exists());
     }
 
     fn success_record(attempt: &RunAttemptV1, bytes: Vec<u8>) -> RunRecordV1 {

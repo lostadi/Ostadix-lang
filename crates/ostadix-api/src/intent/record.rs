@@ -35,6 +35,205 @@ pub const PROJECT_SELECTION_REUSE_BINDING_SCHEMA_V1: &str =
     "ostadix.project-selection-reuse-binding/v1";
 pub const PROJECT_SELECTION_REUSE_OBSERVATION_SCHEMA_V1: &str =
     "ostadix.project-selection-reuse-observation/v1";
+pub const OPERATION_RUN_DECISION_SCHEMA_V1: &str = "ostadix.operation-run-decision/v1";
+pub const OPERATION_RUN_PLAN_SCHEMA_V1: &str = "ostadix.operation-run-plan/v1";
+
+/// Compact original decision, durably frozen before execution. Descriptor and
+/// target identities are declarations; they are never physical observations.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperationRunDecisionV1 {
+    pub schema: String,
+    pub planning_request_id: String,
+    pub deployment_plan_id: String,
+    pub selected_candidate_sha256: String,
+    pub planning_request_content_sha256: String,
+    pub deployment_plan_content_sha256: String,
+    pub bundle_sha256: String,
+    pub route: String,
+    pub route_plan_sha256: String,
+    pub route_deployment_sha256: String,
+    #[serde(default = "default_operation_project_execution_contract")]
+    pub project_execution_contract: String,
+    #[serde(default = "default_operation_project_scheduling_contract")]
+    pub project_scheduling_contract: String,
+    pub route_pipeline_sha256: String,
+    pub implementation: String,
+    pub implementation_sha256: String,
+}
+
+fn default_operation_project_execution_contract() -> String {
+    "strict".to_string()
+}
+
+fn default_operation_project_scheduling_contract() -> String {
+    "serial_host_world_v1".to_string()
+}
+
+impl OperationRunDecisionV1 {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema != OPERATION_RUN_DECISION_SCHEMA_V1 {
+            return Err("unsupported operation-run decision schema".to_string());
+        }
+        for (label, digest) in [
+            (
+                "operation selected candidate",
+                &self.selected_candidate_sha256,
+            ),
+            ("operation planning request", &self.planning_request_id),
+            ("operation deployment plan", &self.deployment_plan_id),
+            (
+                "operation request content",
+                &self.planning_request_content_sha256,
+            ),
+            (
+                "operation deployment content",
+                &self.deployment_plan_content_sha256,
+            ),
+            ("operation bundle", &self.bundle_sha256),
+            ("operation route plan", &self.route_plan_sha256),
+            ("operation route deployment", &self.route_deployment_sha256),
+            ("operation route pipeline", &self.route_pipeline_sha256),
+            ("operation implementation", &self.implementation_sha256),
+        ] {
+            validate_lower_hex_64(digest, label)?;
+        }
+        validate_nonempty(&self.route, "operation route")?;
+        if !matches!(
+            self.project_execution_contract.as_str(),
+            "strict" | "legacy_compatibility"
+        ) {
+            return Err("operation project execution contract is unsupported".to_string());
+        }
+        if !matches!(
+            self.project_scheduling_contract.as_str(),
+            "serial_host_world_v1" | "concurrent_branches_v1"
+        ) {
+            return Err("operation project scheduling contract is unsupported".to_string());
+        }
+        validate_nonempty(&self.implementation, "operation implementation path")?;
+        let path = std::path::Path::new(&self.implementation);
+        if self.implementation.contains('\\')
+            || path.is_absolute()
+            || path
+                .components()
+                .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        {
+            return Err(
+                "operation implementation must be a canonical bundle-relative path".to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_context(
+        &self,
+        input: &RunInputIdentityV1,
+        intent: &ExecutionIntentObservationV1,
+        plan: &PlanIdentitiesV1,
+    ) -> Result<(), String> {
+        self.validate()?;
+        if input.kind != RunInputKindV1::ProjectDirectory
+            || input.digest_sha256 != self.bundle_sha256
+            || intent.selected_route.as_deref() != Some(self.route.as_str())
+            || intent.route_policy.as_deref() != Some(format!("explicit:{}", self.route).as_str())
+            || intent.mesh_mode.is_some()
+            || intent.selection_reuse.is_some()
+            || plan.hgraph_sha256.as_deref() != Some(self.route_plan_sha256.as_str())
+            || plan.deployment_sha256.as_deref() != Some(self.route_deployment_sha256.as_str())
+        {
+            return Err(
+                "original operation decision disagrees with the run input, route, or project plan"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Original authority-free planner records. The request/deployment are retained
+/// in the content-addressed terminal object, never the bounded attempt index.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordedOperationPlanV1 {
+    pub schema: String,
+    /// Canonical JSON projections; semantic validation belongs to the higher
+    /// computation/CLI layer. Content hashes freeze these exact projections.
+    pub request: Value,
+    pub deployment: Value,
+    pub selected_candidate: Value,
+    pub execution: Option<OperationExecutionObservationV1>,
+}
+
+/// Credential-safe facts from a local route result. A direct entrypoint proves
+/// which captured artifact was submitted as argv, not what an interpreter
+/// actually loaded. Host facts do not authenticate the declared target node.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperationExecutionObservationV1 {
+    pub route: String,
+    pub execution_scope: String,
+    pub artifact_use: String,
+    pub operating_system: String,
+    pub architecture: String,
+    pub pointer_width: u16,
+    pub endianness: String,
+    pub target_platform: String,
+    pub runtime: String,
+}
+
+/// SHA-256 of the recursively key-sorted JSON projection retained by the run
+/// store. This is a content binding, distinct from a planner's semantic ID.
+pub fn operation_record_content_sha256(value: &Value) -> String {
+    hex::encode(Sha256::digest(canonical_json_bytes(value)))
+}
+
+impl RecordedOperationPlanV1 {
+    pub fn validate_for_decision(&self, decision: &OperationRunDecisionV1) -> Result<(), String> {
+        decision.validate()?;
+        if self.schema != OPERATION_RUN_PLAN_SCHEMA_V1 {
+            return Err("unsupported operation-run plan schema".to_string());
+        }
+        if operation_record_content_sha256(&self.request)
+            != decision.planning_request_content_sha256
+            || operation_record_content_sha256(&self.deployment)
+                != decision.deployment_plan_content_sha256
+            || self.deployment["operations"].as_array().map(Vec::len) != Some(1)
+            || operation_record_content_sha256(&self.selected_candidate)
+                != decision.selected_candidate_sha256
+            || self.deployment["operations"][0]["selection"] != self.selected_candidate
+        {
+            return Err("original operation planner content or selected candidate differs from the frozen decision".to_string());
+        }
+        if let Some(execution) = &self.execution {
+            if execution.route != decision.route
+                || execution.execution_scope != "isolated_local_project_workspace"
+                || !matches!(
+                    execution.artifact_use.as_str(),
+                    "direct_entrypoint_submitted" | "not_established"
+                )
+                || !matches!(
+                    execution.target_platform.as_str(),
+                    "matched_local_platform" | "mismatched_local_platform" | "partially_observed"
+                )
+                || !matches!(
+                    execution.runtime.as_str(),
+                    "declared_interpreter_command_submitted" | "not_established"
+                )
+                || !matches!(execution.endianness.as_str(), "little" | "big")
+                || execution.pointer_width == 0
+            {
+                return Err(
+                    "operation execution observation has invalid route or evidence classification"
+                        .to_string(),
+                );
+            }
+            validate_nonempty(&execution.operating_system, "observed operating system")?;
+            validate_nonempty(&execution.architecture, "observed architecture")?;
+        }
+        Ok(())
+    }
+}
 
 fn validate_nonempty(value: &str, label: &str) -> Result<(), String> {
     if value.is_empty() || value.contains('\0') {
@@ -160,8 +359,10 @@ impl ExecutionIntentObservationV1 {
         if let Some(binding) = &self.selection_reuse {
             binding.validate()?;
             let expected_policy = format!("explicit:{}", binding.contract.selected_route_id);
-            if self.engine != "project_compatibility"
-                || self.target.as_deref() != Some(binding.contract.target.as_str())
+            if !matches!(
+                self.engine.as_str(),
+                "project_compatibility" | "project_hgraph"
+            ) || self.target.as_deref() != Some(binding.contract.target.as_str())
                 || self.selected_route.as_deref() != Some(binding.contract.target.as_str())
                 || self.route_policy.as_deref() != Some(expected_policy.as_str())
                 || self.route_declarations != binding.contract.route_declaration_sha256
@@ -219,6 +420,11 @@ pub struct RunAttemptSeedV1 {
     pub intent: ExecutionIntentObservationV1,
     pub plan: PlanIdentitiesV1,
     pub started_unix_nanos: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_decision: Option<OperationRunDecisionV1>,
+    /// Neutral original planner snapshot durably published before dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_plan_ref: Option<RunContentRefV1>,
 }
 
 impl RunAttemptSeedV1 {
@@ -226,6 +432,15 @@ impl RunAttemptSeedV1 {
         self.input.validate()?;
         self.intent.validate()?;
         self.plan.validate()?;
+        if let Some(decision) = &self.operation_decision {
+            decision.validate_context(&self.input, &self.intent, &self.plan)?;
+        }
+        if let Some(reference) = &self.operation_plan_ref {
+            reference.validate()?;
+            if reference.kind != RunContentKindV1::Record || self.operation_decision.is_none() {
+                return Err("original operation snapshot reference has no frozen decision or wrong object kind".to_string());
+            }
+        }
         if self.started_unix_nanos == 0 {
             return Err("run start observation must be nonzero".to_string());
         }
@@ -1133,6 +1348,10 @@ pub struct RunRecordV1 {
     pub input: RunInputIdentityV1,
     pub intent: ExecutionIntentObservationV1,
     pub plan: PlanIdentitiesV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_decision: Option<OperationRunDecisionV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_plan: Option<RecordedOperationPlanV1>,
     pub started_unix_nanos: u64,
     pub finished_unix_nanos: u64,
     pub elapsed_nanos: u64,
@@ -1181,6 +1400,8 @@ impl RunRecordV1 {
             input: seed.input.clone(),
             intent: seed.intent.clone(),
             plan: seed.plan.clone(),
+            operation_decision: seed.operation_decision.clone(),
+            operation_plan: None,
             started_unix_nanos: seed.started_unix_nanos,
             finished_unix_nanos,
             elapsed_nanos,
@@ -1344,6 +1565,49 @@ impl RunRecordV1 {
         }
         self.validate_validated_selection_receipt()?;
         self.validate_selection_reuse()?;
+        match (&self.operation_decision, &self.operation_plan) {
+            (Some(decision), snapshot) => {
+                decision.validate_context(&self.input, &self.intent, &self.plan)?;
+                if self.route_results.len() > 1
+                    || self
+                        .route_results
+                        .iter()
+                        .any(|result| result.route_id != decision.route)
+                {
+                    return Err(
+                        "operation run contains results outside its one frozen route".to_string(),
+                    );
+                }
+                if let Some(snapshot) = snapshot {
+                    snapshot.validate_for_decision(decision)?;
+                    if let Some(execution) = &snapshot.execution {
+                        if !self.route_results.iter().any(|result| {
+                            result.route_id == execution.route
+                                && result.disposition == RouteExecutionDisposition::Executed
+                        }) {
+                            return Err(
+                                "operation execution observation has no executed route result"
+                                    .to_string(),
+                            );
+                        }
+                    }
+                } else if !matches!(
+                    self.disposition,
+                    RunDispositionV1::Interrupted | RunDispositionV1::RecordingIncomplete
+                ) {
+                    return Err(
+                        "operation terminal record is missing its original planner records"
+                            .to_string(),
+                    );
+                }
+            }
+            (None, Some(_)) => {
+                return Err(
+                    "operation planner records have no frozen pre-execution decision".to_string(),
+                )
+            }
+            (None, None) => {}
+        }
         let mut result_reference_ids = BTreeSet::new();
         for reference in &self.result_references {
             reference.validate()?;
@@ -1581,9 +1845,18 @@ impl RunRecordV1 {
                         "trace_output" | "stream_observation" | "validated_selection_evidence"
                     )
                 });
+            // A failed benchmark may retain settled branches before its
+            // reference/compare/select operation fails. Those observations
+            // are useful failure evidence; they are not a completed selection.
+            let failed_during_execution = matches!(
+                self.disposition,
+                RunDispositionV1::ExecutionFailed | RunDispositionV1::InfrastructureFailed
+            ) && self.failure.as_ref().is_some_and(|failure| {
+                matches!(failure.stage.as_str(), "execution" | "infrastructure")
+            });
             if policy_is_validated
                 && (self.disposition == RunDispositionV1::Succeeded
-                    || !self.route_results.is_empty()
+                    || (!self.route_results.is_empty() && !failed_during_execution)
                     || known_post_execution_failure)
             {
                 return Err(
@@ -2180,6 +2453,8 @@ mod tests {
                 ..PlanIdentitiesV1::default()
             },
             started_unix_nanos: 1,
+            operation_decision: None,
+            operation_plan_ref: None,
         }
     }
 
@@ -2212,6 +2487,8 @@ mod tests {
                 ..PlanIdentitiesV1::default()
             },
             started_unix_nanos: 1,
+            operation_decision: None,
+            operation_plan_ref: None,
         }
     }
 
@@ -2343,6 +2620,8 @@ mod tests {
                 ..PlanIdentitiesV1::default()
             },
             started_unix_nanos: 1,
+            operation_decision: None,
+            operation_plan_ref: None,
         };
         let route_results = vec![fast];
         let mut record = RunRecordV1::terminal(
@@ -2625,6 +2904,20 @@ mod tests {
         failed_record.validate().unwrap();
         failed_record.validated_selection_receipt = None;
         assert!(failed_record.validate().is_err());
+
+        let mut interrupted_selection = failed_record.clone();
+        interrupted_selection.disposition = RunDispositionV1::ExecutionFailed;
+        interrupted_selection.failure = Some(RunFailureV1 {
+            stage: "execution".to_string(),
+            message: "reference validation failed after branches settled".to_string(),
+        });
+        interrupted_selection.validate().unwrap();
+        interrupted_selection.disposition = RunDispositionV1::InfrastructureFailed;
+        interrupted_selection.failure.as_mut().unwrap().stage = "infrastructure".to_string();
+        interrupted_selection.validate().unwrap();
+        interrupted_selection.disposition = RunDispositionV1::Succeeded;
+        interrupted_selection.failure = None;
+        assert!(interrupted_selection.validate().is_err());
 
         let post_execution_without_results = RunRecordV1::terminal(
             "66".repeat(32),

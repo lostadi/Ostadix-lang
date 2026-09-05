@@ -19,12 +19,13 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{bail, Result};
 
 use crate::backend_catalog::ExecutionMode;
+use crate::backend_morphism::{BackendCrossingObservationV1, RuntimeCrossingStateV1};
 use crate::effects::EffectSummary;
 use crate::eval_core::{
     derive_policy_contexts, trace_fingerprint, ExecutionTrace, GraphEvalFrame, GraphEvaluationHost,
 };
 use crate::evidence::{AdmittedExecution, DispatchAdapterV1, DispatchLaneV1, FailureClassV1};
-use crate::execution_contract::{validate_execution_metadata, Policy};
+use crate::execution_contract::{validate_execution_metadata, BlockOptions, Policy};
 use crate::hgraph::{schedule::ReadySchedule, NodeId, ValueState};
 use crate::ir::{ExecutionPlan, OIr, OIrProgram, PlanNodeId, PlanNodeKind};
 use crate::value::OValue;
@@ -110,6 +111,7 @@ pub struct Coordinator<'a> {
     frame: GraphEvalFrame,
     trace: TraceSink,
     base_policy: Policy,
+    crossing_observations: bool,
 }
 
 impl<'a> Coordinator<'a> {
@@ -206,6 +208,7 @@ impl<'a> Coordinator<'a> {
             frame,
             trace: TraceSink::new(),
             base_policy,
+            crossing_observations: false,
         })
     }
 
@@ -220,6 +223,7 @@ impl<'a> Coordinator<'a> {
     ) -> Result<OValue> {
         evaluator.verify_admitted_runtime_context(&self.admitted)?;
         validate_execution_metadata(&self.flat)?;
+        self.crossing_observations = evaluator.crossing_observations_enabled();
         self.frame.base_scope = scope.clone();
 
         self.materialize_literals()?;
@@ -761,7 +765,11 @@ impl<'a> Coordinator<'a> {
         }
 
         for (index, id, submission) in prepared {
+            let crossing = self.prepare_crossing_observation(id)?;
             driver.submit(submission)?;
+            if let Some(crossing) = crossing {
+                self.trace.crossing_submitted(crossing);
+            }
             crate::process::lifecycle_trace(
                 "coordinator.task_submitted",
                 format!("token={index} plan_node={}", id.0),
@@ -889,6 +897,16 @@ impl<'a> Coordinator<'a> {
                 index,
                 op.state
             );
+        }
+
+        if let Some(crossing) = self.trace.crossing_mut(op.plan_node) {
+            match &completion.outcome {
+                TaskOutcome::Completed(Ok(value)) => crossing.observe_result(value),
+                TaskOutcome::Completed(Err(_)) => crossing.state = RuntimeCrossingStateV1::Failed,
+                TaskOutcome::InfrastructureAbort(_) => {
+                    crossing.state = RuntimeCrossingStateV1::InfrastructureFailure
+                }
+            }
         }
 
         let outcome = if self.ops[index].failure_class == FailureClassV1::Infallible {
@@ -1165,6 +1183,9 @@ impl<'a> Coordinator<'a> {
                 }
             }
         }
+        if let Some(crossing) = self.prepare_crossing_observation(id)? {
+            self.trace.crossing_submitted(crossing);
+        }
         self.trace.ready(id);
         self.trace.started(id);
 
@@ -1176,6 +1197,9 @@ impl<'a> Coordinator<'a> {
 
         match outcome {
             Ok(value) => {
+                if let Some(crossing) = self.trace.crossing_mut(id) {
+                    crossing.observe_result(&value);
+                }
                 self.trace
                     .finished(id, value.type_name().to_string(), trace_fingerprint(&value));
                 self.frame.set_value(id, value)?;
@@ -1183,11 +1207,55 @@ impl<'a> Coordinator<'a> {
                 Ok(())
             }
             Err(err) => {
+                if let Some(crossing) = self.trace.crossing_mut(id) {
+                    crossing.state = if crate::process::is_infrastructure_error(&err) {
+                        RuntimeCrossingStateV1::InfrastructureFailure
+                    } else {
+                        RuntimeCrossingStateV1::Failed
+                    };
+                }
                 self.trace.failed(id, err.to_string());
                 self.record_failure(index, &err.to_string());
                 Err(err)
             }
         }
+    }
+
+    fn prepare_crossing_observation(
+        &self,
+        id: PlanNodeId,
+    ) -> Result<Option<BackendCrossingObservationV1>> {
+        if !self.crossing_observations {
+            return Ok(None);
+        }
+        let OIr::Exec {
+            backend,
+            env_id,
+            attr,
+            ..
+        } = self.flat[id.0]
+        else {
+            return Ok(None);
+        };
+        // Deferred code has not crossed a backend boundary. Inline source
+        // rendering is a different boundary from the binding profile.
+        if backend.execution != ExecutionMode::Shim
+            || BlockOptions::parse(attr.as_deref(), &backend.canonical)?
+                .policy()
+                .is_some()
+        {
+            return Ok(None);
+        }
+        Ok(Some(BackendCrossingObservationV1::prepared(
+            self.admitted.admission().admission_sha256(),
+            self.admitted.admission().admitted_graph_sha256(),
+            id.0,
+            &backend.canonical,
+            *env_id,
+            self.admitted
+                .backend_launch_generation_sha256(&backend.canonical)?,
+            &self.frame.exec_scope(id, self.plan)?,
+        )))
     }
 
     /// Successful execution produces the ordinary value, completion token, and

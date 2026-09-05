@@ -24,6 +24,73 @@ use super::model::{
 };
 use super::runtime::resolve_selection;
 
+/// The trusted caller's ordered-continuation contract. Strict preserves the
+/// original opt-in executor; compatibility preserves the legacy runtime's
+/// explicitly unchecked continuation without asserting idempotence.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectExecutionContract {
+    #[default]
+    Strict,
+    LegacyCompatibility,
+}
+
+impl ProjectExecutionContract {
+    pub const fn is_strict(&self) -> bool {
+        matches!(self, Self::Strict)
+    }
+
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::Strict => "strict",
+            Self::LegacyCompatibility => "legacy_compatibility",
+        }
+    }
+
+    /// Read the caller's configured execution contract. The explicit legacy
+    /// executor has the same descriptive compatibility contract, but produces
+    /// no coordinator trace.
+    pub fn configured() -> Result<Self, String> {
+        match std::env::var_os(super::executor::PROJECT_EXECUTOR_ENV) {
+            None => Ok(Self::LegacyCompatibility),
+            Some(value) if value == "legacy" => Ok(Self::LegacyCompatibility),
+            Some(value) if value == "hgraph" => Ok(Self::Strict),
+            Some(value) => Err(format!("unsupported O_PROJECT_EXECUTOR value `{}`; expected hgraph, legacy, or an unset variable", value.to_string_lossy())),
+        }
+    }
+}
+
+/// Source-bound version of branch scheduling. Absence in archived logical
+/// records retains their original globally ordered ambient-resource graph.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectSchedulingContract {
+    #[default]
+    SerialHostWorldV1,
+    ConcurrentBranchesV1,
+}
+
+impl ProjectSchedulingContract {
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::SerialHostWorldV1 => "serial_host_world_v1",
+            Self::ConcurrentBranchesV1 => "concurrent_branches_v1",
+        }
+    }
+
+    pub const fn is_serial(&self) -> bool {
+        matches!(self, Self::SerialHostWorldV1)
+    }
+
+    pub fn for_policy(policy: &RoutePolicy) -> Self {
+        if policy_runs_parallel(policy) {
+            Self::ConcurrentBranchesV1
+        } else {
+            Self::SerialHostWorldV1
+        }
+    }
+}
+
 /// Policy-level cancellation/short-circuit behavior retained in the logical
 /// plan until PR8 introduces separate runtime and recovery graphs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -125,8 +192,8 @@ pub struct ProjectPlanOperation {
     pub dependencies: Vec<ProjectDependency>,
     pub effects: EffectSummary,
     /// Selected-alternative branch. It designates the isolated workspace used
-    /// by the hosted runtime; residual HGraph resource chains remain global and
-    /// conservative in this logical-planning slice.
+    /// by the hosted runtime. The source scheduling contract determines whether
+    /// ambient effects retain the global chain or a branch-scoped ordering key.
     pub branch: Option<usize>,
     pub route_facts: Option<RoutePlanFacts>,
 }
@@ -134,6 +201,8 @@ pub struct ProjectPlanOperation {
 /// Exact logical project plan from which a project HGraph is projected.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProjectExecutionPlan {
+    pub execution_contract: ProjectExecutionContract,
+    pub scheduling_contract: ProjectSchedulingContract,
     pub project_name: String,
     /// SHA-256 over deterministic serialized `ProjectBundle` bytes. This binds
     /// routes, commands, guards, environment values, files, and policy data.
@@ -159,6 +228,24 @@ impl ProjectExecutionPlan {
         bundle: &ProjectBundle,
         target: Option<&str>,
         policy_override: Option<RoutePolicy>,
+    ) -> Result<Self, String> {
+        let selection = resolve_selection(bundle, target, policy_override.clone())
+            .map_err(|error| format!("failed to resolve project selection: {error}"))?;
+        Self::from_bundle_with_scheduling(
+            bundle,
+            target,
+            policy_override,
+            ProjectSchedulingContract::for_policy(&selection.policy),
+        )
+    }
+
+    /// Reconstruct a particular source-bound scheduling version, including
+    /// archival parallel-policy plans that used the serial HostWorld graph.
+    pub fn from_bundle_with_scheduling(
+        bundle: &ProjectBundle,
+        target: Option<&str>,
+        policy_override: Option<RoutePolicy>,
+        scheduling_contract: ProjectSchedulingContract,
     ) -> Result<Self, String> {
         validate_bundle_structure(bundle)?;
         let selection = resolve_selection(bundle, target, policy_override)
@@ -202,6 +289,17 @@ impl ProjectExecutionPlan {
                 .map(ProjectDependency::Value)
                 .collect()
         };
+        if !scheduling_contract.is_serial() {
+            for operation in &mut builder.operations {
+                if let Some(branch) = operation.branch {
+                    operation.effects = concurrent_branch_effects(
+                        operation.effects.clone(),
+                        branch,
+                        operation.route_facts.as_ref(),
+                    );
+                }
+            }
+        }
         let select = builder.push(
             ExecutableOp::SelectRoute {
                 policy: selection.policy.token(),
@@ -213,6 +311,8 @@ impl ProjectExecutionPlan {
         );
 
         let plan = Self {
+            execution_contract: ProjectExecutionContract::Strict,
+            scheduling_contract,
             project_name: bundle.name.clone(),
             bundle_digest,
             target: selection.target,
@@ -228,6 +328,12 @@ impl ProjectExecutionPlan {
 
     /// Validate planner-local structure independently of the HGraph.
     pub fn validate(&self) -> Result<(), String> {
+        if !self.scheduling_contract.is_serial() && !policy_runs_parallel(&self.policy) {
+            return Err(
+                "concurrent branch scheduling requires an explicitly concurrent route policy"
+                    .into(),
+            );
+        }
         if self.project_name.is_empty() {
             return Err("project plan has an empty project name".to_string());
         }
@@ -321,7 +427,13 @@ impl ProjectExecutionPlan {
                     if branch >= self.alternatives.len()
                         || operation.route_facts.is_some()
                         || !operation.dependencies.is_empty()
-                        || operation.effects != EffectSummary::unknown()
+                        || operation.effects
+                            != project_policy_effects(
+                                EffectSummary::unknown(),
+                                branch,
+                                None,
+                                self.scheduling_contract,
+                            )
                     {
                         return Err(format!(
                             "materialize operation {} has invalid branch, dependencies, metadata, or effects",
@@ -369,7 +481,13 @@ impl ProjectExecutionPlan {
                     })?;
                     if branch >= self.alternatives.len()
                         || route_id.is_empty()
-                        || operation.effects != route_effects_from_facts(facts)?
+                        || operation.effects
+                            != project_policy_effects(
+                                route_effects_from_facts(facts)?,
+                                branch,
+                                Some(facts),
+                                self.scheduling_contract,
+                            )
                     {
                         return Err(format!(
                             "run operation {} has invalid route metadata or effects",
@@ -555,6 +673,10 @@ impl ProjectExecutionPlan {
     /// bound by `bundle-sha256` but are not exposed here.
     pub fn to_text(&self) -> String {
         let mut output = String::from("; ProjectExecutionPlan\n");
+        if !self.execution_contract.is_strict() {
+            output
+                .push_str("execution-contract=legacy-compatibility unchecked-continuation=true\n");
+        }
         writeln!(
             output,
             "project name={} bundle-sha256={} operations={}",
@@ -820,7 +942,13 @@ impl ProjectHGraph {
         target: Option<&str>,
         policy_override: Option<RoutePolicy>,
     ) -> Result<(), String> {
-        let canonical = ProjectExecutionPlan::from_bundle(bundle, target, policy_override)?;
+        let mut canonical = ProjectExecutionPlan::from_bundle_with_scheduling(
+            bundle,
+            target,
+            policy_override,
+            self.plan.scheduling_contract,
+        )?;
+        canonical.execution_contract = self.plan.execution_contract;
         if self.plan != canonical {
             return Err("project plan does not match the supplied bundle and selection".into());
         }
@@ -842,7 +970,49 @@ pub fn build_project_hgraph(
     target: Option<&str>,
     policy_override: Option<RoutePolicy>,
 ) -> Result<ProjectHGraph, String> {
-    let plan = ProjectExecutionPlan::from_bundle(bundle, target, policy_override.clone())?;
+    build_project_hgraph_with_contract(
+        bundle,
+        target,
+        policy_override,
+        ProjectExecutionContract::Strict,
+    )
+}
+
+/// Construct a graph with the caller-selected continuation contract. Execution
+/// separately checks this against its trusted constructor argument; an
+/// untrusted graph or trace cannot opt itself into compatibility continuation.
+pub fn build_project_hgraph_with_contract(
+    bundle: &ProjectBundle,
+    target: Option<&str>,
+    policy_override: Option<RoutePolicy>,
+    execution_contract: ProjectExecutionContract,
+) -> Result<ProjectHGraph, String> {
+    let selection = resolve_selection(bundle, target, policy_override.clone())
+        .map_err(|error| format!("failed to resolve project selection: {error}"))?;
+    build_project_hgraph_with_contracts(
+        bundle,
+        target,
+        policy_override,
+        execution_contract,
+        ProjectSchedulingContract::for_policy(&selection.policy),
+    )
+}
+
+/// Reconstruct both frozen source contracts, including archival scheduling.
+pub fn build_project_hgraph_with_contracts(
+    bundle: &ProjectBundle,
+    target: Option<&str>,
+    policy_override: Option<RoutePolicy>,
+    execution_contract: ProjectExecutionContract,
+    scheduling_contract: ProjectSchedulingContract,
+) -> Result<ProjectHGraph, String> {
+    let mut plan = ProjectExecutionPlan::from_bundle_with_scheduling(
+        bundle,
+        target,
+        policy_override.clone(),
+        scheduling_contract,
+    )?;
+    plan.execution_contract = execution_contract;
     let graph = plan.to_hgraph()?;
     let project = ProjectHGraph { plan, graph };
     project.validate_source(bundle, target, policy_override)?;
@@ -1046,6 +1216,63 @@ fn bundle_digest(bundle: &ProjectBundle) -> Result<String, String> {
     let bytes = bundle::serialize(bundle)
         .map_err(|error| format!("failed to serialize project bundle for planning: {error}"))?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+/// Policies that explicitly request concurrent alternative execution. Ordinary
+/// default/explicit/ordered/all execution retains the strict HostWorld chain.
+pub(crate) fn policy_runs_parallel(policy: &RoutePolicy) -> bool {
+    matches!(
+        policy,
+        RoutePolicy::RaceSuccess
+            | RoutePolicy::RaceSettle
+            | RoutePolicy::VerifyEquivalent
+            | RoutePolicy::BenchmarkAndSelect
+            | RoutePolicy::BenchmarkValidateAndSelect
+    )
+}
+
+fn project_policy_effects(
+    summary: EffectSummary,
+    branch: usize,
+    facts: Option<&RoutePlanFacts>,
+    scheduling_contract: ProjectSchedulingContract,
+) -> EffectSummary {
+    if !scheduling_contract.is_serial() {
+        concurrent_branch_effects(summary, branch, facts)
+    } else {
+        summary
+    }
+}
+
+fn concurrent_branch_effects(
+    mut summary: EffectSummary,
+    branch: usize,
+    facts: Option<&RoutePlanFacts>,
+) -> EffectSummary {
+    // Preserve the unknown/conservative classification. The selected policy
+    // explicitly allows unordered ambient effects across branches; it does not
+    // claim that a temporary working directory isolates arbitrary host access.
+    let explicitly_ambient = facts.is_some_and(|facts| {
+        facts
+            .declared_reads
+            .iter()
+            .chain(&facts.declared_writes)
+            .any(|declaration| {
+                declaration
+                    .split(['+', ';'])
+                    .any(|resource| matches!(resource.trim(), "host:*" | "hostworld"))
+            })
+    });
+    let scope = |resource: ResourceKey| match resource {
+        ResourceKey::HostWorld if !explicitly_ambient => {
+            ResourceKey::ConcurrentProjectBranch(branch)
+        }
+        ResourceKey::ProjectPath(path) => ResourceKey::ProjectBranchPath { branch, path },
+        other => other,
+    };
+    summary.reads = summary.reads.into_iter().map(scope).collect();
+    summary.writes = summary.writes.into_iter().map(scope).collect();
+    summary
 }
 
 fn cancellation_for(policy: &RoutePolicy) -> ProjectCancellationSemantics {

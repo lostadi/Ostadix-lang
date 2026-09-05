@@ -49,6 +49,14 @@ impl fmt::Display for ActorResourceId {
 pub enum ResourceKey {
     /// Conservative umbrella for host-observable state not modeled precisely.
     HostWorld,
+    /// Explicit concurrent project policy permits ambient effects to overlap
+    /// across branches. This is a scheduling contract, not host isolation.
+    ConcurrentProjectBranch(usize),
+    /// A project-relative path in one physically isolated branch workspace.
+    ProjectBranchPath {
+        branch: usize,
+        path: String,
+    },
     /// One exact governed World epoch. This is not ambient host authority.
     WorldState(WorldIdentity),
     /// One exact descriptive Governor position for one World epoch.
@@ -163,6 +171,7 @@ impl ResourceKey {
         matches!(
             self,
             Self::HostWorld
+                | Self::ConcurrentProjectBranch(_)
                 | Self::ProjectPath(_)
                 | Self::HostPath(_)
                 | Self::EnvVar(_)
@@ -202,6 +211,8 @@ impl ResourceKey {
             Self::DeviceState(_) => Some(GovernedResourceKind::Device),
             Self::AcceleratorState(_) => Some(GovernedResourceKind::Accelerator),
             Self::HostWorld
+            | Self::ConcurrentProjectBranch(_)
+            | Self::ProjectBranchPath { .. }
             | Self::EvaluatorState
             | Self::ScopeBinding(_)
             | Self::ProjectPath(_)
@@ -220,6 +231,10 @@ impl fmt::Display for ResourceKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::HostWorld => f.write_str("HostWorld"),
+            Self::ConcurrentProjectBranch(branch) => {
+                write!(f, "concurrent-project-branch:{branch}:ambient-unordered")
+            }
+            Self::ProjectBranchPath { branch, path } => write!(f, "project-branch:{branch}:{path}"),
             Self::WorldState(world) => write!(f, "world-state:{world}"),
             Self::GovernorState(governor) => write!(f, "governor-state:{governor}"),
             Self::NodeState(node) => write!(f, "node-state:{node}"),

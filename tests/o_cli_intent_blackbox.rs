@@ -1323,10 +1323,16 @@ policy = "benchmark_validate_and_select"
             "--no-record",
             "--json",
         ]));
-    assert!(!hgraph.status.success());
-    assert_eq!(single_json(&hgraph)["disposition"], "preflight_failed");
-    assert!(!hgraph_receipt.exists());
-    assert!(!marker.exists());
+    assert!(
+        hgraph.status.success(),
+        "{}",
+        String::from_utf8_lossy(&hgraph.stderr)
+    );
+    assert_eq!(single_json(&hgraph)["disposition"], "succeeded");
+    let receipt: ValidatedSelectionReceiptV1 =
+        serde_json::from_slice(&fs::read(&hgraph_receipt).unwrap()).unwrap();
+    receipt.validate().unwrap();
+    assert!(marker.exists());
 }
 
 fn no_record_preserves_absent_and_existing_state(root: &Path) {

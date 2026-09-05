@@ -221,3 +221,20 @@ fn capability_binding_without_requested_rights_is_not_reported_as_authority() {
     assert!(report.capabilities.is_empty());
     assert!(report.to_text().contains("capability-flow none"));
 }
+
+#[test]
+fn concurrent_project_ambient_marker_remains_residual_host_access() {
+    use o_lang::effects::ResourceKey;
+    use o_lang::world::OperationGrounding;
+    let mut grounding = OperationGrounding {
+        plan_node: PlanNodeId(0),
+        governed_reads: BTreeSet::new(),
+        governed_writes: BTreeSet::new(),
+        ambient_reads: BTreeSet::from([ResourceKey::ConcurrentProjectBranch(0)]),
+        ambient_writes: BTreeSet::new(),
+        actor_affinity: None,
+    };
+    assert!(grounding.has_residual_host_world());
+    std::mem::swap(&mut grounding.ambient_reads, &mut grounding.ambient_writes);
+    assert!(grounding.has_residual_host_world());
+}

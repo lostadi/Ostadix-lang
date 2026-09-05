@@ -1,16 +1,19 @@
 //! Hosted execution of a validated project HGraph.
 //!
-//! The coordinator accepts one already-resolved `Explicit` or `Default`
-//! alternative, plus ordered `Fallback` and `AnySuccess` alternatives. The
-//! graph governs workspace materialization, route preparation, prerequisite
-//! readiness, route execution, short-circuit selection, and final publication.
-//! Parallel/racing policies, retries, placement, receipts, and native/O-core
-//! dispatch are rejected rather than delegated to the legacy selection path.
+//! The graph governs workspace materialization, prerequisite/resource readiness,
+//! concurrent route execution, cancellation, comparison, and final selection.
+//! Explicit parallel policies retain unknown host effects and authorize ambient
+//! overlap; they do not claim sandbox isolation. One coordinator owns all
+//! lifecycle publication, and completed outcomes must pass semantic replay.
+//! The default preserves legacy continuation through a bound compatibility
+//! contract; explicitly selecting `hgraph` retains strict continuation.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::path::Path;
+use std::sync::{mpsc, Arc};
+use std::time::Instant;
 
 use crate::executor::CancellationToken;
 use crate::hgraph::{
@@ -27,19 +30,26 @@ use super::model::{
     ValidatedSelectionReceiptV1,
 };
 use super::plan::{
-    build_project_hgraph, ProjectDependency, ProjectHGraph, ProjectPlanOperation, RoutePlanFacts,
+    build_project_hgraph_with_contract, policy_runs_parallel, ProjectDependency,
+    ProjectExecutionContract, ProjectHGraph, ProjectPlanOperation, RoutePlanFacts,
 };
 use super::runtime::{
-    execute_route_in_workspace, is_skipped_result, public_route_execution_diagnostic, RunOptions,
-    ValidatedSelectionMeasurement, ValidatedSelectionProgressObserverV1,
+    benchmark_validate_and_select, execute_route_in_workspace, is_cancellation_error,
+    is_skipped_result, public_route_execution_diagnostic, verify_results_equivalent,
+    MeasuredRouteExecution, RouteSelectionExecution, RunOptions,
+    ValidatedSelectionCandidateProgressV1, ValidatedSelectionMeasurement,
+    ValidatedSelectionProgressEventV1, ValidatedSelectionProgressObserverV1,
 };
 use super::trace::{
     project_deployment_digest, project_hosted_deployment_digest, project_logical_graph_digest,
-    ProjectAttemptIdentity, ProjectAttemptTrace, ProjectAttemptTraceHeader,
-    ProjectContinuationDecision, ProjectContinuationEvidence, ProjectRouteOutcome,
+    race_selected_settlement, race_selection_ready, race_trigger, ProjectAttemptIdentity,
+    ProjectAttemptTrace, ProjectAttemptTraceHeader, ProjectContinuationDecision,
+    ProjectContinuationEvidence, ProjectPolicyCandidate, ProjectPolicySelection,
+    ProjectRouteOutcome,
 };
 
-/// Opt-in selector for the hosted project HGraph executor.
+/// Hosted project executor selector: unset is compatibility HGraph, `hgraph`
+/// is strict HGraph, and `legacy` explicitly selects the previous runtime.
 pub const PROJECT_EXECUTOR_ENV: &str = "O_PROJECT_EXECUTOR";
 
 /// The selected route result together with its deterministic coordinator trace.
@@ -135,15 +145,19 @@ struct PreparedRoute {
 
 #[derive(Debug)]
 enum ProjectRuntimeValue {
-    Workspace {
-        branch: usize,
-    },
+    Workspace { branch: usize },
     PreparedRoute(PreparedRoute),
     RouteResult(OExecutionResult),
-    SelectedResult {
-        result: OExecutionResult,
-        attempted_results: Vec<OExecutionResult>,
-    },
+    ComparedResults(RouteSelectionExecution),
+    SelectedResult(Box<SelectedProjectResult>),
+}
+
+#[derive(Debug)]
+struct SelectedProjectResult {
+    result: OExecutionResult,
+    attempted_results: Vec<OExecutionResult>,
+    receipt: Option<ValidatedSelectionReceiptV1>,
+    measurements: Option<Vec<ValidatedSelectionMeasurement>>,
 }
 
 /// A `RunRoute` operation that either produced a semantic result or aborted
@@ -178,6 +192,11 @@ struct BranchRouteAssessment {
     failure_continuation: RouteFailureContinuation,
 }
 
+enum ObserverDelivery {
+    Event(ValidatedSelectionProgressEventV1),
+    Flush(mpsc::Sender<()>),
+}
+
 enum OperationResult {
     Finished {
         value: ProjectRuntimeValue,
@@ -201,9 +220,15 @@ struct ProjectCoordinatorOutcome {
     result: OExecutionResult,
     attempted_results: Vec<OExecutionResult>,
     trace: ProjectAttemptTrace,
+    receipt: Option<ValidatedSelectionReceiptV1>,
+    measurements: Option<Vec<ValidatedSelectionMeasurement>>,
 }
 
-/// Deterministic coordinator for validated ordered project branches.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct ProjectPolicyRejection(anyhow::Error);
+
+/// Coordinator for validated project branches and policy selection.
 ///
 /// Runtime values are indexed by the graph operation's ordinary value-output
 /// `NodeId`; readiness and publication are tracked for every graph output,
@@ -218,7 +243,7 @@ pub struct ProjectCoordinator<'a> {
     materialized: BTreeSet<NodeId>,
     failed_outputs: BTreeMap<NodeId, PlanNodeId>,
     values: BTreeMap<NodeId, ProjectRuntimeValue>,
-    workspaces: BTreeMap<usize, Workspace>,
+    workspaces: BTreeMap<usize, Arc<Workspace>>,
     failures: BTreeMap<PlanNodeId, String>,
     public_failures: BTreeMap<PlanNodeId, String>,
     branch_assessments: BTreeMap<usize, Vec<BranchRouteAssessment>>,
@@ -229,6 +254,11 @@ pub struct ProjectCoordinator<'a> {
     deployment: Option<&'a DeploymentPlanV1>,
     trace: ProjectAttemptTrace,
     cancel: CancellationToken,
+    branch_tokens: Vec<CancellationToken>,
+    branch_started: BTreeMap<usize, Instant>,
+    branch_elapsed: BTreeMap<usize, u128>,
+    observer: Option<&'a dyn ValidatedSelectionProgressObserverV1>,
+    observer_delivery: Option<mpsc::Sender<ObserverDelivery>>,
 }
 
 impl<'a> ProjectCoordinator<'a> {
@@ -240,7 +270,25 @@ impl<'a> ProjectCoordinator<'a> {
         opts: &'a RunOptions,
     ) -> Result<Self> {
         let header = project_trace_header(project)?;
-        Self::new_with_header(bundle, project, opts, None, header)
+        Self::new_with_header(
+            bundle,
+            project,
+            opts,
+            None,
+            header,
+            ProjectExecutionContract::Strict,
+        )
+    }
+
+    /// Execute under an explicit caller-owned contract, never a trace flag.
+    pub fn new_with_contract(
+        bundle: &'a ProjectBundle,
+        project: &'a ProjectHGraph,
+        opts: &'a RunOptions,
+        expected_contract: ProjectExecutionContract,
+    ) -> Result<Self> {
+        let header = project_trace_header(project)?;
+        Self::new_with_header(bundle, project, opts, None, header, expected_contract)
     }
 
     /// Enter the coordinator through one exact, current World-hosted launch.
@@ -270,7 +318,14 @@ impl<'a> ProjectCoordinator<'a> {
             .validate_current(current)
             .context("World-hosted project launch freshness fence failed")?;
         let header = project_world_trace_header(project, deployment, launch)?;
-        Self::new_with_header(bundle, project, opts, Some(deployment), header)
+        Self::new_with_header(
+            bundle,
+            project,
+            opts,
+            Some(deployment),
+            header,
+            ProjectExecutionContract::Strict,
+        )
     }
 
     fn new_with_header(
@@ -279,7 +334,13 @@ impl<'a> ProjectCoordinator<'a> {
         opts: &'a RunOptions,
         deployment: Option<&'a DeploymentPlanV1>,
         header: ProjectAttemptTraceHeader,
+        expected_contract: ProjectExecutionContract,
     ) -> Result<Self> {
+        if project.plan.execution_contract != expected_contract {
+            bail!(
+                "project HGraph execution contract differs from the trusted coordinator contract"
+            );
+        }
         // Reconstructing with the plan's fully resolved selection retains the
         // exact target, alternative order, policy, bundle digest, and graph
         // projection. This happens before any workspace or command is created.
@@ -302,20 +363,12 @@ impl<'a> ProjectCoordinator<'a> {
             .validate_route_execution_set(potential_route_executions)?;
 
         match &project.plan.policy {
-            RoutePolicy::Explicit(_) | RoutePolicy::Default => {
-                if project.plan.alternatives.len() != 1 {
-                    bail!(
-                        "project HGraph executor requires exactly one resolved alternative for policy `{}`, found {}",
-                        project.plan.policy.token(),
-                        project.plan.alternatives.len()
-                    );
-                }
+            RoutePolicy::Explicit(_) | RoutePolicy::Default
+                if project.plan.alternatives.len() != 1 =>
+            {
+                bail!("project HGraph executor requires exactly one resolved alternative for policy `{}`, found {}", project.plan.policy.token(), project.plan.alternatives.len());
             }
-            RoutePolicy::Fallback | RoutePolicy::AnySuccess => {}
-            policy => bail!(
-                "project HGraph executor does not support policy `{}`; supported policies are explicit, default, fallback, and any_success",
-                policy.token()
-            ),
+            _ => {}
         }
 
         let schedule = ReadySchedule::derive(&project.graph)
@@ -368,12 +421,22 @@ impl<'a> ProjectCoordinator<'a> {
             deployment,
             trace,
             cancel: CancellationToken::new(),
+            branch_tokens: project
+                .plan
+                .alternatives
+                .iter()
+                .map(|_| CancellationToken::new())
+                .collect(),
+            branch_started: BTreeMap::new(),
+            branch_elapsed: BTreeMap::new(),
+            observer: None,
+            observer_delivery: None,
         })
     }
 
-    /// Run ready operations serially using the conservative launch rank and
-    /// stable operation identity as tie-breakers. A ready ordered selector
-    /// with a successful prefix is prioritized over later alternatives.
+    /// Dispatch graph-ready operations using stable launch rank. Parallel
+    /// policies run independent routes concurrently; one coordinator records
+    /// completion and drains race losers before publishing the selected root.
     pub fn execute(self) -> Result<ProjectExecutionOutcome> {
         let outcome = self.execute_with_attempts()?;
         Ok(ProjectExecutionOutcome {
@@ -385,55 +448,166 @@ impl<'a> ProjectCoordinator<'a> {
     fn execute_with_attempts(mut self) -> Result<ProjectCoordinatorOutcome> {
         let mut pending = (0..self.schedule.ops.len()).collect::<BTreeSet<_>>();
 
-        while !pending.is_empty() {
-            let next = pending
-                .iter()
-                .copied()
-                .filter(|index| self.operation_is_ready(&self.schedule.ops[*index]))
-                .min_by_key(|index| {
-                    let ready = &self.schedule.ops[*index];
-                    (
-                        self.operation_priority(ready),
-                        self.launch_rank
-                            .get(&ready.plan_node)
-                            .copied()
-                            .unwrap_or(usize::MAX),
-                        ready.ordinal,
-                        ready.plan_node.0,
-                        *index,
-                    )
-                });
-
-            let Some(index) = next else {
-                return Err(self.stall_error(&pending));
-            };
-            pending.remove(&index);
-            let ready = self.schedule.ops[index].clone();
-            let operation = self.operation(ready.plan_node)?.clone();
-            let identity = ProjectAttemptIdentity::from_operation(&operation)?;
-            self.trace.record_ready(&identity)?;
-            self.trace.record_started(&identity)?;
-
-            match self.execute_operation(&ready, &operation) {
-                OperationResult::Finished { value, workspace } => {
-                    self.commit_finished(&ready, &identity, value, workspace)?;
-                }
-                OperationResult::Route(settlement) => {
-                    self.commit_route_settlement(&ready, &identity, settlement)?;
-                }
-                OperationResult::Aborted(error) => {
-                    self.commit_abort(&ready, &identity, &error, None)?;
-                }
-            }
-
-            // `Fallback` and `AnySuccess` may materialize the SelectRoute root
-            // after only a successful prefix of alternatives. Operations in
-            // later branches were never ready/started attempts and must not be
-            // launched after the policy has selected its result.
-            if self.root_is_materialized() {
-                break;
-            }
+        if self.project.plan.policy == RoutePolicy::BenchmarkValidateAndSelect {
+            self.observe(ValidatedSelectionProgressEventV1::SelectionStarted {
+                reference_route_id: self.project.plan.alternatives[0].clone(),
+                candidate_count: self.project.plan.alternatives.len(),
+            })?;
         }
+        // Presentation callbacks complete before any candidate window opens.
+        // Finish callbacks use a separate delivery worker so they cannot hold
+        // up another branch's prerequisite dispatch or completion accounting.
+        for (branch, route_id) in self.project.plan.alternatives.iter().enumerate() {
+            self.observe(ValidatedSelectionProgressEventV1::CandidateStarted {
+                declaration_index: branch,
+                route_id: route_id.clone(),
+                candidate_count: self.project.plan.alternatives.len(),
+            })?;
+        }
+        let parallel = policy_runs_parallel(&self.project.plan.policy);
+        let (sender, receiver) = mpsc::channel();
+        std::thread::scope(|scope| -> Result<()> {
+            if let Some(observer) = self
+                .observer
+                .filter(|_| self.project.plan.policy == RoutePolicy::BenchmarkValidateAndSelect)
+            {
+                let (delivery, events) = mpsc::channel();
+                self.observer_delivery = Some(delivery);
+                scope.spawn(move || {
+                    while let Ok(message) = events.recv() {
+                        match message {
+                            ObserverDelivery::Event(event) => {
+                                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    observer.observe(event)
+                                }))
+                                .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            ObserverDelivery::Flush(acknowledge) => {
+                                let _ = acknowledge.send(());
+                            }
+                        }
+                    }
+                });
+            }
+            let execution =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
+                    let mut running = BTreeMap::<usize, (ReadyOp, ProjectAttemptIdentity)>::new();
+                    loop {
+                        let next = pending
+                            .iter()
+                            .copied()
+                            .filter(|index| self.operation_is_ready(&self.schedule.ops[*index]))
+                            .min_by_key(|index| {
+                                let ready = &self.schedule.ops[*index];
+                                (
+                                    self.operation_priority(ready),
+                                    self.launch_rank
+                                        .get(&ready.plan_node)
+                                        .copied()
+                                        .unwrap_or(usize::MAX),
+                                    ready.ordinal,
+                                    ready.plan_node.0,
+                                    *index,
+                                )
+                            });
+                        if let Some(index) = next {
+                            pending.remove(&index);
+                            let ready = self.schedule.ops[index].clone();
+                            let operation = self.operation(ready.plan_node)?.clone();
+                            let identity = ProjectAttemptIdentity::from_operation(&operation)?;
+                            self.trace.record_ready(&identity)?;
+                            self.trace.record_started(&identity)?;
+                            if matches!(operation.op, ExecutableOp::MaterializeProject) {
+                                if let Some(branch) = operation.branch {
+                                    self.branch_started.insert(branch, Instant::now());
+                                }
+                            }
+                            if parallel && matches!(operation.op, ExecutableOp::RunRoute { .. }) {
+                                let (route, workspace, token) =
+                                    match self.prepared_route_worker(&operation) {
+                                        Ok(worker) => worker,
+                                        Err(error) => {
+                                            self.commit_abort(&ready, &identity, &error, None)?;
+                                            continue;
+                                        }
+                                    };
+                                let sender = sender.clone();
+                                let opts = self.opts;
+                                running.insert(index, (ready, identity));
+                                scope.spawn(move || {
+                                    let outcome = std::panic::catch_unwind(
+                                        std::panic::AssertUnwindSafe(|| {
+                                            execute_route_in_workspace(
+                                                &route, &workspace, opts, &token,
+                                            )
+                                        }),
+                                    )
+                                    .unwrap_or_else(|_| {
+                                        Err(anyhow!("project route worker panicked"))
+                                    });
+                                    let _ = sender.send((index, outcome, Instant::now()));
+                                });
+                                // Launch every graph-ready alternative before waiting;
+                                // prerequisites and explicit shared-resource leases are
+                                // still enforced by ordinary graph readiness.
+                                continue;
+                            }
+                            match self.execute_operation(&ready, &operation) {
+                                OperationResult::Finished { value, workspace } => {
+                                    self.commit_finished(&ready, &identity, value, workspace)?
+                                }
+                                OperationResult::Route(settlement) => self
+                                    .commit_route_settlement(
+                                        &ready,
+                                        &identity,
+                                        settlement,
+                                        Instant::now(),
+                                    )?,
+                                OperationResult::Aborted(error) => {
+                                    self.commit_abort(&ready, &identity, &error, None)?
+                                }
+                            }
+                            self.cancel_race_losers();
+                            if self.root_is_materialized() {
+                                break;
+                            }
+                            continue;
+                        }
+                        if !running.is_empty() {
+                            let (index, result, completed) = receiver
+                                .recv()
+                                .context("project route workers disconnected before settlement")?;
+                            let (ready, identity) = running
+                                .remove(&index)
+                                .context("route worker reported an unregistered settlement")?;
+                            self.commit_route_settlement(
+                                &ready,
+                                &identity,
+                                route_settlement(result),
+                                completed,
+                            )?;
+                            self.cancel_race_losers();
+                            continue;
+                        }
+                        if self.root_is_materialized() {
+                            break;
+                        }
+                        return Err(self.stall_error(&pending));
+                    }
+                    Ok(())
+                }));
+            // Close before scoped-thread join on success, error, or unwind.
+            // A sender retained outside this scope would deadlock its observer
+            // receiver while scope waited to join that worker.
+            self.observer_delivery.take();
+            match execution {
+                Ok(result) => result,
+                Err(panic) => std::panic::resume_unwind(panic),
+            }
+        })?;
 
         let root = self
             .project
@@ -442,11 +616,16 @@ impl<'a> ProjectCoordinator<'a> {
             .first()
             .copied()
             .context("project HGraph has no result root")?;
-        let (result, attempted_results) = match self.values.remove(&root) {
-            Some(ProjectRuntimeValue::SelectedResult {
-                result,
-                attempted_results,
-            }) => (result, attempted_results),
+        let (result, attempted_results, receipt, measurements) = match self.values.remove(&root) {
+            Some(ProjectRuntimeValue::SelectedResult(selected)) => {
+                let SelectedProjectResult {
+                    result,
+                    attempted_results,
+                    receipt,
+                    measurements,
+                } = *selected;
+                (result, attempted_results, receipt, measurements)
+            }
             Some(_) => bail!("project HGraph root does not contain a selected route result"),
             None => return Err(self.stall_error(&BTreeSet::new())),
         };
@@ -466,6 +645,8 @@ impl<'a> ProjectCoordinator<'a> {
             result,
             attempted_results,
             trace,
+            receipt,
+            measurements,
         })
     }
 
@@ -479,6 +660,15 @@ impl<'a> ProjectCoordinator<'a> {
         else {
             return false;
         };
+
+        if let Some(trigger) = race_trigger(self.project, self.trace.events()) {
+            if operation.branch.is_some() && operation.branch != trigger.branch {
+                return false;
+            }
+            if matches!(operation.op, ExecutableOp::SelectRoute { .. }) {
+                return race_selection_ready(self.project, self.trace.events());
+            }
+        }
 
         let Some(input_policy) = self.input_policies.get(&ready.plan_node).copied() else {
             return false;
@@ -619,18 +809,33 @@ impl<'a> ProjectCoordinator<'a> {
                 }
             }
             ExecutableOp::SelectRoute { .. } => match self.select_results(ready) {
-                Ok((result, attempted_results)) => OperationResult::Finished {
-                    value: ProjectRuntimeValue::SelectedResult {
-                        result,
-                        attempted_results,
-                    },
+                Ok(selection) => {
+                    let result = selection
+                        .results
+                        .last()
+                        .cloned()
+                        .expect("selection contains a result");
+                    OperationResult::Finished {
+                        value: ProjectRuntimeValue::SelectedResult(Box::new(
+                            SelectedProjectResult {
+                                result,
+                                attempted_results: selection.results,
+                                receipt: selection.validated_selection_receipt,
+                                measurements: selection.validated_selection_measurements,
+                            },
+                        )),
+                        workspace: None,
+                    }
+                }
+                Err(error) => OperationResult::Aborted(error),
+            },
+            ExecutableOp::CompareRouteResults => match self.compare_results(ready) {
+                Ok(selection) => OperationResult::Finished {
+                    value: ProjectRuntimeValue::ComparedResults(selection),
                     workspace: None,
                 },
                 Err(error) => OperationResult::Aborted(error),
             },
-            ExecutableOp::CompareRouteResults => OperationResult::Aborted(anyhow!(
-                "CompareRouteResults is unsupported by the ordered project HGraph executor"
-            )),
             other => OperationResult::Aborted(anyhow!(
                 "non-project operation {other:?} reached the project HGraph executor"
             )),
@@ -724,7 +929,209 @@ impl<'a> ProjectCoordinator<'a> {
         execute_route_in_workspace(&prepared.route, workspace, self.opts, &self.cancel)
     }
 
-    fn select_results(&self, ready: &ReadyOp) -> Result<(OExecutionResult, Vec<OExecutionResult>)> {
+    fn cancel_race_losers(&self) {
+        if let Some(trigger) = race_trigger(self.project, self.trace.events()) {
+            for (branch, token) in self.branch_tokens.iter().enumerate() {
+                if Some(branch) != trigger.branch {
+                    token.cancel();
+                }
+            }
+        }
+    }
+
+    fn observe(&self, event: ValidatedSelectionProgressEventV1) -> Result<()> {
+        if self.project.plan.policy == RoutePolicy::BenchmarkValidateAndSelect {
+            if let Some(delivery) = &self.observer_delivery {
+                let _ = delivery.send(ObserverDelivery::Event(event));
+            } else if let Some(observer) = self.observer {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observer.observe(event)))
+                    .map_err(|_| anyhow!("validated-selection progress observer panicked"))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn flush_observer(&self) -> Result<()> {
+        if let Some(delivery) = &self.observer_delivery {
+            let (acknowledge, completed) = mpsc::channel();
+            delivery
+                .send(ObserverDelivery::Flush(acknowledge))
+                .context("validated-selection progress observer stopped")?;
+            completed
+                .recv()
+                .context("validated-selection progress observer panicked")?;
+        }
+        Ok(())
+    }
+
+    fn prepared_route_worker(
+        &self,
+        operation: &ProjectPlanOperation,
+    ) -> Result<(RouteSpec, Arc<Workspace>, CancellationToken)> {
+        let Some(ProjectDependency::Value(build)) = operation.dependencies.first() else {
+            bail!("RunRoute lacks prepared-route input");
+        };
+        let ProjectRuntimeValue::PreparedRoute(prepared) = self.value_for_operation(*build)? else {
+            bail!("RunRoute input is not a prepared route");
+        };
+        let branch = operation.branch.context("RunRoute lacks branch")?;
+        if prepared.branch != branch
+            || !matches!(&operation.op, ExecutableOp::RunRoute { route_id } if *route_id == prepared.route.id)
+        {
+            bail!("RunRoute received mismatched preparation");
+        }
+        Ok((
+            prepared.route.clone(),
+            self.workspaces
+                .get(&branch)
+                .context("RunRoute lacks workspace")?
+                .clone(),
+            self.branch_tokens[branch].clone(),
+        ))
+    }
+
+    fn compare_results(&self, ready: &ReadyOp) -> Result<RouteSelectionExecution> {
+        self.flush_observer()?;
+        let results = ready
+            .inputs
+            .iter()
+            .map(|input| {
+                self.route_result_for_node(*input)
+                    .cloned()
+                    .context("comparison input has no settled route result")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if self.project.plan.policy == RoutePolicy::BenchmarkValidateAndSelect {
+            let measured = results
+                .into_iter()
+                .enumerate()
+                .map(|(branch, result)| {
+                    Ok(MeasuredRouteExecution {
+                        result,
+                        branch_elapsed_ns: *self
+                            .branch_elapsed
+                            .get(&branch)
+                            .context("candidate lacks complete branch measurement")?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                benchmark_validate_and_select(
+                    self.bundle,
+                    &self.project.plan.target,
+                    &self.project.plan.alternatives,
+                    measured,
+                    self.observer,
+                )
+            }))
+            .map_err(|_| {
+                anyhow!("validated-selection progress observer panicked during validation")
+            })?
+            .map_err(|error| anyhow::Error::new(ProjectPolicyRejection(error)))
+        } else {
+            if results.iter().any(|result| !result.succeeded()) {
+                return Err(anyhow::Error::new(ProjectPolicyRejection(anyhow!(
+                    "verify_equivalent requires every alternative to succeed"
+                ))));
+            }
+            verify_results_equivalent(&results)
+                .map_err(|error| anyhow::Error::new(ProjectPolicyRejection(error)))?;
+            Ok(RouteSelectionExecution::plain(results))
+        }
+    }
+
+    fn select_results(&self, ready: &ReadyOp) -> Result<RouteSelectionExecution> {
+        if self
+            .project
+            .plan
+            .policy
+            .requires_declared_output_validation()
+        {
+            let Some(ProjectRuntimeValue::ComparedResults(selection)) = ready
+                .inputs
+                .first()
+                .and_then(|input| self.values.get(input))
+            else {
+                bail!("SelectRoute lacks compared results");
+            };
+            return Ok(RouteSelectionExecution {
+                results: selection.results.clone(),
+                validated_selection_receipt: selection.validated_selection_receipt.clone(),
+                validated_selection_measurements: selection
+                    .validated_selection_measurements
+                    .clone(),
+            });
+        }
+        if matches!(
+            self.project.plan.policy,
+            RoutePolicy::All
+                | RoutePolicy::BenchmarkAndSelect
+                | RoutePolicy::RaceSuccess
+                | RoutePolicy::RaceSettle
+        ) {
+            let mut indexed = ready
+                .inputs
+                .iter()
+                .enumerate()
+                .filter_map(|(branch, input)| {
+                    self.route_result_for_node(*input)
+                        .cloned()
+                        .map(|result| (branch, result))
+                })
+                .collect::<Vec<_>>();
+            let winner = match self.project.plan.policy {
+                RoutePolicy::BenchmarkAndSelect => indexed
+                    .iter()
+                    .filter(|(_, result)| result.succeeded())
+                    .min_by_key(|(branch, result)| (result.duration_ns, *branch))
+                    .map(|(branch, _)| *branch)
+                    .context("benchmark_and_select: no alternative succeeded")?,
+                RoutePolicy::RaceSuccess | RoutePolicy::RaceSettle => {
+                    if let Some(winner) =
+                        race_selected_settlement(self.project, self.trace.events())
+                    {
+                        if winner.state == super::trace::ProjectAttemptState::Aborted
+                            || winner
+                                .branch
+                                .and_then(|branch| self.project.plan.alternatives.get(branch))
+                                != winner.route_id.as_ref()
+                        {
+                            bail!(
+                                "race: selected alternative `{}` settled with an error",
+                                winner
+                                    .branch
+                                    .and_then(|branch| self.project.plan.alternatives.get(branch))
+                                    .map(String::as_str)
+                                    .unwrap_or("<unknown>")
+                            );
+                        }
+                        winner
+                            .branch
+                            .context("selected race settlement has no branch")?
+                    } else {
+                        indexed
+                            .last()
+                            .map(|(branch, _)| *branch)
+                            .context("race: no alternative settled")?
+                    }
+                }
+                _ => indexed
+                    .last()
+                    .map(|(branch, _)| *branch)
+                    .context("all: no alternative settled")?,
+            };
+            let position = indexed
+                .iter()
+                .position(|(branch, _)| *branch == winner)
+                .context("selected result is absent")?;
+            let selected = indexed.remove(position).1;
+            let mut results = indexed
+                .into_iter()
+                .map(|(_, result)| result)
+                .collect::<Vec<_>>();
+            results.push(selected);
+            return Ok(RouteSelectionExecution::plain(results));
+        }
         let ordered_first_success = self.uses_ordered_first_success();
         if !ordered_first_success
             && !matches!(
@@ -770,7 +1177,8 @@ impl<'a> ProjectCoordinator<'a> {
             .or_else(|| attempted_results.last())
             .cloned()
             .context("SelectRoute has no materialized alternative result")?;
-        Ok((selected, attempted_results))
+        let _ = selected;
+        Ok(RouteSelectionExecution::plain(attempted_results))
     }
 
     fn operation(&self, plan_node: PlanNodeId) -> Result<&ProjectPlanOperation> {
@@ -816,10 +1224,63 @@ impl<'a> ProjectCoordinator<'a> {
         // Local linearization point: once trace validation succeeds, the
         // remaining map/set updates are infallible and form one coordinator
         // transition. This does not make command-side external effects exact-once.
-        self.trace.record_finished(identity)?;
+        if let ProjectRuntimeValue::SelectedResult(selected) = &value {
+            let SelectedProjectResult {
+                result,
+                attempted_results,
+                receipt,
+                ..
+            } = selected.as_ref();
+            if !matches!(
+                self.project.plan.policy,
+                RoutePolicy::Explicit(_)
+                    | RoutePolicy::Default
+                    | RoutePolicy::Fallback
+                    | RoutePolicy::AnySuccess
+            ) {
+                let candidates = self
+                    .project
+                    .plan
+                    .alternatives
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(branch, route)| {
+                        attempted_results
+                            .iter()
+                            .find(|result| &result.route_id == route)
+                            .map(|result| (branch, result))
+                    })
+                    .map(|(branch, result)| {
+                        Ok(ProjectPolicyCandidate {
+                            route_id: result.route_id.clone(),
+                            outcome: ProjectRouteOutcome::from_result(result)?,
+                            terminal_elapsed_ns: result.duration_ns.to_string(),
+                            branch_elapsed_ns: self
+                                .branch_elapsed
+                                .get(&branch)
+                                .copied()
+                                .unwrap_or(result.duration_ns)
+                                .to_string(),
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                self.trace.record_selected(
+                    identity,
+                    ProjectPolicySelection {
+                        selected_route_id: result.route_id.clone(),
+                        candidates,
+                        validated_receipt: receipt.clone(),
+                    },
+                )?;
+            } else {
+                self.trace.record_finished(identity)?;
+            }
+        } else {
+            self.trace.record_finished(identity)?;
+        }
         self.values.insert(ready.value_output, value);
         if let Some((branch, workspace)) = workspace {
-            self.workspaces.insert(branch, workspace);
+            self.workspaces.insert(branch, Arc::new(workspace));
         }
         self.materialized.extend(ready.outputs.iter().copied());
         Ok(())
@@ -830,6 +1291,7 @@ impl<'a> ProjectCoordinator<'a> {
         ready: &ReadyOp,
         identity: &ProjectAttemptIdentity,
         settlement: RouteSettlement,
+        completed: Instant,
     ) -> Result<()> {
         let (status, result, outcome) = match settlement {
             RouteSettlement::Succeeded { result, outcome } => {
@@ -842,12 +1304,22 @@ impl<'a> ProjectCoordinator<'a> {
                 (SettledRouteStatus::Skipped, result, outcome)
             }
             RouteSettlement::Aborted(error) => {
+                if is_cancellation_error(&error) {
+                    if let Some(trigger) = race_trigger(self.project, self.trace.events()) {
+                        let ordinal = trigger.coordinator_ordinal;
+                        self.ensure_outputs_unpublished(ready)?;
+                        self.trace.record_cancelled(identity, ordinal)?;
+                        for output in &ready.outputs {
+                            self.failed_outputs.insert(*output, ready.plan_node);
+                        }
+                        return Ok(());
+                    }
+                }
                 self.commit_abort(ready, identity, &error, None)?;
                 return Ok(());
             }
         };
 
-        let operation = self.operation(ready.plan_node)?;
         let branch = identity.branch.with_context(|| {
             format!(
                 "route `{}` has no alternative branch",
@@ -858,6 +1330,29 @@ impl<'a> ProjectCoordinator<'a> {
             .route_id
             .clone()
             .context("route settlement has no route identity")?;
+        let terminal_branch = self.project.plan.alternatives.get(branch) == Some(&route_id);
+        if terminal_branch {
+            let started = *self
+                .branch_started
+                .get(&branch)
+                .context("terminal branch was never started")?;
+            let elapsed = completed.saturating_duration_since(started).as_nanos();
+            self.branch_elapsed.insert(branch, elapsed);
+            self.observe(ValidatedSelectionProgressEventV1::CandidateFinished {
+                declaration_index: branch,
+                route_id: route_id.clone(),
+                candidate_count: self.project.plan.alternatives.len(),
+                branch_elapsed_ns: elapsed,
+                outcome: if result.succeeded() {
+                    ValidatedSelectionCandidateProgressV1::Succeeded
+                } else {
+                    ValidatedSelectionCandidateProgressV1::SettledUnsuccessful {
+                        exit_code: result.exit_code,
+                    }
+                },
+            })?;
+        }
+        let operation = self.operation(ready.plan_node)?;
         let failure_continuation = operation
             .route_facts
             .as_ref()
@@ -898,6 +1393,10 @@ impl<'a> ProjectCoordinator<'a> {
                         })
                     {
                         ProjectContinuationEvidence::DeclaredIdempotent
+                    } else if self.project.plan.execution_contract
+                        == ProjectExecutionContract::LegacyCompatibility
+                    {
+                        ProjectContinuationEvidence::LegacyUnchecked
                     } else {
                         ProjectContinuationEvidence::UnprovenEffects
                     };
@@ -1014,7 +1513,9 @@ impl<'a> ProjectCoordinator<'a> {
         error: &anyhow::Error,
         outcome: Option<ProjectRouteOutcome>,
     ) -> Result<()> {
-        self.infrastructure_failure_observed = true;
+        if !error.is::<ProjectPolicyRejection>() {
+            self.infrastructure_failure_observed = true;
+        }
         self.ensure_outputs_unpublished(ready)?;
         let description = error.to_string();
         let public_description = public_route_execution_diagnostic(error);
@@ -1158,12 +1659,33 @@ pub fn execute_project_hgraph_selection(
     project: &ProjectHGraph,
     opts: &RunOptions,
 ) -> Result<ConfiguredProjectExecution> {
-    let outcome = ProjectCoordinator::new(bundle, project, opts)?.execute_with_attempts()?;
+    execute_project_hgraph_selection_with_contract_and_progress(
+        bundle,
+        project,
+        opts,
+        ProjectExecutionContract::Strict,
+        None,
+    )
+}
+
+/// Execute a preflighted graph using the caller-frozen continuation contract
+/// and optional presentation-safe progress observer. No environment is read.
+pub fn execute_project_hgraph_selection_with_contract_and_progress(
+    bundle: &ProjectBundle,
+    project: &ProjectHGraph,
+    opts: &RunOptions,
+    expected_contract: ProjectExecutionContract,
+    observer: Option<&dyn ValidatedSelectionProgressObserverV1>,
+) -> Result<ConfiguredProjectExecution> {
+    let mut coordinator =
+        ProjectCoordinator::new_with_contract(bundle, project, opts, expected_contract)?;
+    coordinator.observer = observer;
+    let outcome = coordinator.execute_with_attempts()?;
     Ok(ConfiguredProjectExecution {
         results: outcome.attempted_results,
         trace: Some(outcome.trace),
-        validated_selection_receipt: None,
-        validated_selection_measurements: None,
+        validated_selection_receipt: outcome.receipt,
+        validated_selection_measurements: outcome.measurements,
     })
 }
 
@@ -1212,9 +1734,9 @@ fn project_world_trace_header(
 
 /// Dispatch project selection through the explicitly configured runtime.
 ///
-/// With `O_PROJECT_EXECUTOR=hgraph`, planning or execution errors are returned
-/// directly and never fall back to `run_selection`. With the variable unset,
-/// the existing project runtime remains the compatibility default.
+/// Unset selects the compatibility HGraph contract; `hgraph` retains strict
+/// continuation, and `legacy` explicitly selects the previous runtime. Graph
+/// errors are returned directly and never trigger a legacy fallback.
 pub fn execute_selection_with_configured_executor(
     bundle: &ProjectBundle,
     target: Option<&str>,
@@ -1225,11 +1747,8 @@ pub fn execute_selection_with_configured_executor(
 }
 
 /// Dispatch project selection through the configured runtime while reporting
-/// presentation-safe validated-selection progress when the compatibility
-/// project runtime executes `benchmark_validate_and_select`.
-///
-/// The HGraph executor currently supports a different policy surface and
-/// therefore emits no validated-selection progress events.
+/// presentation-safe validated-selection progress for both HGraph and explicit
+/// legacy execution of `benchmark_validate_and_select`.
 pub fn execute_selection_with_configured_executor_with_progress(
     bundle: &ProjectBundle,
     target: Option<&str>,
@@ -1253,8 +1772,9 @@ fn execute_selection_with_configured_executor_inner(
     opts: &RunOptions,
     observer: Option<&dyn ValidatedSelectionProgressObserverV1>,
 ) -> Result<ConfiguredProjectExecution> {
-    match std::env::var_os(PROJECT_EXECUTOR_ENV) {
-        None => {
+    let configured = std::env::var_os(PROJECT_EXECUTOR_ENV);
+    match configured.as_deref() {
+        Some(value) if value == "legacy" => {
             let execution = match observer {
                 Some(observer) => super::runtime::run_selection_observed_with_progress(
                     bundle,
@@ -1274,16 +1794,21 @@ fn execute_selection_with_configured_executor_inner(
                 validated_selection_measurements: execution.validated_selection_measurements,
             })
         }
-        Some(value) if value == "hgraph" => {
-            let project = build_project_hgraph(bundle, target, policy_override)
+        None | Some(_) if configured.is_none() || configured.as_deref().is_some_and(|value| value == "hgraph") => {
+            let contract = if configured.is_none() { ProjectExecutionContract::LegacyCompatibility } else { ProjectExecutionContract::Strict };
+            let project = build_project_hgraph_with_contract(bundle, target, policy_override, contract)
                 .map_err(anyhow::Error::msg)
                 .context("failed to build project HGraph for execution")?;
-            execute_project_hgraph_selection(bundle, &project, opts)
+            let mut coordinator = ProjectCoordinator::new_with_contract(bundle, &project, opts, contract)?;
+            coordinator.observer = observer;
+            let outcome = coordinator.execute_with_attempts()?;
+            Ok(ConfiguredProjectExecution { results: outcome.attempted_results, trace: Some(outcome.trace), validated_selection_receipt: outcome.receipt, validated_selection_measurements: outcome.measurements })
         }
         Some(value) => bail!(
-            "unsupported {PROJECT_EXECUTOR_ENV} value `{}`; expected `hgraph` or an unset variable",
+            "unsupported {PROJECT_EXECUTOR_ENV} value `{}`; expected `hgraph`, `legacy`, or an unset variable",
             value.to_string_lossy()
         ),
+        None => unreachable!("unset executor selects compatibility HGraph"),
     }
 }
 
@@ -1327,5 +1852,175 @@ fn route_plan_facts(route: &RouteSpec) -> RoutePlanFacts {
         declared_writes: route.effects.writes.clone(),
         declared_pure: route.effects.pure,
         failure_continuation: route.failure_continuation,
+    }
+}
+
+fn route_settlement(result: Result<OExecutionResult>) -> RouteSettlement {
+    match result {
+        Ok(result) => match ProjectRouteOutcome::from_result(&result) {
+            Ok(outcome) if is_skipped_result(&result) => {
+                RouteSettlement::Skipped { result, outcome }
+            }
+            Ok(outcome) if result.succeeded() => RouteSettlement::Succeeded { result, outcome },
+            Ok(outcome) => RouteSettlement::NonZero { result, outcome },
+            Err(error) => RouteSettlement::Aborted(error.into()),
+        },
+        Err(error) => RouteSettlement::Aborted(error),
+    }
+}
+
+#[cfg(test)]
+mod policy_settlement_tests {
+    use super::*;
+    use crate::project::{build_project_hgraph, RouteProvenance, RouteSet};
+
+    #[test]
+    fn race_settle_post_drain_tie_break_includes_real_errors_in_declaration_order() {
+        for earlier_branch_succeeds in [true, false] {
+            let mut bundle = ProjectBundle::empty("injected-race-settlement-order");
+            for branch in 0..2 {
+                let mut route =
+                    RouteSpec::new(format!("branch-{branch}"), RouteProvenance::CliOverride);
+                route.command = if (branch == 0) == earlier_branch_succeeds {
+                    vec!["sh".into(), "-c".into(), "printf settled".into()]
+                } else {
+                    vec!["/ostadix-test/nonexistent-race-executable".into()]
+                };
+                bundle.routes.push(route);
+            }
+            bundle.route_sets.push(RouteSet {
+                provides: "race".into(),
+                alternatives: vec!["branch-0".into(), "branch-1".into()],
+                policy: RoutePolicy::RaceSettle,
+            });
+            let project = build_project_hgraph(&bundle, Some("race"), None).unwrap();
+            let opts = RunOptions::default();
+            let mut coordinator = ProjectCoordinator::new(&bundle, &project, &opts).unwrap();
+            let mut settled = BTreeMap::new();
+            // Produce both actual outcomes before delivering either terminal
+            // event. This deterministically models already-returned workers.
+            for operation in &project.plan.operations {
+                if matches!(operation.op, ExecutableOp::SelectRoute { .. }) {
+                    continue;
+                }
+                let ready = coordinator
+                    .schedule
+                    .ops
+                    .iter()
+                    .find(|ready| ready.plan_node == operation.id)
+                    .unwrap()
+                    .clone();
+                assert!(coordinator.operation_is_ready(&ready));
+                let identity = ProjectAttemptIdentity::from_operation(operation).unwrap();
+                coordinator.trace.record_ready(&identity).unwrap();
+                coordinator.trace.record_started(&identity).unwrap();
+                if matches!(operation.op, ExecutableOp::MaterializeProject) {
+                    coordinator
+                        .branch_started
+                        .insert(operation.branch.unwrap(), Instant::now());
+                }
+                match coordinator.execute_operation(&ready, operation) {
+                    OperationResult::Finished { value, workspace } => coordinator
+                        .commit_finished(&ready, &identity, value, workspace)
+                        .unwrap(),
+                    OperationResult::Route(outcome) => {
+                        settled.insert(
+                            operation.branch.unwrap(),
+                            (ready, identity, outcome, Instant::now()),
+                        );
+                    }
+                    OperationResult::Aborted(error) => {
+                        panic!("unexpected preparation error: {error}")
+                    }
+                }
+            }
+            for branch in [1, 0] {
+                let (ready, identity, outcome, completed) = settled.remove(&branch).unwrap();
+                coordinator
+                    .commit_route_settlement(&ready, &identity, outcome, completed)
+                    .unwrap();
+                coordinator.cancel_race_losers();
+            }
+            assert_eq!(
+                race_trigger(&project, coordinator.trace.events())
+                    .unwrap()
+                    .branch,
+                Some(1)
+            );
+            assert_eq!(
+                race_selected_settlement(&project, coordinator.trace.events())
+                    .unwrap()
+                    .branch,
+                Some(0)
+            );
+            let operation = project.plan.operations.last().unwrap();
+            let ready = coordinator
+                .schedule
+                .ops
+                .iter()
+                .find(|ready| ready.plan_node == operation.id)
+                .unwrap()
+                .clone();
+            assert!(coordinator.operation_is_ready(&ready));
+            let identity = ProjectAttemptIdentity::from_operation(operation).unwrap();
+            coordinator.trace.record_ready(&identity).unwrap();
+            coordinator.trace.record_started(&identity).unwrap();
+            match coordinator.execute_operation(&ready, operation) {
+                OperationResult::Finished { value, workspace } => {
+                    assert!(earlier_branch_succeeds);
+                    let ProjectRuntimeValue::SelectedResult(selected) = &value else {
+                        panic!("missing selected result")
+                    };
+                    assert_eq!(selected.result.route_id, "branch-0");
+                    coordinator
+                        .commit_finished(&ready, &identity, value, workspace)
+                        .unwrap();
+                }
+                OperationResult::Aborted(error) => {
+                    assert!(!earlier_branch_succeeds);
+                    assert!(error.to_string().contains("branch-0"));
+                    let result = coordinator
+                        .values
+                        .values()
+                        .find_map(|value| match value {
+                            ProjectRuntimeValue::RouteResult(result) => Some(result),
+                            _ => None,
+                        })
+                        .unwrap();
+                    let mut forged = coordinator.trace.clone();
+                    forged
+                        .record_selected(
+                            &identity,
+                            ProjectPolicySelection {
+                                selected_route_id: result.route_id.clone(),
+                                candidates: vec![ProjectPolicyCandidate {
+                                    route_id: result.route_id.clone(),
+                                    outcome: ProjectRouteOutcome::from_result(result).unwrap(),
+                                    terminal_elapsed_ns: result.duration_ns.to_string(),
+                                    branch_elapsed_ns: "0".into(),
+                                }],
+                                validated_receipt: None,
+                            },
+                        )
+                        .unwrap();
+                    assert!(ProjectAttemptTrace::try_from_project_events(
+                        &project,
+                        forged.header().clone(),
+                        forged.events().to_vec()
+                    )
+                    .is_err());
+                    coordinator
+                        .commit_abort(&ready, &identity, &error, None)
+                        .unwrap();
+                }
+                OperationResult::Route(_) => panic!("selector dispatched a route"),
+            }
+            ProjectAttemptTrace::try_from_project_events(
+                &project,
+                coordinator.trace.header().clone(),
+                coordinator.trace.events().to_vec(),
+            )
+            .unwrap();
+        }
     }
 }

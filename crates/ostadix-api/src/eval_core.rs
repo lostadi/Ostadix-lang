@@ -23,11 +23,15 @@ use crate::value::{fingerprint_preview, DecimalSpecial, FloatFormat, ONumber, OV
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionTrace {
     pub events: Vec<TraceEvent>,
+    pub backend_crossings: Vec<crate::backend_morphism::BackendCrossingObservationV1>,
 }
 
 impl ExecutionTrace {
     pub fn new() -> Self {
-        Self { events: Vec::new() }
+        Self {
+            events: Vec::new(),
+            backend_crossings: Vec::new(),
+        }
     }
 }
 
@@ -118,6 +122,10 @@ impl GraphEvalFrame {
 /// This trait is deliberately crate-private and has no `Send` bound: the
 /// process registry and live actor state stay on the coordinator thread.
 pub(crate) trait GraphEvaluationHost {
+    fn crossing_observations_enabled(&self) -> bool {
+        false
+    }
+
     fn verify_admitted_runtime_context(&self, admitted: &AdmittedExecution<'_>) -> Result<()>;
 
     fn local_worker_parallelism_override(&self) -> Option<usize>;

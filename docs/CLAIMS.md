@@ -1178,9 +1178,8 @@
   parity, or G1 evidence.
 - World PR8-2 adds bounded canonical `PlacementSnapshotV1` and
   `DeploymentPlanV1` intention records. The exact hosted-unbound plan maps
-  operations for supported coordinator policies only to `AmbientHost` or
-  `HostedCoordinator`, carries no World/task/provider identity, and keeps
-  unsupported hosted policies `Unresolved`. Its active derived requirements
+  operations for all ten current policies to `AmbientHost` or
+  `HostedCoordinator` and carries no World/task/provider identity. Its active derived requirements
   are the exact bundle plus bundle-scoped role/path declarations, runtime
   classes, executable/evaluator facts, platform and ambient-environment guards,
   authority absence, and residual `HostWorld` admission. Bundle environment
@@ -1191,7 +1190,7 @@
   `TaskIdentity` per logical operation. Canonical provider selection is a
   deterministic descriptive proposal, not authenticated or current inventory,
   Governor admission, authority, dispatch, reservation, health, or execution.
-  `require_current_world` checks only World identity/epoch. The ordinary opt-in
+  `require_current_world` checks only World identity/epoch. The ordinary configured
   executor does not consume this plan, but the
   explicit hosted-reference World entry point consumes it together with
   `HostedWorldLaunchV1` and a caller-supplied current view. The launch contains
@@ -1227,55 +1226,38 @@
   `pure=true`. Logical alternative branches may therefore be serialized and
   cross-coupled by the shared ambient/resource state chains; PR7 does not prove
   parallel branch execution or independent host mediation.
-- `scripts/smoke-project-hgraph-exec.sh` is the opt-in, ordered-alternative
-  hosted execution gate. Under `O_PROJECT_EXECUTOR=hgraph`, a validated Project
-  HGraph controls isolated materialization, `Value` versus `Success`
-  prerequisite readiness, and policy selection for `Explicit`, `Default`, and
-  serial ordered `Fallback`/`AnySuccess`. Only the two first-success selectors
-  derive `ReadyInputPolicy::OrderedFirstSuccess`; every other operation retains
-  conjunctive input readiness. Fallback follows resolved priority order,
-  AnySuccess follows declaration order, and a first success prevents later
-  branches from materializing or starting. Every attempted alternative result
-  is retained. When the terminal alternative settles unsuccessfully, it admits
-  the next route only when every route child was guard-skipped or every route
-  that executed in that branch, including successful prerequisites, carries
-  the bundle-bound `failure_continuation = "declared_idempotent"` contract. The default
-  `unproven` class denies continuation; an infrastructure abort publishes no
-  route value and stops the policy. A nonzero prerequisite publishes its value
-  and conservative `HostWorld` successor but withholds completion; because no
-  first-class branch-failure value is synthesized in this slice, a failed
-  prerequisite hard-stops even when it declares idempotence. The unsigned
-  diagnostic trace v5 binds a canonical `LogicalHGraphV1` schema/digest plus
-  stable source identity and the exact canonical hosted-unbound
-  `DeploymentPlanV1` schema/digest to a fresh execution-attempt identifier and
-  distinguishes settlement, guard skip, and abort. Its continuation decision
-  records the assessed route prefix, proposed next route,
-  `no_execution`/`declared_idempotent`/`unproven_effects` evidence, and the
-  allow/deny result; a denied decision is persisted before the CLI reports no
-  successful route. Standalone replay checks only structural lifecycle
-  consistency. Plan-aware replay against a trusted `ProjectHGraph` verifies the
-  header/projection, reconstructs the hosted-unbound deployment artifact and
-  rejects its substitution, verifies exact operation identities and next
-  alternative, requires complete causally ordered lifecycle coverage for every
-  transitive route prerequisite, recomputes evidence from `RoutePlanFacts`, and
-  rejects missing decisions or later-branch events after denial; every complete
-  coordinator trace passes that semantic replay before return. Operations never
-  attempted after short-circuit or denial emit no lifecycle event.
-  Parallel/racing, aggregate, equivalence, and benchmark policies fail closed
-  rather than falling back to the compatibility runtime. The execution-attempt
-  identifier is diagnostic and is not a World `TaskIdentity` or
-  `TaskAttemptIdentity`.
-  `declared_idempotent` is an author declaration, not independently verified
-  idempotency, sandboxing, effect journaling, fencing, compensation, or an
-  exactly-once guarantee. This rule exists only in the opt-in hosted HGraph
-  coordinator and does not alter the default compatibility runtime. The
-  ordinary opt-in path remains distinct from the explicit World-bound
-  hosted-reference adapter. Neither proves parallel race/cancellation, retry,
-  authenticated or actual remote placement, Governor admission/commit,
-  capability/lease enforcement, reservation, recovery, remote dispatch,
-  exactly-once effects, native project execution, native Ed25519 verification,
-  physical-device assignment, PCI/DMA/IOMMU isolation, physical hardware,
-  Workstream A acceptance, G1, or passage of any G0--G13 gate.
+- `scripts/smoke-project-hgraph-exec.sh` retains strict ordered-alternative
+  qualification. The broader `tests/project_hgraph_exec.rs` corpus exercises
+  all ten Project HGraph policies, actual concurrent branch overlap, shared
+  host-resource ordering, race cancellation/drain, comparison and validated
+  reference selection, and policy-aware trace tamper rejection. Default
+  configured execution uses a canonical `LegacyCompatibility` contract;
+  `O_PROJECT_EXECUTOR=hgraph` retains strict idempotence-gated continuation and
+  `legacy` is the explicit previous-runtime opt-out. Compatibility continuation
+  records `legacy_unchecked`; it does not assert safe repetition. The contract
+  is bound to logical/deployment identity and checked against the trusted
+  constructor before materialization. The independent source scheduling
+  contract encodes `concurrent_branches_v1` for new parallel graphs. An absent
+  field means `serial_host_world_v1`, preserving historical graph bytes and
+  digest, including earlier parallel-policy inspection records. Strict omits
+  the continuation field; it retains earlier bytes when scheduling is unchanged.
+  Parallel policies retain unknown/conservative ambient effects and explicitly
+  authorize cross-branch overlap. Isolated workspace paths carry branch
+  identity, while declared shared resources remain ordered. The marker still
+  requires residual ambient-host admission in deployment and grounding. This is not
+  independent host mediation or strict effect equivalence. Race workers are
+  cancelled cooperatively and drained before final result publication; trace
+  v7 binds cancellation to its earlier qualifying settlement and records
+  candidate outcomes, timing observations, selected route, and validated
+  receipt where applicable. Replay verifies causal readiness and selection
+  against those observations; it does not attest clock accuracy or re-execute
+  external commands. Infrastructure/prerequisite failure does not invent a
+  successful route result. The execution-attempt identifier remains diagnostic.
+  Neither this path nor the explicit World-bound hosted-reference adapter
+  establishes retries, authenticated remote placement, Governor commit,
+  capability/lease enforcement, reservation, recovery, exactly-once effects,
+  native project execution, physical-device assignment, G1, or G0--G13 passage.
+
 - Neither the present repository nor the OSTADIX Alpha target claims coherent
   cross-node RAM, transparent remote pointers, arbitrary Linux compatibility,
   universal hardware support, or transparent migration of every process.

@@ -223,9 +223,16 @@ The facet names do not automatically attach these records to an
 Canonical decoding reconstructs descriptive records, never admission,
 placement, dispatch, a live runtime object, or reusable authority.
 
-Existing project `RouteSet`, placement, HGraph, and runtime-observation systems
-remain separate. This V1 does not generalize or silently connect their
-selection, scheduling, placement, or execution behavior.
+The explicit marked-project bridge described in [operation planning and
+observation](OPERATION_PLANNING_V1.md) connects these declarations to one
+manifest route. Its separate `operation-run-decision/v1` and
+`operation-run-plan/v1` records retain the original request, deployment, and
+candidate before dispatch, including a durable original planner snapshot that
+survives orphan reconciliation; V2 observation bindings verify that retained choice
+without current-planner reranking. Direct-entrypoint submission and local target
+platform observations remain separate from declaration identity and do not
+prove behavioral equivalence or physical target identity. The four semantic
+records described here still supply no execution authority.
 
 ## Explicit nonclaims
 

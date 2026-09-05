@@ -208,7 +208,7 @@ RULES = (
             "world",
         ),
         "the graph-evaluation contract must remain independent of evaluator and executor realizations",
-        ("backend_catalog", "capability", "evidence", "execution_contract", "ir", "value"),
+        ("backend_catalog", "backend_morphism", "capability", "evidence", "execution_contract", "ir", "value"),
     ),
     Rule(
         EXECUTOR_RUNTIME_PATHS,

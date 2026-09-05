@@ -268,7 +268,7 @@ struct Cli {
     routes_policy: Option<String>,
 
     /// Write the unsigned Project HGraph attempt trace as JSON. Requires
-    /// hosted project execution through --run and O_PROJECT_EXECUTOR=hgraph.
+    /// hosted project execution through --run (default or strict HGraph executor).
     #[arg(long = "project-trace-out", value_name = "PATH", requires = "run")]
     project_trace_out: Option<PathBuf>,
 
@@ -912,14 +912,7 @@ fn run_project(cli: &Cli, bundle: &o_lang::project::ProjectBundle) -> Result<()>
             resolved.policy.token()
         );
     }
-    if cli.selection_receipt_out.is_some()
-        && mesh_execution_config(cli).is_none()
-        && std::env::var_os(PROJECT_EXECUTOR_ENV).as_deref() == Some(std::ffi::OsStr::new("hgraph"))
-    {
-        bail!(
-            "--selection-receipt-out is unavailable with O_PROJECT_EXECUTOR=hgraph because that executor does not implement benchmark_validate_and_select"
-        );
-    }
+
     let opts = RunOptions::default();
     let mesh_config = mesh_execution_config(cli).map(|mut config| {
         // o-link retains the returned trace through its private atomic writer.
@@ -929,10 +922,10 @@ fn run_project(cli: &Cli, bundle: &o_lang::project::ProjectBundle) -> Result<()>
     if cli.project_trace_out.is_some()
         && (mesh_config.is_some()
             || std::env::var_os(PROJECT_EXECUTOR_ENV).as_deref()
-                != Some(std::ffi::OsStr::new("hgraph")))
+                == Some(std::ffi::OsStr::new("legacy")))
     {
         bail!(
-            "--project-trace-out requires {PROJECT_EXECUTOR_ENV}=hgraph without mesh execution; use --mesh-trace-out for mesh placement and retry evidence"
+            "--project-trace-out requires the default or strict HGraph executor without mesh execution; use --mesh-trace-out for mesh placement and retry evidence"
         );
     }
 
