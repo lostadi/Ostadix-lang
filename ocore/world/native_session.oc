@@ -1,0 +1,218 @@
+module world::native_session;
+
+use world::sha256::Sha256Scratch;
+use world::sha256::scratch_init;
+use world::sha256::compute;
+
+// Explicit provisioned-peer Ethernet profile, not TLS, encryption, enrollment,
+// a Governor, or transferable CSpace authority. The boot caller supplies an
+// exact finite graph delegation independently of possession of the pair key.
+pub const CONFIG_BYTES: usize = 160;
+pub const PACKET_BYTES: usize = 320;
+pub const SIGNED_BYTES: usize = 288;
+static CONFIG_MAGIC: [u8; 8] = b"OCNBOOT1";
+static PACKET_MAGIC: [u8; 8] = b"OCNDIS01";
+static mut CONFIG: [u8; 160] = [0; 160];
+static mut SHA_STORAGE: [u64; 4] = [0; 4];
+static mut SHA_SCHEDULE: [u64; 64] = [0; 64];
+static mut HMAC_WORK: [u8; 352] = [0; 352];
+static mut HMAC_INNER: [u8; 32] = [0; 32];
+static mut HMAC_EXPECTED: [u8; 32] = [0; 32];
+static mut HASH_WORK: [u8; 64] = [0; 64];
+static mut GRAPH_DIGEST: [u8; 32] = [0; 32];
+static mut LIVE: u8 = 0;
+
+pub unsafe fn copy(target: *mut u8, source: *const u8, length: usize) -> void {
+    let mut index: usize = 0;
+    while index < length {
+        volatile_store(target + index, volatile_load(source + index));
+        index += 1;
+    }
+}
+
+pub unsafe fn clear(target: *mut u8, length: usize) -> void {
+    let mut index: usize = 0;
+    while index < length {
+        volatile_store(target + index, 0);
+        index += 1;
+    }
+}
+
+pub unsafe fn equal(left: *const u8, right: *const u8, length: usize) -> bool {
+    let mut difference: u8 = 0;
+    let mut index: usize = 0;
+    while index < length {
+        difference = difference | (volatile_load(left + index) ^ volatile_load(right + index));
+        index += 1;
+    }
+    return difference == 0;
+}
+
+pub unsafe fn get(source: *const u8) -> u64 {
+    let mut value: u64 = 0;
+    let mut index: usize = 0;
+    while index < 8 {
+        value = (value << 8) | volatile_load(source + index) as u64;
+        index += 1;
+    }
+    return value;
+}
+
+pub unsafe fn put(target: *mut u8, value: u64) -> void {
+    let mut index: usize = 0;
+    while index < 8 {
+        volatile_store(target + index, (value >> ((7 - index) * 8)) as u8);
+        index += 1;
+    }
+}
+
+unsafe fn scratch() -> *mut Sha256Scratch {
+    return (&mut SHA_STORAGE[0]) as *mut Sha256Scratch;
+}
+
+pub unsafe fn digest(source: *const u8, length: usize, target: *mut u8) -> bool {
+    return compute(source, length, target, scratch()) == 1;
+}
+
+unsafe fn hmac(key: *const u8, key_length: usize, source: *const u8,
+    length: usize, target: *mut u8) -> bool {
+    if key_length > 64 || length > SIGNED_BYTES { return false; }
+    let mut index: usize = 0;
+    while index < 64 {
+        let mut byte: u8 = 0;
+        if index < key_length { byte = volatile_load(key + index); }
+        HMAC_WORK[index] = byte ^ 0x36;
+        index += 1;
+    }
+    copy((&mut HMAC_WORK[64]), source, length);
+    if !digest((&HMAC_WORK[0]), 64 + length, (&mut HMAC_INNER[0])) { return false; }
+    index = 0;
+    while index < 64 {
+        let mut byte: u8 = 0;
+        if index < key_length { byte = volatile_load(key + index); }
+        HMAC_WORK[index] = byte ^ 0x5c;
+        index += 1;
+    }
+    copy((&mut HMAC_WORK[64]), (&HMAC_INNER[0]), 32);
+    return digest((&HMAC_WORK[0]), 96, target);
+}
+
+// RFC 4231 test case 1, exercised in the native image before provisioning.
+static TEST_KEY: [u8; 20] = [0x0b; 20];
+static TEST_DATA: [u8; 8] = b"Hi There";
+static TEST_EXPECTED: [u8; 32] = [
+    0xb0, 0x34, 0x4c, 0x61, 0xd8, 0xdb, 0x38, 0x53,
+    0x5c, 0xa8, 0xaf, 0xce, 0xaf, 0x0b, 0xf1, 0x2b,
+    0x88, 0x1d, 0xc2, 0x00, 0xc9, 0x83, 0x3d, 0xa7,
+    0x26, 0xe9, 0x37, 0x6c, 0x2e, 0x32, 0xcf, 0xf7
+];
+
+pub unsafe fn self_test() -> bool {
+    if scratch_init(scratch(), (&mut SHA_SCHEDULE[0]), 64) != 1 { return false; }
+    return hmac((&TEST_KEY[0]), 20, (&TEST_DATA[0]), 8, (&mut HMAC_EXPECTED[0]))
+        && equal((&TEST_EXPECTED[0]), (&HMAC_EXPECTED[0]), 32);
+}
+
+pub unsafe fn provision(source: *const u8, length: usize) -> bool {
+    if LIVE != 0 || source as usize == 0 || length != CONFIG_BYTES
+        || !equal(source, (&CONFIG_MAGIC[0]), 8) { return false; }
+    let local: u64 = get(source + 8);
+    let remote: u64 = get(source + 16);
+    let role: u64 = get(source + 104);
+    let count: u64 = get(source + 112);
+    if local < 1 || local > 254 || remote < 1 || remote > 254 || local == remote
+        || get(source + 24) == 0 || get(source + 32) == 0
+        || (role != 1 && role != 2) || count < 2 || count > 4
+        || get(source + 120) > 0xffff_ffff { return false; }
+    let mut nonce_bits: u8 = 0;
+    let mut key_bits: u8 = 0;
+    let mut index: usize = 0;
+    while index < 32 {
+        nonce_bits = nonce_bits | volatile_load(source + 40 + index);
+        key_bits = key_bits | volatile_load(source + 72 + index);
+        index += 1;
+    }
+    if nonce_bits == 0 || key_bits == 0 { return false; }
+    index = 0;
+    while index < 4 {
+        let operand: u64 = get(source + 128 + index * 8);
+        if operand > 0xffff_ffff || (index >= count as usize && operand != 0) {
+            return false;
+        }
+        index += 1;
+    }
+    copy((&mut CONFIG[0]), source, CONFIG_BYTES);
+    if !digest(source + 112, 48, (&mut GRAPH_DIGEST[0])) { return false; }
+    LIVE = 1;
+    return true;
+}
+
+pub unsafe fn local_node() -> u64 { return get((&CONFIG[8])); }
+pub unsafe fn peer_node() -> u64 { return get((&CONFIG[16])); }
+pub unsafe fn role() -> u64 { return get((&CONFIG[104])); }
+pub unsafe fn tasks() -> u64 { return get((&CONFIG[112])); }
+pub unsafe fn initial() -> u64 { return get((&CONFIG[120])); }
+pub unsafe fn graph_digest(target: *mut u8) -> void {
+    copy(target, (&GRAPH_DIGEST[0]), 32);
+}
+pub unsafe fn operand(task: u64) -> u64 {
+    if task < 1 || task > tasks() { return 0; }
+    return get((&CONFIG[128]) + ((task - 1) as usize) * 8);
+}
+
+pub unsafe fn begin(packet: *mut u8, kind: u64, sequence: u64) -> bool {
+    if LIVE == 0 || packet as usize == 0 || kind < 1 || kind > 5 || sequence == 0 {
+        return false;
+    }
+    clear(packet, PACKET_BYTES);
+    copy(packet, (&PACKET_MAGIC[0]), 8);
+    volatile_store(packet + 9, 1);
+    volatile_store(packet + 11, kind as u8);
+    volatile_store(packet + 14, 1);
+    volatile_store(packet + 15, 64);
+    put(packet + 16, local_node());
+    put(packet + 24, peer_node());
+    put(packet + 32, get((&CONFIG[24])));
+    put(packet + 40, get((&CONFIG[32])));
+    copy(packet + 48, (&CONFIG[40]), 32);
+    put(packet + 80, sequence);
+    copy(packet + 256, (&GRAPH_DIGEST[0]), 32);
+    return true;
+}
+
+pub unsafe fn sign(packet: *mut u8) -> bool {
+    return LIVE != 0 && hmac((&CONFIG[72]), 32, packet as *const u8, SIGNED_BYTES, packet + SIGNED_BYTES);
+}
+
+pub unsafe fn authenticate(packet: *const u8, length: usize) -> bool {
+    if LIVE == 0 || packet as usize == 0 || length != PACKET_BYTES
+        || !equal(packet, (&PACKET_MAGIC[0]), 8)
+        || volatile_load(packet + 8) != 0 || volatile_load(packet + 9) != 1
+        || volatile_load(packet + 10) != 0
+        || volatile_load(packet + 11) < 1 || volatile_load(packet + 11) > 5
+        || volatile_load(packet + 12) != 0 || volatile_load(packet + 13) != 0
+        || volatile_load(packet + 14) != 1 || volatile_load(packet + 15) != 64
+        || get(packet + 16) != peer_node() || get(packet + 24) != local_node()
+        || get(packet + 32) != get((&CONFIG[32]))
+        || get(packet + 40) != get((&CONFIG[24]))
+        || !equal(packet + 48, (&CONFIG[40]), 32) || get(packet + 80) == 0 {
+        return false;
+    }
+    if !equal(packet + 256, (&GRAPH_DIGEST[0]), 32) { return false; }
+    return hmac((&CONFIG[72]), 32, packet, SIGNED_BYTES, (&mut HMAC_EXPECTED[0]))
+        && equal(packet + SIGNED_BYTES, (&HMAC_EXPECTED[0]), 32);
+}
+
+pub unsafe fn input_digest(packet: *const u8, target: *mut u8) -> bool {
+    copy((&mut HASH_WORK[0]), packet + 96, 32);
+    copy((&mut HASH_WORK[32]), packet + 160, 32);
+    return digest((&HASH_WORK[0]), 64, target);
+}
+
+pub unsafe fn retire() -> void {
+    LIVE = 0;
+    clear((&mut CONFIG[0]), CONFIG_BYTES);
+    clear((&mut HMAC_WORK[0]), 352);
+    clear((&mut HMAC_INNER[0]), 32);
+    clear((&mut HMAC_EXPECTED[0]), 32);
+}

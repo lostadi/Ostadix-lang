@@ -1,0 +1,322 @@
+module runtime::aarch64::kernel_world_monitor;
+
+use runtime::aarch64::kernel_world_virtio::init as device_init;
+use runtime::aarch64::kernel_world_virtio::mmio_read as device_read;
+use runtime::aarch64::kernel_world_virtio::mmio_write as device_write;
+use runtime::aarch64::kernel_world_virtio::poll as device_poll;
+use runtime::aarch64::kernel_world_virtio::arm_hold_next_read;
+use runtime::aarch64::kernel_world_virtio::begin_withdraw;
+use runtime::aarch64::kernel_world_virtio::query_completion;
+use runtime::aarch64::kernel_world_virtio::note_guest_consumed;
+use runtime::aarch64::kernel_world_virtio::successes;
+use runtime::aarch64::kernel_world_virtio::ioerrs;
+use runtime::aarch64::kernel_world_virtio::generation;
+use runtime::aarch64::kernel_world_virtio_selftest::run as device_selftest;
+
+extern "ocore" fn kw_serial_putc(byte: u64) -> void;
+extern "ocore" fn kw_counter_read() -> u64;
+extern "ocore" fn kw_counter_frequency() -> u64;
+extern "ocore" fn kw_revoke_guest_ram() -> void;
+extern "ocore" fn kw_halt() -> never;
+
+// Trusted fixed layout of this image's QEMU loader contract. The guest cannot
+// map the EL2 monitor, its state, stage-2 tables, or arbitrary outer RAM.
+const GUEST_BASE: u64 = 0x4000_0000;
+const GUEST_SIZE: u64 = 0x2000_0000;
+const HOST_OFFSET: u64 = 0x0800_0000;
+const MAX_U64: u64 = 0xffff_ffff_ffff_ffff;
+static ONLINE: [u8; 31] = b"KW AArch64 EL2 monitor: online\n";
+static MAPPED: [u8; 33] = b"KW stage2 guest-only RAM: online\n";
+static SELFTEST: [u8; 42] = b"KW native virtio negative selftests: PASS\n";
+static HEALTH: [u8; 24] = b"KW LINUX SERVICE HEALTHY";
+static CONSUMED: [u8; 23] = b"KW LINUX IOERR CONSUMED";
+static ALIVE: [u8; 30] = b"KW LINUX POST-WITHDRAWAL ALIVE";
+static HEALTH_OBSERVED: [u8; 57] = b"KW Linux block pattern and service health observed: PASS\n";
+static WITHDRAW: [u8; 41] = b"KW virtio pending read withdrawal: begun\n";
+static COMPLETED: [u8; 48] = b"KW virtio guest-consumed IOERR completion: PASS\n";
+static REVOKED: [u8; 45] = b"KW guest RAM stage2 mappings withdrawn: PASS\n";
+static FAULT: [u8; 58] = b"KW real Linux revoked-access stage2 fault contained: PASS\n";
+static FAULT_DETAILS: [u8; 29] = b"KW revoked access esr/ipa/pc ";
+static TIMER: [u8; 41] = b"KW post-Linux EL2 counter progress: PASS\n";
+static BAD: [u8; 29] = b"KW terminal unexpected exit: ";
+static INIT_BAD: [u8; 37] = b"KW Linux boot payload header invalid\n";
+
+static mut RAM_LIVE: u64 = 0;
+static mut HEALTH_SEEN: u64 = 0;
+static mut CONSUMED_SEEN: u64 = 0;
+static mut ALIVE_SEEN: u64 = 0;
+static mut WITHDRAWAL: u64 = 0;
+static mut LINE: [u8; 256] = [0; 256];
+static mut LINE_LENGTH: usize = 0;
+static mut LINE_OVERFLOW: u64 = 0;
+static mut UART_REGS: [u32; 64] = [0; 64];
+static mut EXITS: u64 = 0;
+
+unsafe fn emit(bytes: *const u8, length: usize) -> void {
+    let mut i: usize = 0;
+    while i < length {
+        kw_serial_putc(volatile_load(bytes + i) as u64);
+        i += 1;
+    }
+}
+
+unsafe fn hex(value: u64) -> void {
+    let mut shift: u64 = 60;
+    loop {
+        let digit: u64 = (value >> (shift as usize)) & 15;
+        if digit < 10 { kw_serial_putc(48 + digit); }
+        else { kw_serial_putc(87 + digit); }
+        if shift == 0 { break; }
+        shift -= 4;
+    }
+}
+
+unsafe fn terminal(esr: u64, address: u64, pc: u64) -> never {
+    emit((&BAD[0]), 29);
+    hex(esr); kw_serial_putc(32);
+    hex(address); kw_serial_putc(32);
+    hex(pc); kw_serial_putc(10);
+    kw_halt();
+}
+
+@export
+@no_mangle
+pub unsafe fn kw_guest_address(gpa: u64, length: u64) -> usize {
+    if RAM_LIVE != 1 || length == 0 || gpa < GUEST_BASE || length > GUEST_SIZE {
+        return 0;
+    }
+    let offset: u64 = gpa - GUEST_BASE;
+    if offset > GUEST_SIZE - length { return 0; }
+    return (gpa + HOST_OFFSET) as usize;
+}
+
+@export
+@no_mangle
+pub unsafe fn kw_monitor_init() -> u64 {
+    emit((&ONLINE[0]), 31);
+    let image: usize = 0x4800_0000;
+    if volatile_load((image + 56) as *const u32) != 0x644d_5241 {
+        emit((&INIT_BAD[0]), 37);
+        return 0;
+    }
+    let size: u64 = volatile_load((image + 16) as *const u64);
+    let offset: u64 = volatile_load((image + 8) as *const u64);
+    if size == 0 || size > 0x0700_0000 || offset != 0 {
+        emit((&INIT_BAD[0]), 37);
+        return 0;
+    }
+    // The FDT is independently generated and hash-recorded by the build
+    // harness; this is a structural boot check, not an authority certificate.
+    let fdt: usize = 0x4fe0_0000;
+    if volatile_load(fdt as *const u32) != 0xedfe_0dd0 {
+        emit((&INIT_BAD[0]), 37);
+        return 0;
+    }
+    RAM_LIVE = 1;
+    let next_generation: u64 = device_selftest(0x5ff0_0000);
+    if next_generation != 5 { terminal(0x1009, next_generation, 0); }
+    emit((&SELFTEST[0]), 42);
+    if device_init(GUEST_BASE, GUEST_SIZE, next_generation) != 1 { return 0; }
+    UART_REGS[0x30 / 4] = 0x301;
+    emit((&MAPPED[0]), 33);
+    return 1;
+}
+
+unsafe fn line_is(bytes: *const u8, length: usize) -> bool {
+    if LINE_OVERFLOW != 0 || LINE_LENGTH != length { return false; }
+    let mut i: usize = 0;
+    while i < length {
+        if LINE[i] != volatile_load(bytes + i) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+unsafe fn console(byte: u8) -> void {
+    kw_serial_putc(byte as u64);
+    if byte == 13 { return; }
+    if byte != 10 {
+        if LINE_LENGTH < 256 { LINE[LINE_LENGTH] = byte; LINE_LENGTH += 1; }
+        else { LINE_OVERFLOW = 1; }
+        return;
+    }
+    if line_is((&HEALTH[0]), 24) {
+        if HEALTH_SEEN != 0 || successes() == 0
+            || arm_hold_next_read(generation()) != 1 {
+            terminal(0x1001, successes(), EXITS);
+        }
+        HEALTH_SEEN = 1;
+        emit((&HEALTH_OBSERVED[0]), 57);
+    }
+    if line_is((&CONSUMED[0]), 23) {
+        if HEALTH_SEEN != 1 || CONSUMED_SEEN != 0 || WITHDRAWAL == 0
+            || ioerrs() != 1 || note_guest_consumed(generation()) != 1 {
+            terminal(0x1002, ioerrs(), EXITS);
+        }
+        CONSUMED_SEEN = 1;
+    }
+    if line_is((&ALIVE[0]), 30) {
+        if CONSUMED_SEEN != 1 || ALIVE_SEEN != 0 { terminal(0x1008, 0, EXITS); }
+        ALIVE_SEEN = 1;
+    }
+    LINE_LENGTH = 0;
+    LINE_OVERFLOW = 0;
+}
+
+unsafe fn uart_interrupt() -> void {
+    let asserted: bool = (UART_REGS[0x38 / 4] & 0x20) != 0;
+    let mut address: usize = 0x0800_0204;
+    if !asserted { address = 0x0800_0284; }
+    volatile_store(address as *mut u32, 2);
+}
+
+unsafe fn uart_read(offset: u64) -> u64 {
+    if offset == 0x18 { return 0x90; } // TX empty, RX empty.
+    if offset == 0x3c { return 0x20; }
+    if offset == 0x40 { return (UART_REGS[0x38 / 4] & 0x20) as u64; }
+    if offset == 0xfe0 { return 0x11; }
+    if offset == 0xfe4 { return 0x10; }
+    if offset == 0xfe8 { return 0x14; }
+    if offset == 0xfec { return 0; }
+    if offset == 0xff0 { return 0x0d; }
+    if offset == 0xff4 { return 0xf0; }
+    if offset == 0xff8 { return 0x05; }
+    if offset == 0xffc { return 0xb1; }
+    if offset < 0x100 && (offset & 3) == 0 { return UART_REGS[(offset / 4) as usize] as u64; }
+    return 0;
+}
+
+unsafe fn uart_write(offset: u64, value: u64) -> void {
+    if offset == 0 { console((value & 255) as u8); return; }
+    if offset < 0x100 && (offset & 3) == 0 {
+        UART_REGS[(offset / 4) as usize] = value as u32;
+        uart_interrupt();
+        return;
+    }
+    terminal(0x1003, offset, value);
+}
+
+unsafe fn progress() -> void {
+    let status: u64 = device_poll();
+    if status == 2 {
+        if HEALTH_SEEN != 1 || WITHDRAWAL != 0 { terminal(0x1004, status, EXITS); }
+        WITHDRAWAL = begin_withdraw(1);
+        if WITHDRAWAL == 0 { terminal(0x1005, status, EXITS); }
+        emit((&WITHDRAW[0]), 41);
+        if device_poll() != 1 { terminal(0x1006, ioerrs(), EXITS); }
+    }
+    if ALIVE_SEEN == 1 && query_completion(WITHDRAWAL) == 1 && RAM_LIVE == 1 {
+        emit((&COMPLETED[0]), 48);
+        // Guest notification/ring consumption precedes memory revocation.
+        // No host/broker guest-memory accessor may succeed after this point.
+        RAM_LIVE = 0;
+        kw_revoke_guest_ram();
+        emit((&REVOKED[0]), 45);
+    }
+}
+
+unsafe fn psci(frame: *mut u64, esr: u64) -> void {
+    let function: u64 = volatile_load(frame);
+    let mut result: u64 = MAX_U64; // PSCI_NOT_SUPPORTED (-1).
+    if function == 0x8400_0000 { result = 2; }
+    if function == 0x8400_000a {
+        let requested: u64 = volatile_load(frame + 1);
+        if requested == 0x8400_0000 || requested == 0x8400_000a
+            || requested == 0x8400_0004 || requested == 0xc400_0004
+            || requested == 0x8400_0008 {
+            result = 0;
+        }
+    }
+    if function == 0x8400_0004 || function == 0xc400_0004 {
+        if volatile_load(frame + 1) == 0 { result = 0; }
+        else { result = 0xffff_ffff_ffff_fffe; }
+    }
+    if function == 0x8400_0008 {
+        terminal(0x1007, CONSUMED_SEEN, volatile_load(frame + 31));
+    }
+    if (function & 0xff00_0000) != 0x8400_0000
+        && (function & 0xff00_0000) != 0xc400_0000 {
+        terminal(esr, function, volatile_load(frame + 31));
+    }
+    volatile_store(frame, result);
+    // For HVC, ELR_EL2 already names the instruction after the call.
+}
+
+@export
+@no_mangle
+pub unsafe fn kw_handle_exit(frame_address: usize, esr: u64, far: u64, hpfar: u64) -> u64 {
+    let frame: *mut u64 = frame_address as *mut u64;
+    EXITS += 1;
+    let ec: u64 = esr >> 26;
+    let pc: u64 = volatile_load(frame + 31);
+    let ipa: u64 = ((hpfar & 0xffff_fff0) << 8) | (far & 0xfff);
+    if RAM_LIVE == 0 && CONSUMED_SEEN == 1 && ALIVE_SEEN == 1
+        && (ec == 0x20 || ec == 0x24) && (esr & 0x3c) == 4
+        && ipa >= GUEST_BASE && ipa < GUEST_BASE + GUEST_SIZE {
+        if kw_guest_address(GUEST_BASE, 1) != 0 { terminal(0x1011, ipa, pc); }
+        emit((&FAULT_DETAILS[0]), 29);
+        hex(esr); kw_serial_putc(32);
+        hex(ipa); kw_serial_putc(32);
+        hex(pc); kw_serial_putc(10);
+        emit((&FAULT[0]), 58);
+        let start: u64 = kw_counter_read();
+        let period: u64 = kw_counter_frequency() / 100;
+        let mut spins: u64 = 0;
+        while kw_counter_read() - start < period && spins < 1_000_000 {
+            spins += 1;
+        }
+        if period == 0 || kw_counter_read() - start < period { terminal(0x1010, period, spins); }
+        emit((&TIMER[0]), 41);
+        return 1;
+    }
+    if ec == 0x16 {
+        if (esr & 0xffff) != 0 { terminal(esr, far, pc); }
+        psci(frame, esr);
+        progress();
+        return 0;
+    }
+    // Lower-EL AArch64 data abort with a valid single-register access. The
+    // handler consumes only MMIO windows, never repairs unknown guest faults.
+    if ec != 0x24 || (esr & (1 << 24)) == 0 || (esr & (1 << 25)) == 0
+        || (esr & (1 << 10)) != 0 || (esr & (1 << 7)) != 0 {
+        terminal(esr, ipa, pc);
+    }
+    let width: u64 = (1 as u64) << (((esr >> 22) & 3) as usize);
+    let register: usize = ((esr >> 16) & 31) as usize;
+    let writing: bool = (esr & 64) != 0;
+    if width > 4 || (ipa & (width - 1)) != 0 { terminal(esr, ipa, pc); }
+    let mut value: u64 = 0;
+    if register != 31 { value = volatile_load(frame + register); }
+    if ipa >= 0x0900_0000 && ipa + width <= 0x0900_1000 {
+        if writing { uart_write(ipa - 0x0900_0000, value); }
+        else { value = uart_read(ipa - 0x0900_0000); }
+    } else if ipa >= 0x0a00_0000 && ipa + width <= 0x0a00_0200 {
+        let offset: u64 = ipa - 0x0a00_0000;
+        if writing {
+            if width != 4 || device_write(offset, value & 0xffff_ffff) != 1 {
+                terminal(esr, ipa, pc);
+            }
+        } else {
+            if offset < 0x100 && width != 4 { terminal(esr, ipa, pc); }
+            value = device_read(offset & 0xffff_fffc) >> (((offset & 3) * 8) as usize);
+        }
+    } else { terminal(esr, ipa, pc); }
+    if !writing && register != 31 {
+        let mask: u64 = ((1 as u64) << ((width * 8) as usize)) - 1;
+        value = value & mask;
+        if (esr & (1 << 21)) != 0 && (value & ((1 as u64) << ((width * 8 - 1) as usize))) != 0 {
+            value = value | (MAX_U64 ^ mask);
+        }
+        if (esr & (1 << 15)) == 0 { value = value & 0xffff_ffff; }
+        volatile_store(frame + register, value);
+    }
+    volatile_store(frame + 31, pc + 4);
+    progress();
+    return 0;
+}
+
+@export
+@no_mangle
+pub unsafe fn kw_unexpected_exit(esr: u64, far: u64, pc: u64) -> never {
+    terminal(esr, far, pc);
+}

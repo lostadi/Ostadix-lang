@@ -2,6 +2,10 @@
 
 Status: draft v0.1, normative for the `ocorec` implementation.
 
+The separate [native Ethernet and real Linux integration profiles](NATIVE_DISTRIBUTED_LINUX_STATUS.md)
+describe the new executable QEMU paths and their remaining distributed-authority
+and physical-device requirements.
+
 O-core is the native systems-programming member of O-lang. It is deliberately
 separate from the polyglot orchestration language and its OIR. O-core programs
 are statically typed and compile ahead of time to target object files. Foreign

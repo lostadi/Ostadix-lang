@@ -1,0 +1,438 @@
+module runtime::aarch64::kernel_world_virtio;
+
+// One standard modern virtio-mmio block transport, executed by O-core at EL2.
+// The guest uses the ordinary Linux virtio-mmio/virtio-blk drivers. All RAM
+// accesses pass the monitor's current stage-2 ownership/range projection.
+// This single-vCPU profile has no physical DMA, hardware reset or G7 authority.
+extern "ocore" fn kw_guest_address(gpa: u64, length: u64) -> usize;
+extern "ocore" fn kw_memory_barrier() -> void;
+extern "ocore" fn kw_irq_level(asserted: u64) -> void;
+
+const QUEUE_MAX: u64 = 32;
+const FEATURES_LOW: u64 = 102;
+// SIZE_MAX, SEG_MAX, RO and BLK_SIZE. VERSION_1 is high word bit zero.
+const CAPACITY: u64 = 2048;
+const SEGMENT_MAX: u64 = 4096;
+const STATE_EMPTY: u64 = 0;
+const STATE_LIVE: u64 = 1;
+const STATE_WITHDRAWING: u64 = 2;
+const STATE_RETIRED: u64 = 3;
+const STATE_FAILED: u64 = 4;
+
+static mut STATE: u64 = 0;
+static mut GENERATION: u64 = 0;
+static mut RAM_BASE: u64 = 0;
+static mut RAM_SIZE: u64 = 0;
+static mut STATUS: u64 = 0;
+static mut DEVICE_FEATURE_SEL: u64 = 0;
+static mut DRIVER_FEATURE_SEL: u64 = 0;
+static mut DRIVER_LOW: u64 = 0;
+static mut DRIVER_HIGH: u64 = 0;
+static mut QUEUE_SEL: u64 = 0;
+static mut QUEUE_SIZE: u64 = 0;
+static mut QUEUE_READY: u64 = 0;
+static mut DESC: u64 = 0;
+static mut AVAIL: u64 = 0;
+static mut USED: u64 = 0;
+static mut LAST_AVAIL: u64 = 0;
+static mut LAST_USED: u64 = 0;
+static mut INTERRUPT: u64 = 0;
+static mut HOLD_NEXT: u64 = 0;
+static mut PENDING: u64 = 0;
+static mut PENDING_HEAD: u64 = 0;
+static mut PENDING_SECTOR: u64 = 0;
+static mut PENDING_TYPE: u64 = 0;
+static mut CHAIN_COUNT: usize = 0;
+static mut ADDRESSES: [u64; 32] = [0; 32];
+static mut LENGTHS: [u64; 32] = [0; 32];
+static mut FLAGS: [u64; 32] = [0; 32];
+static mut CHAIN_IDS: [u64; 32] = [0; 32];
+static mut COMPLETION: u64 = 0;
+static mut OPERATION: u64 = 0;
+static mut CONSUMED: u64 = 0;
+static mut SUCCESS_COUNT: u64 = 0;
+static mut IOERR_COUNT: u64 = 0;
+static mut DENIED_COUNT: u64 = 0;
+
+unsafe fn address(gpa: u64, length: u64) -> usize {
+    if length == 0 || gpa < RAM_BASE || length > RAM_SIZE {
+        return 0;
+    }
+    let offset: u64 = gpa - RAM_BASE;
+    if offset > RAM_SIZE - length {
+        return 0;
+    }
+    return kw_guest_address(gpa, length);
+}
+
+unsafe fn load16(gpa: u64) -> u64 {
+    return volatile_load(address(gpa, 2) as *const u16) as u64;
+}
+
+unsafe fn load32(gpa: u64) -> u64 {
+    return volatile_load(address(gpa, 4) as *const u32) as u64;
+}
+
+unsafe fn load64(gpa: u64) -> u64 {
+    return volatile_load(address(gpa, 8) as *const u64);
+}
+
+unsafe fn overlaps(a: u64, alen: u64, b: u64, blen: u64) -> bool {
+    // Every input was independently checked within one nonwrapping RAM range.
+    return a < b + blen && b < a + alen;
+}
+
+unsafe fn queue_valid() -> bool {
+    if QUEUE_SIZE == 0 || QUEUE_SIZE > QUEUE_MAX
+        || (QUEUE_SIZE & (QUEUE_SIZE - 1)) != 0
+        || (DESC & 15) != 0 || (AVAIL & 1) != 0 || (USED & 3) != 0 {
+        return false;
+    }
+    let dlen: u64 = QUEUE_SIZE * 16;
+    let alen: u64 = 4 + QUEUE_SIZE * 2;
+    let ulen: u64 = 4 + QUEUE_SIZE * 8;
+    return address(DESC, dlen) != 0 && address(AVAIL, alen) != 0
+        && address(USED, ulen) != 0
+        && !overlaps(DESC, dlen, AVAIL, alen)
+        && !overlaps(DESC, dlen, USED, ulen)
+        && !overlaps(AVAIL, alen, USED, ulen);
+}
+
+unsafe fn fail_queue() -> u64 {
+    STATE = STATE_FAILED;
+    STATUS = STATUS | 64;
+    DENIED_COUNT += 1;
+    INTERRUPT = INTERRUPT | 2;
+    kw_irq_level(1);
+    return 0;
+}
+
+unsafe fn reset_transport() -> void {
+    STATUS = 0;
+    DEVICE_FEATURE_SEL = 0;
+    DRIVER_FEATURE_SEL = 0;
+    DRIVER_LOW = 0;
+    DRIVER_HIGH = 0;
+    QUEUE_SEL = 0;
+    QUEUE_SIZE = 0;
+    QUEUE_READY = 0;
+    DESC = 0;
+    AVAIL = 0;
+    USED = 0;
+    LAST_AVAIL = 0;
+    LAST_USED = 0;
+    INTERRUPT = 0;
+    HOLD_NEXT = 0;
+    PENDING = 0;
+    CHAIN_COUNT = 0;
+    kw_irq_level(0);
+}
+
+pub unsafe fn init(guest_base: u64, guest_size: u64, generation: u64) -> u64 {
+    if generation == 0 || generation > 0xffff_ffff || guest_size == 0
+        || guest_base > 0xffff_ffff_ffff_ffff - guest_size
+        || generation <= GENERATION || STATE == STATE_LIVE
+        || STATE == STATE_WITHDRAWING || PENDING != 0
+        || (STATE == STATE_RETIRED && (CONSUMED != 1 || INTERRUPT != 0))
+        || (STATE == STATE_FAILED && COMPLETION != 0) {
+        return 0;
+    }
+    RAM_BASE = guest_base;
+    RAM_SIZE = guest_size;
+    GENERATION = generation;
+    STATE = STATE_LIVE;
+    COMPLETION = 0;
+    OPERATION = 0;
+    CONSUMED = 0;
+    SUCCESS_COUNT = 0;
+    IOERR_COUNT = 0;
+    DENIED_COUNT = 0;
+    reset_transport();
+    return 1;
+}
+
+pub unsafe fn mmio_read(offset: u64) -> u64 {
+    if offset == 0 { return 0x7472_6976; }
+    if offset == 4 { return 2; }
+    if offset == 8 { return 2; }
+    if offset == 12 { return 0x4f43_4f52; }
+    if offset == 16 {
+        if DEVICE_FEATURE_SEL == 0 { return FEATURES_LOW; }
+        if DEVICE_FEATURE_SEL == 1 { return 1; }
+        return 0;
+    }
+    if offset == 52 {
+        if QUEUE_SEL == 0 { return QUEUE_MAX; }
+        return 0;
+    }
+    if offset == 68 {
+        if QUEUE_SEL == 0 { return QUEUE_READY; }
+        return 0;
+    }
+    if offset == 96 { return INTERRUPT; }
+    if offset == 112 { return STATUS; }
+    if offset == 252 { return GENERATION & 0xff; }
+    if offset == 256 { return CAPACITY; }
+    if offset == 260 { return 0; }
+    if offset == 264 { return SEGMENT_MAX; }
+    if offset == 268 { return QUEUE_MAX - 2; }
+    if offset == 276 { return 512; }
+    return 0;
+}
+
+pub unsafe fn mmio_write(offset: u64, value: u64) -> u64 {
+    if value > 0xffff_ffff || (offset & 3) != 0 {
+        if STATE == STATE_LIVE { return fail_queue(); }
+        return 0;
+    }
+    if offset == 100 {
+        INTERRUPT = INTERRUPT & ~(value & 3);
+        kw_irq_level((INTERRUPT != 0) as u64);
+        return 1;
+    }
+    if offset == 112 && value == 0 {
+        // A reset is not a way to resurrect a withdrawn generation or discard
+        // retained terminal evidence while the guest has not consumed it.
+        if STATE != STATE_LIVE { return 0; }
+        if PENDING != 0 { return fail_queue(); }
+        reset_transport();
+        return 1;
+    }
+    if STATE != STATE_LIVE { return 0; }
+    if offset == 20 { DEVICE_FEATURE_SEL = value; return 1; }
+    if offset == 36 {
+        if (STATUS & 8) != 0 { return fail_queue(); }
+        DRIVER_FEATURE_SEL = value;
+        return 1;
+    }
+    if offset == 32 {
+        if (STATUS & 8) != 0 { return fail_queue(); }
+        if DRIVER_FEATURE_SEL == 0 { DRIVER_LOW = value; return 1; }
+        if DRIVER_FEATURE_SEL == 1 { DRIVER_HIGH = value; return 1; }
+        if value != 0 { return fail_queue(); }
+        return 1;
+    }
+    if offset == 48 { QUEUE_SEL = value; return 1; }
+    if offset == 112 {
+        if (value & STATUS) != STATUS { return fail_queue(); }
+        if (value & 8) != 0
+            && ((DRIVER_LOW & ~FEATURES_LOW) != 0 || DRIVER_HIGH != 1) {
+            STATUS = value & ~8;
+            return 1;
+        }
+        if (value & 4) != 0 && ((value & 11) != 11 || QUEUE_READY != 1) {
+            return fail_queue();
+        }
+        STATUS = value;
+        return 1;
+    }
+    if QUEUE_SEL != 0 { return 0; }
+    if offset == 68 {
+        if value == 0 && PENDING == 0 { QUEUE_READY = 0; return 1; }
+        if value == 1 && (STATUS & 8) != 0 && queue_valid() {
+            QUEUE_READY = 1;
+            return 1;
+        }
+        return fail_queue();
+    }
+    if offset == 80 {
+        if value != 0 || QUEUE_READY != 1 || (STATUS & 4) == 0 {
+            return fail_queue();
+        }
+        return 1;
+    }
+    if QUEUE_READY != 0 { return fail_queue(); }
+    if offset == 56 { QUEUE_SIZE = value; return 1; }
+    if offset == 128 { DESC = (DESC & 0xffff_ffff_0000_0000) | value; return 1; }
+    if offset == 132 { DESC = (DESC & 0xffff_ffff) | (value << 32); return 1; }
+    if offset == 144 { AVAIL = (AVAIL & 0xffff_ffff_0000_0000) | value; return 1; }
+    if offset == 148 { AVAIL = (AVAIL & 0xffff_ffff) | (value << 32); return 1; }
+    if offset == 160 { USED = (USED & 0xffff_ffff_0000_0000) | value; return 1; }
+    if offset == 164 { USED = (USED & 0xffff_ffff) | (value << 32); return 1; }
+    return 0;
+}
+
+unsafe fn capture_chain(head: u64) -> bool {
+    CHAIN_COUNT = 0;
+    let mut id: u64 = head;
+    let mut walking: bool = true;
+    while walking {
+        if id >= QUEUE_SIZE || CHAIN_COUNT >= 32 { return false; }
+        let mut previous: usize = 0;
+        while previous < CHAIN_COUNT {
+            if CHAIN_IDS[previous] == id { return false; }
+            previous += 1;
+        }
+        let entry: u64 = DESC + id * 16;
+        let start: u64 = load64(entry);
+        let length: u64 = load32(entry + 8);
+        let flags: u64 = load16(entry + 12);
+        if (flags & ~3) != 0 || address(start, length) == 0
+            || overlaps(start, length, DESC, QUEUE_SIZE * 16)
+            || overlaps(start, length, AVAIL, 4 + QUEUE_SIZE * 2)
+            || overlaps(start, length, USED, 4 + QUEUE_SIZE * 8) {
+            return false;
+        }
+        previous = 0;
+        while previous < CHAIN_COUNT {
+            if overlaps(start, length, ADDRESSES[previous], LENGTHS[previous]) {
+                return false;
+            }
+            previous += 1;
+        }
+        CHAIN_IDS[CHAIN_COUNT] = id;
+        ADDRESSES[CHAIN_COUNT] = start;
+        LENGTHS[CHAIN_COUNT] = length;
+        FLAGS[CHAIN_COUNT] = flags;
+        CHAIN_COUNT += 1;
+        walking = (flags & 1) != 0;
+        id = load16(entry + 14);
+    }
+    if CHAIN_COUNT < 2 || LENGTHS[0] != 16 || (FLAGS[0] & 2) != 0
+        || LENGTHS[CHAIN_COUNT - 1] != 1 || FLAGS[CHAIN_COUNT - 1] != 2 {
+        return false;
+    }
+    PENDING_TYPE = load32(ADDRESSES[0]);
+    PENDING_SECTOR = load64(ADDRESSES[0] + 8);
+    let mut index: usize = 1;
+    let mut total: u64 = 0;
+    while index + 1 < CHAIN_COUNT {
+        if LENGTHS[index] > SEGMENT_MAX { return false; }
+        if PENDING_TYPE == 0 && (FLAGS[index] & 2) == 0 { return false; }
+        if PENDING_TYPE == 1 && (FLAGS[index] & 2) != 0 { return false; }
+        total += LENGTHS[index];
+        index += 1;
+    }
+    if PENDING_TYPE == 0 || PENDING_TYPE == 1 {
+        if total == 0 || (total & 511) != 0 || PENDING_SECTOR >= CAPACITY
+            || total / 512 > CAPACITY - PENDING_SECTOR {
+            return false;
+        }
+    }
+    PENDING_HEAD = head;
+    return true;
+}
+
+unsafe fn publish(status: u64) -> u64 {
+    if !queue_valid() || CHAIN_COUNT < 2 { return fail_queue(); }
+    let status_address: usize = address(ADDRESSES[CHAIN_COUNT - 1], 1);
+    if status_address == 0 { return fail_queue(); }
+    let mut length: u64 = 1;
+    if status == 0 {
+        let mut index: usize = 1;
+        let mut disk_offset: u64 = PENDING_SECTOR * 512;
+        while index + 1 < CHAIN_COUNT {
+            let destination: usize = address(ADDRESSES[index], LENGTHS[index]);
+            if destination == 0 { return fail_queue(); }
+            let mut byte: u64 = 0;
+            while byte < LENGTHS[index] {
+                // Deterministic immutable block contents; no persistence claim.
+                volatile_store((destination + byte as usize) as *mut u8,
+                    ((disk_offset + byte) ^ 0x5a) as u8);
+                byte += 1;
+            }
+            disk_offset += LENGTHS[index];
+            length += LENGTHS[index];
+            index += 1;
+        }
+    }
+    volatile_store(status_address as *mut u8, status as u8);
+    let used_entry: u64 = USED + 4 + (LAST_USED % QUEUE_SIZE) * 8;
+    volatile_store(address(used_entry, 4) as *mut u32, PENDING_HEAD as u32);
+    volatile_store(address(used_entry + 4, 4) as *mut u32, length as u32);
+    kw_memory_barrier();
+    LAST_USED = (LAST_USED + 1) & 0xffff;
+    volatile_store(address(USED + 2, 2) as *mut u16, LAST_USED as u16);
+    kw_memory_barrier();
+    INTERRUPT = INTERRUPT | 1;
+    kw_irq_level(1);
+    PENDING = 0;
+    if status == 0 { SUCCESS_COUNT += 1; }
+    if status == 1 { IOERR_COUNT += 1; }
+    return 1;
+}
+
+// Return 2 only after a valid uncommitted read has actually been captured.
+// The supervisor decides whether and when that pending work is withdrawn.
+pub unsafe fn poll() -> u64 {
+    if STATE == STATE_EMPTY || STATE == STATE_RETIRED || STATE == STATE_FAILED {
+        return 0;
+    }
+    if STATE == STATE_WITHDRAWING {
+        if PENDING != 0 {
+            if publish(1) == 0 { return 0; }
+        }
+        STATE = STATE_RETIRED;
+        return 1;
+    }
+    if PENDING != 0 { return 2; }
+    if QUEUE_READY != 1 || (STATUS & 4) == 0 || (STATUS & 192) != 0 { return 0; }
+    if !queue_valid() { return fail_queue(); }
+    kw_memory_barrier();
+    let available: u64 = load16(AVAIL + 2);
+    let distance: u64 = (available + 65536 - LAST_AVAIL) & 0xffff;
+    if distance > QUEUE_SIZE { return fail_queue(); }
+    if distance == 0 { return 0; }
+    let head: u64 = load16(AVAIL + 4 + (LAST_AVAIL % QUEUE_SIZE) * 2);
+    if !capture_chain(head) { return fail_queue(); }
+    LAST_AVAIL = (LAST_AVAIL + 1) & 0xffff;
+    PENDING = 1;
+    if HOLD_NEXT != 0 && PENDING_TYPE == 0 {
+        HOLD_NEXT = 0;
+        return 2;
+    }
+    if PENDING_TYPE == 0 { return publish(0); }
+    if PENDING_TYPE == 1 { return publish(1); }
+    return publish(2);
+}
+
+pub unsafe fn arm_hold_next_read(generation: u64) -> u64 {
+    if generation != GENERATION || STATE != STATE_LIVE || PENDING != 0
+        || HOLD_NEXT != 0 || SUCCESS_COUNT == 0 {
+        return 0;
+    }
+    HOLD_NEXT = 1;
+    return 1;
+}
+
+pub unsafe fn begin_withdraw(operation_id: u64) -> u64 {
+    if operation_id == 0 || operation_id > 0xffff_ffff { return 0; }
+    if COMPLETION != 0 {
+        if operation_id == OPERATION { return COMPLETION; }
+        return 0;
+    }
+    if STATE != STATE_LIVE || PENDING == 0 || PENDING_TYPE != 0 { return 0; }
+    OPERATION = operation_id;
+    COMPLETION = (GENERATION << 32) | operation_id;
+    STATE = STATE_WITHDRAWING;
+    HOLD_NEXT = 0;
+    return COMPLETION;
+}
+
+// This is a broker completion, not a physical-DMA or O-Machine HostResourceAck.
+// The supervisor must observe a genuine guest protocol result before calling
+// note_guest_consumed; guest serial text alone is not production authority.
+pub unsafe fn query_completion(handle: u64) -> u64 {
+    if handle == 0 || handle != COMPLETION { return 2; }
+    if STATE == STATE_FAILED { return 2; }
+    if STATE == STATE_RETIRED && PENDING == 0 && CONSUMED == 1 && INTERRUPT == 0 {
+        return 1;
+    }
+    return 0;
+}
+
+pub unsafe fn note_guest_consumed(generation: u64) -> u64 {
+    if generation != GENERATION || STATE != STATE_RETIRED || PENDING != 0
+        || IOERR_COUNT == 0 || CONSUMED != 0 {
+        return 0;
+    }
+    CONSUMED = 1;
+    return 1;
+}
+
+pub unsafe fn interrupt_pending() -> u64 { return INTERRUPT; }
+pub unsafe fn pending() -> u64 { return PENDING; }
+pub unsafe fn generation() -> u64 { return GENERATION; }
+pub unsafe fn successes() -> u64 { return SUCCESS_COUNT; }
+pub unsafe fn ioerrs() -> u64 { return IOERR_COUNT; }
+pub unsafe fn denials() -> u64 { return DENIED_COUNT; }

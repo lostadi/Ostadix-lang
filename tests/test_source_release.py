@@ -1367,6 +1367,8 @@ class SourceReleaseTests(unittest.TestCase):
             contents.setdefault(path, b"fixture runtime asset\n")
         for path in release.HOSTED_TLS_TEST_IDENTITY_PATHS:
             contents.setdefault(path, b"fixture hosted TLS test identity\n")
+        for path in release.NATIVE_DISTRIBUTED_LINUX_RELEASE_PATHS:
+            contents.setdefault(path, b"fixture native source closure\n")
         if files:
             contents.update(files)
         for index in range(FIXTURE_EVIDENCE_GATE_COUNT):
@@ -2046,6 +2048,7 @@ class SourceReleaseTests(unittest.TestCase):
             included.update(release.REAL_WORLD_BENCHMARK_RELEASE_PATHS)
             included.update(release.OSTADIX_API_RELEASE_PATHS)
             included.update(release.OSTADIX_API_ROOT_MODULE_PATHS.values())
+            included.update(release.NATIVE_DISTRIBUTED_LINUX_RELEASE_PATHS)
             excluded = {
                 ".DS_Store",
                 ".ocore-repair-backups/run/typeck.rs",
@@ -2632,6 +2635,42 @@ class SourceReleaseTests(unittest.TestCase):
         self.assertIn("missing required path(s)", message)
         for required_path in required:
             self.assertIn(required_path, message)
+
+    def test_native_distributed_linux_is_a_required_release_closure(self) -> None:
+        required = (
+            "docs/NATIVE_DISTRIBUTED_LINUX_STATUS.md",
+            "ocore/guest/linux/README.md",
+            "ocore/guest/linux/build-initramfs.sh",
+            "ocore/guest/linux/init.c",
+            "ocore/kernel/aarch64/kernel_world/guest.dts",
+            "ocore/kernel/aarch64/kernel_world/linker.ld",
+            "ocore/kernel/aarch64/kernel_world/monitor.S",
+            "ocore/kernel/build-aarch64-kernel-world-linux.sh",
+            "ocore/kernel/smoke-aarch64-kernel-world-linux-qemu.py",
+            "ocore/kernel/native-cluster/boot.S",
+            "ocore/kernel/native-cluster/build.sh",
+            "ocore/kernel/native-cluster/linker.ld",
+            "ocore/kernel/native-cluster/main.oc",
+            "ocore/kernel/native-cluster/README.md",
+            "ocore/kernel/native-cluster/verify.py",
+            "ocore/runtime/aarch64/kernel_world_monitor.oc",
+            "ocore/runtime/aarch64/kernel_world_virtio.oc",
+            "ocore/runtime/aarch64/kernel_world_virtio_selftest.oc",
+            "ocore/runtime/x86_64/rtl8139.oc",
+            "ocore/world/native_distributed.oc",
+            "ocore/world/native_session.oc",
+            "scripts/build-real-linux-payload.sh",
+            "tests/test_native_cluster_harness.py",
+            "tests/test_kernel_world_real_linux.py",
+        )
+        self._commit()
+        archive = self._build("native-systems-closure.zip")
+        with zipfile.ZipFile(archive.output) as members:
+            for path in required:
+                self.assertIn(f"{archive.prefix}/{path}", members.namelist())
+        self._git("rm", *required)
+        self._git("commit", "-q", "-m", "remove native distributed Linux closure")
+        self._assert_missing_required_paths("missing-native-systems.zip", required)
 
     def test_hosted_placement_v6_commands_and_contract_are_required(self) -> None:
         required = (

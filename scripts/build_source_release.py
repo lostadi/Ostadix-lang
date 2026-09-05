@@ -369,6 +369,38 @@ EXCLUDED_SUFFIXES = (
     ".wasm",
 )
 
+# Native executors and the real-Linux guest remain independently reproducible
+# from a source release. Generated kernels, initramfs archives and transcripts
+# are deliberately not substituted for these reviewed source/build surfaces.
+NATIVE_DISTRIBUTED_LINUX_RELEASE_PATHS = frozenset(
+    {
+        "docs/NATIVE_DISTRIBUTED_LINUX_STATUS.md",
+        "ocore/guest/linux/README.md",
+        "ocore/guest/linux/build-initramfs.sh",
+        "ocore/guest/linux/init.c",
+        "ocore/kernel/aarch64/kernel_world/guest.dts",
+        "ocore/kernel/aarch64/kernel_world/linker.ld",
+        "ocore/kernel/aarch64/kernel_world/monitor.S",
+        "ocore/kernel/build-aarch64-kernel-world-linux.sh",
+        "ocore/kernel/smoke-aarch64-kernel-world-linux-qemu.py",
+        "ocore/kernel/native-cluster/boot.S",
+        "ocore/kernel/native-cluster/build.sh",
+        "ocore/kernel/native-cluster/linker.ld",
+        "ocore/kernel/native-cluster/main.oc",
+        "ocore/kernel/native-cluster/README.md",
+        "ocore/kernel/native-cluster/verify.py",
+        "ocore/runtime/aarch64/kernel_world_monitor.oc",
+        "ocore/runtime/aarch64/kernel_world_virtio.oc",
+        "ocore/runtime/aarch64/kernel_world_virtio_selftest.oc",
+        "ocore/runtime/x86_64/rtl8139.oc",
+        "ocore/world/native_distributed.oc",
+        "ocore/world/native_session.oc",
+        "scripts/build-real-linux-payload.sh",
+        "tests/test_native_cluster_harness.py",
+        "tests/test_kernel_world_real_linux.py",
+    }
+)
+
 REQUIRED_RELEASE_PATHS = frozenset(
     {
         ".github/workflows/ci.yml",
@@ -816,6 +848,7 @@ REQUIRED_RELEASE_PATHS = frozenset(
     | REAL_WORLD_BENCHMARK_RELEASE_PATHS
     | OSTADIX_API_RELEASE_PATHS
     | frozenset(OSTADIX_API_ROOT_MODULE_PATHS.values())
+    | NATIVE_DISTRIBUTED_LINUX_RELEASE_PATHS
 )
 VALID_GIT_MODES = frozenset({"100644", "100755"})
 REQUIRED_EXECUTABLE_RELEASE_PATHS = frozenset(
