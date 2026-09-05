@@ -779,10 +779,12 @@ class SourceReleaseTests(unittest.TestCase):
             "SECURITY.md": "# Security\n",
             "boot-and-test.sh": "#!/bin/sh\nexit 0\n",
             "apps/olang-browser-wasi/browser-main.mjs": "// fixture browser entry\n",
+            "apps/olang-browser-wasi/browser-process.mjs": "// fixture browser process\n",
             "apps/olang-browser-wasi/index.html": "<!doctype html><title>fixture</title>\n",
             "apps/olang-browser-wasi/runner.mjs": "// fixture browser runner\n",
             "apps/olang-browser-wasi/test-bundle.mjs": "// fixture bundle test\n",
             "apps/olang-browser-wasi/test-browser.mjs": "// fixture browser test\n",
+            "apps/olang-browser-wasi/test-browser-harness.mjs": "// fixture browser harness test\n",
             "apps/olang-browser-wasi/test-direct-wasm.mjs": (
                 "// fixture direct wasm test\n"
             ),
@@ -1064,6 +1066,12 @@ class SourceReleaseTests(unittest.TestCase):
             "ocore/world/protocol.oc": "module world::protocol;\n",
             "ocore/world/receipt.oc": "module world::receipt;\n",
             "ocore/world/receipt_codec.oc": "module world::receipt_codec;\n",
+            "ocore/world/native_scalar.oc": "module world::native_scalar;\n",
+            "ocore/kernel/world_native_scalar_semantics.oc": "module kernel::world_native_scalar_semantics;\n",
+            "ocore/kernel/world_native_scalar_semantics_stub.oc": "module kernel::world_native_scalar_semantics;\n",
+            "ocore/kernel/smoke-world-native-scalar-qemu.sh": "#!/bin/sh\nexit 0\n",
+            "ocore/kernel/verify-native-scalar.py": "# fixture native verifier\n",
+            "tests/world_native_scalar.rs": "// fixture native scalar corpus\n",
             "ocore/world/sha256.oc": "module world::sha256;\n",
             "ocore/world/value.oc": "module world::value;\n",
             "ocore/world/value_codec.oc": "module world::value_codec;\n",
@@ -1584,10 +1592,12 @@ class SourceReleaseTests(unittest.TestCase):
                 ".gitignore",
                 ".mcp.json",
                 "apps/olang-browser-wasi/browser-main.mjs",
+                "apps/olang-browser-wasi/browser-process.mjs",
                 "apps/olang-browser-wasi/index.html",
                 "apps/olang-browser-wasi/runner.mjs",
                 "apps/olang-browser-wasi/test-bundle.mjs",
                 "apps/olang-browser-wasi/test-browser.mjs",
+                "apps/olang-browser-wasi/test-browser-harness.mjs",
                 "apps/olang-browser-wasi/test-direct-wasm.mjs",
                 "apps/olang-browser-wasi/test-host.mjs",
                 "apps/olang-browser-wasi/wasi-preview1-host.mjs",
@@ -1757,6 +1767,12 @@ class SourceReleaseTests(unittest.TestCase):
                 "ocore/world/protocol.oc",
                 "ocore/world/receipt.oc",
                 "ocore/world/receipt_codec.oc",
+                "ocore/world/native_scalar.oc",
+                "ocore/kernel/world_native_scalar_semantics.oc",
+                "ocore/kernel/world_native_scalar_semantics_stub.oc",
+                "ocore/kernel/smoke-world-native-scalar-qemu.sh",
+                "ocore/kernel/verify-native-scalar.py",
+                "tests/world_native_scalar.rs",
                 "ocore/world/sha256.oc",
                 "ocore/world/value.oc",
                 "ocore/world/value_codec.oc",
@@ -3348,6 +3364,20 @@ class SourceReleaseTests(unittest.TestCase):
                 "tests/project_world_runtime.rs",
             ),
         )
+
+    def test_native_scalar_execution_receipt_surface_is_required(self) -> None:
+        paths = (
+            "ocore/world/native_scalar.oc",
+            "ocore/kernel/world_native_scalar_semantics.oc",
+            "ocore/kernel/world_native_scalar_semantics_stub.oc",
+            "ocore/kernel/smoke-world-native-scalar-qemu.sh",
+            "ocore/kernel/verify-native-scalar.py",
+            "tests/world_native_scalar.rs",
+        )
+        self._commit()
+        self._git("rm", *paths)
+        self._git("commit", "-q", "-m", "remove native scalar receipt surface")
+        self._assert_missing_required_paths("missing-native-scalar.zip", paths)
 
     def test_world_normative_bytes_are_sealed_before_packaging(self) -> None:
         for path, data in WORLD_NORMATIVE_BYTES.items():

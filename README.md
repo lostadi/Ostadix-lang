@@ -183,6 +183,13 @@ was admitted and placed. Hosted V2 journals and World receipt formats bind
 longer-lived execution facts. The native gate manifest binds positive claims
 to exact transcript markers.
 
+`O --crossing-evidence` also records direct admitted backend operations: the
+prepared binding hashes, bounded directional input-profile assessments,
+and returned OValue hashes, with publication and discarded completion reported
+separately. These opt-in diagnostics bind the admission and adapter launch
+generation; they do not infer native egress fidelity from an already lifted
+result. See [bounded semantic custody](docs/SEMANTIC_CUSTODY.md).
+
 The evidence layer turns an implementation claim into a reproducible route
 from source bytes to observed execution.
 
@@ -550,12 +557,13 @@ complete candidate's cost-profile binding. They do not select or execute.
 the selected project route and its project HGraph/deployment identities,
 executes through the existing project path, and requires a durable run record.
 
-`observe` reads a content-verified terminal record without executing, checks its
-exact bundle, route, and recorded project-plan identities against current-binary
-recomputation, and emits a `RuntimeGraphV2`. `RunRecordV1` did not persist the
-operation planning-request ID, operation `DeploymentPlanV2` ID, or selected
-candidate tuple, so the reported operation plan is current reconstruction, not
-a historical receipt for those coordinates. `replan` applies caller-supplied
+`run` freezes the original operation decision before dispatch and retains the
+original planning request, operation `DeploymentPlanV2`, and selected candidate
+in its content-addressed terminal record. `observe` verifies these retained
+records against the frozen decision and unchanged bundle, checks the recorded
+project-route identities, and emits a `RuntimeGraphV2` without reranking the
+historical selection. Older records without the optional operation fields use
+explicitly labeled current-planner reconstruction. `replan` applies caller-supplied
 exclusions and emits a recomputed, non-executing `DeploymentPlanV2`. It emits a
 descriptive `RecoveryPlanV1` only when the exact source observation failed and
 selection changed; a successful source run is not a recovery event. Recovery
@@ -565,9 +573,12 @@ offer, so the exclusion is a no-op and emits no recovery plan.
 
 Static rankability is not live target eligibility. State and actor requirements,
 objective ruleset content, cost and validation evidence, and physical residency
-feasibility remain unresolved. A manifest route binding does not prove
-behavioral equivalence, that the route loaded the separately bound implementation,
-or that it ran on the target described by the tuple. The example's two ambient
+feasibility remain unresolved. Local execution observations distinguish a
+captured artifact submitted as a direct entrypoint from an indirect route whose
+artifact use is not established. They compare the local process platform with
+declared target facts, without claiming authenticated physical target identity.
+A manifest route binding still does not prove behavioral equivalence or that an
+interpreter loaded the submitted artifact. The example's two ambient
 Python targets are descriptive static alternatives, not distinct observed
 machines or failure domains. None of these records or inspection/planning
 commands grants admission, capability, reservation, lease, dispatch, retry,
@@ -2520,8 +2531,7 @@ source-format-insensitive identity.
 World PR8-2 adds canonical `PlacementSnapshotV1` and `DeploymentPlanV1`
 records. For policies implemented by the current hosted coordinator, the
 ordinary hosted plan binds workspace/route work to `ambient_host` and
-in-process work to `hosted_coordinator`; unsupported hosted policies remain
-explicit `unresolved`. The hosted plan preserves residual `HostWorld` and
+in-process work to `hosted_coordinator`; all ten current policies are supported. The hosted plan preserves residual `HostWorld` and
 contains no World, task, node, domain, process, or provider identity.
 Optionally, a caller may supply an exact World-epoch placement snapshot plus
 one exact `TaskIdentity` per logical operation. The deterministic
@@ -2540,7 +2550,7 @@ runtime placement. `require_current_world` checks only the supplied World
 identity and epoch, not nested generation freshness. Structural/canonical
 decode is not a trusted source comparison; callers must use the trusted hosted
 or snapshot validator. `olangc --target ir` prints both canonical digests.
-The ordinary opt-in executor binds the canonical hosted-unbound plan into trace
+The ordinary configured executor binds the canonical hosted-unbound plan into trace
 v5. A separate explicit hosted-reference World entry point consumes the exact
 snapshot-derived plan. `HostedWorldLaunchV1` plus a caller-supplied current view
 re-derive and fence the logical/deployment/snapshot bindings, exact
@@ -2569,8 +2579,8 @@ comparison documented above, not native project execution, native Ed25519
 verification, physical-hardware evidence, G1, or Workstream A acceptance. G1
 remains defined and unpassed.
 
-ProjectExec-A adds a separate, opt-in hosted executor for one resolved
-`Explicit` or `Default` alternative. ProjectExec-B extends it to serial ordered
+The strict ProjectExec-A contract covers a hosted executor for one resolved
+`Explicit` or `Default` alternative. ProjectExec-B extends that strict contract to ordered
 `Fallback` and `AnySuccess` alternatives:
 
 ```bash
@@ -2596,16 +2606,16 @@ branch-terminal result from it. A settled nonzero route still publishes its
 result and conservative
 `HostWorld` successor, but not its success-completion token; infrastructure
 abort publishes no route result and stops the policy. Guard skips continue to
-the next alternative when no route child executed. The unsigned trace v5 binds
+the next alternative when no route child executed. The unsigned trace v7 binds
 the canonical `LogicalHGraphV1` schema/digest and distinguishes
 `SettledSuccess`, `SettledFailure`, `Skipped`, and `Aborted` and binds each run
 to stable source/graph digests plus a fresh execution-attempt identifier. It
 also records the assessed route prefix, proposed next route,
 `no_execution`/`declared_idempotent`/`unproven_effects` evidence, and the
-allow/deny decision. On this ordinary opt-in path, trace v5 additionally binds
+allow/deny decision. On this explicit strict path, trace v7 additionally binds
 the canonical hosted-unbound `DeploymentPlanV1` schema/digest before execution;
 plan-aware replay recomputes it and rejects substitution of that exact artifact.
-The ordinary opt-in trace binds the canonical hosted-unbound plan and a fresh
+The explicit strict trace binds the canonical hosted-unbound plan and a fresh
 diagnostic execution-attempt identifier. The snapshot-derived World launch
 path supplies World identity and explicit `TaskIdentity` values. A denied
 decision is persisted before the command reports
@@ -2615,19 +2625,34 @@ the evidence and exact next branch, requires complete causally ordered
 lifecycle coverage for every transitive route prerequisite, and rejects missing
 decisions or execution after denial. Every complete coordinator trace passes
 that semantic replay.
-The compatibility runtime remains the default when `O_PROJECT_EXECUTOR` is
-unset.
+Unset `O_PROJECT_EXECUTOR` now uses the Project HGraph with a canonical
+`LegacyCompatibility` continuation contract. An executed failure can continue
+under explicit `legacy_unchecked` evidence, preserving existing route behavior
+without claiming idempotence. `O_PROJECT_EXECUTOR=hgraph` retains the strict
+contract described above; `O_PROJECT_EXECUTOR=legacy` explicitly selects the
+previous runtime. The contract is bound through the logical/deployment digests
+and checked against the trusted caller before materialization.
 
-Materialization and route commands remain fallible `HostWorld` operations even
-when a manifest says `pure=true`. Race, aggregate, equivalence, and benchmark
-policies fail closed. This bounded hosted gate does not establish parallel
-race/cancellation, retry, authenticated or actual remote placement, Governor
-authority or commit, capability/lease enforcement, reservation, recovery,
-exactly-once effects, native project execution, native Ed25519 verification,
-physical hardware, G1, Workstream A acceptance, or G0--G13 passage.
-`declared_idempotent` is a bundle-bound author declaration, not verified
-idempotency, sandboxing, effect journaling, fencing, compensation, or an
-exactly-once guarantee.
+The coordinator implements all ten route policies. Explicit race, equivalence,
+and benchmark policies dispatch graph-ready alternatives concurrently. Their
+`ConcurrentProjectBranch` marker records permission for unordered ambient
+effects; isolated workspace paths carry branch identity, while explicit shared
+host resources still order access. The logical source explicitly binds
+`concurrent_branches_v1` scheduling. Archived records without that field retain
+`serial_host_world_v1`, their original graph bytes, and their original digest.
+Both modes reconstruct against the trusted bundle. Unknown effects remain
+unknown and still require ambient host admission. Races
+request cooperative cancellation on the first qualifying settlement, drain
+started workers, and record the cause of cancellation before final selection.
+Trace v7 retains candidate outcomes, measurements, the selected route, and the
+existing validated-selection receipt when that policy is used; semantic replay
+checks the decision and lifecycle prerequisites.
+
+This hosted path does not establish retry, remote placement, Governor commit,
+capability enforcement, exactly-once effects, native project execution,
+physical hardware, G1, or G0--G13 passage. `declared_idempotent` is a bundle-bound
+author declaration. Explicit ambient concurrency is not host isolation or
+strict effect equivalence.
 
 ### Docker
 
@@ -4769,14 +4794,15 @@ Project inputs take a direct, typed
 synthesizing OIR. The project-specific validator reconstructs the exact plan
 from the bundle and selected policy before checking its operation, dependency,
 effect, and HGraph projection. Unlike ordinary OIR execution, this project
-HGraph has its own opt-in coordinator: `O_PROJECT_EXECUTOR=hgraph` executes one
-resolved `Explicit`/`Default` branch or serial ordered `Fallback`/`AnySuccess`
-alternatives through graph-governed materialization, typed prerequisite
-readiness, route settlement, and selection. Ordered first-success selectors
-retain attempted results and stop before later branches start. The compatibility
-hosted project runtime remains the default; parallel races and aggregate,
-equivalence, and benchmark policies are not yet implemented by the Project
-HGraph coordinator.
+HGraph has its own coordinator, which now executes every route policy.
+Default project execution uses a bound compatibility continuation contract;
+`O_PROJECT_EXECUTOR=hgraph` selects strict continuation and `legacy` selects the
+previous runtime. The graph controls materialization, prerequisite and resource
+readiness, concurrent alternative execution, comparison, cancellation, and
+selection. Ordered first-success policies preserve attempted-result prefixes.
+Parallel policies explicitly allow unordered ambient effects while retaining
+isolated branch workspaces and declared shared-resource ordering. Completed
+traces undergo policy-aware semantic replay before results are returned.
 
 OIR is not SSA and does not model native pointer mutation. Those semantics
 belong to O-core MIR.

@@ -67,7 +67,7 @@ fn read_cli_trace(path: &Path) -> serde_json::Value {
 fn assert_unsigned_diagnostic_trace(trace: &serde_json::Value) {
     let root = trace.as_object().expect("trace root must be a JSON object");
     assert_eq!(root.len(), 3, "unexpected trace root fields: {root:?}");
-    assert_eq!(trace["format_version"], 6);
+    assert_eq!(trace["format_version"], 7);
     assert!(trace["header"].is_object());
     let events = trace["events"]
         .as_array()
@@ -2422,7 +2422,7 @@ fn ordered_first_success_aborts_without_starting_the_next_alternative() {
 }
 
 #[test]
-fn unsupported_policy_kinds_fail_closed_with_one_or_many_alternatives() {
+fn every_project_policy_executes_and_replays_with_valid_cardinality() {
     let external = tempfile::tempdir().unwrap();
     for policy in [
         RoutePolicy::RaceSuccess,
@@ -2432,14 +2432,12 @@ fn unsupported_policy_kinds_fail_closed_with_one_or_many_alternatives() {
         RoutePolicy::BenchmarkAndSelect,
         RoutePolicy::BenchmarkValidateAndSelect,
     ] {
-        let token = policy.token();
         for alternative_count in [1, 2] {
             let marker = external
                 .path()
-                .join(format!("executed-{token}-{alternative_count}"));
+                .join(format!("executed-{}-{alternative_count}", policy.token()));
             let bundle = unsupported_policy_bundle(policy.clone(), alternative_count, &marker);
             let project = match build_project_hgraph(&bundle, Some("application"), None) {
-                Ok(project) => project,
                 Err(error)
                     if policy == RoutePolicy::BenchmarkValidateAndSelect
                         && alternative_count == 1 =>
@@ -2448,27 +2446,25 @@ fn unsupported_policy_kinds_fail_closed_with_one_or_many_alternatives() {
                     assert!(!marker.exists());
                     continue;
                 }
-                Err(error) => panic!(
-                    "unexpected planning failure for {token} with {alternative_count} alternative(s): {error}"
-                ),
+                result => result.unwrap(),
             };
-            let error =
-                execute_project_hgraph(&bundle, &project, &RunOptions::default()).unwrap_err();
-            let message = format!("{error:#}");
-            assert!(
-                message.contains(&token) || message.to_ascii_lowercase().contains("unsupported"),
-                "unchecked {token} error for {alternative_count} alternative(s): {error:#}"
-            );
-            assert!(
-                !marker.exists(),
-                "unsupported policy {token} executed {alternative_count} alternative(s)"
-            );
+            let outcome = execute_project_hgraph(&bundle, &project, &RunOptions::default())
+                .unwrap_or_else(|error| panic!("{}: {error:#}", policy.token()));
+            assert!(outcome.result.succeeded());
+            assert!(marker.exists());
+            ProjectAttemptTrace::try_from_project_events(
+                &project,
+                outcome.trace.header().clone(),
+                outcome.trace.events().to_vec(),
+            )
+            .unwrap();
+            assert!(outcome.trace.events().last().unwrap().selection.is_some());
         }
     }
 }
 
 #[test]
-fn environment_opt_in_never_falls_back_for_an_unsupported_policy() {
+fn environment_opt_in_executes_all_through_hgraph_trace() {
     let external = tempfile::tempdir().unwrap();
     let poison = external.path().join("cli-outside-workspace-poison");
     let unexpected_execution = external.path().join("unsupported-cli-executed");
@@ -2512,24 +2508,19 @@ fn environment_opt_in_never_falls_back_for_an_unsupported_policy() {
         .output()
         .unwrap();
     assert!(
-        !unsupported.status.success(),
-        "unsupported HGraph policy silently fell back: {}",
+        unsupported.status.success(),
+        "HGraph all policy failed: {}",
         String::from_utf8_lossy(&unsupported.stdout)
     );
-    let error = String::from_utf8_lossy(&unsupported.stderr);
     assert!(
-        error.contains("all") || error.to_ascii_lowercase().contains("unsupported"),
-        "unchecked HGraph policy error: {error}"
-    );
-    assert!(
-        !unexpected_execution.exists(),
-        "unsupported HGraph policy executed through legacy run_selection"
+        unexpected_execution.exists(),
+        "HGraph all policy did not run the route"
     );
     assert!(!poison.exists());
 }
 
 #[test]
-fn olangc_hgraph_success_writes_an_unsigned_parseable_attempt_trace() {
+fn olangc_default_hgraph_success_writes_an_unsigned_parseable_attempt_trace() {
     let project_dir = tempfile::tempdir().unwrap();
     for name in ["olang.project.toml", "input.txt"] {
         std::fs::copy(fixture_path().join(name), project_dir.path().join(name)).unwrap();
@@ -2545,7 +2536,7 @@ fn olangc_hgraph_success_writes_an_unsigned_parseable_attempt_trace() {
             .args(["--target", "script", "--route", "application"])
             .arg("--project-trace-out")
             .arg(&trace_path)
-            .env("O_PROJECT_EXECUTOR", "hgraph")
+            .env_remove("O_PROJECT_EXECUTOR")
             .env("PROJECT_EXEC_A_EXTERNAL_POISON_MARKER", &poison)
             .output()
             .unwrap()
@@ -2636,7 +2627,7 @@ fn olangc_hgraph_success_writes_an_unsigned_parseable_attempt_trace() {
 }
 
 #[test]
-fn olangc_trace_out_without_hgraph_fails_before_route_execution() {
+fn olangc_trace_out_with_explicit_legacy_fails_before_route_execution() {
     let external = tempfile::tempdir().unwrap();
     let trace_path = external.path().join("legacy-must-not-write.json");
     let execution_marker = external.path().join("legacy-must-not-execute");
@@ -2646,7 +2637,7 @@ fn olangc_trace_out_without_hgraph_fails_before_route_execution() {
         .args(["--target", "script", "--route", "application"])
         .arg("--project-trace-out")
         .arg(&trace_path)
-        .env_remove("O_PROJECT_EXECUTOR")
+        .env("O_PROJECT_EXECUTOR", "legacy")
         .env("PROJECT_EXEC_A_EXECUTION_MARKER", &execution_marker)
         .output()
         .unwrap();
@@ -2657,7 +2648,7 @@ fn olangc_trace_out_without_hgraph_fails_before_route_execution() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("--project-trace-out") && stderr.contains("O_PROJECT_EXECUTOR=hgraph"),
+        stderr.contains("--project-trace-out") && stderr.contains("O_PROJECT_EXECUTOR=legacy"),
         "missing checked trace-mode diagnostic: {stderr}"
     );
     assert!(
@@ -2776,4 +2767,601 @@ fn ordinary_oir_graph_execution_is_unchanged() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "[number] 2");
+}
+
+fn concurrent_bundle(
+    policy: RoutePolicy,
+    coordinator: &Path,
+    scripts: &[(&str, &str)],
+) -> ProjectBundle {
+    let mut bundle = ProjectBundle::empty("project-concurrent-policy");
+    for (id, script) in scripts {
+        let mut route = RouteSpec::new(*id, RouteProvenance::CliOverride);
+        route.command = vec!["sh".into(), "-c".into(), (*script).into()];
+        route
+            .environment
+            .insert("COORD".into(), coordinator.to_string_lossy().into_owned());
+        bundle.routes.push(route);
+    }
+    bundle.route_sets.push(RouteSet {
+        provides: "application".into(),
+        alternatives: scripts.iter().map(|(id, _)| (*id).into()).collect(),
+        policy,
+    });
+    bundle
+}
+
+#[test]
+fn parallel_policy_overlaps_isolated_branches_with_same_output_path() {
+    let coordinator = tempfile::tempdir().unwrap();
+    let mut bundle = concurrent_bundle(RoutePolicy::VerifyEquivalent, coordinator.path(), &[
+        ("first", "touch \"$COORD/first\"; n=0; while [ ! -f \"$COORD/second\" ]; do n=$((n+1)); [ \"$n\" -lt 200 ] || exit 91; sleep .01; done; printf same > shared.txt; printf same"),
+        ("second", "touch \"$COORD/second\"; n=0; while [ ! -f \"$COORD/first\" ]; do n=$((n+1)); [ \"$n\" -lt 200 ] || exit 92; sleep .01; done; printf same > shared.txt; printf same"),
+    ]);
+    for route in &mut bundle.routes {
+        route.outputs.push("shared.txt".into());
+    }
+    let project = build_project_hgraph(&bundle, Some("application"), None).unwrap();
+    let execution =
+        execute_project_hgraph_selection(&bundle, &project, &RunOptions::default()).unwrap();
+    assert_eq!(execution.results.len(), 2);
+    assert_ne!(
+        execution.results[0].provenance.workspace,
+        execution.results[1].provenance.workspace
+    );
+    assert!(execution
+        .results
+        .iter()
+        .all(|result| result.succeeded() && result.artifacts.len() == 1));
+    let trace = execution.trace.unwrap();
+    let started = trace
+        .events()
+        .iter()
+        .filter(|event| {
+            event.state == ProjectAttemptState::Started
+                && event.operation_label.starts_with("run-route:")
+        })
+        .collect::<Vec<_>>();
+    let first_terminal = trace
+        .events()
+        .iter()
+        .find(|event| event.operation_label.starts_with("run-route:") && event.state.is_terminal())
+        .unwrap();
+    assert_eq!(started.len(), 2);
+    assert!(started
+        .iter()
+        .all(|event| event.coordinator_ordinal < first_terminal.coordinator_ordinal));
+}
+
+#[test]
+fn concurrent_policy_preserves_explicit_shared_host_resource_order() {
+    let coordinator = tempfile::tempdir().unwrap();
+    let mut bundle = concurrent_bundle(RoutePolicy::BenchmarkAndSelect, coordinator.path(), &[
+        ("first", "printf first > \"$COORD/shared\"; sleep .05; printf done > \"$COORD/shared\"; printf first"),
+        ("second", "[ \"$(cat \"$COORD/shared\")\" = done ] || exit 93; printf second"),
+    ]);
+    let resource = format!("host:{}", coordinator.path().join("shared").display());
+    for route in &mut bundle.routes {
+        route.effects.writes.push(resource.clone());
+    }
+    let project = build_project_hgraph(&bundle, Some("application"), None).unwrap();
+    let outcome = execute_project_hgraph(&bundle, &project, &RunOptions::default()).unwrap();
+    let events = outcome.trace.events();
+    let finished = events
+        .iter()
+        .find(|event| {
+            event.operation_label == "run-route:first"
+                && event.state == ProjectAttemptState::SettledSuccess
+        })
+        .unwrap();
+    let started = events
+        .iter()
+        .find(|event| {
+            event.operation_label == "run-route:second"
+                && event.state == ProjectAttemptState::Started
+        })
+        .unwrap();
+    assert!(finished.coordinator_ordinal < started.coordinator_ordinal);
+}
+
+#[test]
+fn race_success_cancels_and_drains_loser_with_replayable_cause() {
+    let coordinator = tempfile::tempdir().unwrap();
+    let bundle = concurrent_bundle(RoutePolicy::RaceSuccess, coordinator.path(), &[
+        ("slow", "touch \"$COORD/slow-started\"; sleep 30; touch \"$COORD/loser-finished\""),
+        ("fast", "n=0; while [ ! -f \"$COORD/slow-started\" ]; do n=$((n+1)); [ \"$n\" -lt 200 ] || exit 94; sleep .01; done; printf winner"),
+    ]);
+    let project = build_project_hgraph(&bundle, Some("application"), None).unwrap();
+    let outcome = execute_project_hgraph(&bundle, &project, &RunOptions::default()).unwrap();
+    assert_eq!(outcome.result.route_id, "fast");
+    assert!(!coordinator.path().join("loser-finished").exists());
+    let cancellation = outcome
+        .trace
+        .events()
+        .iter()
+        .find(|event| event.cancelled_by_ordinal.is_some())
+        .unwrap();
+    assert_eq!(cancellation.route_id.as_deref(), Some("slow"));
+    assert_eq!(cancellation.state, ProjectAttemptState::Aborted);
+    let mut tampered = outcome.trace.events().to_vec();
+    tampered[cancellation.coordinator_ordinal as usize].cancelled_by_ordinal = Some(0);
+    assert!(ProjectAttemptTrace::try_from_project_events(
+        &project,
+        outcome.trace.header().clone(),
+        tampered
+    )
+    .is_err());
+    let mut tampered = outcome.trace.events().to_vec();
+    tampered
+        .last_mut()
+        .unwrap()
+        .selection
+        .as_mut()
+        .unwrap()
+        .selected_route_id = "slow".into();
+    assert!(ProjectAttemptTrace::try_from_project_events(
+        &project,
+        outcome.trace.header().clone(),
+        tampered
+    )
+    .is_err());
+}
+
+#[test]
+fn race_settle_preserves_first_failure_and_stops_loser() {
+    let coordinator = tempfile::tempdir().unwrap();
+    let bundle = concurrent_bundle(
+        RoutePolicy::RaceSettle,
+        coordinator.path(),
+        &[
+            ("failed", "sleep .05; exit 17"),
+            ("slow", "sleep 30; touch \"$COORD/loser-finished\""),
+        ],
+    );
+    let project = build_project_hgraph(&bundle, Some("application"), None).unwrap();
+    let outcome = execute_project_hgraph(&bundle, &project, &RunOptions::default()).unwrap();
+    assert_eq!(outcome.result.route_id, "failed");
+    assert_eq!(outcome.result.exit_code, Some(17));
+    assert!(!coordinator.path().join("loser-finished").exists());
+}
+
+#[test]
+fn validated_policy_preserves_reference_and_rejects_divergent_faster_candidate() {
+    let coordinator = tempfile::tempdir().unwrap();
+    let bundle = concurrent_bundle(
+        RoutePolicy::BenchmarkValidateAndSelect,
+        coordinator.path(),
+        &[
+            ("reference", "sleep .05; printf expected"),
+            ("divergent", "printf wrong"),
+        ],
+    );
+    let project = build_project_hgraph(&bundle, Some("application"), None).unwrap();
+    let outcome =
+        execute_project_hgraph_selection(&bundle, &project, &RunOptions::default()).unwrap();
+    assert_eq!(outcome.results.last().unwrap().route_id, "reference");
+    let receipt = outcome.validated_selection_receipt.unwrap();
+    assert_eq!(receipt.reference_route_id, "reference");
+    assert_eq!(receipt.selected_route_id, "reference");
+    assert!(!receipt.candidates[1].disposition.is_eligible());
+    receipt.validate().unwrap();
+    let trace = outcome.trace.unwrap();
+    let mut tampered = trace.events().to_vec();
+    let selection = tampered.last_mut().unwrap().selection.as_mut().unwrap();
+    selection.candidates[0].outcome.stdout_sha256 = sha256(b"tampered");
+    assert!(ProjectAttemptTrace::try_from_project_events(
+        &project,
+        trace.header().clone(),
+        tampered
+    )
+    .is_err());
+    let mut forged_capture = trace.events().to_vec();
+    let receipt = forged_capture
+        .last_mut()
+        .unwrap()
+        .selection
+        .as_mut()
+        .unwrap()
+        .validated_receipt
+        .as_mut()
+        .unwrap();
+    receipt.candidates[0]
+        .observation
+        .stderr_capture
+        .total_observed_bytes += 1;
+    receipt.candidates[0]
+        .observation
+        .stderr_capture
+        .retained_bytes += 1;
+    // Rebind the receipt's own evidence digest so this mutation is locally
+    // valid and tests the stronger binding to the independent route event.
+    receipt.candidates[0].observation_sha256 = receipt.candidates[0].observation.sha256().unwrap();
+    receipt.validate().unwrap();
+    ProjectAttemptTrace::try_from_events(trace.header().clone(), forged_capture.clone()).unwrap();
+    let error = ProjectAttemptTrace::try_from_project_events(
+        &project,
+        trace.header().clone(),
+        forged_capture,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, o_lang::project::ProjectTraceError::InvalidEvent(reason)
+        if reason.contains("not bound to observed candidate results"))
+    );
+}
+
+#[test]
+fn compatibility_continuation_is_bound_to_trusted_contract_and_strict_stays_strict() {
+    use o_lang::project::{
+        build_project_hgraph_with_contract, ProjectCoordinator, ProjectExecutionContract,
+    };
+    let coordinator = tempfile::tempdir().unwrap();
+    let mut bundle = concurrent_bundle(
+        RoutePolicy::AnySuccess,
+        coordinator.path(),
+        &[
+            ("failed", "printf failed; exit 7"),
+            ("success", "touch \"$COORD/success\"; printf success"),
+        ],
+    );
+    for route in &mut bundle.routes {
+        route.failure_continuation = RouteFailureContinuation::Unproven;
+    }
+    let strict = build_project_hgraph(&bundle, Some("application"), None).unwrap();
+    let compatibility = build_project_hgraph_with_contract(
+        &bundle,
+        Some("application"),
+        None,
+        ProjectExecutionContract::LegacyCompatibility,
+    )
+    .unwrap();
+    let error =
+        execute_project_hgraph(&bundle, &compatibility, &RunOptions::default()).unwrap_err();
+    assert!(error.to_string().contains("trusted coordinator contract"));
+    assert!(!coordinator.path().join("success").exists());
+    let strict_outcome = execute_project_hgraph(&bundle, &strict, &RunOptions::default()).unwrap();
+    assert_eq!(strict_outcome.result.route_id, "failed");
+    assert!(!coordinator.path().join("success").exists());
+    let options = RunOptions::default();
+    let compatible_outcome = ProjectCoordinator::new_with_contract(
+        &bundle,
+        &compatibility,
+        &options,
+        ProjectExecutionContract::LegacyCompatibility,
+    )
+    .unwrap()
+    .execute()
+    .unwrap();
+    assert_eq!(compatible_outcome.result.route_id, "success");
+    assert!(coordinator.path().join("success").exists());
+    let decision = compatible_outcome
+        .trace
+        .events()
+        .iter()
+        .find_map(|event| event.continuation.as_ref())
+        .unwrap();
+    assert_eq!(
+        decision.evidence,
+        ProjectContinuationEvidence::LegacyUnchecked
+    );
+    assert!(decision.admitted);
+    ProjectAttemptTrace::try_from_project_events(
+        &compatibility,
+        compatible_outcome.trace.header().clone(),
+        compatible_outcome.trace.events().to_vec(),
+    )
+    .unwrap();
+    assert!(ProjectAttemptTrace::try_from_project_events(
+        &strict,
+        compatible_outcome.trace.header().clone(),
+        compatible_outcome.trace.events().to_vec()
+    )
+    .is_err());
+    let mut forged = strict_outcome.trace.events().to_vec();
+    let decision = forged
+        .iter_mut()
+        .find_map(|event| event.continuation.as_mut())
+        .unwrap();
+    decision.evidence = ProjectContinuationEvidence::LegacyUnchecked;
+    decision.admitted = true;
+    assert!(ProjectAttemptTrace::try_from_project_events(
+        &strict,
+        strict_outcome.trace.header().clone(),
+        forged
+    )
+    .is_err());
+    let strict_logical = strict.logical_v1().unwrap();
+    let compatibility_logical = compatibility.logical_v1().unwrap();
+    let strict_json = serde_json::to_value(&strict_logical).unwrap();
+    assert!(strict_json["source"].get("execution_contract").is_none());
+    assert!(
+        !String::from_utf8(strict_logical.canonical_bytes().unwrap())
+            .unwrap()
+            .contains("execution_contract")
+    );
+    assert_ne!(
+        strict_logical.digest().unwrap(),
+        compatibility_logical.digest().unwrap()
+    );
+    assert_ne!(
+        strict_outcome.trace.header().deployment_plan_digest,
+        compatible_outcome.trace.header().deployment_plan_digest
+    );
+}
+
+#[test]
+fn strict_logical_bytes_preserve_the_frozen_pre_contract_layout() {
+    use o_lang::project::logical::{
+        LogicalCancellationV1, LogicalHGraphV1, LogicalOperationIdV1, LogicalOperationV1,
+        LogicalRoutePolicyV1,
+    };
+    #[derive(serde::Serialize)]
+    struct FrozenSource<'a> {
+        project_name: &'a str,
+        bundle: &'a o_lang::world::ArtifactId,
+        target: &'a str,
+        alternatives: &'a [String],
+        policy: &'a LogicalRoutePolicyV1,
+        cancellation: LogicalCancellationV1,
+    }
+    #[derive(serde::Serialize)]
+    struct FrozenGraph<'a> {
+        schema_version: u16,
+        source: FrozenSource<'a>,
+        operations: &'a [LogicalOperationV1],
+        roots: &'a [LogicalOperationIdV1],
+    }
+    let external = tempfile::tempdir().unwrap();
+    let bundle = fixture_bundle(&external.path().join("poison"));
+    let project = explicit_project(&bundle);
+    let logical = project.logical_v1().unwrap();
+    let source = &logical.source;
+    let frozen = FrozenGraph {
+        schema_version: logical.schema_version,
+        source: FrozenSource {
+            project_name: &source.project_name,
+            bundle: &source.bundle,
+            target: &source.target,
+            alternatives: &source.alternatives,
+            policy: &source.policy,
+            cancellation: source.cancellation,
+        },
+        operations: &logical.operations,
+        roots: &logical.roots,
+    };
+    let old_bytes = serde_json::to_vec(&frozen).unwrap();
+    assert_eq!(old_bytes, logical.canonical_bytes().unwrap());
+    assert_eq!(
+        LogicalHGraphV1::decode_canonical(&old_bytes).unwrap(),
+        logical
+    );
+}
+
+#[test]
+fn declared_output_policy_rejection_remains_a_semantic_execution_failure() {
+    use o_lang::project::{ProjectExecutionError, ProjectExecutionFailureClass};
+    let coordinator = tempfile::tempdir().unwrap();
+    for (policy, reference) in [
+        (RoutePolicy::BenchmarkValidateAndSelect, "exit 9"),
+        (RoutePolicy::VerifyEquivalent, "printf expected"),
+    ] {
+        let bundle = concurrent_bundle(
+            policy,
+            coordinator.path(),
+            &[("reference", reference), ("candidate", "printf different")],
+        );
+        let project = build_project_hgraph(&bundle, Some("application"), None).unwrap();
+        let failure = execute_project_hgraph_selection(&bundle, &project, &RunOptions::default())
+            .unwrap_err();
+        let execution = failure.downcast_ref::<ProjectExecutionError>().unwrap();
+        assert_eq!(execution.class(), ProjectExecutionFailureClass::Semantic);
+        assert_eq!(execution.settled_results().count(), 2);
+        ProjectAttemptTrace::try_from_project_events(
+            &project,
+            execution.trace.header().clone(),
+            execution.trace.events().to_vec(),
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn validated_progress_callbacks_do_not_enter_branch_measurements_or_delay_prerequisites() {
+    use o_lang::project::{
+        execute_project_hgraph_selection_with_contract_and_progress, ProjectExecutionContract,
+        ValidatedSelectionProgressEventV1,
+    };
+    use std::sync::Mutex;
+    use std::time::Duration;
+    for delay_start in [true, false] {
+        let coordinator = tempfile::tempdir().unwrap();
+        let mut bundle = concurrent_bundle(
+            RoutePolicy::BenchmarkValidateAndSelect,
+            coordinator.path(),
+            &[
+                ("reference", "sleep .04; printf expected"),
+                ("candidate", "sleep .04; printf expected"),
+            ],
+        );
+        let mut prepare = RouteSpec::new("prepare", RouteProvenance::CliOverride);
+        prepare.command = vec!["sh".into(), "-c".into(), "sleep .08".into()];
+        bundle.routes.push(prepare);
+        bundle.routes[1].prerequisites.push("prepare".into());
+        let project = build_project_hgraph(&bundle, Some("application"), None).unwrap();
+        let observed = Mutex::new(Vec::new());
+        let observer = |event: ValidatedSelectionProgressEventV1| {
+            let slow = match &event {
+                ValidatedSelectionProgressEventV1::CandidateStarted {
+                    declaration_index: 0,
+                    ..
+                } => delay_start,
+                ValidatedSelectionProgressEventV1::CandidateFinished {
+                    declaration_index: 0,
+                    ..
+                } => !delay_start,
+                _ => false,
+            };
+            if slow {
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            observed.lock().unwrap().push(event);
+        };
+        let execution = execute_project_hgraph_selection_with_contract_and_progress(
+            &bundle,
+            &project,
+            &RunOptions::default(),
+            ProjectExecutionContract::Strict,
+            Some(&observer),
+        )
+        .unwrap();
+        let receipt = execution.validated_selection_receipt.unwrap();
+        assert_eq!(receipt.selected_route_id, "reference");
+        for candidate in &receipt.candidates {
+            assert!(
+                candidate.branch_elapsed_ns.parse::<u128>().unwrap() < 400_000_000,
+                "presentation delay entered {} measurement: {} ns",
+                candidate.route_id,
+                candidate.branch_elapsed_ns
+            );
+        }
+        assert!(matches!(
+            observed.lock().unwrap().last(),
+            Some(ValidatedSelectionProgressEventV1::ValidationStarted { .. })
+        ));
+    }
+}
+
+#[test]
+fn panicking_observers_close_delivery_and_drain_owned_routes_with_bounded_wait() {
+    use o_lang::project::{
+        execute_project_hgraph_selection_with_contract_and_progress, ProjectExecutionContract,
+        ProjectExecutionError, ProjectExecutionFailureClass, ValidatedSelectionProgressEventV1,
+    };
+    use std::sync::mpsc;
+    use std::time::Duration;
+    // Exercise every current event variant. ValidationStarted is delivered
+    // synchronously by the comparison helper, after the delivery worker exists.
+    for phase in [
+        "selection_start",
+        "candidate_start",
+        "candidate_finish",
+        "validation_start",
+    ] {
+        let (finished, result) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let checked = std::panic::catch_unwind(|| {
+                let coordinator = tempfile::tempdir().unwrap();
+                let bundle = concurrent_bundle(
+                    RoutePolicy::BenchmarkValidateAndSelect,
+                    coordinator.path(),
+                    &[
+                        ("reference", "printf expected"),
+                        ("candidate", "sleep .02; printf expected"),
+                    ],
+                );
+                let project = build_project_hgraph(&bundle, Some("application"), None).unwrap();
+                let observer = |event: ValidatedSelectionProgressEventV1| {
+                    let observed_phase = match event {
+                        ValidatedSelectionProgressEventV1::SelectionStarted { .. } => {
+                            "selection_start"
+                        }
+                        ValidatedSelectionProgressEventV1::CandidateStarted { .. } => {
+                            "candidate_start"
+                        }
+                        ValidatedSelectionProgressEventV1::CandidateFinished { .. } => {
+                            "candidate_finish"
+                        }
+                        ValidatedSelectionProgressEventV1::ValidationStarted { .. } => {
+                            "validation_start"
+                        }
+                    };
+                    assert_ne!(observed_phase, phase, "intentional observer panic");
+                };
+                let error = execute_project_hgraph_selection_with_contract_and_progress(
+                    &bundle,
+                    &project,
+                    &RunOptions::default(),
+                    ProjectExecutionContract::Strict,
+                    Some(&observer),
+                )
+                .unwrap_err();
+                if matches!(phase, "candidate_finish" | "validation_start") {
+                    let failure = error.downcast_ref::<ProjectExecutionError>().unwrap();
+                    assert_eq!(
+                        failure.class(),
+                        ProjectExecutionFailureClass::Infrastructure
+                    );
+                    assert_eq!(failure.settled_results().count(), 2);
+                } else {
+                    assert!(error.to_string().contains("progress observer panicked"));
+                }
+            });
+            let _ = finished.send(checked.is_ok());
+        });
+        // A regressed scope/receiver deadlock must fail this test, not hang the
+        // entire test executable. A timed-out thread is detached on failure.
+        assert!(
+            result
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap_or_else(|_| panic!(
+                    "observer panic at {phase} did not return within five seconds"
+                )),
+            "observer panic at {phase} escaped execution or violated drain invariants"
+        );
+        worker.join().unwrap();
+    }
+}
+
+#[test]
+fn benchmark_trace_rejects_zero_exit_incomplete_artifacts_before_selection() {
+    use o_lang::project::{ArtifactCaptureFailure, ArtifactCaptureStatus};
+    let coordinator = tempfile::tempdir().unwrap();
+    let mut bundle = concurrent_bundle(
+        RoutePolicy::BenchmarkAndSelect,
+        coordinator.path(),
+        &[
+            ("fast", "printf proof > proof; printf expected"),
+            ("slow", "sleep .05; printf proof > proof; printf expected"),
+        ],
+    );
+    for route in &mut bundle.routes {
+        route.outputs.push("proof".into());
+    }
+    let project = build_project_hgraph(&bundle, Some("application"), None).unwrap();
+    let trace = execute_project_hgraph_selection(&bundle, &project, &RunOptions::default())
+        .unwrap()
+        .trace
+        .unwrap();
+    let mut events = trace.events().to_vec();
+    let fast = events
+        .iter_mut()
+        .find(|event| {
+            event.route_id.as_deref() == Some("fast")
+                && event.state == ProjectAttemptState::SettledSuccess
+        })
+        .unwrap();
+    fast.state = ProjectAttemptState::SettledFailure;
+    let outcome = fast.outcome.as_mut().unwrap();
+    outcome.artifacts.clear();
+    outcome.artifact_capture = ArtifactCaptureStatus::Incomplete {
+        failure: Box::new(ArtifactCaptureFailure::Missing {
+            requirement: "proof".into(),
+        }),
+    };
+    let failed_outcome = outcome.clone();
+    let selection = events.last_mut().unwrap().selection.as_mut().unwrap();
+    selection.candidates[0].outcome = failed_outcome;
+    selection.selected_route_id = "slow".into();
+    // This combination is forbidden by the outcome carrier itself, before
+    // policy selection. Do not treat an impossible outcome as valid evidence.
+    for error in [
+        ProjectAttemptTrace::try_from_events(trace.header().clone(), events.clone()).unwrap_err(),
+        ProjectAttemptTrace::try_from_project_events(&project, trace.header().clone(), events)
+            .unwrap_err(),
+    ] {
+        assert!(
+            matches!(error, o_lang::project::ProjectTraceError::InvalidOutcome(reason)
+            if reason == "exit-zero route outcome has incomplete artifact evidence")
+        );
+    }
 }

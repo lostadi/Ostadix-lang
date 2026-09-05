@@ -297,7 +297,7 @@ fn static_plan_matches_olangc_exactly_and_does_not_open_run_state() {
 }
 
 #[test]
-fn local_project_preserves_compatibility_default_and_hgraph_override() {
+fn local_project_freezes_default_hgraph_contract_and_supports_explicit_legacy() {
     let _serial = environment_lock().lock().unwrap();
     let temp = tempfile::tempdir().unwrap();
     let project = temp.path().join("project");
@@ -309,12 +309,17 @@ fn local_project_preserves_compatibility_default_and_hgraph_override() {
     let PreparedExecutionIntentV1::Project(compatibility) = compatibility else {
         panic!("project directory was misclassified")
     };
-    assert_eq!(compatibility.executor, ProjectExecutorV1::Compatibility);
+    assert_eq!(compatibility.executor, ProjectExecutorV1::Hgraph);
+    assert_eq!(
+        compatibility.execution_contract,
+        o_lang::project::ProjectExecutionContract::LegacyCompatibility
+    );
+    std::env::set_var("O_PROJECT_EXECUTOR", "hgraph");
     let compatibility_outcome = execute_prepared_project(&compatibility).unwrap();
     assert_eq!(compatibility_outcome.results.len(), 1);
     assert!(compatibility_outcome.results[0].succeeded());
-    assert!(compatibility_outcome.project_trace.is_none());
-    assert!(compatibility_outcome.trace_unavailable_reason.is_some());
+    assert!(compatibility_outcome.project_trace.is_some());
+    assert!(compatibility_outcome.trace_unavailable_reason.is_none());
 
     std::env::set_var("O_PROJECT_EXECUTOR", "hgraph");
     let hgraph = prepare_execution_intent(&project, options(temp.path())).unwrap();
@@ -322,9 +327,23 @@ fn local_project_preserves_compatibility_default_and_hgraph_override() {
         panic!("project directory was misclassified")
     };
     assert_eq!(hgraph.executor, ProjectExecutorV1::Hgraph);
+    assert_eq!(
+        hgraph.execution_contract,
+        o_lang::project::ProjectExecutionContract::Strict
+    );
+    std::env::set_var("O_PROJECT_EXECUTOR", "legacy");
     let hgraph_outcome = execute_prepared_project(&hgraph).unwrap();
     assert_eq!(hgraph_outcome.results.len(), 1);
     assert!(hgraph_outcome.results[0].succeeded());
     assert!(hgraph_outcome.project_trace.is_some());
     assert!(hgraph_outcome.trace_unavailable_reason.is_none());
+    let legacy = prepare_execution_intent(&project, options(temp.path())).unwrap();
+    let PreparedExecutionIntentV1::Project(legacy) = legacy else {
+        panic!("expected project")
+    };
+    assert_eq!(legacy.executor, ProjectExecutorV1::Compatibility);
+    std::env::remove_var("O_PROJECT_EXECUTOR");
+    let legacy_outcome = execute_prepared_project(&legacy).unwrap();
+    assert!(legacy_outcome.project_trace.is_none());
+    assert!(legacy_outcome.results[0].succeeded());
 }

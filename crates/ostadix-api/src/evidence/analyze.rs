@@ -1247,6 +1247,15 @@ fn encode_effect_summary(hash: &mut CanonicalHasher, summary: &EffectSummary) {
 fn encode_resource_key(hash: &mut CanonicalHasher, resource: &ResourceKey) {
     match resource {
         ResourceKey::HostWorld => hash.tag("host-world"),
+        ResourceKey::ConcurrentProjectBranch(branch) => {
+            hash.tag("concurrent-project-branch");
+            hash.u64(*branch as u64);
+        }
+        ResourceKey::ProjectBranchPath { branch, path } => {
+            hash.tag("project-branch-path");
+            hash.u64(*branch as u64);
+            hash.field(path.as_bytes());
+        }
         ResourceKey::WorldState(identity) => {
             hash.tag("world-state");
             encode_serialized_identity(hash, identity);

@@ -472,6 +472,9 @@ jobs:
         run: ./boot-and-test.sh smoke
       # END GENERATED: REQUIRED_QEMU_EVIDENCE_CI
 
+      - name: Prove supplemental native scalar execution and unsigned receipts
+        run: ocore/kernel/smoke-world-native-scalar-qemu.sh
+
       - name: Prove Mode 18 progress at shift-1 virtual timer cadence
         env:
           OCORE_M6A_QEMU_ICOUNT: shift=1,align=off,sleep=off

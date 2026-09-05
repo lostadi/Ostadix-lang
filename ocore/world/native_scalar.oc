@@ -1,0 +1,218 @@
+module world::native_scalar;
+
+use world::identity::IdentityRecord;
+use world::identity::receipt_context_is_bound;
+use world::identity::encode_record as encode_identity;
+use world::sha256::Sha256Scratch;
+use world::sha256::compute as sha256_compute;
+use world::value::ValueArena;
+use world::value::arena_clear;
+use world::value::add_integer;
+use world::value::seal;
+use world::value_codec::ValueCodecScratch;
+use world::value_codec::encode_record as encode_value;
+
+// A deliberately narrow native execution prerequisite, not a project executor
+// or an authority service. A trusted kernel caller provisions the identity
+// snapshot. Matching descriptive identities never grants capability rights.
+pub const REQUEST_BYTES: usize = 64;
+pub const MAX_CONTEXT_BYTES: usize = 1024;
+const CONTEXT_DOMAIN_BYTES: usize = 33;
+static CONTEXT_DOMAIN: [u8; 33] = b"OSTADIX/NATIVE-SCALAR-CONTEXT/V1\0";
+static REQUEST_MAGIC: [u8; 8] = b"ONSCAL1\0";
+
+pub struct NativeScalarSession {
+    context: *const u8,
+    context_length: usize,
+    binding: *const u8,
+    executions: u64,
+}
+
+unsafe fn put_u16(output: *mut u8, value: usize) -> void {
+    volatile_store(output, (value >> 8) as u8);
+    volatile_store(output + 1, value as u8);
+}
+
+unsafe fn put_u32(output: *mut u8, value: usize) -> void {
+    volatile_store(output, (value >> 24) as u8);
+    volatile_store(output + 1, (value >> 16) as u8);
+    volatile_store(output + 2, (value >> 8) as u8);
+    volatile_store(output + 3, value as u8);
+}
+
+unsafe fn read_u64(source: *const u8) -> u64 {
+    let mut value: u64 = 0;
+    let mut index: usize = 0;
+    while index < 8 {
+        value = (value << 8) | (volatile_load(source + index) as u64);
+        index += 1;
+    }
+    return value;
+}
+
+unsafe fn copy(destination: *mut u8, source: *const u8, length: usize) -> void {
+    let mut index: usize = 0;
+    while index < length {
+        volatile_store(destination + index, volatile_load(source + index));
+        index += 1;
+    }
+}
+
+unsafe fn equal(left: *const u8, right: *const u8, length: usize) -> bool {
+    let mut index: usize = 0;
+    while index < length {
+        if volatile_load(left + index) != volatile_load(right + index) { return false; }
+        index += 1;
+    }
+    return true;
+}
+
+// identities points to six borrowed IdentityRecord pointers in canonical order:
+// receipt, World, Governor, attempt, node, domain. The gate has no CPL3 process.
+// Copy the validated context so later mutation of those records cannot alter
+// the provisioned request fence. All storage remains caller-owned.
+pub unsafe fn provision(
+    session: *mut NativeScalarSession,
+    identities: *const u64,
+    storage: *mut u8,
+    capacity: usize,
+    binding: *mut u8,
+    sha: *mut Sha256Scratch
+) -> u64 {
+    if session as usize == 0 { return 0; }
+    (*session).context = 0 as *const u8;
+    (*session).context_length = 0;
+    (*session).binding = 0 as *const u8;
+    (*session).executions = 0;
+    if identities as usize == 0 || storage as usize == 0 || binding as usize == 0
+        || capacity < MAX_CONTEXT_BYTES + CONTEXT_DOMAIN_BYTES {
+        return 0;
+    }
+    if !receipt_context_is_bound(
+        volatile_load(identities) as *const IdentityRecord,
+        volatile_load(identities + 1) as *const IdentityRecord,
+        volatile_load(identities + 2) as *const IdentityRecord,
+        volatile_load(identities + 4) as *const IdentityRecord,
+        volatile_load(identities + 5) as *const IdentityRecord,
+        0 as *const IdentityRecord,
+        volatile_load(identities + 3) as *const IdentityRecord) {
+        return 0;
+    }
+    copy(storage, (&CONTEXT_DOMAIN[0]), CONTEXT_DOMAIN_BYTES);
+    let context: *mut u8 = storage + CONTEXT_DOMAIN_BYTES;
+    let mut cursor: usize = 0;
+    let mut index: usize = 0;
+    while index < 6 {
+        if cursor > MAX_CONTEXT_BYTES - 2 { return 0; }
+        let mut written: usize = 0;
+        if encode_identity(volatile_load(identities + index) as *const IdentityRecord,
+            context + cursor + 2, MAX_CONTEXT_BYTES - cursor - 2, (&mut written)) != 1 {
+            return 0;
+        }
+        put_u16(context + cursor, written);
+        cursor += 2 + written;
+        index += 1;
+    }
+    if cursor > MAX_CONTEXT_BYTES - 2 { return 0; }
+    put_u16(context + cursor, 0);
+    cursor += 2;
+    if sha256_compute(storage as *const u8, CONTEXT_DOMAIN_BYTES + cursor,
+        binding, sha) != 1 { return 0; }
+    (*session).context = context as *const u8;
+    (*session).context_length = cursor;
+    (*session).binding = binding as *const u8;
+    return 1;
+}
+
+pub unsafe fn execution_count(session: *const NativeScalarSession) -> u64 {
+    if session as usize == 0 { return 0; }
+    return (*session).executions;
+}
+
+// Execute one native add-u32 instruction, returning an unsigned canonical
+// OWRECEIPT body. The body is constructed only from this session and the
+// computed result; no caller-supplied terminal, placement, effect, signature,
+// or commit claim is accepted. One session represents one attempt.
+pub unsafe fn execute(
+    session: *mut NativeScalarSession,
+    request: *const u8,
+    request_length: usize,
+    body: *mut u8,
+    body_capacity: usize,
+    body_length: *mut usize,
+    arena: *mut ValueArena,
+    codec: *mut ValueCodecScratch,
+    value_bytes: *mut u8,
+    sha: *mut Sha256Scratch,
+    request_digest: *mut u8
+) -> u64 {
+    if body_length as usize == 0 { return 0; }
+    *body_length = 0;
+    if session as usize == 0 || request as usize == 0 || request_length != REQUEST_BYTES
+        || body as usize == 0 || value_bytes as usize == 0 || request_digest as usize == 0
+        || (*session).context as usize == 0 || (*session).binding as usize == 0
+        || (*session).context_length > MAX_CONTEXT_BYTES || (*session).executions != 0
+        || body_capacity < (*session).context_length + 128 {
+        return 0;
+    }
+    if !equal(request, (&REQUEST_MAGIC[0]), 8)
+        || !equal(request + 8, (*session).binding, 32)
+        || read_u64(request + 40) != 1 {
+        return 0;
+    }
+    let left: u64 = read_u64(request + 48);
+    let right: u64 = read_u64(request + 56);
+    if left > 0xffff_ffff || right > 0xffff_ffff
+        || arena_clear(arena) != 1
+        || sha256_compute(request, REQUEST_BYTES, request_digest, sha) != 1 {
+        return 0;
+    }
+
+    // The counter changes at the actual operation, after every request fence.
+    // u32 inputs make the u64 sum total without overflow or wrapping.
+    (*session).executions = 1;
+    let result: u64 = left + right;
+    let mut index: usize = 0;
+    while index < 8 {
+        volatile_store(value_bytes + index, (result >> ((7 - index) * 8)) as u8);
+        index += 1;
+    }
+    let mut first: usize = 0;
+    while first < 8 && volatile_load(value_bytes + first) == 0 { first += 1; }
+    let mut root: u64 = 0;
+    if add_integer(arena, 0, (value_bytes + first) as *const u8, 8 - first, (&mut root)) != 1
+        || seal(arena, root) != 1 {
+        return 0;
+    }
+    let mut value_length: usize = 0;
+    if encode_value(arena as *const ValueArena, value_bytes, 64,
+        (&mut value_length), codec) != 1 { return 0; }
+
+    copy(body, (*session).context, (*session).context_length);
+    let mut cursor: usize = (*session).context_length;
+    // Source is the exact native instruction record. No logical-HGraph,
+    // package, effect, capability, or provider placement evidence is invented.
+    volatile_store(body + cursor, 1);
+    index = 1;
+    while index < 4 { volatile_store(body + cursor + index, 0); index += 1; }
+    cursor += 4;
+    copy(body + cursor, request_digest as *const u8, 32);
+    cursor += 32;
+    // Empty components, capabilities, objects, capsules, effects, placement
+    // rejections, and checkpoints. These are seven canonical u16 counts.
+    index = 0;
+    while index < 14 { volatile_store(body + cursor + index, 0); index += 1; }
+    cursor += 14;
+    volatile_store(body + cursor, 1);
+    index = 1;
+    while index < 4 { volatile_store(body + cursor + index, 0); index += 1; }
+    put_u32(body + cursor + 4, value_length);
+    cursor += 8;
+    copy(body + cursor, value_bytes as *const u8, value_length);
+    cursor += value_length;
+    // Uncommitted fence and absent gate evidence; neither is a signature.
+    index = 0;
+    while index < 8 { volatile_store(body + cursor + index, 0); index += 1; }
+    *body_length = cursor + 8;
+    return 1;
+}

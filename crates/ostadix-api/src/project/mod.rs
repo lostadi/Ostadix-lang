@@ -44,8 +44,9 @@ pub use deployment::{
     PLACEMENT_SNAPSHOT_SCHEMA_V1,
 };
 pub use executor::{
-    execute_project_hgraph, execute_project_hgraph_selection, execute_project_hgraph_world_bound,
-    execute_selection_with_configured_executor,
+    execute_project_hgraph, execute_project_hgraph_selection,
+    execute_project_hgraph_selection_with_contract_and_progress,
+    execute_project_hgraph_world_bound, execute_selection_with_configured_executor,
     execute_selection_with_configured_executor_with_progress,
     run_selection_with_configured_executor, write_project_attempt_trace,
     ConfiguredProjectExecution, ProjectCoordinator, ProjectExecutionError,
@@ -75,8 +76,10 @@ pub use model::{
     VALIDATED_SELECTION_RECEIPT_SCHEMA_V1, VALIDATED_SELECTION_RULE_V1,
 };
 pub use plan::{
-    build_project_hgraph, ProjectCancellationSemantics, ProjectDependency, ProjectExecutionPlan,
-    ProjectHGraph, ProjectPlanOperation, RoutePlanFacts,
+    build_project_hgraph, build_project_hgraph_with_contract, build_project_hgraph_with_contracts,
+    ProjectCancellationSemantics, ProjectDependency, ProjectExecutionContract,
+    ProjectExecutionPlan, ProjectHGraph, ProjectPlanOperation, ProjectSchedulingContract,
+    RoutePlanFacts,
 };
 pub use reuse::{
     check_selection_reuse_output, validate_selection_reuse_effect_boundary,

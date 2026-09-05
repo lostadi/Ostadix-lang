@@ -75,7 +75,7 @@ mark 'Project HGraph malformed/substitution rejection: PASS'
 logical_tests_log="$work_dir/project-logical-hgraph-tests.log"
 run_logged "$logical_tests_log" env CARGO_TERM_COLOR=never \
     cargo test --locked --package o-lang --test project_logical_hgraph
-require_test_count "$logical_tests_log" 13
+require_test_count "$logical_tests_log" 14
 for name in \
     directory_and_lifted_project_have_identical_canonical_bytes_and_digest \
     fixture_mode_normalization_ignores_group_write_umask_drift \
@@ -89,7 +89,8 @@ for name in \
     hosted_profile_rejects_forged_governed_resources_and_authority \
     hosted_profile_rejects_host_world_removal_and_effect_flag_tampering \
     trusted_project_comparison_rejects_a_digest_substitution \
-    structural_substitutions_fail_closed_while_valid_source_and_policy_changes_rehash
+    structural_substitutions_fail_closed_while_valid_source_and_policy_changes_rehash \
+    archival_parallel_graph_preserves_v1_digest_and_source_reconstruction
 do
     require_test "$logical_tests_log" "$name"
 done
@@ -157,7 +158,8 @@ grep -Fqx '; DeploymentPlanV1' "$first"
 grep -Eq '^deployment schema=1 sha256=[0-9a-f]{64}$' "$first"
 grep -Fqx '; DeploymentPlan oworld.deployment/v1' "$first"
 grep -Fqx 'placement hosted-unbound' "$first"
-grep -Fq 'binding=unresolved' "$first"
+require_count "$first" '^deploy L[0-9]+ task=none binding=ambient-host hostworld=residual ' 6
+require_count "$first" '^deploy L[0-9]+ task=none binding=hosted-coordinator hostworld=no ' 6
 grep -Fqx '; ProjectExecutionPlan' "$first"
 grep -Fqx 'selection target=main policy=verify_equivalent alternatives=[impl-a,impl-b] cancellation=none equivalence=required' "$first"
 require_count "$first" '^project-op p[0-9]+ kind=materialize-project ' 2
@@ -170,7 +172,8 @@ grep -Fq 'deps=[value:p8,success:p7]' "$first"
 grep -Fq 'guards=[env:PR7_REQUIRED_ENV] env=[PLAN_VARIANT]' "$first"
 grep -Fq 'declared-pure=true' "$first"
 grep -Fq 'failure-continuation=declared_idempotent' "$first"
-grep -Fq 'reads=[HostWorld,project:input.txt]' "$first"
+grep -Fq 'reads=[concurrent-project-branch:0:ambient-unordered,project-branch:0:input.txt,env:PR7_REQUIRED_ENV]' "$first"
+grep -Fq 'reads=[concurrent-project-branch:1:ambient-unordered,project-branch:1:input.txt]' "$first"
 if grep -Fq 'PR7_IMPL_A_EXECUTED' "$first"; then
     printf 'project plan exposed or executed the poison command\n' >&2
     exit 1
@@ -293,7 +296,7 @@ import sys
 
 with open(sys.argv[1], "r", encoding="utf-8") as handle:
     trace = json.load(handle)
-assert trace["format_version"] == 6
+assert trace["format_version"] == 7
 header = trace["header"]
 assert header["policy"] == "any_success"
 assert header["logical_graph_schema"] == 1
@@ -340,7 +343,7 @@ assert first < second
 
 with open(sys.argv[2], "r", encoding="utf-8") as handle:
     trace = json.load(handle)
-assert trace["format_version"] == 6
+assert trace["format_version"] == 7
 header = trace["header"]
 assert header["policy"] == "any_success"
 assert header["logical_graph_schema"] == 1

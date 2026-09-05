@@ -838,6 +838,52 @@ capability/lease authority, reservation, remote dispatch, consensus, recovery,
 exactly-once execution, OSTADIX Alpha acceptance, a G0--G13 gate,
 physical-hardware evidence, or hardware-isolation evidence.
 
+Mode 35 is a supplemental native execution/receipt prerequisite. Trusted boot
+code provisions a fixed World, Governor, node, domain, receipt, and task-attempt
+identity hierarchy using the shared native identity codec. These are test
+fixtures; the named Governor is not running. The native session snapshots the
+validated hierarchy and derives a domain-separated context digest. A 64-byte
+`ONSCAL1` instruction contains that digest, opcode 1, and two big-endian u64
+operands restricted to the u32 range. It cannot supply receipt terminal data,
+placement, rights, effects, or a commit claim.
+
+The O-core handler validates the context, opcode, operand bounds, and receipt
+capacity before incrementing its execution counter and adding the operands.
+The result is a u64 sum, including values larger than u32. Native identity and
+OWVALUE codecs then produce a fresh canonical **unsigned OWRECEIPT body** with
+the exact context and instruction digest. Its terminal value comes from the
+native operation, its commit fence is `Uncommitted`, and its capability,
+effect, checkpoint, and evidence observations are empty. The receipt names the
+kernel fixture domain without inventing a CPL3 process. Serial transport is
+qualification instrumentation outside the scalar operation's receipt scope.
+
+```bash
+./ocore/kernel/smoke-world-native-scalar-qemu.sh
+```
+
+The gate retains four native result bodies and ten QEMU transcripts beneath
+`target/ocore-native-scalar/`. Rust independently constructs the expected
+identity bindings and arithmetic results, then decodes every returned native
+body through `inspect_unsigned_receipt_v1` and requires exact canonical bytes,
+the current fixture hierarchy, and the unconditional uncommitted fence. Native
+controls require zero executions for stale context, unknown opcode, and
+insufficient receipt capacity, and exactly one after replay rejection. Six
+external malformed/stale/range requests must produce no execution or receipt.
+A post-test timer establishes kernel liveness after each accepted instruction.
+
+This gate is additional to the 26 required portable release gates. It does not
+promote G1 or relabel Mode 32's historical receipt-comparison evidence. The
+session's one-attempt counter is an in-memory gate invariant, not persistent
+global replay protection. Each QEMU case starts a new session with intentionally
+fixed fixture identities; these are not globally unique production receipt IDs.
+The unsafe provision API assumes a trusted caller
+and does not turn an identity or snapshot into authority. No signature is
+emitted or verified natively. G1 still requires native project-route lowering
+and provider dispatch tied to the logical HGraph, a live native identity and
+admission source, and explicit reconciliation of residual hosted effects with
+native execution. Native signing/trust and governed commitment also remain
+separate implementation work; the unsigned inspector grants neither.
+
 Mode 20 is a separate bounded KernelWorld supervisor-admission and object-model
 gate. A host-side `VerifiedKernelWorld` produces a deterministic `OKWORLD1` V2
 normal form that keeps verified package and canonical manifest digests

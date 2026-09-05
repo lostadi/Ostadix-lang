@@ -32,15 +32,18 @@ The records and their exact schema coordinates are:
 | `RecoveryPlanV1` | `ostadix.recovery-plan/v1` | Records an ordered set of conditional alternatives for a selected candidate observed to have failed. |
 | `OperationPlanningRequestV1` | `ostadix.operation-planning-request/v1` | Supplies the exact semantic closure, objective, explicit offers, and transfer records consumed by the first planner. |
 
-The marked-project bridge also uses three separately versioned auxiliary
+The marked-project bridge also uses separately versioned auxiliary
 coordinates:
 
 - `ostadix.project-route-pipeline/v1` identifies the versioned, deterministic
   serialized route-pipeline projection of a captured `olang.project.toml` route that a
   descriptor names as its execution pipeline;
-- `ostadix.operation-runtime-binding/v1` identifies the observation binding
-  between one content-verified terminal run record and the current binary's
-  recomputed operation and project-route plan identities; and
+- `ostadix.operation-run-decision/v1` freezes the original operation choice in
+  the pre-execution seed; `ostadix.operation-run-plan/v1` retains its original
+  request and deployment in the terminal content object;
+- `ostadix.operation-runtime-binding/v2` binds observation to that original
+  decision and the exact recorded route; V1 remains the explicitly labeled
+  reconstruction for legacy records without an original decision; and
 - `ostadix.operation-command-error/v1` versions the JSON error envelope for the
   marked-project commands.
 
@@ -219,26 +222,67 @@ checkpoint, migrate state, reserve capacity, fence effects, or grant authority.
 Replanning after a successful run is not recovery and must not be represented
 as a `RecoveryPlanV1`.
 
-The marked-project CLI makes these schema boundaries concrete. `o observe`
-resolves the selector to an exact run ID and reads a content-verified terminal
-record and its `RunContentRefV1`. Against the current unchanged project bundle,
-it recomputes the `OperationPlanningRequestV1`, `DeploymentPlanV2`, selected
-`RealizationCandidateTupleV1`, project-route logical HGraph, and project-route
-deployment. It requires the recorded selected route and recorded project-route
-plan identities to match that current recomputation, then emits a real
-`RuntimeGraphV2` containing one direct `Succeeded` or `Failed` observation. The
-graph's evidence includes an `ostadix.operation-runtime-binding/v1` content
-reference over those exact joins.
+The marked-project CLI freezes an `ostadix.operation-run-decision/v1` before
+execution in the durable attempt seed. It binds the original planning-request
+ID, operation `DeploymentPlanV2` ID, selected-candidate content digest, exact bundle,
+selected route, project execution and scheduling contracts, project-route graph/deployment IDs,
+pipeline digest, and implementation path/content digest. Terminal finalization
+must preserve that exact decision.
 
-This is deliberately a current-binary reconstruction, not a historical
-operation-plan receipt. `RunRecordV1` persisted the exact project bundle digest,
-selected route, route result, and project-route logical-HGraph/deployment
-identities. `RunRecordV1` did not persist the `OperationPlanningRequestV1` ID,
-the operation `DeploymentPlanV2` ID, or the selected
-`RealizationCandidateTupleV1`. The recomputed operation-plan IDs and tuple in an
-observation therefore prove consistency with the retained record and current
-bundle/current binary; they do not prove that those operation-plan coordinates
-or tuple were recorded at execution time.
+Before dispatch, `begin_with_operation_plan` also durably publishes
+`ostadix.operation-run-plan/v1`: the original
+`OperationPlanningRequestV1`, original `DeploymentPlanV2`, full selected candidate
+tuple, initially without an execution observation. The seed's optional
+`operation_plan_ref` retains only its private content address, keeping the
+256 KiB attempt index compact even for large port/representation tuples. Active
+attempts pin their snapshots in the store's aggregate retention accounting.
+The snapshot has its own closed schema within the existing private records
+namespace. Separate canonical-content
+SHA-256 values freeze their exact bytes independently of planner semantic IDs.
+The store validates neutral content bindings; the higher CLI layer validates
+typed semantic records and their exact request/deployment/candidate joins.
+Terminal finalization rereads the immutable initial snapshot and requires an
+exact match after removing only the appended execution observation. It embeds
+the verified snapshot in the terminal record; the separate initial object can
+then be collected. Orphan and recording-incomplete reconciliation perform the
+same verified read and retain the original planner payload even after SIGKILL.
+Snapshot corruption fails verification instead of reconstructing missing history.
+The optional additions preserve absent fields in legacy canonical bytes. A
+legacy on-disk decision-only seed with no snapshot reference remains explicitly degraded;
+it cannot be observed as a fully retained original plan. New decision-bearing leases
+must use `begin_with_operation_plan`; ordinary `begin` rejects a missing planner
+payload before allocating a run or changing retention.
+
+`o observe` resolves an exact content-verified terminal record, verifies the
+retained request/deployment IDs and selected tuple against that frozen decision,
+and checks the unchanged project's exact request, descriptor, implementation,
+and route bindings. It recomputes the project-route projection under the persisted execution contract
+for substitution checks, independently of the current executor environment,
+but **does not rerank the historical operation selection**. The resulting
+`RuntimeGraphV2` binds `ostadix.operation-runtime-binding/v2`, which names the
+recorded decision and execution observation. Old records without these fields
+retain the explicitly labeled V1 current-binary reconstruction; observation
+never upgrades an old record into a persisted original choice.
+
+An interrupted or recording-incomplete record may retain no terminal route
+result. `o observe` still returns its exact original choice with `execution =
+null` and a `Proposed` runtime observation containing no execution metrics.
+It does not infer whether an external side effect occurred. `o replan` can
+compute an alternative, but cannot emit a recovery claim from that unknown
+execution outcome.
+
+Execution observations separate three claims. The selected route's executed
+result establishes isolated local project execution. A matching direct
+interpreter/native entrypoint establishes submission of the captured artifact
+as an argument or executable; it does not prove interpreter loading or semantic
+behavior. Other shell, package, generated, or indirect routes remain executable
+and report `artifact_use = not_established`. Local OS, architecture, pointer
+width, and endianness are compared with the selected target's declared platform;
+a matching interpreter command is reported separately. These are process-local
+observations, not authenticated physical node identity, interpreter-version or
+loaded-executable evidence, live capacity admission, or an independent failure
+domain. Raw argv, credentials, hostnames, and workspace paths are not retained
+in the new observations.
 
 `o replan` always emits the recomputed `DeploymentPlanV2`; it emits a
 `RecoveryPlanV1` only when that exact source observation failed and the new
@@ -273,7 +317,7 @@ The command boundaries are intentional:
 | `o realizations TARGET` | Lists declared offers, costs, exact implementation and route-pipeline identities, route bindings, and manifest-declared unavailable targets. | It does not perform planning or live availability/eligibility discovery. |
 | `o plan TARGET --explain` | Runs deterministic offline selection and emits the deployment, causal assessments, selected route, and static project route plan. | It does not dispatch, reserve, or authorize work. |
 | `o run TARGET` | Repeats exact preflight, pins the selected tuple's manifest-bound project route and its project HGraph/deployment identities, executes through the existing project admission/executor path, and requires a durable run record. | Planner selection itself supplies no execution authority, and the exact joins do not prove that the route loaded the named implementation or ran on the physical target described by the tuple. |
-| `o observe TARGET [--run RUN]` | Reads a content-verified terminal record, recomputes the current operation and project-route plans against the unchanged exact bundle, checks the recorded route identities, and emits a bound `RuntimeGraphV2`. The default run selector is `last-run`. | It does not execute work, recover the historical operation-plan tuple that `RunRecordV1` did not store, authenticate the observation's real-world truth, or turn a run record into trusted World state. |
+| `o observe TARGET [--run RUN]` | Reads a content-verified terminal record, verifies its original operation decision and retained planner records against the unchanged bundle, recomputes only the project-route projection, and emits a bound `RuntimeGraphV2`. Legacy records use explicitly labeled current-planner reconstruction. The default run selector is `last-run`. | It does not execute work, invent an original tuple for a legacy record, authenticate the observation's real-world truth, or turn a run record into trusted World state. |
 | `o replan TARGET [--run RUN] --without-target TARGET_ID` | Verifies the source runtime/bundle binding, removes caller-named target offers, and emits a recomputed `DeploymentPlanV2`. It emits a descriptive `RecoveryPlanV1` only for a failed source observation when selection changes. | It does not discover unavailability, prove an independent failure domain, dispatch the replacement, perform recovery, or make a successful source run into a recovery event. |
 
 The marked bridge has two exact descriptor joins. First, the descriptor's
@@ -308,7 +352,9 @@ The CLI output-envelope coordinates are
 `ostadix.operation-observation/v1`, `ostadix.operation-replan/v1`, and
 `ostadix.operation-command-error/v1`. The exact route and observation joins use
 `ostadix.project-route-pipeline/v1` and
-`ostadix.operation-runtime-binding/v1`, respectively. These coordinates version
+`ostadix.operation-runtime-binding/v2` (V1 for legacy records), respectively.
+The persisted decision and planner snapshot use `ostadix.operation-run-decision/v1`
+and `ostadix.operation-run-plan/v1`. These coordinates version
 reports or deterministic identity projections, not authority protocols.
 
 ## Authority and equivalence boundary
@@ -331,8 +377,8 @@ the internal consistency of supplied observation/recovery records. It does
 - general artifact discovery, adapter execution, implementation loading, or
   transfer. The marked bridge resolves one exact captured implementation file
   but does not prove that its bound route loads it;
-- historical persistence of an operation planning-request ID, operation
-  DeploymentPlan V2 ID, or selected realization tuple in `RunRecordV1`;
+- a historical original decision for legacy records that predate operation
+  decision persistence;
 - admission, capability, warrant, reservation, lease, dispatch, retry,
   recovery execution, checkpoint restore, effect fencing, settlement, or World
   authority; or

@@ -18,8 +18,9 @@ use super::{
     RunInputKindV1, VerifiedTerminalRunV1,
 };
 use crate::project::{
-    build_project_hgraph, check_selection_reuse_output, DeploymentPlanV1, OExecutionResult,
-    RoutePolicy, SelectionReuseContractV1, SelectionReuseOutputCheckV1,
+    build_project_hgraph_with_contract, build_project_hgraph_with_contracts,
+    check_selection_reuse_output, DeploymentPlanV1, OExecutionResult, ProjectExecutionContract,
+    ProjectSchedulingContract, RoutePolicy, SelectionReuseContractV1, SelectionReuseOutputCheckV1,
     SelectionReuseOutputStatusV1,
 };
 
@@ -32,6 +33,8 @@ pub struct PreparedSelectionReuseV1 {
     binding: ProjectSelectionReuseBindingV1,
     admitted_input_kind: super::IntentInputKindV1,
     admitted_input_path: PathBuf,
+    admitted_executor: ProjectExecutorV1,
+    admitted_execution_contract: ProjectExecutionContract,
 }
 
 impl PreparedSelectionReuseV1 {
@@ -140,12 +143,15 @@ pub fn prepare_selection_reuse_intent(
     let source_record = source.record();
     if source_record.disposition != RunDispositionV1::Succeeded
         || source_record.failure.is_some()
-        || source_record.intent.engine != ProjectExecutorV1::Compatibility.token()
+        || !matches!(
+            source_record.intent.engine.as_str(),
+            "project_compatibility" | "project_hgraph"
+        )
         || matches!(source_record.input.kind, RunInputKindV1::OrdinaryO)
         || source_record.intent.selection_reuse.is_some()
     {
         bail!(
-            "selection source must be a successful local compatibility benchmark run, not a reused or remote execution"
+            "selection source must be a successful local project benchmark run, not a reused or remote execution"
         );
     }
     let receipt = source_record
@@ -159,17 +165,15 @@ pub fn prepare_selection_reuse_intent(
     let PreparedExecutionIntentV1::Project(mut project) = prepared else {
         bail!("selection reuse requires a project directory or lifted project bundle");
     };
-    if project.executor != ProjectExecutorV1::Compatibility
-        || project.mesh.is_some()
+    if !matches!(
+        project.executor,
+        ProjectExecutorV1::Compatibility | ProjectExecutorV1::Hgraph
+    ) || project.mesh.is_some()
         || project.effective_policy != RoutePolicy::BenchmarkValidateAndSelect.token()
     {
-        bail!("selection reuse v1 requires the local compatibility project executor");
+        bail!("selection reuse v1 requires a local project executor");
     }
     if project.identities.bundle_sha256 != source_record.input.digest_sha256
-        || source_record.plan.hgraph_sha256.as_deref()
-            != Some(project.identities.logical_hgraph_sha256.as_str())
-        || source_record.plan.deployment_sha256.as_deref()
-            != Some(project.identities.deployment_plan_sha256.as_str())
         || source_record.intent.target.as_deref() != Some(receipt.target.as_str())
         || source_record.intent.route_declarations != project.route_declaration_sha256
     {
@@ -178,11 +182,58 @@ pub fn prepare_selection_reuse_intent(
         );
     }
 
+    // Historical records predate the configurable execution contract. Match a
+    // supported projection to the exact retained IDs without changing the
+    // engine or contract already prepared for this new explicit execution.
+    let historical_hgraph = source_record
+        .plan
+        .hgraph_sha256
+        .as_deref()
+        .context("selection source has no benchmark HGraph identity")?;
+    let historical_deployment = source_record
+        .plan
+        .deployment_sha256
+        .as_deref()
+        .context("selection source has no benchmark deployment identity")?;
+    let mut historical_match = false;
+    'historical: for execution_contract in [
+        ProjectExecutionContract::Strict,
+        ProjectExecutionContract::LegacyCompatibility,
+    ] {
+        for scheduling_contract in [
+            ProjectSchedulingContract::SerialHostWorldV1,
+            ProjectSchedulingContract::ConcurrentBranchesV1,
+        ] {
+            let Ok(graph) = build_project_hgraph_with_contracts(
+                &project.bundle,
+                Some(&receipt.target),
+                Some(RoutePolicy::BenchmarkValidateAndSelect),
+                execution_contract,
+                scheduling_contract,
+            ) else {
+                continue;
+            };
+            let logical = graph
+                .logical_v1()
+                .context("failed to normalize historical benchmark graph")?;
+            let deployment = DeploymentPlanV1::hosted(&logical)
+                .context("failed to rebuild historical benchmark deployment")?;
+            if logical.digest()?.as_sha256() == historical_hgraph
+                && deployment.digest()?.as_sha256() == historical_deployment
+            {
+                historical_match = true;
+                break 'historical;
+            }
+        }
+    }
+    if !historical_match {
+        bail!("the current benchmark plan does not exactly match the selection source run");
+    }
     let contract = SelectionReuseContractV1::from_current_project(
         &project.bundle,
         receipt,
-        &project.identities.logical_hgraph_sha256,
-        &project.identities.deployment_plan_sha256,
+        historical_hgraph,
+        historical_deployment,
         project.route_declaration_sha256.clone(),
     )
     .map_err(anyhow::Error::msg)
@@ -227,14 +278,15 @@ fn derive_explicit_reuse_project(
     let target = binding.contract.target.clone();
     let selected = binding.contract.selected_route_id.clone();
     let policy = RoutePolicy::Explicit(selected);
-    let graph = build_project_hgraph(&project.bundle, Some(&target), Some(policy.clone()))
-        .map_err(anyhow::Error::msg)
-        .context("failed to derive the selected-route reuse graph")?;
-    super::validate_project_executor_preflight(
+    let graph = build_project_hgraph_with_contract(
         &project.bundle,
-        &graph,
-        ProjectExecutorV1::Compatibility,
-    )?;
+        Some(&target),
+        Some(policy.clone()),
+        project.execution_contract,
+    )
+    .map_err(anyhow::Error::msg)
+    .context("failed to derive the selected-route reuse graph")?;
+    super::validate_project_executor_preflight(&project.bundle, &graph, project.executor)?;
     let logical = graph
         .logical_v1()
         .context("failed to normalize selected-route reuse HGraph")?;
@@ -264,6 +316,8 @@ fn derive_explicit_reuse_project(
         binding,
         admitted_input_kind: project.input_kind,
         admitted_input_path: project.input_path.clone(),
+        admitted_executor: project.executor,
+        admitted_execution_contract: project.execution_contract,
     }));
     Ok(())
 }
@@ -296,6 +350,8 @@ pub(crate) fn validate_prepared_selection_reuse(
     if rebuilt_contract != binding.contract
         || prepared.input_kind != reuse.admitted_input_kind
         || prepared.input_path != reuse.admitted_input_path
+        || prepared.executor != reuse.admitted_executor
+        || prepared.execution_contract != reuse.admitted_execution_contract
         || prepared.identities.bundle_sha256 != binding.contract.bundle_sha256
         || prepared.route.as_deref() != Some(binding.contract.target.as_str())
         || prepared.policy
@@ -307,26 +363,26 @@ pub(crate) fn validate_prepared_selection_reuse(
             != RoutePolicy::Explicit(binding.contract.selected_route_id.clone()).token()
         || prepared.route_declaration_sha256 != binding.contract.route_declaration_sha256
         || prepared.parallel_auto
-        || prepared.executor != ProjectExecutorV1::Compatibility
+        || !matches!(
+            prepared.executor,
+            ProjectExecutorV1::Compatibility | ProjectExecutorV1::Hgraph
+        )
         || prepared.mesh.is_some()
     {
         bail!("prepared selected-route execution differs from its admitted reuse contract");
     }
 
-    let graph = build_project_hgraph(
+    let graph = build_project_hgraph_with_contract(
         &prepared.bundle,
         Some(&binding.contract.target),
         Some(RoutePolicy::Explicit(
             binding.contract.selected_route_id.clone(),
         )),
+        prepared.execution_contract,
     )
     .map_err(anyhow::Error::msg)
     .context("failed to rebuild the admitted selected-route graph")?;
-    super::validate_project_executor_preflight(
-        &prepared.bundle,
-        &graph,
-        ProjectExecutorV1::Compatibility,
-    )?;
+    super::validate_project_executor_preflight(&prepared.bundle, &graph, prepared.executor)?;
     let logical = graph
         .logical_v1()
         .context("failed to normalize the admitted selected-route HGraph")?;
@@ -488,7 +544,7 @@ name = "reuse-api-integrity"
 
 [[routes]]
 id = "reference"
-command = [{shell}, "-c", 'printf reference >> "$MARKER"; sleep 0.08; printf stable']
+command = [{shell}, "-c", 'printf reference >> "$MARKER"; printf stable']
 env = {{ MARKER = {reference_marker} }}
 pure = true
 
@@ -500,7 +556,7 @@ env = {{ MARKER = {prerequisite_marker} }}
 
 [[routes]]
 id = "selected"
-command = [{shell}, "-c", 'printf selected >> "$MARKER"; printf stable']
+command = [{shell}, "-c", 'if [ -f "$MARKER.fail" ]; then exit 9; fi; printf selected >> "$MARKER"; printf stable']
 env = {{ MARKER = {selected_marker} }}
 depends_on = ["selected-prerequisite"]
 {alternative_purity}
@@ -528,7 +584,43 @@ policy = "benchmark_validate_and_select"
     }
 
     fn retain_benchmark_source(project: &Path, store_root: &Path) -> VerifiedTerminalRunV1 {
-        let prepared = prepare_execution_intent(project, benchmark_options()).unwrap();
+        retain_benchmark_source_fixture(project, store_root, false)
+    }
+
+    fn retain_benchmark_source_fixture(
+        project: &Path,
+        store_root: &Path,
+        archival_serial: bool,
+    ) -> VerifiedTerminalRunV1 {
+        let mut prepared = prepare_execution_intent(project, benchmark_options()).unwrap();
+        if archival_serial {
+            let PreparedExecutionIntentV1::Project(project) = &mut prepared else {
+                unreachable!()
+            };
+            // Saved legacy fixture: the original compatibility runtime supplies
+            // real benchmark results, while its historical graph uses the old
+            // strict + serial projection. Neither current mode nor new
+            // concurrent graph identity may replace that original source ID.
+            let graph = build_project_hgraph_with_contracts(
+                &project.bundle,
+                Some("main"),
+                Some(RoutePolicy::BenchmarkValidateAndSelect),
+                ProjectExecutionContract::Strict,
+                ProjectSchedulingContract::SerialHostWorldV1,
+            )
+            .unwrap();
+            let logical = graph.logical_v1().unwrap();
+            project.identities.logical_hgraph_sha256 =
+                logical.digest().unwrap().as_sha256().to_string();
+            project.identities.deployment_plan_sha256 = DeploymentPlanV1::hosted(&logical)
+                .unwrap()
+                .digest()
+                .unwrap()
+                .as_sha256()
+                .to_string();
+            project.execution_contract = ProjectExecutionContract::Strict;
+            project.executor = ProjectExecutorV1::Compatibility;
+        }
         let store = RunStoreV1::open_at(store_root).unwrap();
         let lease = store.begin(prepared.run_attempt_seed(1).unwrap()).unwrap();
         let attempt = lease.attempt().clone();
@@ -536,6 +628,51 @@ policy = "benchmark_validate_and_select"
         let ExecutionObservationV1::Project(observation) = observation else {
             panic!("project benchmark unexpectedly produced an ordinary-O observation");
         };
+        assert!(
+            observation.validated_selection_receipt.is_some(),
+            "benchmark execution produced no validated-selection receipt"
+        );
+        // Reuse admission tests need a known selected branch, not a wall-clock
+        // race. Preserve real route outputs and terminal durations, then feed
+        // explicit synthetic branch timings through the production selector.
+        // Both timings exceed every observed terminal duration; the selected
+        // branch is deterministically faster. No lifecycle trace is attached
+        // to this test-only retained fixture.
+        let alternatives = ["reference".to_string(), "selected".to_string()];
+        let branch_floor = observation
+            .results
+            .iter()
+            .map(|result| result.duration_ns)
+            .max()
+            .unwrap();
+        let measured = alternatives
+            .iter()
+            .enumerate()
+            .map(
+                |(index, route_id)| crate::project::runtime::MeasuredRouteExecution {
+                    result: observation
+                        .results
+                        .iter()
+                        .find(|result| &result.route_id == route_id)
+                        .expect("benchmark candidate has no observed route result")
+                        .clone(),
+                    branch_elapsed_ns: branch_floor
+                        .checked_add((alternatives.len() - index) as u128)
+                        .unwrap(),
+                },
+            )
+            .collect();
+        let PreparedExecutionIntentV1::Project(prepared_project) = &prepared else {
+            unreachable!()
+        };
+        let observation = crate::project::runtime::benchmark_validate_and_select(
+            &prepared_project.bundle,
+            "main",
+            &alternatives,
+            measured,
+            None,
+        )
+        .unwrap();
         let receipt = observation
             .validated_selection_receipt
             .expect("benchmark execution produced no validated-selection receipt");
@@ -595,7 +732,7 @@ policy = "benchmark_validate_and_select"
             ),
             None,
         );
-        record.validated_selection_receipt = Some((*receipt).clone());
+        record.validated_selection_receipt = Some(receipt);
         record.validate().unwrap();
         let finalized = lease.finalize(record, None).unwrap();
         RunStoreReaderV1::open_existing(store.root())
@@ -641,7 +778,7 @@ policy = "benchmark_validate_and_select"
         let PreparedExecutionIntentV1::Project(pinned_project) = &pinned else {
             panic!("selection reuse did not prepare a project intent");
         };
-        assert_eq!(pinned_project.executor, ProjectExecutorV1::Compatibility);
+        assert_eq!(pinned_project.executor, ProjectExecutorV1::Hgraph);
         std::env::set_var(PROJECT_EXECUTOR_ENV, "hgraph");
         let executed = execute_prepared_intent(&pinned).unwrap();
         std::env::remove_var(PROJECT_EXECUTOR_ENV);
@@ -654,6 +791,91 @@ policy = "benchmark_validate_and_select"
         assert!(!markers.reference.exists());
         assert_eq!(fs::read(&markers.prerequisite).unwrap(), b"prerequisite");
         assert_eq!(fs::read(&markers.selected).unwrap(), b"selected");
+
+        markers.clear();
+        let historical_source = retain_benchmark_source_fixture(
+            &project,
+            &temporary.path().join("historical-runs"),
+            true,
+        );
+        assert_ne!(
+            historical_source.record().plan.hgraph_sha256,
+            source.record().plan.hgraph_sha256
+        );
+        markers.clear();
+        let historical_reuse = admitted_project(&project, &historical_source);
+        let PreparedExecutionIntentV1::Project(new_project) = &historical_reuse else {
+            unreachable!()
+        };
+        assert_eq!(new_project.executor, ProjectExecutorV1::Hgraph);
+        assert_eq!(
+            new_project.execution_contract,
+            ProjectExecutionContract::LegacyCompatibility
+        );
+        assert_eq!(
+            new_project
+                .selection_reuse()
+                .unwrap()
+                .binding()
+                .contract
+                .benchmark_hgraph_sha256,
+            historical_source
+                .record()
+                .plan
+                .hgraph_sha256
+                .as_ref()
+                .unwrap()
+                .as_str()
+        );
+        assert!(execute_prepared_intent(&historical_reuse).is_ok());
+        assert!(!markers.reference.exists());
+
+        // Reuse a compatibility benchmark under a newly requested strict
+        // engine without substituting the original benchmark's identities.
+        markers.clear();
+        std::env::set_var(PROJECT_EXECUTOR_ENV, "hgraph");
+        let strict_reuse = admitted_project(&project, &source);
+        std::env::remove_var(PROJECT_EXECUTOR_ENV);
+        let PreparedExecutionIntentV1::Project(strict_project) = &strict_reuse else {
+            unreachable!()
+        };
+        assert_eq!(
+            strict_project.execution_contract,
+            ProjectExecutionContract::Strict
+        );
+        assert!(execute_prepared_intent(&strict_reuse).is_ok());
+
+        markers.clear();
+        let failed_reuse = admitted_project(&project, &source);
+        let fail_marker = PathBuf::from(format!("{}.fail", markers.selected.display()));
+        fs::write(&fail_marker, b"fail selected route").unwrap();
+        let error = execute_prepared_intent(&failed_reuse).unwrap_err();
+        let failure = error
+            .downcast_ref::<SelectionReuseExecutionErrorV1>()
+            .unwrap();
+        assert_eq!(
+            failure.observation.output_check.status,
+            SelectionReuseOutputStatusV1::RouteFailed
+        );
+        assert_eq!(failure.results.len(), 1);
+        assert_eq!(failure.results[0].exit_code, Some(9));
+        assert!(!markers.reference.exists());
+        fs::remove_file(fail_marker).unwrap();
+
+        markers.clear();
+        let mut changed_engine = admitted_project(&project, &source);
+        let PreparedExecutionIntentV1::Project(changed) = &mut changed_engine else {
+            unreachable!()
+        };
+        changed.executor = ProjectExecutorV1::Compatibility;
+        assert_pre_dispatch_rejection(&changed_engine, &markers);
+
+        let mut changed_contract = admitted_project(&project, &source);
+        let PreparedExecutionIntentV1::Project(changed) = &mut changed_contract else {
+            unreachable!()
+        };
+        changed.execution_contract = ProjectExecutionContract::Strict;
+        assert_pre_dispatch_rejection(&changed_contract, &markers);
 
         markers.clear();
         let mut changed_policy = admitted_project(&project, &source);

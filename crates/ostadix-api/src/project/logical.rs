@@ -95,6 +95,16 @@ pub struct LogicalOperationIdV1(pub u64);
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LogicalProjectSourceV1 {
+    #[serde(
+        default,
+        skip_serializing_if = "super::plan::ProjectSchedulingContract::is_serial"
+    )]
+    pub scheduling_contract: super::plan::ProjectSchedulingContract,
+    #[serde(
+        default,
+        skip_serializing_if = "super::plan::ProjectExecutionContract::is_strict"
+    )]
+    pub execution_contract: super::plan::ProjectExecutionContract,
     pub project_name: String,
     pub bundle: ArtifactId,
     pub target: String,
@@ -460,6 +470,13 @@ impl From<&ActorResourceId> for LogicalActorResourceV1 {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum LogicalResourceV1 {
     HostWorld,
+    ConcurrentProjectBranch {
+        branch: usize,
+    },
+    ProjectBranchPath {
+        branch: usize,
+        path: String,
+    },
     WorldState {
         world: WorldIdentity,
     },
@@ -550,6 +567,25 @@ impl LogicalResourceV1 {
             Self::ScopeBinding { name } | Self::EnvVar { name } | Self::Service { name } => {
                 validate_text(name, "logical resource name")
             }
+            Self::ProjectBranchPath { path, .. } => {
+                validate_text(path, "branch workspace resource path")?;
+                let path = std::path::Path::new(path);
+                if path.is_absolute()
+                    || path.components().any(|part| {
+                        matches!(
+                            part,
+                            std::path::Component::ParentDir
+                                | std::path::Component::RootDir
+                                | std::path::Component::Prefix(_)
+                        )
+                    })
+                {
+                    return Err(invalid(
+                        "branch workspace resource path escapes its workspace",
+                    ));
+                }
+                Ok(())
+            }
             Self::ProjectPath { path } | Self::HostPath { path } => {
                 validate_text(path, "logical resource path")
             }
@@ -564,6 +600,13 @@ impl LogicalResourceV1 {
     fn to_project(&self) -> ResourceKey {
         match self {
             Self::HostWorld => ResourceKey::HostWorld,
+            Self::ConcurrentProjectBranch { branch } => {
+                ResourceKey::ConcurrentProjectBranch(*branch)
+            }
+            Self::ProjectBranchPath { branch, path } => ResourceKey::ProjectBranchPath {
+                branch: *branch,
+                path: path.clone(),
+            },
             Self::WorldState { world } => ResourceKey::WorldState(world.clone()),
             Self::GovernorState { governor } => ResourceKey::GovernorState(governor.clone()),
             Self::NodeState { node } => ResourceKey::NodeState(node.clone()),
@@ -602,6 +645,13 @@ impl From<&ResourceKey> for LogicalResourceV1 {
     fn from(resource: &ResourceKey) -> Self {
         match resource {
             ResourceKey::HostWorld => Self::HostWorld,
+            ResourceKey::ConcurrentProjectBranch(branch) => {
+                Self::ConcurrentProjectBranch { branch: *branch }
+            }
+            ResourceKey::ProjectBranchPath { branch, path } => Self::ProjectBranchPath {
+                branch: *branch,
+                path: path.clone(),
+            },
             ResourceKey::WorldState(world) => Self::WorldState {
                 world: world.clone(),
             },
@@ -749,7 +799,12 @@ impl LogicalEffectSummaryV1 {
                 resource.validate()?;
             }
         }
+        let explicit_concurrent_project = self.reads.iter().any(|resource| {
+            matches!(resource, LogicalResourceV1::ConcurrentProjectBranch { .. })
+                && self.writes.contains(resource)
+        });
         if self.unknown
+            && !explicit_concurrent_project
             && (!self.reads.contains(&LogicalResourceV1::HostWorld)
                 || !self.writes.contains(&LogicalResourceV1::HostWorld))
         {
@@ -881,6 +936,8 @@ pub struct LogicalHGraphV1 {
 impl LogicalHGraphV1 {
     fn to_project_plan(&self) -> Result<ProjectExecutionPlan, LogicalHGraphError> {
         Ok(ProjectExecutionPlan {
+            execution_contract: self.source.execution_contract,
+            scheduling_contract: self.source.scheduling_contract,
             project_name: self.source.project_name.clone(),
             bundle_digest: self.source.bundle.as_sha256().to_owned(),
             target: self.source.target.clone(),
@@ -915,6 +972,8 @@ impl LogicalHGraphV1 {
 
         let bundle = ArtifactId::from_sha256(project.plan.bundle_digest.clone())?;
         let source = LogicalProjectSourceV1 {
+            execution_contract: project.plan.execution_contract,
+            scheduling_contract: project.plan.scheduling_contract,
             project_name: project.plan.project_name.clone(),
             bundle,
             target: project.plan.target.clone(),

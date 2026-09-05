@@ -194,11 +194,14 @@ fn fixture_snapshot(logical: &project::LogicalHGraphV1) -> PlacementSnapshotV1 {
 
 #[test]
 fn hosted_plan_is_canonical_explicit_and_never_mints_world_identity() {
-    let unsupported = DeploymentPlanV1::hosted(&fixture_logical()).unwrap();
-    assert!(unsupported.operations.iter().all(|operation| matches!(
+    let concurrent_logical = fixture_logical();
+    let concurrent = DeploymentPlanV1::hosted(&concurrent_logical).unwrap();
+    concurrent
+        .validate_trusted_hosted(&concurrent_logical)
+        .unwrap();
+    assert!(concurrent.operations.iter().all(|operation| !matches!(
         &operation.binding,
-        DeploymentOperationBindingV1::Unresolved { issues }
-            if matches!(issues.as_slice(), [DeploymentCompatibilityIssueV1::UnsupportedHostedPolicy { .. }])
+        DeploymentOperationBindingV1::Unresolved { .. }
     )));
 
     let logical = fixture_supported_logical();

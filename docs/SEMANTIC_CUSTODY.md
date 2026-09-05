@@ -107,6 +107,42 @@ shadow result can therefore expose differences such as the compatibility
 solver's optimistic container classification without reducing current
 execution capacity.
 
+### Observed graph adapter boundaries
+
+`O --crossing-evidence program.O /absolute/backends` enables JSON observations
+for direct admitted graph backend operations. Embedders use
+`Evaluator::with_crossing_observations()` and read
+`last_execution_trace().backend_crossings`. Ordinary execution does not collect
+or hash these diagnostic payloads. The option requires graph execution; it is
+not a serial-reference or parse-only result.
+
+Each observation binds the admission and admitted graph digests, plan node,
+canonical backend, encoded environment identity, and the admission's launch
+generation. That generation binds the retained executable set, adapter artifact,
+and launch context. Sorted prepared bindings retain canonical OValue hashes and a
+directional bounded input-profile assessment. Preparation or worker submission
+does not prove adapter receipt: authority checks, splice resolution, actor
+reentrancy checks, or restoration can still fail before the send. Python plain data and JavaScript
+scalar binding claims use their existing kernels. JavaScript container inputs
+remain executable and explicitly report `outside-profile`; the Rust scalar
+source-constant profile is never misrepresented as a runtime binding profile.
+
+The result records the hash and type of the OValue actually returned by the
+adapter. Its boundary is `adapter-wire-response-ovalue`: the pre-lifting native
+object was not captured, so this is not a newly inferred native-egress fidelity
+claim. Neither input projection nor result observation asserts that arbitrary
+backend code is an identity function. Source-splice rendering, deferred request
+execution, and recursive callback graphs are outside this direct-operation
+coverage and must not be silently counted as observed binding crossings.
+
+Physical completion, semantic publication, and discarded speculative results
+are recorded separately. Failed operations never acquire a successful result
+or publication claim. Each record has a domain-separated digest and strict
+decoder; `verify` accepts a trusted external record digest and expected
+admission/graph identities. These unsigned observations do not grant authority
+or authenticate themselves. They augment the trace without changing scheduling,
+the compatibility solver, admission decisions, or out-of-profile execution.
+
 ## Operation-description boundary
 
 Operation-realization V1 adds separate authority-free descriptive records.

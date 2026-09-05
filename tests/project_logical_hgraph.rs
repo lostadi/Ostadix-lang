@@ -101,7 +101,7 @@ fn directory_and_lifted_project_have_identical_canonical_bytes_and_digest() {
 fn project_profile_v1_digest_is_pinned() {
     assert_eq!(
         fixture_logical().digest().unwrap().as_sha256(),
-        "5f8815019223109644bd20e765983872e133dd3a3b038d52c04155271fb96216",
+        "58d11e66b6daac176e2d97107a618c43221c23bc593a5997534b6d0132d10f05",
         "a canonical schema change requires a new version and reviewed vector"
     );
 }
@@ -210,14 +210,16 @@ fn hosted_effects_preserve_host_world_and_mint_no_authority_requirements() {
         }
         if operation.effects.unknown {
             unknown_effects += 1;
-            assert!(operation
-                .effects
-                .reads
-                .contains(&LogicalResourceV1::HostWorld));
-            assert!(operation
-                .effects
-                .writes
-                .contains(&LogicalResourceV1::HostWorld));
+            assert!(operation.effects.reads.contains(
+                &LogicalResourceV1::ConcurrentProjectBranch {
+                    branch: operation.branch.unwrap() as usize
+                }
+            ));
+            assert!(operation.effects.writes.contains(
+                &LogicalResourceV1::ConcurrentProjectBranch {
+                    branch: operation.branch.unwrap() as usize
+                }
+            ));
         }
         for dependency in &operation.dependencies {
             match dependency.requirement {
@@ -371,14 +373,24 @@ fn hosted_profile_rejects_host_world_removal_and_effect_flag_tampering() {
     missing_host_world.operations[unknown_index]
         .effects
         .reads
-        .retain(|resource| resource != &LogicalResourceV1::HostWorld);
+        .retain(|resource| {
+            !matches!(
+                resource,
+                LogicalResourceV1::HostWorld | LogicalResourceV1::ConcurrentProjectBranch { .. }
+            )
+        });
     assert_structural_rejection(&missing_host_world);
 
     let mut missing_host_world_write = logical.clone();
     missing_host_world_write.operations[unknown_index]
         .effects
         .writes
-        .retain(|resource| resource != &LogicalResourceV1::HostWorld);
+        .retain(|resource| {
+            !matches!(
+                resource,
+                LogicalResourceV1::HostWorld | LogicalResourceV1::ConcurrentProjectBranch { .. }
+            )
+        });
     assert_structural_rejection(&missing_host_world_write);
 
     type LogicalMutation = Box<dyn FnOnce(&mut LogicalHGraphV1)>;
@@ -478,4 +490,48 @@ fn structural_substitutions_fail_closed_while_valid_source_and_policy_changes_re
     root_substitution.roots = vec![LogicalOperationIdV1(0)];
     assert!(root_substitution.validate().is_err());
     assert!(root_substitution.digest().is_err());
+}
+
+#[test]
+fn archival_parallel_graph_preserves_v1_digest_and_source_reconstruction() {
+    use project::{ProjectExecutionPlan, ProjectHGraph, ProjectSchedulingContract};
+    let bundle = fixture_bundle();
+    let plan = ProjectExecutionPlan::from_bundle_with_scheduling(
+        &bundle,
+        Some("main"),
+        None,
+        ProjectSchedulingContract::SerialHostWorldV1,
+    )
+    .unwrap();
+    let graph = plan.to_hgraph().unwrap();
+    let archived = ProjectHGraph { plan, graph };
+    archived
+        .validate_source(&bundle, Some("main"), None)
+        .unwrap();
+    let logical = archived.logical_v1().unwrap();
+    assert_eq!(
+        logical.digest().unwrap().as_sha256(),
+        "5f8815019223109644bd20e765983872e133dd3a3b038d52c04155271fb96216"
+    );
+    let bytes = logical.canonical_bytes().unwrap();
+    assert!(!String::from_utf8_lossy(&bytes).contains("scheduling_contract"));
+    let decoded = LogicalHGraphV1::decode_canonical(&bytes).unwrap();
+    decoded.validate_trusted_project(&archived).unwrap();
+    assert!(decoded
+        .validate_trusted_project(&fixture_project())
+        .is_err());
+    assert_ne!(
+        logical.digest().unwrap(),
+        fixture_logical().digest().unwrap()
+    );
+    let mut forged = fixture_logical();
+    forged.source.scheduling_contract = ProjectSchedulingContract::SerialHostWorldV1;
+    assert_structural_rejection(&forged);
+    assert!(ProjectExecutionPlan::from_bundle_with_scheduling(
+        &bundle,
+        Some("impl-a"),
+        Some(RoutePolicy::Explicit("impl-a".into())),
+        ProjectSchedulingContract::ConcurrentBranchesV1
+    )
+    .is_err());
 }

@@ -1315,7 +1315,18 @@ impl HGraph {
         summary: &EffectSummary,
     ) -> Result<(), String> {
         if summary.unknown {
-            require_read_write(summary, &ResourceKey::HostWorld, info.plan_node)?;
+            let explicit_project_concurrency = matches!(
+                edge.op,
+                HEdgeKind::Execute(
+                    ExecutableOp::MaterializeProject | ExecutableOp::RunRoute { .. }
+                )
+            ) && summary.reads.iter().any(|resource| {
+                matches!(resource, ResourceKey::ConcurrentProjectBranch(_))
+                    && summary.writes.contains(resource)
+            });
+            if !explicit_project_concurrency {
+                require_read_write(summary, &ResourceKey::HostWorld, info.plan_node)?;
+            }
         }
 
         let HEdgeKind::Execute(op) = &edge.op else {
@@ -1968,7 +1979,18 @@ fn require_hosted_project_operation(
             plan_node.0
         ));
     }
-    require_read_write(summary, &ResourceKey::HostWorld, plan_node)
+    // A project source validator separately binds this marker to an explicit
+    // concurrent policy and the exact branch. It retains unknown effects; it
+    // does not turn temporary workspaces into host-isolation evidence.
+    if let Some(resource) = summary
+        .reads
+        .iter()
+        .find(|resource| matches!(resource, ResourceKey::ConcurrentProjectBranch(_)))
+    {
+        require_read_write(summary, resource, plan_node)
+    } else {
+        require_read_write(summary, &ResourceKey::HostWorld, plan_node)
+    }
 }
 
 fn require_read_write(

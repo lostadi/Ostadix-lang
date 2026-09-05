@@ -25,6 +25,7 @@ fn main() -> Result<()> {
     let mut backend_grants = Vec::new();
     let mut json_output = false;
     let mut check_only = false;
+    let mut crossing_evidence = false;
     let mut eval_source: Option<String> = None;
     let mut local_workers = None;
     let mut required_source_sha256: Option<String> = None;
@@ -37,6 +38,7 @@ fn main() -> Result<()> {
                 | "--workers"
                 | "--json"
                 | "--check"
+                | "--crossing-evidence"
                 | "--eval"
                 | "-e"
                 | "--require-source-sha256"
@@ -50,6 +52,10 @@ fn main() -> Result<()> {
             ),
             "--json" => json_output = true,
             "--check" => check_only = true,
+            "--crossing-evidence" => {
+                crossing_evidence = true;
+                json_output = true;
+            }
             "--eval" | "-e" => {
                 eval_source = Some(
                     args.pop_front()
@@ -98,6 +104,13 @@ fn main() -> Result<()> {
             }
             _ => unreachable!(),
         }
+    }
+
+    if crossing_evidence
+        && (check_only
+            || env::var("O_EXECUTOR").is_ok_and(|value| value.eq_ignore_ascii_case("serial")))
+    {
+        bail!("--crossing-evidence requires graph execution (not --check or --executor serial)");
     }
 
     let required_execution_intent = match (
@@ -203,6 +216,9 @@ fn main() -> Result<()> {
     }
 
     let mut evaluator = Evaluator::new(shim_dir).with_registered_backends(backends);
+    if crossing_evidence {
+        evaluator = evaluator.with_crossing_observations();
+    }
     if let Some(workers) = local_workers {
         evaluator = evaluator.with_local_worker_parallelism(workers);
     }
@@ -223,22 +239,55 @@ fn main() -> Result<()> {
             ),
         None => evaluator.eval_document_with_scope(nodes, &mut scope),
     };
+    let crossing_records = if crossing_evidence {
+        let observations = evaluator
+            .last_execution_trace()
+            .map(|trace| trace.backend_crossings.as_slice())
+            .unwrap_or_default();
+        Some(
+            observations
+                .iter()
+                .map(|observation| {
+                    Ok(serde_json::json!({
+                        "sha256": observation.digest().map_err(anyhow::Error::msg)?,
+                        "observation": observation,
+                    }))
+                })
+                .collect::<Result<Vec<_>>>()?,
+        )
+    } else {
+        None
+    };
     let result = match evaluation {
         Ok(result) => result,
+        Err(e) if crossing_evidence => {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "ok": false, "stage": "eval", "error": format!("{e:#}"),
+                    "backend_crossings": crossing_records,
+                    "crossing_coverage": "direct-admitted-graph-bindings-and-lifted-results",
+                })
+            );
+            std::process::exit(1);
+        }
         Err(e) => return fail_stage(json_output, "eval", e),
     };
 
     let elapsed = start.elapsed();
     if json_output {
-        println!(
-            "{}",
-            serde_json::json!({
-                "ok": true,
-                "value": result,
-                "type": result.type_name(),
-                "elapsed_ms": elapsed.as_millis() as u64,
-            })
-        );
+        let mut envelope = serde_json::json!({
+            "ok": true,
+            "value": result,
+            "type": result.type_name(),
+            "elapsed_ms": elapsed.as_millis() as u64,
+        });
+        if let Some(records) = crossing_records {
+            envelope["backend_crossings"] = serde_json::json!(records);
+            envelope["crossing_coverage"] =
+                serde_json::json!("direct-admitted-graph-bindings-and-lifted-results");
+        }
+        println!("{envelope}");
     } else {
         print_result(&result);
     }
@@ -282,6 +331,10 @@ fn print_usage(out: &mut impl Write) -> io::Result<()> {
     writeln!(
         out,
         "  O --json <input.O>                   # machine-readable JSON result/error on stdout"
+    )?;
+    writeln!(
+        out,
+        "  O --crossing-evidence <input.O>      # JSON with observed graph adapter boundaries"
     )?;
     writeln!(
         out,

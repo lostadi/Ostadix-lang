@@ -326,7 +326,7 @@ policy = "benchmark_validate_and_select"
         fs::metadata(&trace_path).unwrap().permissions().mode() & 0o777,
         0o600
     );
-    assert_eq!(read_project_trace(&trace_path)["format_version"], 6);
+    assert_eq!(read_project_trace(&trace_path)["format_version"], 7);
 }
 
 #[test]
@@ -556,7 +556,7 @@ fn olink_explicit_project_run_uses_default_route() {
 }
 
 #[test]
-fn olink_explicit_project_hgraph_run_writes_unsigned_attempt_trace() {
+fn olink_default_project_hgraph_run_writes_unsigned_attempt_trace() {
     if !support::require_runtime("python3") {
         return;
     }
@@ -570,7 +570,7 @@ fn olink_explicit_project_hgraph_run_writes_unsigned_attempt_trace() {
         .arg("--run")
         .arg("--project-trace-out")
         .arg(&trace_path)
-        .env("O_PROJECT_EXECUTOR", "hgraph")
+        .env_remove("O_PROJECT_EXECUTOR")
         .output()
         .unwrap();
     assert!(
@@ -582,7 +582,7 @@ fn olink_explicit_project_hgraph_run_writes_unsigned_attempt_trace() {
     let trace = read_project_trace(&trace_path);
     let root = trace.as_object().expect("trace root must be an object");
     assert_eq!(root.len(), 3, "unexpected trace root fields: {root:?}");
-    assert_eq!(trace["format_version"], 6);
+    assert_eq!(trace["format_version"], 7);
     let target = trace["header"]["target"]
         .as_str()
         .expect("trace header must name the selected route");

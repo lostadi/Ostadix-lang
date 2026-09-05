@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use o_lang::effects::{EffectSummary, ResourceKey};
-use o_lang::hgraph::{ExecutableOp, HNode, HNodeKind};
+use o_lang::hgraph::{ExecutableOp, HNode};
 use o_lang::ir::PlanNodeId;
 use o_lang::project::plan::ProjectDependency;
 use o_lang::project::runtime::resolve_selection;
@@ -115,8 +115,18 @@ fn real_bundle_constructs_all_five_project_operations() {
         if matches!(operation.op, ExecutableOp::RunRoute { .. }) {
             assert!(operation.effects.unknown);
             assert!(operation.effects.spawn);
-            assert!(operation.effects.reads.contains(&ResourceKey::HostWorld));
-            assert!(operation.effects.writes.contains(&ResourceKey::HostWorld));
+            assert!(operation
+                .effects
+                .reads
+                .contains(&ResourceKey::ConcurrentProjectBranch(
+                    operation.branch.unwrap()
+                )));
+            assert!(operation
+                .effects
+                .writes
+                .contains(&ResourceKey::ConcurrentProjectBranch(
+                    operation.branch.unwrap()
+                )));
         }
     }
     let declared_pure = route_operation(&project, 1, "impl-b", true);
@@ -213,36 +223,23 @@ fn topology_preserves_logical_branches_prerequisites_compare_and_selection() {
         }
     }
 
-    // The plan branches are logically separate, but residual ambient effects
-    // deliberately remain one conservative HostWorld chain. Preserve that
-    // honesty until a trusted branch-scoped resource model exists.
+    // ConcurrentBranchesV1 retains the ambient host lease as a read and
+    // orders unknown effects within each branch, without a cross-branch edge.
     let second_materialize = project.graph.op_for(materializations[1]).unwrap();
-    let ambient_input = second_materialize
-        .inputs
-        .iter()
-        .find(|node| {
-            matches!(
-                project.graph.node(**node).map(|node| &node.kind),
-                Some(HNodeKind::ResourceState {
-                    resource: ResourceKey::HostWorld,
-                    ..
-                })
-            )
-        })
-        .copied()
-        .expect("second branch consumes the shared HostWorld chain");
-    let ambient_producer = project.graph.node(ambient_input).unwrap().producer.unwrap();
-    let predecessor = project
-        .graph
-        .op_map
-        .values()
-        .find(|operation| operation.edge == ambient_producer)
-        .unwrap();
-    assert_eq!(
-        project.plan.operations[predecessor.plan_node.0].branch,
-        Some(0),
-        "residual HostWorld must conservatively serialize the logical branches"
-    );
+    for input in &second_materialize.inputs {
+        if let Some(producer) = project.graph.node(*input).unwrap().producer {
+            let predecessor = project
+                .graph
+                .op_map
+                .values()
+                .find(|operation| operation.edge == producer)
+                .unwrap();
+            assert_ne!(
+                project.plan.operations[predecessor.plan_node.0].branch,
+                Some(0)
+            );
+        }
+    }
 }
 
 #[test]
@@ -403,7 +400,7 @@ fn project_source_validation_rejects_bundle_and_policy_substitution() {
     assert!(project
         .validate_source(&bundle, Some("main"), Some(RoutePolicy::All))
         .unwrap_err()
-        .contains("does not match"));
+        .contains("concurrent branch scheduling requires"));
 }
 
 #[test]

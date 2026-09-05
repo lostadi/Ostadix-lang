@@ -1,4 +1,3 @@
-import { spawn } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
 import {
   access,
@@ -10,18 +9,15 @@ import {
 } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
-import { extname, join, resolve, sep } from "node:path";
+import { delimiter, extname, join, resolve, sep } from "node:path";
+import { launchBrowser } from "./browser-process.mjs";
 
 const PASS_MARKER = "OSTADIX_BROWSER_WASI_DOM_PASS_V1";
 const TEST_PAGE = "/__olang_browser_qualification__.html";
-const WAIT_RESOURCE = "/__olang_browser_qualification_wait__.gif";
 const DONE_RESOURCE = "/__olang_browser_qualification_done__";
-const PROCESS_TIMEOUT_MS = 30_000;
-const MAX_PROCESS_OUTPUT_BYTES = 8 * 1024 * 1024;
-const ONE_PIXEL_GIF = Buffer.from(
-  "R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==",
-  "base64",
-);
+// A cold browser has a separate deadline from the unchanged UI execution budget.
+const STARTUP_TIMEOUT_MS = 60_000;
+const EXECUTION_TIMEOUT_MS = 30_000;
 
 const [bundleArgument, expectedStdout] = process.argv.slice(2);
 if (!bundleArgument || expectedStdout === undefined) {
@@ -36,8 +32,10 @@ async function browserTestPage(bundleRoot) {
     throw new Error("shipped index.html lacks a closing body element");
   }
   const qualification = `
-    <img hidden alt="" src="${WAIT_RESOURCE}">
-    <script type="module">
+    <script>
+    // Register during parsing; DOMContentLoaded waits for the shipped module and
+    // its dependencies, even when this inline script arrives before they do.
+    document.addEventListener("DOMContentLoaded", async () => {
       const runButton = document.querySelector("#run");
       const output = document.querySelector("#output");
       const expected = new URL(location.href).searchParams.get("expected");
@@ -77,6 +75,7 @@ async function browserTestPage(bundleRoot) {
         });
         await fetch(\`${DONE_RESOURCE}?\${completion}\`, { cache: "no-store" });
       }
+    }, { once: true });
     </script>
   `;
   return index.replace("</body>", `${qualification}</body>`);
@@ -104,7 +103,6 @@ function send(response, status, contentType, body, headOnly = false) {
 
 async function createBundleServer(bundleRoot) {
   const page = await browserTestPage(bundleRoot);
-  const waitingResponses = [];
   const requestLog = [];
   let completionStatus;
   let resolveCompletion;
@@ -125,14 +123,6 @@ async function createBundleServer(bundleRoot) {
         send(response, 200, MIME_TYPES[".html"], page, method === "HEAD");
         return;
       }
-      if (url.pathname === WAIT_RESOURCE) {
-        if (completionStatus !== undefined) {
-          send(response, 200, "image/gif", ONE_PIXEL_GIF, method === "HEAD");
-        } else {
-          waitingResponses.push({ response, headOnly: method === "HEAD" });
-        }
-        return;
-      }
       if (url.pathname === DONE_RESOURCE) {
         const status = url.searchParams.get("status");
         const domStatus = url.searchParams.get("domStatus");
@@ -148,9 +138,6 @@ async function createBundleServer(bundleRoot) {
         const firstCompletion = completionStatus === undefined;
         completionStatus = status;
         send(response, 200, "text/plain; charset=utf-8", `${status}\n`, method === "HEAD");
-        for (const waiter of waitingResponses.splice(0)) {
-          send(waiter.response, 200, "image/gif", ONE_PIXEL_GIF, waiter.headOnly);
-        }
         if (firstCompletion) resolveCompletion({ status, domStatus, domMarker });
         return;
       }
@@ -204,77 +191,6 @@ async function createBundleServer(bundleRoot) {
   return server;
 }
 
-function runProcess(command, args, timeoutMs = PROCESS_TIMEOUT_MS, stopWhen) {
-  return new Promise((resolveProcess, rejectProcess) => {
-    const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
-    let timedOut = false;
-    let excessiveOutput = false;
-    let settled = false;
-    let stopValue;
-    let stopError;
-    let stoppedForCompletion = false;
-
-    const append = (current, chunk) => {
-      const next = current + chunk;
-      if (Buffer.byteLength(next) > MAX_PROCESS_OUTPUT_BYTES) {
-        excessiveOutput = true;
-        child.kill("SIGKILL");
-      }
-      return next;
-    };
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => { stdout = append(stdout, chunk); });
-    child.stderr.on("data", (chunk) => { stderr = append(stderr, chunk); });
-
-    const timer = setTimeout(() => {
-      timedOut = true;
-      child.kill("SIGKILL");
-    }, timeoutMs);
-
-    if (stopWhen) {
-      void Promise.resolve(stopWhen).then(
-        (value) => {
-          stopValue = value;
-          if (!settled) {
-            stoppedForCompletion = true;
-            child.kill("SIGKILL");
-          }
-        },
-        (error) => {
-          stopError = error;
-          if (!settled) child.kill("SIGKILL");
-        },
-      );
-    }
-
-    child.once("error", (error) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      rejectProcess(error);
-    });
-    child.once("close", (code, signal) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolveProcess({
-        code,
-        signal,
-        stdout,
-        stderr,
-        timedOut,
-        excessiveOutput,
-        stopValue,
-        stopError,
-        stoppedForCompletion,
-      });
-    });
-  });
-}
-
 async function findBrowser() {
   const candidates = [
     process.env.CHROME_BIN,
@@ -287,17 +203,17 @@ async function findBrowser() {
     "/Applications/Chromium.app/Contents/MacOS/Chromium",
   ].filter(Boolean);
 
-  for (const command of [...new Set(candidates)]) {
-    try {
-      const result = await runProcess(command, ["--version"], 5_000);
-      if (result.code === 0) {
-        return {
-          command,
-          version: (result.stdout || result.stderr).trim(),
-        };
+  for (const candidate of [...new Set(candidates)]) {
+    const paths = candidate.includes(sep)
+      ? [candidate]
+      : (process.env.PATH ?? "").split(delimiter).map((directory) => join(directory, candidate));
+    for (const command of paths) {
+      try {
+        await access(command, fsConstants.X_OK);
+        if ((await stat(command)).isFile()) return command;
+      } catch (error) {
+        if (!["ENOENT", "ENOTDIR", "EACCES"].includes(error?.code)) throw error;
       }
-    } catch (error) {
-      if (error?.code !== "ENOENT" && error?.code !== "ENOTDIR") throw error;
     }
   }
   throw new Error(
@@ -320,6 +236,14 @@ for (const path of [
 const browser = await findBrowser();
 const profileDirectory = await mkdtemp(join(tmpdir(), "olang-browser-qualification-"));
 let server;
+let browserProcess;
+let interruption;
+const interrupted = (signal) => {
+  interruption = new Error(`browser qualification interrupted by ${signal}`);
+  browserProcess?.abort(interruption);
+};
+process.on("SIGINT", interrupted);
+process.on("SIGTERM", interrupted);
 
 try {
   server = await createBundleServer(bundleRoot);
@@ -330,8 +254,9 @@ try {
   const testUrl = new URL(TEST_PAGE, `http://127.0.0.1:${address.port}`);
   testUrl.searchParams.set("expected", expectedStdout);
 
-  const result = await runProcess(browser.command, [
+  browserProcess = launchBrowser(browser, [
     "--headless",
+    "--remote-debugging-pipe",
     "--disable-background-networking",
     "--disable-component-update",
     "--disable-default-apps",
@@ -343,45 +268,61 @@ try {
     "--no-first-run",
     "--hide-scrollbars",
     "--mute-audio",
+    "--password-store=basic",
+    "--use-mock-keychain",
     `--user-data-dir=${profileDirectory}`,
-    "--dump-dom",
-    testUrl.href,
-  ], PROCESS_TIMEOUT_MS, server.completion);
-  if (result.timedOut) {
-    throw new Error(
-      `headless browser exceeded ${PROCESS_TIMEOUT_MS} ms; requests:\n${server.requestLog.join("\n")}\n${result.stderr}`,
-    );
-  }
-  if (result.excessiveOutput) {
-    throw new Error(`headless browser exceeded ${MAX_PROCESS_OUTPUT_BYTES} output bytes`);
-  }
-  if (result.stopError) {
-    throw new Error(`browser completion signal failed: ${result.stopError}`);
-  }
-  if (!result.stopValue) {
-    throw new Error(
-      `headless browser exited before reporting completion (code ${result.code} signal ${result.signal ?? "none"}):\n${result.stderr}`,
-    );
-  }
-  if (
-    result.stopValue.status !== "pass"
-    || result.stopValue.domStatus !== "pass"
-    || result.stopValue.domMarker !== PASS_MARKER
-  ) {
-    throw new Error(
-      `browser DOM did not contain the qualification marker: ${JSON.stringify(result.stopValue)}`,
-    );
-  }
-  if (!result.stoppedForCompletion && result.code !== 0) {
-    throw new Error(
-      `headless browser exited with code ${result.code} signal ${result.signal ?? "none"}:\n${result.stderr}`,
-    );
-  }
-  console.log(`${PASS_MARKER} (${browser.version})`);
+    "about:blank",
+  ]);
+  if (interruption) browserProcess.abort(interruption);
+  const started = Date.now();
+  const { version, sessionId } = await browserProcess.phase("browser startup/readiness", STARTUP_TIMEOUT_MS, async () => {
+    const version = await browserProcess.send("Browser.getVersion");
+    const { targetId } = await browserProcess.send("Target.createTarget", { url: "about:blank" });
+    const { sessionId } = await browserProcess.send("Target.attachToTarget", { targetId, flatten: true });
+    await browserProcess.send("Page.enable", {}, sessionId);
+    return { version, sessionId };
+  });
+  const startupMs = Date.now() - started;
+  const executionStarted = Date.now();
+  await browserProcess.phase("browser navigation/UI execution", EXECUTION_TIMEOUT_MS, async () => {
+    const navigation = await browserProcess.send("Page.navigate", { url: testUrl.href }, sessionId);
+    if (navigation.errorText) throw new Error(`browser navigation failed: ${navigation.errorText}`);
+    const completion = await server.completion;
+    if (
+      completion.status !== "pass"
+      || completion.domStatus !== "pass"
+      || completion.domMarker !== PASS_MARKER
+    ) {
+      throw new Error(`browser UI qualification failed: ${JSON.stringify(completion)}`);
+    }
+    // Read the actual DOM independently after the UI sends its completion signal.
+    const dom = await browserProcess.send("Runtime.evaluate", {
+      expression: `({ status: document.documentElement.getAttribute("data-olang-browser-qualification"),
+        execution: document.documentElement.dataset.olangExecution,
+        marker: document.querySelector("#output")?.textContent })`,
+      returnByValue: true,
+    }, sessionId);
+    const state = dom.result?.value;
+    if (dom.exceptionDetails || state?.status !== "pass" || state?.execution !== "success" || state?.marker !== PASS_MARKER) {
+      throw new Error(`browser DOM did not confirm successful execution: ${JSON.stringify(dom)}`);
+    }
+  });
+  console.log(`${PASS_MARKER} (${version.product}; startup=${startupMs}ms execution=${Date.now() - executionStarted}ms)`);
+} catch (error) {
+  throw new Error(`${error.message}; requests:\n${server?.requestLog.join("\n") ?? ""}\n${browserProcess?.stderr ?? ""}`, { cause: error });
 } finally {
-  if (server) {
-    server.closeAllConnections?.();
-    await new Promise((resolveClose) => server.close(resolveClose));
+  try {
+    try {
+      await browserProcess?.close();
+    } finally {
+      if (server) {
+        server.closeAllConnections?.();
+        await new Promise((resolveClose) => server.close(resolveClose));
+      }
+      await rm(profileDirectory, { recursive: true, force: true, maxRetries: 3 });
+    }
+  } finally {
+    process.off("SIGINT", interrupted);
+    process.off("SIGTERM", interrupted);
   }
-  await rm(profileDirectory, { recursive: true, force: true, maxRetries: 3 });
 }

@@ -40,22 +40,26 @@ use o_lang::hosted_remote::project_mesh::{
 use o_lang::intent::{
     decoded_value_result_references, execute_prepared_intent,
     execute_prepared_intent_with_progress, explain_verified_run, live_placement_preview,
-    parse_run_selector, prepare_execution_intent, prepare_selection_reuse_intent,
-    render_ordinary_value_stdout_with_color, route_result_references, CapturedStreamV1,
-    ExecutionObservationV1, LocalOExecutorV1, OrdinaryExecutionTraceV1, OrdinaryOExecutionErrorV1,
-    PrepareExecutionOptionsV1, PreparedExecutionIntentV1, ProjectExecutorV1,
-    ProjectSelectionReuseObservationV1, RecordedRouteResultV1, RunContentRefV1, RunDispositionV1,
-    RunFailureV1, RunInputKindV1, RunRecordV1, RunRecordingStatusV1, RunResultReferenceV1,
-    RunSelectorV1, RunStoreReaderV1, RunStoreV1, RunSummaryV1, RunTraceAttachmentV1,
-    RunTraceBindingV1, SelectionReuseExecutionErrorV1, RUN_SUMMARY_SCHEMA_V1,
+    operation_record_content_sha256, parse_run_selector, prepare_execution_intent,
+    prepare_selection_reuse_intent, render_ordinary_value_stdout_with_color,
+    route_result_references, CapturedStreamV1, ExecutionObservationV1, LocalOExecutorV1,
+    OperationExecutionObservationV1, OperationRunDecisionV1, OrdinaryExecutionTraceV1,
+    OrdinaryOExecutionErrorV1, PrepareExecutionOptionsV1, PreparedExecutionIntentV1,
+    ProjectExecutorV1, ProjectSelectionReuseObservationV1, RecordedOperationPlanV1,
+    RecordedRouteResultV1, RunContentRefV1, RunDispositionV1, RunFailureV1, RunInputKindV1,
+    RunRecordV1, RunRecordingStatusV1, RunResultReferenceV1, RunSelectorV1, RunStoreReaderV1,
+    RunStoreV1, RunSummaryV1, RunTraceAttachmentV1, RunTraceBindingV1,
+    SelectionReuseExecutionErrorV1, OPERATION_RUN_DECISION_SCHEMA_V1, OPERATION_RUN_PLAN_SCHEMA_V1,
+    RUN_SUMMARY_SCHEMA_V1,
 };
 use o_lang::project::executor::{ProjectExecutionError, ProjectExecutionFailureClass};
 use o_lang::project::model::OutputCapture;
 use o_lang::project::runtime::public_route_execution_diagnostic;
 use o_lang::project::{
-    build_project_hgraph, DeploymentPlanV1, OExecutionResult, ProjectBundle, ResultCodec,
-    RouteFailureContinuation, RouteGuard, RouteKind, RoutePolicy, RouteProvenance, RouteSet,
-    RouteSpec, SelectionReuseOutputStatusV1, ValidatedSelectionCandidateProgressV1,
+    build_project_hgraph_with_contract, build_project_hgraph_with_contracts, DeploymentPlanV1,
+    OExecutionResult, ProjectBundle, ProjectExecutionContract, ProjectSchedulingContract,
+    ResultCodec, RouteFailureContinuation, RouteGuard, RouteKind, RoutePolicy, RouteProvenance,
+    RouteSet, RouteSpec, SelectionReuseOutputStatusV1, ValidatedSelectionCandidateProgressV1,
     ValidatedSelectionDispositionV1, ValidatedSelectionMismatchV1,
     ValidatedSelectionProgressEventV1, ValidatedSelectionProgressObserverV1,
     ValidatedSelectionReceiptV1,
@@ -379,7 +383,7 @@ struct RunArgs {
     /// Internal operation-plan binding installed only after exact marked-project
     /// preflight. It is never accepted from argv.
     #[arg(skip)]
-    operation_run: Option<OperationRunBindingV1>,
+    operation_run: Option<Box<OperationRunBindingV1>>,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -558,6 +562,9 @@ struct OperationRunBindingV1 {
     route: String,
     route_plan_sha256: String,
     route_deployment_sha256: String,
+    decision: OperationRunDecisionV1,
+    plan: RecordedOperationPlanV1,
+    request: OperationPlanningRequestV1,
 }
 
 #[derive(serde::Serialize)]
@@ -1351,10 +1358,15 @@ fn route_set_optimize_rejection(bundle: &ProjectBundle, set: &RouteSet) -> Optio
     {
         return Some("route set references a missing route".to_string());
     }
-    if o_lang::project::build_project_hgraph(
+    let execution_contract = match ProjectExecutionContract::configured() {
+        Ok(contract) => contract,
+        Err(error) => return Some(error),
+    };
+    if build_project_hgraph_with_contract(
         bundle,
         Some(&set.provides),
         Some(RoutePolicy::BenchmarkValidateAndSelect),
+        execution_contract,
     )
     .is_err()
     {
@@ -2164,13 +2176,15 @@ struct PlannedOperationProjectV1 {
     selected_binding: ResolvedOperationOfferV1,
     route_plan_sha256: String,
     route_deployment_sha256: String,
+    project_execution_contract: ProjectExecutionContract,
+    project_scheduling_contract: ProjectSchedulingContract,
     excluded_targets: Vec<String>,
     excluded_offer_count: usize,
 }
 
 struct ObservedOperationRunV1 {
     record: RunRecordV1,
-    selected_route_result_index: usize,
+    selected_route_result_index: Option<usize>,
     planned: PlannedOperationProjectV1,
     runtime_graph: RuntimeGraphV2,
     runtime_graph_id: String,
@@ -2309,8 +2323,11 @@ fn operation_realizations(args: &OperationTargetArgs) -> Result<i32> {
 fn operation_observe(args: &OperationObserveArgs) -> Result<i32> {
     let loaded = load_operation_project(&args.target)?;
     let observed = observe_operation_run(&loaded, &args.run)?;
-    let route_result = &observed.record.route_results[observed.selected_route_result_index];
-    let report = serde_json::json!({
+    let route_result = observed
+        .selected_route_result_index
+        .map(|index| &observed.record.route_results[index]);
+    let historical = observed.record.operation_decision.is_some();
+    let mut report = serde_json::json!({
         "schema": OPERATION_OBSERVATION_SCHEMA_V1,
         "status": "current_binary_recomputed_plan_matched_content_verified_run",
         "input": operation_project_input_json(&loaded),
@@ -2333,7 +2350,7 @@ fn operation_observe(args: &OperationObserveArgs) -> Result<i32> {
             "integrity": observed.record.integrity,
         },
         "selected": operation_selected_json(&observed.planned),
-        "execution": {
+        "execution": route_result.map(|route_result| serde_json::json!({
             "route": route_result.route_id,
             "disposition": route_result.disposition,
             "exit_code": route_result.exit_code,
@@ -2342,7 +2359,7 @@ fn operation_observe(args: &OperationObserveArgs) -> Result<i32> {
             "stderr": route_result.stderr.capture,
             "value": route_result.value,
             "result_references": observed.record.result_references,
-        },
+        })),
         "binding": {
             "bundle": "exact_sha256_match",
             "run": "content_verified_exact_terminal_record",
@@ -2352,6 +2369,24 @@ fn operation_observe(args: &OperationObserveArgs) -> Result<i32> {
         },
         "nonclaims": operation_project_nonclaims("current_binary_recomputed_for_binding", "current_binary_recomputed_for_binding", "not_run_by_observe", "not_applicable", "run_record_only"),
     });
+    if historical {
+        report["status"] = serde_json::json!("retained_original_plan_matched_content_verified_run");
+        report["binding"]["operation_plan"] =
+            serde_json::json!("original_pre_execution_decision_and_planner_records_retained");
+        report["nonclaims"]["planning"] =
+            serde_json::json!("original_record_verified_without_reranking");
+        report["nonclaims"]["selection"] =
+            serde_json::json!("original_selected_candidate_retained");
+        report["nonclaims"]["operation_plan_persistence"] =
+            serde_json::json!("original_decision_request_and_deployment_retained");
+        report["nonclaims"]["retrospective_planner_proof"] =
+            serde_json::json!("content_verified_original_records_not_current_planner_output");
+    } else {
+        report["nonclaims"]["operation_plan_persistence"] =
+            serde_json::json!("not_stored_in_legacy_run_record");
+        report["nonclaims"]["retrospective_planner_proof"] =
+            serde_json::json!("current_binary_recomputation_only");
+    }
     if args.json {
         println!("{}", serde_json::to_string(&report)?);
     } else {
@@ -2367,7 +2402,12 @@ fn operation_observe(args: &OperationObserveArgs) -> Result<i32> {
         );
         println!("Bundle: exact SHA-256 match ({})", loaded.bundle_sha256);
         println!(
-            "Operation plan: current-binary recomputation matched recorded route identities ({})",
+            "Operation plan: {} matched recorded route identities ({})",
+            if historical {
+                "retained original decision"
+            } else {
+                "legacy current-binary recomputation"
+            },
             observed.planned.deployment_id
         );
         println!(
@@ -2394,7 +2434,8 @@ fn operation_replan(args: &OperationReplanArgs) -> Result<i32> {
     let observed = observe_operation_run(&loaded, &args.run)?;
     let replanned = plan_loaded_operation(&loaded, &args.without_targets)?;
     let changed = observed.planned.selected != replanned.selected;
-    let recovery = if !observed.record.disposition.is_success() && changed {
+    let outcome_observed = observed.selected_route_result_index.is_some();
+    let recovery = if outcome_observed && !observed.record.disposition.is_success() && changed {
         let condition_bytes = serde_json::to_vec(&serde_json::json!({
             "schema": "ostadix.recovery/excluded-targets/v1",
             "runtime_graph_id": observed.runtime_graph_id,
@@ -2427,6 +2468,8 @@ fn operation_replan(args: &OperationReplanArgs) -> Result<i32> {
     };
     let recovery_status = if recovery.is_some() {
         "descriptive"
+    } else if !outcome_observed {
+        "not_applicable_source_outcome_unobserved"
     } else if observed.record.disposition.is_success() {
         "not_applicable_source_succeeded"
     } else {
@@ -2453,6 +2496,7 @@ fn operation_replan(args: &OperationReplanArgs) -> Result<i32> {
         "source_run_id": observed.record.run_id,
         "source_bundle_sha256": observed.record.input.digest_sha256,
         "source_runtime_graph_id": observed.runtime_graph_id,
+        "source_operation_decision": observed.record.operation_decision,
         "prior": operation_selected_json(&observed.planned),
         "exclusions": replanned.excluded_targets,
         "excluded_offer_count": replanned.excluded_offer_count,
@@ -2976,9 +3020,16 @@ fn plan_loaded_operation(
         .cloned()
         .context("operation planner found no rankable candidate")?;
     let selected_binding = resolved_binding_for_candidate(loaded, &selected)?.clone();
-    let route_plan = build_project_hgraph(&loaded.bundle, Some(&selected_binding.route), None)
-        .map_err(anyhow::Error::msg)
-        .context("failed to construct the exact selected project-route plan")?;
+    let project_execution_contract =
+        ProjectExecutionContract::configured().map_err(anyhow::Error::msg)?;
+    let route_plan = build_project_hgraph_with_contract(
+        &loaded.bundle,
+        Some(&selected_binding.route),
+        None,
+        project_execution_contract,
+    )
+    .map_err(anyhow::Error::msg)
+    .context("failed to construct the exact selected project-route plan")?;
     let route_logical = route_plan
         .logical_v1()
         .context("failed to normalize the exact selected project-route plan")?;
@@ -3006,6 +3057,8 @@ fn plan_loaded_operation(
         selected_binding,
         route_plan_sha256,
         route_deployment_sha256,
+        project_execution_contract,
+        project_scheduling_contract: route_plan.plan.scheduling_contract,
         excluded_targets: exclusions.into_iter().collect(),
         excluded_offer_count,
     })
@@ -3032,11 +3085,68 @@ fn resolved_binding_for_candidate<'a>(
     Ok(matches[0])
 }
 
+fn decode_recorded_operation_plan(
+    snapshot: &RecordedOperationPlanV1,
+    decision: &OperationRunDecisionV1,
+) -> Result<(
+    OperationPlanningRequestV1,
+    DeploymentPlanV2,
+    RealizationCandidateTupleV1,
+)> {
+    snapshot
+        .validate_for_decision(decision)
+        .map_err(anyhow::Error::msg)?;
+    let request = OperationPlanningRequestV1::decode_json(&serde_json::to_vec(&snapshot.request)?)
+        .map_err(operation_validation_error)?;
+    let deployment = DeploymentPlanV2::decode_json(&serde_json::to_vec(&snapshot.deployment)?)
+        .map_err(operation_validation_error)?;
+    let selected: RealizationCandidateTupleV1 =
+        serde_json::from_value(snapshot.selected_candidate.clone())?;
+    ensure!(
+        serde_json::to_value(&request)? == snapshot.request
+            && serde_json::to_value(&deployment)? == snapshot.deployment,
+        "retained operation planner projections are not canonical typed records"
+    );
+    ensure!(request.id().map_err(operation_validation_error)?.as_sha256() == decision.planning_request_id
+        && deployment.id().map_err(operation_validation_error)?.as_sha256() == decision.deployment_plan_id
+        && deployment.selected_candidate() == Some(&selected)
+        && deployment.logical_hgraph == request.graph.id().map_err(operation_validation_error)?
+        && deployment.objective == request.objective.id().map_err(operation_validation_error)?,
+        "original operation planner records disagree with the frozen request, deployment, or selected candidate");
+    let offer = request
+        .offers
+        .iter()
+        .find(|offer| offer.candidate().ok().as_ref() == Some(&selected))
+        .context("original operation candidate is outside the retained request")?;
+    let descriptor = request
+        .descriptors
+        .iter()
+        .find(|descriptor| descriptor.id().ok().as_ref() == Some(&selected.descriptor))
+        .context("original operation descriptor is outside the retained request")?;
+    ensure!(
+        descriptor.implementation.as_sha256() == decision.implementation_sha256
+            && descriptor.execution_pipeline.schema.as_str() == OPERATION_ROUTE_PIPELINE_SCHEMA_V1
+            && descriptor.execution_pipeline.content.as_sha256() == decision.route_pipeline_sha256,
+        "original operation implementation or route pipeline differs from the retained request"
+    );
+    if let Some(execution) = &snapshot.execution {
+        let expected = if operation_platform_matches(execution, offer.target.platform()) {
+            "matched_local_platform"
+        } else {
+            "mismatched_local_platform"
+        };
+        ensure!(
+            execution.target_platform == expected,
+            "recorded target classification disagrees with observed local platform facts"
+        );
+    }
+    Ok((request, deployment, selected))
+}
+
 fn observe_operation_run(
     loaded: &LoadedOperationProjectV1,
     selector: &str,
 ) -> Result<ObservedOperationRunV1> {
-    let planned = plan_loaded_operation(loaded, &[])?;
     let selector = parse_run_selector(selector)?;
     let reader = RunStoreReaderV1::open_default_existing()
         .context("operation observation requires an existing private run store")?;
@@ -3074,6 +3184,108 @@ fn observe_operation_run(
         record.input.digest_sha256,
         loaded.bundle_sha256
     );
+    let planned = match (&record.operation_decision, &record.operation_plan) {
+        (Some(decision), Some(snapshot)) => {
+            let (request, deployment, selected) =
+                decode_recorded_operation_plan(snapshot, decision)?;
+            ensure!(
+                decision.planning_request_id == loaded.request_id && request == loaded.request,
+                "retained original operation request differs from the exact project request"
+            );
+            let selected_binding = resolved_binding_for_candidate(loaded, &selected)?.clone();
+            ensure!(selected_binding.route == decision.route
+                && selected_binding.implementation == decision.implementation
+                && selected_binding.implementation_sha256 == decision.implementation_sha256
+                && selected_binding.route_pipeline_sha256 == decision.route_pipeline_sha256,
+                "retained original operation decision differs from the exact project implementation or route binding");
+            if let Some(execution) = &snapshot.execution {
+                let route = loaded
+                    .bundle
+                    .route(&decision.route)
+                    .context("recorded operation route disappeared")?;
+                let direct = operation_route_direct_entrypoint(route, &decision.implementation);
+                ensure!(
+                    execution.artifact_use != "direct_entrypoint_submitted" || direct,
+                    "recorded artifact submission is not supported by the exact route entrypoint"
+                );
+                if execution.runtime == "declared_interpreter_command_submitted" {
+                    let offer = request
+                        .offers
+                        .iter()
+                        .find(|offer| offer.candidate().ok().as_ref() == Some(&selected))
+                        .context("recorded selected offer disappeared")?;
+                    ensure!(direct && route.kind == RouteKind::InterpreterCommand && route.command.first().and_then(|command| Path::new(command).file_name()).is_some_and(|name| name == offer.target.platform().abi()),
+                        "recorded interpreter submission disagrees with the exact route and declared target ABI");
+                }
+            }
+            // Recompute only the route projection. Never rerank a historical
+            // operation decision through the current planner.
+            let project_execution_contract: ProjectExecutionContract =
+                serde_json::from_value(serde_json::json!(decision.project_execution_contract))?;
+            let project_scheduling_contract: ProjectSchedulingContract =
+                serde_json::from_value(serde_json::json!(decision.project_scheduling_contract))?;
+            let graph = build_project_hgraph_with_contracts(
+                &loaded.bundle,
+                Some(&decision.route),
+                None,
+                project_execution_contract,
+                project_scheduling_contract,
+            )
+            .map_err(anyhow::Error::msg)?;
+            let logical = graph.logical_v1()?;
+            let route_plan_sha256 = logical.digest()?.as_sha256().to_string();
+            let route_deployment_sha256 = DeploymentPlanV1::hosted(&logical)?
+                .digest()?
+                .as_sha256()
+                .to_string();
+            PlannedOperationProjectV1 {
+                request_id: decision.planning_request_id.clone(),
+                deployment,
+                deployment_id: decision.deployment_plan_id.clone(),
+                selected,
+                selected_binding,
+                route_plan_sha256,
+                route_deployment_sha256,
+                project_execution_contract,
+                project_scheduling_contract,
+                excluded_targets: Vec::new(),
+                excluded_offer_count: 0,
+            }
+        }
+        (None, None) => {
+            let mut planned = plan_loaded_operation(loaded, &[])?;
+            // Pre-persistence records may predate the compatibility graph
+            // contract. Select a projection only by its recorded exact digest.
+            for contract in [
+                ProjectExecutionContract::Strict,
+                ProjectExecutionContract::LegacyCompatibility,
+            ] {
+                let graph = build_project_hgraph_with_contract(
+                    &loaded.bundle,
+                    Some(&planned.selected_binding.route),
+                    None,
+                    contract,
+                )
+                .map_err(anyhow::Error::msg)?;
+                let logical = graph.logical_v1()?;
+                let graph_id = logical.digest()?.as_sha256().to_string();
+                let deployment_id = DeploymentPlanV1::hosted(&logical)?
+                    .digest()?
+                    .as_sha256()
+                    .to_string();
+                if record.plan.hgraph_sha256.as_deref() == Some(graph_id.as_str())
+                    && record.plan.deployment_sha256.as_deref() == Some(deployment_id.as_str())
+                {
+                    planned.route_plan_sha256 = graph_id;
+                    planned.route_deployment_sha256 = deployment_id;
+                    planned.project_execution_contract = contract;
+                    break;
+                }
+            }
+            planned
+        }
+        _ => bail!("legacy decision-only operation run has no durably retained original planner payload; original IDs remain recorded but cannot reconstruct historical planning"),
+    };
     ensure!(
         record.intent.selected_route.as_deref() == Some(planned.selected_binding.route.as_str()),
         "run {} selected route {:?}, but the current-binary operation plan binds route `{}`",
@@ -3088,33 +3300,22 @@ fn observe_operation_run(
         "run {} recorded project-route plan identities that differ from the current-binary recomputation",
         record.run_id
     );
-    ensure!(
-        record.route_results.len() == 1,
-        "run {} contains {} route results; an operation-project run must record exactly one explicit route",
-        record.run_id,
-        record.route_results.len()
-    );
-    let matching_results = record
-        .route_results
-        .iter()
-        .enumerate()
-        .filter(|(_, result)| result.route_id == planned.selected_binding.route)
-        .map(|(index, _)| index)
-        .collect::<Vec<_>>();
-    ensure!(
-        matching_results.len() == 1,
-        "run {} contains {} results for selected route `{}`",
-        record.run_id,
-        matching_results.len(),
-        planned.selected_binding.route
-    );
-    let route_result_index = matching_results[0];
+    let outcome_unobserved = record.operation_plan.is_some()
+        && matches!(
+            record.disposition,
+            RunDispositionV1::Interrupted | RunDispositionV1::RecordingIncomplete
+        )
+        && record.route_results.is_empty();
+    ensure!(outcome_unobserved || (record.route_results.len() == 1
+        && record.route_results[0].route_id == planned.selected_binding.route),
+        "run {} must retain one exact selected route result or an explicitly unobserved interrupted operation", record.run_id);
+    let route_result_index = (!outcome_unobserved).then_some(0);
     let (runtime_graph, runtime_binding) = operation_runtime_graph(
         loaded,
         &planned,
         &record,
         &run_record_ref,
-        &record.route_results[route_result_index],
+        route_result_index.map(|index| &record.route_results[index]),
     )?;
     let runtime_graph_id = runtime_graph
         .id()
@@ -3137,16 +3338,21 @@ fn operation_runtime_graph(
     planned: &PlannedOperationProjectV1,
     record: &RunRecordV1,
     run_record_ref: &RunContentRefV1,
-    route_result: &RecordedRouteResultV1,
+    route_result: Option<&RecordedRouteResultV1>,
 ) -> Result<(RuntimeGraphV2, serde_json::Value)> {
     let execution_ns = route_result
-        .duration_ns
-        .parse::<u128>()
-        .context("recorded operation route duration is not an unsigned integer")?;
-    let execution_ns = u64::try_from(execution_ns)
-        .context("recorded operation route duration exceeds RuntimeMetricsV2")?;
-    let succeeded = record.disposition.is_success() && route_result.exit_code == Some(0);
-    let failure_classification = (!succeeded)
+        .map(|result| {
+            let duration = result
+                .duration_ns
+                .parse::<u128>()
+                .context("recorded operation route duration is not an unsigned integer")?;
+            u64::try_from(duration)
+                .context("recorded operation route duration exceeds RuntimeMetricsV2")
+        })
+        .transpose()?;
+    let succeeded = record.disposition.is_success()
+        && route_result.is_some_and(|result| result.exit_code == Some(0));
+    let failure_classification = (route_result.is_some() && !succeeded)
         .then(|| {
             let classification = record
                 .failure
@@ -3171,14 +3377,20 @@ fn operation_runtime_graph(
         .context("operation run omitted its selected project-route deployment identity")?;
     let binding = OperationRuntimeBindingV1 {
         schema: OPERATION_RUNTIME_BINDING_SCHEMA_V1,
-        status: "current_binary_recomputed_plan_matched_recorded_route",
+        status: if route_result.is_none() {
+            "retained_original_plan_without_terminal_execution_observation"
+        } else if record.operation_decision.is_some() {
+            "retained_original_plan_matched_recorded_route"
+        } else {
+            "current_binary_recomputed_plan_matched_recorded_route"
+        },
         run_id: &record.run_id,
         run_record: run_record_ref,
         bundle_sha256: &loaded.bundle_sha256,
         recomputed_planning_request_id: &planned.request_id,
         recomputed_deployment_plan_id: &planned.deployment_id,
         recomputed_selected_candidate: &planned.selected,
-        recorded_route: &route_result.route_id,
+        recorded_route: &planned.selected_binding.route,
         exact_route_pipeline_sha256: &planned.selected_binding.route_pipeline_sha256,
         recorded_route_plan_sha256,
         recomputed_route_plan_sha256: &planned.route_plan_sha256,
@@ -3187,14 +3399,56 @@ fn operation_runtime_graph(
     };
     let binding_bytes =
         serde_json::to_vec(&binding).context("failed to encode the operation runtime binding")?;
-    let binding_json =
+    let mut binding_json =
         serde_json::to_value(&binding).context("failed to render the operation runtime binding")?;
-    let evidence = operation_semantic_ref(OPERATION_RUNTIME_BINDING_SCHEMA_V1, &binding_bytes)?;
+    if let Some(decision) = &record.operation_decision {
+        // The V2 envelope names historical coordinates explicitly; recomputed
+        // operation coordinates are reserved for legacy V1 observations.
+        binding_json["schema"] = serde_json::json!("ostadix.operation-runtime-binding/v2");
+        let object = binding_json
+            .as_object_mut()
+            .expect("runtime binding is an object");
+        object.remove("recomputed_planning_request_id");
+        object.remove("recomputed_deployment_plan_id");
+        object.remove("recomputed_selected_candidate");
+        object.insert("recorded_decision".into(), serde_json::to_value(decision)?);
+        object.insert(
+            "recorded_selected_candidate".into(),
+            record
+                .operation_plan
+                .as_ref()
+                .expect("original plan verified")
+                .selected_candidate
+                .clone(),
+        );
+        object.insert(
+            "execution_observation".into(),
+            serde_json::to_value(
+                record
+                    .operation_plan
+                    .as_ref()
+                    .and_then(|plan| plan.execution.as_ref()),
+            )?,
+        );
+    }
+    let binding_bytes = if record.operation_decision.is_some() {
+        serde_json::to_vec(&binding_json)?
+    } else {
+        binding_bytes
+    };
+    let binding_schema = if record.operation_decision.is_some() {
+        "ostadix.operation-runtime-binding/v2"
+    } else {
+        OPERATION_RUNTIME_BINDING_SCHEMA_V1
+    };
+    let evidence = operation_semantic_ref(binding_schema, &binding_bytes)?;
     let observation = RuntimeObservationV2 {
         ordinal: 0,
         logical_operation: planned.selected.logical_operation,
         candidate: planned.selected.clone(),
-        state: if succeeded {
+        state: if route_result.is_none() {
+            RuntimeObservationStateV2::Proposed
+        } else if succeeded {
             RuntimeObservationStateV2::Succeeded
         } else {
             RuntimeObservationStateV2::Failed
@@ -3204,9 +3458,9 @@ fn operation_runtime_graph(
             queue_ns: None,
             startup_ns: None,
             conversion_ns: None,
-            execution_ns: Some(execution_ns),
+            execution_ns,
             checkpoint_ns: None,
-            elapsed_ns: Some(record.elapsed_nanos),
+            elapsed_ns: route_result.map(|_| record.elapsed_nanos),
             peak_memory_bytes: None,
         },
         observed_fidelity: None,
@@ -3214,8 +3468,15 @@ fn operation_runtime_graph(
         actor_generation: None,
         evidence: vec![evidence],
         detail: Some(format!(
-            "content-verified retained run {} over unchanged bundle {} matched current-binary recomputation for route {}",
-            record.run_id, loaded.bundle_sha256, route_result.route_id
+            "content-verified retained run {} over unchanged bundle {} matched {} for route {}",
+            record.run_id,
+            loaded.bundle_sha256,
+            if record.operation_decision.is_some() {
+                "its original operation decision"
+            } else {
+                "legacy current-binary recomputation"
+            },
+            planned.selected_binding.route
         )),
     };
     let runtime_graph = RuntimeGraphV2::from_deployment(&planned.deployment, vec![observation])
@@ -3276,6 +3537,8 @@ fn operation_selected_json(planned: &PlannedOperationProjectV1) -> serde_json::V
         "route": planned.selected_binding.route,
         "route_plan_sha256": planned.route_plan_sha256,
         "route_deployment_sha256": planned.route_deployment_sha256,
+        "project_execution_contract": planned.project_execution_contract,
+        "project_scheduling_contract": planned.project_scheduling_contract,
     })
 }
 
@@ -3297,8 +3560,8 @@ fn operation_project_nonclaims(
         "dispatch": dispatch,
         "recovery_plan": recovery_plan,
         "recovery_execution": "not_performed",
-        "operation_plan_persistence": "not_stored_in_run_record_v1",
-        "retrospective_planner_proof": "current_binary_recomputation_only_future_planner_coordinates_require_new_schema",
+        "operation_plan_persistence": "original_decision_retained_by_marked_operation_runs",
+        "retrospective_planner_proof": "requires_retained_original_decision_otherwise_current_binary_reconstruction",
         "world_state": world_state,
         "authority": "none",
     })
@@ -4159,15 +4422,49 @@ fn bind_operation_run(mut args: RunArgs) -> Result<RunArgs> {
         bail!("marked operation-project execution accepts only TARGET, --project, --json, or --require-record; realization planning owns the exact route and requires durable recording");
     }
     let planned = plan_loaded_operation(&loaded, &[])?;
+    let decision = OperationRunDecisionV1 {
+        schema: OPERATION_RUN_DECISION_SCHEMA_V1.to_string(),
+        planning_request_id: planned.request_id.clone(),
+        deployment_plan_id: planned.deployment_id.clone(),
+        selected_candidate_sha256: operation_record_content_sha256(&serde_json::to_value(
+            &planned.selected,
+        )?),
+        planning_request_content_sha256: operation_record_content_sha256(&serde_json::to_value(
+            &loaded.request,
+        )?),
+        deployment_plan_content_sha256: operation_record_content_sha256(&serde_json::to_value(
+            &planned.deployment,
+        )?),
+        bundle_sha256: loaded.bundle_sha256.clone(),
+        route: planned.selected_binding.route.clone(),
+        route_plan_sha256: planned.route_plan_sha256.clone(),
+        route_deployment_sha256: planned.route_deployment_sha256.clone(),
+        project_execution_contract: planned.project_execution_contract.token().to_string(),
+        project_scheduling_contract: planned.project_scheduling_contract.token().to_string(),
+        route_pipeline_sha256: planned.selected_binding.route_pipeline_sha256.clone(),
+        implementation: planned.selected_binding.implementation.clone(),
+        implementation_sha256: planned.selected_binding.implementation_sha256.clone(),
+    };
+    let plan = RecordedOperationPlanV1 {
+        schema: OPERATION_RUN_PLAN_SCHEMA_V1.to_string(),
+        request: serde_json::to_value(&loaded.request)?,
+        deployment: serde_json::to_value(&planned.deployment)?,
+        selected_candidate: serde_json::to_value(&planned.selected)?,
+        execution: None,
+    };
+    decode_recorded_operation_plan(&plan, &decision)?;
     args.require_record = true;
     args.project = true;
     args.route = Some(planned.selected_binding.route.clone());
-    args.operation_run = Some(OperationRunBindingV1 {
+    args.operation_run = Some(Box::new(OperationRunBindingV1 {
         bundle_sha256: loaded.bundle_sha256,
         route: planned.selected_binding.route,
         route_plan_sha256: planned.route_plan_sha256,
         route_deployment_sha256: planned.route_deployment_sha256,
-    });
+        decision,
+        plan,
+        request: loaded.request,
+    }));
     Ok(args)
 }
 
@@ -4238,7 +4535,7 @@ fn prepare_run(args: &RunArgs) -> Result<PreparedExecutionIntentV1> {
         }
         if args.project_trace_out.is_some() && project.executor != ProjectExecutorV1::Hgraph {
             bail!(
-                "--project-trace-out requires O_PROJECT_EXECUTOR=hgraph without mesh execution; use --mesh-trace-out for mesh placement and retry evidence"
+                "--project-trace-out requires the local HGraph executor (default, or O_PROJECT_EXECUTOR=hgraph); legacy and mesh execution do not provide it; use --mesh-trace-out for mesh placement and retry evidence"
             );
         }
         if args.selection_receipt_out.is_some()
@@ -4247,11 +4544,6 @@ fn prepare_run(args: &RunArgs) -> Result<PreparedExecutionIntentV1> {
             bail!(
                 "--selection-receipt-out requires effective project policy benchmark_validate_and_select, got {}",
                 project.effective_policy
-            );
-        }
-        if args.selection_receipt_out.is_some() && project.executor == ProjectExecutorV1::Hgraph {
-            bail!(
-                "--selection-receipt-out is unavailable with O_PROJECT_EXECUTOR=hgraph because that executor does not implement benchmark_validate_and_select"
             );
         }
     }
@@ -4719,6 +5011,7 @@ struct ExecutionReport {
     route_results: Vec<RecordedRouteResultV1>,
     validated_selection_receipt: Option<ValidatedSelectionReceiptV1>,
     selection_reuse: Option<ProjectSelectionReuseObservationV1>,
+    operation_execution: Option<OperationExecutionObservationV1>,
     selection_receipt_published: bool,
     result_references: Vec<RunResultReferenceV1>,
     trace: Option<RunTraceAttachmentV1>,
@@ -4737,6 +5030,7 @@ impl ExecutionReport {
             route_results: Vec::new(),
             validated_selection_receipt: None,
             selection_reuse: None,
+            operation_execution: None,
             selection_receipt_published: false,
             result_references: Vec::new(),
             trace: None,
@@ -4759,6 +5053,7 @@ impl ExecutionReport {
             route_results: Vec::new(),
             validated_selection_receipt: None,
             selection_reuse: None,
+            operation_execution: None,
             selection_receipt_published: false,
             result_references: Vec::new(),
             trace: None,
@@ -4902,7 +5197,12 @@ fn run_intent(args: &RunArgs, presentation: RunPresentation) -> Result<i32> {
     };
     // This observation is intentionally taken only after exact preflight.
     let started_unix_nanos = unix_nanos_now()?;
-    let seed = prepared.run_attempt_seed(started_unix_nanos)?;
+    let mut seed = prepared.run_attempt_seed(started_unix_nanos)?;
+    seed.operation_decision = args
+        .operation_run
+        .as_ref()
+        .map(|operation| operation.decision.clone());
+    seed.validate().map_err(anyhow::Error::msg)?;
     let started = Instant::now();
     // Descriptor capture redirects stdout/stderr to private regular files.
     // Snapshot the actual invocation terminal capabilities before that
@@ -4955,7 +5255,10 @@ fn run_intent(args: &RunArgs, presentation: RunPresentation) -> Result<i32> {
         None
     };
     if !args.no_record && process_capture.is_some() {
-        match RunStoreV1::open_default().and_then(|store| store.begin(seed.clone())) {
+        match RunStoreV1::open_default().and_then(|store| match &args.operation_run {
+            Some(operation) => store.begin_with_operation_plan(seed.clone(), &operation.plan),
+            None => store.begin(seed.clone()),
+        }) {
             Ok(run_lease) => lease = Some(run_lease),
             Err(error) if args.require_record => {
                 return required_recording_begin_failure(
@@ -5050,6 +5353,11 @@ fn run_intent(args: &RunArgs, presentation: RunPresentation) -> Result<i32> {
         );
         record.validated_selection_receipt = report.validated_selection_receipt.clone();
         record.selection_reuse = report.selection_reuse.clone();
+        record.operation_plan = args.operation_run.as_ref().map(|operation| {
+            let mut plan = operation.plan.clone();
+            plan.execution = report.operation_execution.clone();
+            plan
+        });
         match lease.finalize(record.clone(), report.trace.clone()) {
             Ok(finalized) => RunSummaryV1::from_record(
                 &record,
@@ -5225,6 +5533,7 @@ fn execute_for_report(
                 route_results: Vec::new(),
                 validated_selection_receipt: None,
                 selection_reuse: None,
+                operation_execution: None,
                 selection_receipt_published: false,
                 result_references,
                 trace,
@@ -5248,6 +5557,8 @@ fn execute_for_report(
             match report {
                 Ok(mut report) => {
                     report.selection_reuse = observation.selection_reuse.as_deref().cloned();
+                    report.operation_execution =
+                        operation_execution_observation(args, prepared, &observation.results);
                     bind_selection_reuse_result_codec(&mut report, prepared);
                     match write_observed_project_traces(args, &observation) {
                         Ok(()) => {
@@ -5445,6 +5756,136 @@ fn validated_selection_summary_line(receipt: &ValidatedSelectionReceiptV1) -> St
     )
 }
 
+fn operation_execution_observation(
+    args: &RunArgs,
+    prepared: &PreparedExecutionIntentV1,
+    results: &[OExecutionResult],
+) -> Option<OperationExecutionObservationV1> {
+    let operation = args.operation_run.as_ref()?;
+    let PreparedExecutionIntentV1::Project(project) = prepared else {
+        return None;
+    };
+    if !matches!(
+        project.executor,
+        ProjectExecutorV1::Compatibility | ProjectExecutorV1::Hgraph
+    ) {
+        return None;
+    }
+    let result = results
+        .iter()
+        .find(|result| result.route_id == operation.route && !result.was_guard_skipped())?;
+    let route = project.bundle.route(&operation.route)?;
+    let command_matches = result.provenance.command == route.full_command();
+    // Restrict the positive evidence profile, not execution. Arbitrary shell,
+    // package, and generated routes keep working with artifact_use absent.
+    let direct_entrypoint = command_matches
+        && operation_route_direct_entrypoint(route, &operation.decision.implementation)
+        && result.provenance.cwd == result.provenance.workspace.join(&route.working_directory);
+    let offer = operation.request.offers.iter().find(|offer| {
+        offer
+            .candidate()
+            .ok()
+            .and_then(|candidate| serde_json::to_value(candidate).ok())
+            .as_ref()
+            == Some(&operation.plan.selected_candidate)
+    })?;
+    let platform = offer.target.platform();
+    let observed_endianness = if cfg!(target_endian = "little") {
+        "little"
+    } else {
+        "big"
+    };
+    // This records the interpreter command submitted by the executor. It does
+    // not assert an executable inode, interpreter version, or loaded image.
+    let runtime_matches = direct_entrypoint
+        && route.kind == RouteKind::InterpreterCommand
+        && result
+            .provenance
+            .command
+            .first()
+            .and_then(|command| Path::new(command).file_name())
+            .is_some_and(|name| name == platform.abi());
+    let mut observation = OperationExecutionObservationV1 {
+        route: operation.route.clone(),
+        execution_scope: "isolated_local_project_workspace".to_string(),
+        artifact_use: if direct_entrypoint {
+            "direct_entrypoint_submitted"
+        } else {
+            "not_established"
+        }
+        .to_string(),
+        operating_system: env::consts::OS.to_string(),
+        architecture: env::consts::ARCH.to_string(),
+        pointer_width: usize::BITS as u16,
+        endianness: observed_endianness.to_string(),
+        target_platform: String::new(),
+        runtime: if runtime_matches {
+            "declared_interpreter_command_submitted"
+        } else {
+            "not_established"
+        }
+        .to_string(),
+    };
+    observation.target_platform = if operation_platform_matches(&observation, platform) {
+        "matched_local_platform"
+    } else {
+        "mismatched_local_platform"
+    }
+    .to_string();
+    Some(observation)
+}
+
+fn operation_platform_matches(
+    observed: &OperationExecutionObservationV1,
+    platform: &o_lang::placement::PlatformDescriptorV1,
+) -> bool {
+    let posix = matches!(
+        observed.operating_system.as_str(),
+        "linux"
+            | "macos"
+            | "freebsd"
+            | "openbsd"
+            | "netbsd"
+            | "dragonfly"
+            | "illumos"
+            | "solaris"
+            | "android"
+            | "ios"
+    );
+    (platform.operating_system() == observed.operating_system
+        || (platform.operating_system() == "posix" && posix))
+        && (platform.architecture() == observed.architecture
+            || platform.architecture() == "portable")
+        && platform.pointer_width() == observed.pointer_width
+        && match platform.endianness() {
+            o_lang::placement::EndiannessV1::Little => observed.endianness == "little",
+            o_lang::placement::EndiannessV1::Big => observed.endianness == "big",
+        }
+}
+
+fn operation_route_direct_entrypoint(route: &RouteSpec, implementation: &str) -> bool {
+    let command = route.full_command();
+    let argument = match route.kind {
+        RouteKind::InterpreterCommand => command.get(1),
+        RouteKind::CompiledBinary => command.first().filter(|command| command.contains('/')),
+        _ => None,
+    };
+    argument.is_some_and(|argument| {
+        let relative = Path::new(&route.working_directory).join(argument);
+        let mut components = Vec::new();
+        for component in relative.components() {
+            match component {
+                std::path::Component::CurDir => {}
+                std::path::Component::Normal(value) => {
+                    components.push(value.to_string_lossy().into_owned())
+                }
+                _ => return false,
+            }
+        }
+        components.join("/") == implementation
+    })
+}
+
 fn project_report(
     results: &[OExecutionResult],
     validated_selection_receipt: Option<&o_lang::project::ValidatedSelectionReceiptV1>,
@@ -5537,6 +5978,7 @@ fn project_report(
         route_results,
         validated_selection_receipt: validated_selection_receipt.cloned(),
         selection_reuse: None,
+        operation_execution: None,
         selection_receipt_published: false,
         result_references,
         trace,
@@ -5677,6 +6119,7 @@ fn error_report(
             route_results: Vec::new(),
             validated_selection_receipt: None,
             selection_reuse: None,
+            operation_execution: None,
             selection_receipt_published: false,
             result_references: Vec::new(),
             trace,
@@ -6342,6 +6785,97 @@ mod tests {
             panic!("expected run command")
         };
         run
+    }
+
+    #[test]
+    fn original_operation_records_validate_semantic_ids_and_target_observations() {
+        let project = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/normalize");
+        let bound =
+            bind_operation_run(parse_run(&["o", "run", project.to_str().unwrap()])).unwrap();
+        let binding = bound.operation_run.as_ref().unwrap();
+        decode_recorded_operation_plan(&binding.plan, &binding.decision).unwrap();
+        for field in 0..3 {
+            let mut decision = binding.decision.clone();
+            match field {
+                0 => decision.planning_request_id = "ab".repeat(32),
+                1 => decision.deployment_plan_id = "ab".repeat(32),
+                _ => decision.implementation_sha256 = "ab".repeat(32),
+            }
+            assert!(decode_recorded_operation_plan(&binding.plan, &decision).is_err());
+        }
+        let offer = binding
+            .request
+            .offers
+            .iter()
+            .find(|offer| {
+                serde_json::to_value(offer.candidate().unwrap()).unwrap()
+                    == binding.plan.selected_candidate
+            })
+            .unwrap();
+        let mut observation = OperationExecutionObservationV1 {
+            route: binding.route.clone(),
+            execution_scope: "isolated_local_project_workspace".to_string(),
+            artifact_use: "not_established".to_string(),
+            operating_system: env::consts::OS.to_string(),
+            architecture: env::consts::ARCH.to_string(),
+            pointer_width: usize::BITS as u16,
+            endianness: if cfg!(target_endian = "little") {
+                "little"
+            } else {
+                "big"
+            }
+            .to_string(),
+            target_platform: String::new(),
+            runtime: "not_established".to_string(),
+        };
+        observation.target_platform =
+            if operation_platform_matches(&observation, offer.target.platform()) {
+                "matched_local_platform"
+            } else {
+                "mismatched_local_platform"
+            }
+            .to_string();
+        let mut snapshot = binding.plan.clone();
+        snapshot.execution = Some(observation.clone());
+        decode_recorded_operation_plan(&snapshot, &binding.decision).unwrap();
+        snapshot.execution.as_mut().unwrap().target_platform =
+            if observation.target_platform == "matched_local_platform" {
+                "mismatched_local_platform"
+            } else {
+                "matched_local_platform"
+            }
+            .to_string();
+        assert!(decode_recorded_operation_plan(&snapshot, &binding.decision).is_err());
+    }
+
+    #[test]
+    fn operation_artifact_profile_does_not_claim_indirect_route_loading() {
+        let project = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/normalize");
+        let loaded = load_operation_project(&project).unwrap();
+        let mut route = loaded.bundle.route("normalize_chunked").unwrap().clone();
+        assert!(operation_route_direct_entrypoint(
+            &route,
+            "normalize_chunked.py"
+        ));
+        route.command = vec![
+            "python3".into(),
+            "wrapper.py".into(),
+            "normalize_chunked.py".into(),
+        ];
+        assert!(!operation_route_direct_entrypoint(
+            &route,
+            "normalize_chunked.py"
+        ));
+        route.command = vec![
+            "sh".into(),
+            "-c".into(),
+            "python3 normalize_chunked.py input.json".into(),
+        ];
+        route.kind = RouteKind::ShellTask;
+        assert!(!operation_route_direct_entrypoint(
+            &route,
+            "normalize_chunked.py"
+        ));
     }
 
     fn parse_optimize(arguments: &[&str]) -> OptimizeArgs {

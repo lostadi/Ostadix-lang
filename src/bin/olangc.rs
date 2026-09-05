@@ -269,7 +269,7 @@ struct Cli {
 
     /// Write the unsigned Project HGraph attempt trace as JSON. This is
     /// available only for hosted project execution with --target script and
-    /// requires O_PROJECT_EXECUTOR=hgraph.
+    /// uses the default Project HGraph executor (legacy opt-out is incompatible).
     #[arg(long = "project-trace-out", value_name = "PATH")]
     project_trace_out: Option<PathBuf>,
 
@@ -696,10 +696,12 @@ fn compile_or_run_project(cli: &Cli, input_is_dir: bool, source: &str) -> Result
             Ok(())
         }
         CompileTarget::Dot => {
-            let project = o_lang::project::build_project_hgraph(
+            let project = o_lang::project::build_project_hgraph_with_contract(
                 &bundle,
                 cli.route.as_deref(),
                 policy_override,
+                o_lang::project::ProjectExecutionContract::configured()
+                    .map_err(anyhow::Error::msg)?,
             )
             .map_err(anyhow::Error::msg)
             .context("failed to build logical project HGraph")?;
@@ -744,10 +746,10 @@ fn execute_project_selection(
     };
 
     if trace_out.is_some()
-        && std::env::var_os(PROJECT_EXECUTOR_ENV).as_deref() != Some(std::ffi::OsStr::new("hgraph"))
+        && std::env::var_os(PROJECT_EXECUTOR_ENV).as_deref() == Some(std::ffi::OsStr::new("legacy"))
     {
         bail!(
-            "--project-trace-out requires {PROJECT_EXECUTOR_ENV}=hgraph; the legacy project runtime does not produce a Project HGraph attempt trace"
+            "--project-trace-out is incompatible with {PROJECT_EXECUTOR_ENV}=legacy; use the default executor or hgraph"
         );
     }
 
@@ -988,10 +990,10 @@ fn main() -> anyhow::Result<()> {{
 
     if trace_out.is_some()
         && std::env::var_os(PROJECT_EXECUTOR_ENV).as_deref()
-            != Some(std::ffi::OsStr::new("hgraph"))
+            == Some(std::ffi::OsStr::new("legacy"))
     {{
         return Err(anyhow::anyhow!(
-            "--project-trace-out requires {{PROJECT_EXECUTOR_ENV}}=hgraph; the legacy project runtime does not produce a Project HGraph attempt trace"
+            "--project-trace-out is incompatible with {{PROJECT_EXECUTOR_ENV}}=legacy; use the default executor or hgraph"
         ));
     }}
 

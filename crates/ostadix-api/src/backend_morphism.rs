@@ -10,6 +10,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use num_bigint::BigInt;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 pub use crate::backend_catalog::BackendMorphismProfileV1;
@@ -18,6 +19,230 @@ use crate::value::{AnnotationKind, FidelityAssessmentV2, FloatFormat, ONumber, O
 
 pub const BACKEND_MORPHISM_SCHEMA_V1: &str = "ostadix.backend-morphism/v1";
 pub const MAX_BACKEND_MORPHISM_DEPTH_V1: usize = 64;
+
+/// An execution observation is separate from both the static compatibility
+/// judgment and admission authority. Inputs are the prepared OValue bindings;
+/// preparation does not prove adapter receipt. Results are observed *after*
+/// adapter wire lifting.
+/// It never asserts that arbitrary backend code preserves its input values.
+pub const BACKEND_CROSSING_OBSERVATION_SCHEMA_V1: &str = "ostadix.backend-crossing-observation/v1";
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum RuntimeInputProfileV1 {
+    Assessed { fidelity: FidelityAssessmentV2 },
+    OutsideProfile { reason: BackendMorphismErrorV1 },
+    Unprofiled,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeBindingObservationV1 {
+    pub name: String,
+    pub value_sha256: String,
+    pub input_profile: RuntimeInputProfileV1,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimeCrossingStateV1 {
+    Prepared,
+    ResultObserved,
+    Failed,
+    InfrastructureFailure,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeResultObservationV1 {
+    /// This is the adapter's returned OValue, not the backend's pre-lifting
+    /// native object. Native egress loss is deliberately not inferred from it.
+    pub boundary: String,
+    pub value_type: String,
+    pub value_sha256: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackendCrossingObservationV1 {
+    pub schema: String,
+    pub admission_sha256: String,
+    pub graph_sha256: String,
+    pub plan_node: usize,
+    pub backend: String,
+    pub environment: u32,
+    /// Binds the retained executable set, adapter artifact, and launch context.
+    pub launch_generation_sha256: String,
+    pub profile: Option<BackendMorphismProfileV1>,
+    pub input_boundary: String,
+    pub bindings: Vec<RuntimeBindingObservationV1>,
+    pub state: RuntimeCrossingStateV1,
+    pub result: Option<RuntimeResultObservationV1>,
+    /// Physical completion and semantic publication are different facts.
+    pub published: bool,
+    pub discarded: bool,
+}
+
+impl BackendCrossingObservationV1 {
+    pub(crate) fn prepared(
+        admission_sha256: &str,
+        graph_sha256: &str,
+        plan_node: usize,
+        backend: &str,
+        environment: u32,
+        launch_generation_sha256: String,
+        bindings: &HashMap<String, OValue>,
+    ) -> Self {
+        let kernel = BackendMorphismKernelV1::for_backend(backend);
+        let profile = kernel.as_ref().map(|kernel| kernel.spec().profile);
+        let mut observed = bindings
+            .iter()
+            .map(|(name, value)| {
+                // Rust's source-constant profile is not its runtime binding path.
+                // Keep that distinction explicit even when a scalar would fit.
+                let input_profile = match kernel.as_ref() {
+                    Some(kernel) if !matches!(kernel, BackendMorphismKernelV1::Rust) => {
+                        match kernel.project(value) {
+                            Ok(projected) => RuntimeInputProfileV1::Assessed {
+                                fidelity: projected.fidelity,
+                            },
+                            Err(reason) => RuntimeInputProfileV1::OutsideProfile { reason },
+                        }
+                    }
+                    _ => RuntimeInputProfileV1::Unprofiled,
+                };
+                RuntimeBindingObservationV1 {
+                    name: name.clone(),
+                    value_sha256: observed_value_sha256(value),
+                    input_profile,
+                }
+            })
+            .collect::<Vec<_>>();
+        observed.sort_by(|a, b| a.name.cmp(&b.name));
+        Self {
+            schema: BACKEND_CROSSING_OBSERVATION_SCHEMA_V1.to_owned(),
+            admission_sha256: admission_sha256.to_owned(),
+            graph_sha256: graph_sha256.to_owned(),
+            plan_node,
+            backend: backend.to_owned(),
+            environment,
+            launch_generation_sha256,
+            profile,
+            input_boundary: "prepared-ovalue-adapter-bindings".to_owned(),
+            bindings: observed,
+            state: RuntimeCrossingStateV1::Prepared,
+            result: None,
+            published: false,
+            discarded: false,
+        }
+    }
+
+    pub(crate) fn observe_result(&mut self, value: &OValue) {
+        self.state = RuntimeCrossingStateV1::ResultObserved;
+        self.result = Some(RuntimeResultObservationV1 {
+            boundary: "adapter-wire-response-ovalue".to_owned(),
+            value_type: value.type_name().to_owned(),
+            value_sha256: observed_value_sha256(value),
+        });
+    }
+
+    /// Validate structural facts and a trusted external observation digest.
+    /// A digest supplied by the same untrusted document is not authentication.
+    pub fn verify(
+        &self,
+        expected_sha256: &str,
+        admission_sha256: &str,
+        graph_sha256: &str,
+    ) -> Result<(), String> {
+        if self.schema != BACKEND_CROSSING_OBSERVATION_SCHEMA_V1
+            || self.admission_sha256 != admission_sha256
+            || self.graph_sha256 != graph_sha256
+            || self.input_boundary != "prepared-ovalue-adapter-bindings"
+            || self.digest()? != expected_sha256
+        {
+            return Err("backend crossing observation identity mismatch".to_owned());
+        }
+        for digest in [
+            &self.admission_sha256,
+            &self.graph_sha256,
+            &self.launch_generation_sha256,
+        ] {
+            validate_observation_digest(digest)?;
+        }
+        let kernel = BackendMorphismKernelV1::for_backend(&self.backend);
+        if kernel.as_ref().map(|kernel| kernel.spec().profile) != self.profile {
+            return Err("backend crossing profile does not match backend".to_owned());
+        }
+        if self
+            .bindings
+            .windows(2)
+            .any(|pair| pair[0].name >= pair[1].name)
+        {
+            return Err("backend crossing bindings are not uniquely ordered".to_owned());
+        }
+        for binding in &self.bindings {
+            validate_observation_digest(&binding.value_sha256)?;
+            match &binding.input_profile {
+                RuntimeInputProfileV1::Assessed { fidelity } => {
+                    fidelity.validate().map_err(|error| error.to_string())?;
+                    if kernel.is_none() || matches!(kernel, Some(BackendMorphismKernelV1::Rust)) {
+                        return Err("backend has no runtime binding profile".to_owned());
+                    }
+                }
+                RuntimeInputProfileV1::OutsideProfile { reason } => {
+                    if reason.backend != self.backend
+                        || reason.direction
+                            != BackendMorphismDirectionV1::OValueToBackendInputProfile
+                    {
+                        return Err(
+                            "backend crossing rejection is for a different boundary".to_owned()
+                        );
+                    }
+                }
+                RuntimeInputProfileV1::Unprofiled => {}
+            }
+        }
+        if (self.state == RuntimeCrossingStateV1::ResultObserved) != self.result.is_some()
+            || (self.published && (self.result.is_none() || self.discarded))
+        {
+            return Err("inconsistent backend crossing outcome/publication".to_owned());
+        }
+        if let Some(result) = &self.result {
+            if result.boundary != "adapter-wire-response-ovalue" {
+                return Err("unrecognized backend result boundary".to_owned());
+            }
+            validate_observation_digest(&result.value_sha256)?;
+        }
+        Ok(())
+    }
+
+    pub fn digest(&self) -> Result<String, String> {
+        let bytes = serde_json::to_vec(self).map_err(|error| error.to_string())?;
+        let mut digest = Sha256::new();
+        digest.update(b"ostadix.backend-crossing-observation/v1\0");
+        digest.update(bytes);
+        Ok(hex::encode(digest.finalize()))
+    }
+}
+
+pub fn observed_value_sha256(value: &OValue) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"ostadix.observed-ovalue/v1\0");
+    digest.update(value.canonical_bytes());
+    hex::encode(digest.finalize())
+}
+
+fn validate_observation_digest(digest: &str) -> Result<(), String> {
+    if digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        Ok(())
+    } else {
+        Err("backend crossing observation has an invalid SHA-256 digest".to_owned())
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]

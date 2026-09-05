@@ -52,6 +52,7 @@ enum RouteMode {
     GuardSkipped,
     MissingArtifact,
     SpawnAbort,
+    RaceSuccess,
 }
 
 struct WorldFixture {
@@ -267,7 +268,37 @@ fn fixture(marker: &Path, mode: RouteMode) -> WorldFixture {
         main.outputs = vec!["required-but-not-produced.bin".to_owned()];
     }
 
-    let project = build_project_hgraph(&bundle, Some("main"), None).unwrap();
+    let policy =
+        if matches!(mode, RouteMode::RaceSuccess) {
+            let main = bundle
+                .routes
+                .iter_mut()
+                .find(|route| route.id == "main")
+                .unwrap();
+            main.prerequisites.clear();
+            main.outputs.clear();
+            main.command =
+                vec!["sh".into(), "-c".into(),
+            format!("while [ ! -e '{marker}.slow-started' ]; do sleep 0.01; done; printf winner")];
+            let mut slow = main.clone();
+            slow.id = "slow".into();
+            slow.command = vec![
+                "sh".into(),
+                "-c".into(),
+                format!("touch '{marker}.slow-started'; sleep 30; printf loser"),
+            ];
+            bundle.routes.push(slow);
+            bundle.route_sets.retain(|set| set.provides != "world-race");
+            bundle.route_sets.push(project::RouteSet {
+                provides: "world-race".into(),
+                alternatives: vec!["slow".into(), "main".into()],
+                policy: project::RoutePolicy::RaceSuccess,
+            });
+            Some("world-race")
+        } else {
+            Some("main")
+        };
+    let project = build_project_hgraph(&bundle, policy, None).unwrap();
     let logical = project.logical_v1().unwrap();
     let (tasks, attempts) = identities(&logical);
     let snapshot = PlacementSnapshotV1::new(world(7), vec![compatible_provider(&logical)]).unwrap();
@@ -1339,4 +1370,179 @@ fn incomplete_required_artifact_cannot_emit_a_success_receipt() {
         verified.receipt().commit(),
         ReceiptCommitFenceV1::Uncommitted
     ));
+}
+
+#[test]
+fn world_bound_race_records_drained_loser_cancellation_and_residual_host_access() {
+    let temp = TempDir::new().unwrap();
+    let fixture = fixture(&temp.path().join("race"), RouteMode::RaceSuccess);
+    let outcome = execute(&fixture).unwrap();
+    assert!(
+        outcome.coordinator_succeeded(),
+        "{:?}",
+        outcome.coordinator_failure
+    );
+    let result = outcome.result.as_ref().unwrap();
+    assert_eq!(result.route_id, "main");
+    assert!(outcome
+        .trace
+        .events()
+        .iter()
+        .any(|event| event.cancelled_by_ordinal.is_some()));
+    let bytes = outcome.runtime_graph.canonical_bytes().unwrap();
+    let decoded = RuntimeGraphV1::decode_canonical(&bytes).unwrap();
+    decoded
+        .validate_trusted_project_result(
+            &fixture.project,
+            &fixture.deployment,
+            &fixture.launch,
+            &outcome.trace,
+            result,
+        )
+        .unwrap();
+    assert!(matches!(
+        decoded.terminal,
+        RuntimeGraphTerminalV1::RouteSettlement {
+            residual_host_world: true,
+            ..
+        }
+    ));
+    let mut forged = decoded;
+    let cancelled = forged
+        .operations
+        .iter_mut()
+        .flat_map(|operation| &mut operation.observations)
+        .find(|observation| observation.cancelled_by_ordinal.is_some())
+        .unwrap();
+    cancelled.cancelled_by_ordinal = Some(cancelled.coordinator_ordinal);
+    assert!(forged.validate().is_err());
+}
+
+#[test]
+fn archived_v6_runtime_graph_keeps_bytes_and_trusted_terminal_reconstruction() {
+    for mode in [RouteMode::Success, RouteMode::SpawnAbort] {
+        let temp = TempDir::new().unwrap();
+        let fixture = fixture(&temp.path().join("archived"), mode);
+        let outcome = execute(&fixture).unwrap();
+        assert_eq!(outcome.runtime_graph.trace_format_version, 7);
+        let mut archived = outcome.runtime_graph.clone();
+        archived.trace_format_version = 6;
+        // This is the old field shape: no v7 selection/cancellation fields.
+        // Decode the archived bytes instead of rebuilding a current record.
+        let bytes = serde_json::to_vec(&archived).unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(!text.contains("\"selection\""));
+        assert!(!text.contains("\"cancelled_by_ordinal\""));
+        let decoded = RuntimeGraphV1::decode_canonical(&bytes).unwrap();
+        let digest = decoded.digest().unwrap();
+        assert_eq!(decoded.canonical_bytes().unwrap(), bytes);
+        if let Some(result) = &outcome.result {
+            decoded
+                .validate_trusted_project_result(
+                    &fixture.project,
+                    &fixture.deployment,
+                    &fixture.launch,
+                    &outcome.trace,
+                    result,
+                )
+                .unwrap();
+            for change_execution in [true, false] {
+                let mut substituted = ProjectHGraph {
+                    plan: fixture.project.plan.clone(),
+                    graph: fixture.project.plan.to_hgraph().unwrap(),
+                };
+                if change_execution {
+                    substituted.plan.execution_contract =
+                        project::ProjectExecutionContract::LegacyCompatibility;
+                } else {
+                    substituted.plan.scheduling_contract =
+                        project::ProjectSchedulingContract::ConcurrentBranchesV1;
+                }
+                let error = decoded
+                    .validate_trusted_project_result(
+                        &substituted,
+                        &fixture.deployment,
+                        &fixture.launch,
+                        &outcome.trace,
+                        result,
+                    )
+                    .unwrap_err();
+                assert!(error
+                    .to_string()
+                    .contains("trusted strict execution and serial HostWorld"));
+            }
+        } else {
+            decoded
+                .validate_trusted_coordinator_failure(
+                    &fixture.project,
+                    &fixture.deployment,
+                    &fixture.launch,
+                    &outcome.trace,
+                    outcome.coordinator_failure.as_deref().unwrap(),
+                )
+                .unwrap();
+        }
+        assert_eq!(decoded.trace_format_version, 6);
+        assert_eq!(decoded.canonical_bytes().unwrap(), bytes);
+        assert_eq!(decoded.digest().unwrap(), digest);
+    }
+}
+
+#[test]
+fn archived_v6_runtime_graph_rejects_new_policy_and_event_vocabulary() {
+    let temp = TempDir::new().unwrap();
+    let fixture = fixture(&temp.path().join("archival-controls"), RouteMode::Success);
+    let outcome = execute(&fixture).unwrap();
+    let mut archived = outcome.runtime_graph;
+    archived.trace_format_version = 6;
+    for policy in [
+        "all",
+        "race_success",
+        "race_settle",
+        "verify_equivalent",
+        "benchmark_and_select",
+        "benchmark_validate_and_select",
+    ] {
+        let mut forged = archived.clone();
+        forged.policy = policy.to_string();
+        assert_runtime_graph_rejected(
+            &forged,
+            "trace format 6 permits only archived ordered policies",
+        );
+    }
+    for mutation in 0..3 {
+        let mut forged = archived.clone();
+        let observation = forged
+            .operations
+            .iter_mut()
+            .flat_map(|operation| &mut operation.observations)
+            .next()
+            .unwrap();
+        match mutation {
+            0 => {
+                observation.selection = Some(project::trace::ProjectPolicySelection {
+                    selected_route_id: "main".to_string(),
+                    candidates: Vec::new(),
+                    validated_receipt: None,
+                })
+            }
+            1 => observation.cancelled_by_ordinal = Some(0),
+            _ => {
+                observation.continuation = Some(
+                    ProjectContinuationDecision::new(
+                        "main",
+                        vec!["other".to_string()],
+                        ProjectContinuationEvidence::LegacyUnchecked,
+                    )
+                    .unwrap(),
+                )
+            }
+        }
+        assert_runtime_graph_rejected(&forged, "trace format 6 cannot carry");
+    }
+    for version in [5, 8] {
+        let mut unsupported = archived.clone();
+        unsupported.trace_format_version = version;
+        assert_runtime_graph_rejected(&unsupported, "trace format version must be");
+    }
 }
