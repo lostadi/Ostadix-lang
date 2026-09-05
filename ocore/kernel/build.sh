@@ -14,9 +14,9 @@ else
 fi
 PROBE_MODE="${OCORE_PROBE_MODE:-0}"
 case "$PROBE_MODE" in
-  0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 | 24 | 25 | 26 | 27 | 28 | 29 | 30 | 31 | 32 | 33 | 34) ;;
+  0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 | 24 | 25 | 26 | 27 | 28 | 29 | 30 | 31 | 32 | 33 | 34 | 35) ;;
   *)
-    echo "error: OCORE_PROBE_MODE must be an integer from 0 through 34" >&2
+    echo "error: OCORE_PROBE_MODE must be an integer from 0 through 35" >&2
     exit 2
     ;;
 esac
@@ -216,13 +216,15 @@ WORLD_VALUE_SEMANTICS_SOURCE="$KERNEL_DIR/world_value_semantics_stub.oc"
 WORLD_VALUE_SOURCES=()
 WORLD_RECEIPT_SEMANTICS_SOURCE="$KERNEL_DIR/world_receipt_semantics_stub.oc"
 WORLD_PROJECT_RECEIPT_SEMANTICS_SOURCE="$KERNEL_DIR/world_project_receipt_semantics_stub.oc"
+WORLD_NATIVE_SCALAR_SEMANTICS_SOURCE="$KERNEL_DIR/world_native_scalar_semantics_stub.oc"
+WORLD_NATIVE_SCALAR_SOURCES=()
 WORLD_RECEIPT_SOURCES=()
 ENDPOINT_SOURCE="$ROOT/ocore/runtime/x86_64/endpoint.oc"
 if (( PROBE_MODE == 20 || PROBE_MODE == 21 || PROBE_MODE == 22 || PROBE_MODE == 23 )); then
   KERNEL_WORLD_BOOT_SOURCE="$ROOT/ocore/runtime/x86_64/kernel_world_boot.oc"
   KERNEL_WORLD_SEMANTICS_SOURCE="$KERNEL_DIR/kernel_world_semantics.oc"
 fi
-if (( PROBE_MODE == 19 || PROBE_MODE == 20 || PROBE_MODE == 21 || PROBE_MODE == 22 || PROBE_MODE == 23 || PROBE_MODE == 28 || PROBE_MODE == 29 || PROBE_MODE == 30 || PROBE_MODE == 32 )); then
+if (( PROBE_MODE == 19 || PROBE_MODE == 20 || PROBE_MODE == 21 || PROBE_MODE == 22 || PROBE_MODE == 23 || PROBE_MODE == 28 || PROBE_MODE == 29 || PROBE_MODE == 30 || PROBE_MODE == 32 || PROBE_MODE == 35 )); then
   # Mode 19's direct memory-view oracle and the KernelWorld probes use neither
   # IPC queues nor endpoint lifecycle. Link a fail-closed API substitute that
   # preserves common one-shot initialization. Modes 28 and 32 are likewise
@@ -230,8 +232,13 @@ if (( PROBE_MODE == 19 || PROBE_MODE == 20 || PROBE_MODE == 21 || PROBE_MODE == 
   # retain the full four-message endpoint implementation where required.
   ENDPOINT_SOURCE="$ROOT/ocore/runtime/x86_64/endpoint_probe_stub.oc"
 fi
-if (( PROBE_MODE == 32 )); then
-  WORLD_PROJECT_RECEIPT_SEMANTICS_SOURCE="$KERNEL_DIR/world_project_receipt_semantics.oc"
+if (( PROBE_MODE == 32 || PROBE_MODE == 35 )); then
+  if (( PROBE_MODE == 32 )); then
+    WORLD_PROJECT_RECEIPT_SEMANTICS_SOURCE="$KERNEL_DIR/world_project_receipt_semantics.oc"
+  else
+    WORLD_NATIVE_SCALAR_SEMANTICS_SOURCE="$KERNEL_DIR/world_native_scalar_semantics.oc"
+    WORLD_NATIVE_SCALAR_SOURCES=("$ROOT/ocore/world/native_scalar.oc")
+  fi
   WORLD_RECEIPT_SOURCES=(
     "$ROOT/ocore/world/identity.oc"
     "$ROOT/ocore/world/protocol.oc"
@@ -371,7 +378,7 @@ M2_SOURCE="$KERNEL_DIR/m2.oc"
 M3_SOURCE="$KERNEL_DIR/m3.oc"
 M3_LIVE_SOURCE="$KERNEL_DIR/m3_live.oc"
 M4_SOURCE="$KERNEL_DIR/m4.oc"
-if (( PROBE_MODE == 18 || PROBE_MODE == 25 || PROBE_MODE == 26 || PROBE_MODE == 28 || PROBE_MODE == 29 || PROBE_MODE == 30 || PROBE_MODE == 31 || PROBE_MODE == 32 )); then
+if (( PROBE_MODE == 18 || PROBE_MODE == 25 || PROBE_MODE == 26 || PROBE_MODE == 28 || PROBE_MODE == 29 || PROBE_MODE == 30 || PROBE_MODE == 31 || PROBE_MODE == 32 || PROBE_MODE == 35 )); then
   # Modes 18, 25, 26, and 31 enter only kernel::m6, while Modes 28--30 and 32
   # enter only their World codec oracles. Keep historical probes fail-closed
   # without linking their unreachable harness bodies, preserving the hard
@@ -389,6 +396,7 @@ fi
   ${WORLD_PROTOCOL_SOURCES[@]+"${WORLD_PROTOCOL_SOURCES[@]}"} \
   ${WORLD_VALUE_SOURCES[@]+"${WORLD_VALUE_SOURCES[@]}"} \
   ${WORLD_RECEIPT_SOURCES[@]+"${WORLD_RECEIPT_SOURCES[@]}"} \
+  ${WORLD_NATIVE_SCALAR_SOURCES[@]+"${WORLD_NATIVE_SCALAR_SOURCES[@]}"} \
   "$ROOT/ocore/runtime/x86_64/serial.oc" \
   "$BOOT_INFO_SOURCE" \
   "$ROOT/ocore/runtime/x86_64/pages.oc" \
@@ -451,6 +459,7 @@ fi
   "$WORLD_VALUE_SEMANTICS_SOURCE" \
   "$WORLD_RECEIPT_SEMANTICS_SOURCE" \
   "$WORLD_PROJECT_RECEIPT_SEMANTICS_SOURCE" \
+  "$WORLD_NATIVE_SCALAR_SEMANTICS_SOURCE" \
   "$CAPABILITY_BOOT_TEST_SOURCE" \
   "$SMP_PROBE_SOURCE" \
   "$KERNEL_DIR/scheduler_bridge.oc" \

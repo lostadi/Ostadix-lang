@@ -533,6 +533,10 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "ocore/kernel/world_identity_semantics_stub.oc",
         "ocore/kernel/world_project_receipt_semantics.oc",
         "ocore/kernel/world_project_receipt_semantics_stub.oc",
+        "ocore/kernel/world_native_scalar_semantics.oc",
+        "ocore/kernel/world_native_scalar_semantics_stub.oc",
+        "ocore/kernel/smoke-world-native-scalar-qemu.sh",
+        "ocore/kernel/verify-native-scalar.py",
         "ocore/kernel/world_receipt_semantics.oc",
         "ocore/kernel/world_receipt_semantics_stub.oc",
         "ocore/kernel/x86_64/grub-iso.cfg",
@@ -548,6 +552,7 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "ocore/world/protocol.oc",
         "ocore/world/receipt.oc",
         "ocore/world/receipt_codec.oc",
+        "ocore/world/native_scalar.oc",
         "ocore/world/sha256.oc",
         "ocore/world/value.oc",
         "ocore/world/value_codec.oc",
@@ -803,6 +808,7 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "tests/world_identity_wire.rs",
         "tests/world_protocol.rs",
         "tests/world_receipt.rs",
+        "tests/world_native_scalar.rs",
         "tests/world_value.rs",
     }
 ) | (

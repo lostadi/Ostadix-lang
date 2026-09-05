@@ -162,14 +162,25 @@ pub fn encode_signed_receipt_v1(
     encode_envelope(&body, &key_id, &signature)
 }
 
-pub fn inspect_signed_receipt_v1(record: &[u8]) -> Result<SignedExecutionReceiptV1, ReceiptError> {
-    let parsed = parse_envelope(record)?;
-    let receipt = decode_body(parsed.body)?;
+/// Inspect one canonical unsigned receipt body, including native observations.
+/// This performs structural and semantic validation only. It neither verifies
+/// a signature nor constructs trusted execution, current state, or authority.
+pub fn inspect_unsigned_receipt_v1(body: &[u8]) -> Result<ExecutionReceiptV1, ReceiptError> {
+    if body.is_empty() || body.len() > MAX_WORLD_RECEIPT_BODY_BYTES {
+        return Err(ReceiptError::Malformed("invalid unsigned body length"));
+    }
+    let receipt = decode_body(body)?;
     let canonical_body = encode_body(&receipt)?;
-    if canonical_body != parsed.body {
+    if canonical_body != body {
         return Err(ReceiptError::Malformed("unsigned body is not canonical"));
     }
-    let canonical = encode_envelope(&canonical_body, &parsed.key_id, &parsed.signature)?;
+    Ok(receipt)
+}
+
+pub fn inspect_signed_receipt_v1(record: &[u8]) -> Result<SignedExecutionReceiptV1, ReceiptError> {
+    let parsed = parse_envelope(record)?;
+    let receipt = inspect_unsigned_receipt_v1(parsed.body)?;
+    let canonical = encode_envelope(parsed.body, &parsed.key_id, &parsed.signature)?;
     if canonical != record {
         return Err(ReceiptError::Malformed("signed envelope is not canonical"));
     }

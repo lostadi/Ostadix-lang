@@ -33,6 +33,7 @@ use kernel::world_protocol_semantics::start as start_world_protocol_semantics;
 use kernel::world_value_semantics::start as start_world_value_semantics;
 use kernel::world_receipt_semantics::start as start_world_receipt_semantics;
 use kernel::world_project_receipt_semantics::start as start_world_project_receipt_semantics;
+use kernel::world_native_scalar_semantics::start as start_world_native_scalar_semantics;
 use runtime::capability::init as capabilities_init;
 use kernel::capability_boot_test::run as capabilities_self_test;
 use runtime::capability::close_in_cspace;
@@ -175,6 +176,10 @@ unsafe fn start_portable_world_probe(probe_mode: u64) -> void {
         // and does not arm a CPL3 expected-fault profile.
         interrupts_init();
         start_world_project_receipt_semantics(probe_mode);
+    }
+    if probe_mode == 35 {
+        interrupts_init();
+        start_world_native_scalar_semantics(probe_mode);
     }
 }
 
