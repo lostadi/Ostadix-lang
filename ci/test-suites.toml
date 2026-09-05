@@ -116,3 +116,6 @@ required_executables = ["bash", "python3"]
 
 [suites.ocore-qemu]
 required_executables = ["clang", "grub-mkrescue", "grub-mkstandalone", "mcopy", "qemu-system-aarch64", "qemu-system-x86_64", "xorriso"]
+
+[suites.native-systems]
+required_executables = ["bash", "cargo", "clang", "make", "python3", "qemu-system-aarch64", "qemu-system-x86_64"]
