@@ -60,15 +60,16 @@
   dispatch; and `o run` repeats preflight, pins the selected route plus its
   project HGraph/deployment identities, executes it through the existing project
   admission/executor path, and requires durable recording.
-- `o observe` reads and content-verifies an exact terminal record and checks its
-  project path, captured bundle digest, selected route, single route result, and
-  recorded project-route plan identities against current-binary recomputation.
-  It emits a `RuntimeGraphV2` whose evidence binds the `RunContentRefV1` and
-  current recomputed operation plan IDs and tuple under
-  `ostadix.operation-runtime-binding/v1`. `RunRecordV1` did not persist the
-  operation planning-request ID, operation `DeploymentPlanV2` ID, or selected
-  `RealizationCandidateTupleV1`; the observation therefore does not prove those
-  operation coordinates or tuple were recorded at execution time.
+- `o observe` reads and content-verifies an exact terminal record. Current
+  marked-project runs durably retain the original operation decision and full
+  planner snapshot before dispatch. Observation verifies those records against
+  the unchanged project bundle and persisted execution/scheduling contracts;
+  it does not rerank the historical choice. `RuntimeGraphV2` binds the retained
+  original decision and execution observation through
+  `ostadix.operation-runtime-binding/v2`. Only legacy records without an
+  original decision use explicitly labeled current-binary reconstruction;
+  they cannot be upgraded into a persisted original choice. An interrupted run
+  may retain its original planner snapshot without any execution observation.
 - `o replan --without-target` filters caller-named offers and emits a recomputed
   `DeploymentPlanV2` without dispatch. It emits a descriptive `RecoveryPlanV1`
   only for a failed exact source observation when selection changes. A
@@ -1233,7 +1234,9 @@
   reference selection, and policy-aware trace tamper rejection. Default
   configured execution uses a canonical `LegacyCompatibility` contract;
   `O_PROJECT_EXECUTOR=hgraph` retains strict idempotence-gated continuation and
-  `legacy` is the explicit previous-runtime opt-out. Compatibility continuation
+  `legacy` is the explicit previous-runtime opt-out. Graph errors never trigger
+  automatic legacy fallback; unsupported executor settings are rejected.
+  Compatibility continuation
   records `legacy_unchecked`; it does not assert safe repetition. The contract
   is bound to logical/deployment identity and checked against the trusted
   constructor before materialization. The independent source scheduling
@@ -1252,7 +1255,8 @@
   receipt where applicable. Replay verifies causal readiness and selection
   against those observations; it does not attest clock accuracy or re-execute
   external commands. Infrastructure/prerequisite failure does not invent a
-  successful route result. The execution-attempt identifier remains diagnostic.
+  successful route result. The execution-attempt
+  identifier is diagnostic and is not a World `TaskIdentity`.
   Neither this path nor the explicit World-bound hosted-reference adapter
   establishes retries, authenticated remote placement, Governor commit,
   capability/lease enforcement, reservation, recovery, exactly-once effects,

@@ -461,9 +461,90 @@ require_fixed README.md \
 require_fixed README.md \
     'World PR8-2 adds canonical `PlacementSnapshotV1` and `DeploymentPlanV1`' \
     'the canonical project deployment-intention slice is missing from public status'
+# PROJECT_EXECUTION_CLAIMS_BEGIN
+# Current execution and historical-record boundaries are independently required.
 require_fixed README.md \
-    'unsupported hosted policies remain' \
-    'unsupported hosted policies could be misread as executable placements'
+    'The coordinator implements all ten route policies.' \
+    'current project policy coverage is missing'
+require_fixed docs/CLAIMS.md \
+    'all ten Project HGraph policies' \
+    'current hosted policy coverage is missing'
+require_fixed docs/CLAIMS.md \
+    'configured execution uses a canonical `LegacyCompatibility` contract;' \
+    'the default project compatibility contract is missing'
+require_fixed docs/CLAIMS.md \
+    '`O_PROJECT_EXECUTOR=hgraph` retains strict idempotence-gated continuation' \
+    'explicit strict execution could silently lose its continuation requirements'
+require_fixed docs/CLAIMS.md \
+    '`legacy` is the explicit previous-runtime opt-out. Graph errors never trigger' \
+    'legacy execution must require an explicit executor choice'
+require_fixed docs/CLAIMS.md \
+    'automatic legacy fallback; unsupported executor settings are rejected.' \
+    'graph errors or unknown executor settings could silently select legacy execution'
+require_fixed docs/CLAIMS.md \
+    'records `legacy_unchecked`; it does not assert safe repetition.' \
+    'compatibility continuation could be mislabeled as safe repetition'
+require_fixed docs/CLAIMS.md \
+    'is bound to logical/deployment identity and checked against the trusted' \
+    'untrusted trace metadata could become continuation authority'
+require_fixed docs/CLAIMS.md \
+    'contract encodes `concurrent_branches_v1` for new parallel graphs.' \
+    'parallel scheduling has lost its explicit versioned source contract'
+require_fixed docs/CLAIMS.md \
+    'field means `serial_host_world_v1`, preserving historical graph bytes and' \
+    'archival graph scheduling could be silently changed'
+require_fixed docs/CLAIMS.md \
+    'identity, while declared shared resources remain ordered.' \
+    'parallel execution could bypass explicit shared-resource ordering'
+require_fixed docs/CLAIMS.md \
+    'requires residual ambient-host admission in deployment and grounding.' \
+    'ambient parallel effects could be misread as governed or isolated effects'
+require_fixed docs/CLAIMS.md \
+    'cancelled cooperatively and drained before final result publication; trace' \
+    'race completion could precede loser drain'
+require_fixed docs/CLAIMS.md \
+    'v7 binds cancellation to its earlier qualifying settlement' \
+    'race cancellation could lose its recorded cause'
+require_fixed docs/CLAIMS.md \
+    'identifier is diagnostic and is not a World `TaskIdentity`' \
+    'a diagnostic trace identifier could be misread as a World task'
+require_fixed docs/CLAIMS.md \
+    'planner snapshot before dispatch. Observation verifies those records against' \
+    'public operation claims no longer require durable pre-dispatch planner state'
+require_fixed docs/CLAIMS.md \
+    '`ostadix.operation-runtime-binding/v2`. Only legacy records without an' \
+    'new operation observations could be downgraded to legacy reconstruction'
+require_fixed docs/OPERATION_PLANNING_V1.md \
+    'Before dispatch, `begin_with_operation_plan` also durably publishes' \
+    'operation dispatch could precede durable planner snapshot publication'
+require_fixed docs/OPERATION_PLANNING_V1.md \
+    'must preserve that exact decision.' \
+    'terminal recording could substitute the pre-dispatch operation choice'
+require_fixed docs/OPERATION_PLANNING_V1.md \
+    'Snapshot corruption fails verification instead of reconstructing missing history.' \
+    'corrupt planner history could silently become reconstruction'
+require_fixed docs/OPERATION_PLANNING_V1.md \
+    'but **does not rerank the historical operation selection**.' \
+    'historical observation could silently rerank the original choice'
+require_fixed docs/OPERATION_PLANNING_V1.md \
+    'never upgrades an old record into a persisted original choice.' \
+    'legacy reconstruction could be mislabeled as a retained original decision'
+require_fixed tests/o_cli_operation_planner_blackbox.rs \
+    '"retained_original_plan_matched_content_verified_run"' \
+    'operation tests no longer verify the retained original decision'
+require_fixed tests/o_cli_operation_planner_blackbox.rs \
+    '"current_binary_recomputed_plan_matched_content_verified_run"' \
+    'operation tests no longer exercise explicitly degraded legacy reconstruction'
+require_fixed tests/o_cli_operation_planner_blackbox.rs \
+    '.begin_with_operation_plan(frozen_seed.clone(), &initial_snapshot)' \
+    'operation tests no longer exercise a frozen pre-dispatch planner snapshot'
+require_fixed scripts/smoke-project-hgraph-exec.sh \
+    'does not establish Governor authority, native execution, or G1' \
+    'the hosted project smoke could be promoted to Governor authority, native execution, or G1 evidence'
+require_fixed scripts/smoke-project-hgraph-exec.sh \
+    'Retry, placement, OWRECEIPT attestation, and exactly-once effects remain outside' \
+    'the hosted project smoke could be promoted to retries, placement, receipts, or exactly-once effects'
+# PROJECT_EXECUTION_CLAIMS_END
 require_fixed README.md \
     'A separate explicit hosted-reference World entry point consumes the exact' \
     'the explicit snapshot-derived World executor input is missing'
@@ -471,7 +552,7 @@ require_fixed README.md \
     'not a whitespace-insensitive' \
     'the logical graph digest could be misread as source-format-insensitive'
 require_fixed docs/HGRAPH_EXECUTOR_PLAN.md \
-    '`ProjectAttemptTrace` version 5 binds events' \
+    '`ProjectAttemptTrace` version 7 binds events' \
     'the executor plan still describes an obsolete project trace version'
 require_fixed docs/HGRAPH_EXECUTOR_PLAN.md \
     'reconstructs the ordinary hosted-unbound deployment' \
@@ -579,9 +660,6 @@ require_fixed docs/CLAIMS.md \
     'World PR8-2 adds bounded canonical `PlacementSnapshotV1` and' \
     'the bounded World PR8-2 deployment-intention claim is missing'
 require_fixed docs/CLAIMS.md \
-    'unsupported hosted policies `Unresolved`' \
-    'unsupported hosted policies could be promoted to executable placement'
-require_fixed docs/CLAIMS.md \
     'explicit hosted-reference World entry point consumes it together' \
     'the bounded snapshot-derived World entry point is missing'
 require_fixed docs/CLAIMS.md \
@@ -591,32 +669,14 @@ require_fixed docs/CLAIMS.md \
     'G1 remains' \
     'the bounded deployment-intention slice could be promoted to G1 passage'
 require_fixed docs/CLAIMS.md \
-    'identifier is diagnostic and is not a World `TaskIdentity`' \
-    'the hosted trace attempt identifier could be misread as a World task identity'
-require_fixed docs/CLAIMS.md \
-    'opt-in, ordered-alternative' \
-    'the bounded hosted project execution claim is missing'
-require_fixed docs/CLAIMS.md \
     'conservative fallible `HostWorld` effects' \
     'untrusted project purity could be misread as verified mediated execution'
 require_fixed docs/CLAIMS.md \
     'Logical alternative branches may therefore be serialized and' \
     'logical branches could be misread as independently mediated or parallel execution'
-require_fixed docs/CLAIMS.md \
-    'Parallel/racing, aggregate,' \
-    'unsupported project policies must fail closed rather than use legacy fallback'
 require_fixed scripts/smoke-project-hgraph-exec.sh \
     'Project HGraph ordered hosted execution: PASS' \
     'the exact ProjectExec-A/ProjectExec-B hosted execution evidence marker is missing'
-require_fixed scripts/smoke-project-hgraph-exec.sh \
-    'does not establish parallel' \
-    'the ProjectExec-A/ProjectExec-B smoke non-claim boundary is missing'
-require_fixed scripts/smoke-project-hgraph-exec.sh \
-    'retry, placement, Governor authority, OWRECEIPT' \
-    'the ordered hosted smoke could be promoted to retries, placement, governance, or receipts'
-require_fixed scripts/smoke-project-hgraph-exec.sh \
-    'exactly-once effects, native execution, or G1 passage' \
-    'the ordered hosted smoke could be promoted to exact-once, native, or World-gate evidence'
 require_fixed docs/RELEASE_CHECKLIST.md \
     'plus serial ordered' \
     'the release checklist omits the bounded ProjectExec-B ordered execution surface'
@@ -811,9 +871,6 @@ require_fixed docs/OPERATION_PLANNING_V1.md \
     '`ostadix.project-route-pipeline/v1` projection of the bound' \
     'operation-project contract no longer states the exact route-pipeline join'
 require_fixed docs/OPERATION_PLANNING_V1.md \
-    '`RunRecordV1` did not persist the `OperationPlanningRequestV1` ID' \
-    'operation observation no longer states the historical operation-plan persistence gap'
-require_fixed docs/OPERATION_PLANNING_V1.md \
     'Recovery planning is not recovery execution' \
     'operation recovery planning is no longer separated from recovery execution'
 require_fixed docs/OPERATION_PLANNING_V1.md \
@@ -825,9 +882,6 @@ require_fixed docs/CLAIMS.md \
 require_fixed docs/CLAIMS.md \
     'Recovery planning is not recovery execution' \
     'public claims no longer distinguish a recovery plan from recovery execution'
-require_fixed docs/CLAIMS.md \
-    '`RunRecordV1` did not persist the' \
-    'public claims no longer disclose the operation-plan persistence gap'
 require_fixed docs/CLAIMS.md \
     'ambient-Python target offers are static descriptions' \
     'public claims no longer disclose the ambient-target failure-domain boundary'
@@ -852,9 +906,6 @@ require_fixed tests/o_cli_operation_planner_blackbox.rs \
 require_fixed tests/o_cli_operation_planner_blackbox.rs \
     '"ostadix.operation-runtime-binding/v1"' \
     'the operation-project test no longer proves runtime-binding evidence emission'
-require_fixed tests/o_cli_operation_planner_blackbox.rs \
-    '"current_binary_recomputed_not_persisted_in_run_record_v1"' \
-    'the operation-project test no longer proves the operation-plan persistence boundary'
 require_fixed tests/o_cli_operation_planner_blackbox.rs \
     '"descriptive_execution_context_not_verified_physical_node_or_failure_domain"' \
     'the operation-project test no longer proves descriptive target semantics'

@@ -534,7 +534,7 @@ lease, and no dispatch or overlap observed. Even a `yes` coverage value proves
 no simultaneous dispatch, CPU/memory fit, runtime readiness, placement, or
 dynamic-frontier bound.
 
-`ProjectAttemptTrace` version 5 binds events to the project name, bundle digest,
+`ProjectAttemptTrace` version 7 binds events to the project name, bundle digest,
 target, policy, canonical `LogicalHGraphV1` schema/digest, exact canonical
 deployment schema/digest, and an execution-attempt identifier. The ordinary
 path binds the hosted-unbound plan and uses a fresh diagnostic identifier. The
