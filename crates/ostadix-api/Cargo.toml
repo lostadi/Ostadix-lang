@@ -27,7 +27,7 @@ hkdf = "0.12"
 hmac = "0.12"
 if-addrs = "0.15"
 ignore = "0.4"
-num-bigint = { version = "0.4", features = ["serde"] }
+num-bigint = { version = "0.5", features = ["serde"] }
 num-traits = "0.2"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = "2"
