@@ -132,7 +132,7 @@ signal-hook = "0.3"
 
 [dev-dependencies]
 base64 = "0.22"
-ed25519-dalek = "2"
+ed25519-dalek = "3"
 num-bigint = { version = "0.4", features = ["serde"] }
 proptest = "1"
 tempfile = "3"
