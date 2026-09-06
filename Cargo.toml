@@ -115,7 +115,7 @@ clap        = { version = "4", features = ["derive"] }
 ignore      = "0.4"
 
 # REPL line editing: history, arrow keys, Ctrl+A/E, Ctrl+C/D
-rustyline   = "14"
+rustyline   = "18"
 
 # Hidden terminal input for one-use node pairing passcodes.
 rpassword  = "7.5.4"
