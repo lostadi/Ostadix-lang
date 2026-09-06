@@ -34,7 +34,7 @@ rustls-pemfile = "2"
 semver = { version = "1", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
-sha2 = "0.10"
+sha2 = "0.11"
 socket2 = "0.6"
 spake2 = "0.4.0"
 thiserror = "2"
