@@ -14,6 +14,7 @@ use super::super::tls::{
 use super::crypto::{
     constant_time_eq, decode_fixed_hex, salted_bearer_hash, verify_placement_lease_signature_v2,
 };
+use super::migration_protocol::*;
 use super::protocol::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +79,12 @@ pub struct HostedNodeClientV2 {
 }
 
 impl HostedNodeClientV2 {
+    pub fn migrate_session(&self, request: MigrateSessionRequestV2) -> Result<HostedResponseV2> {
+        self.request(HostedRequestV2::MigrateSession {
+            protocol: HOSTED_PROTOCOL_V2.to_owned(),
+            request: Box::new(request),
+        })
+    }
     pub fn new(
         address: impl Into<String>,
         tls_identity: ClientTlsIdentity,
@@ -234,6 +241,61 @@ pub fn validate_hosted_response_v2(
 ) -> Result<()> {
     request.validate()?;
     match (request, response) {
+        (
+            HostedRequestV2::MigrateSession { request, .. },
+            HostedResponseV2::Migration { receipt, snapshot },
+        ) => {
+            verify_response_receipt(receipt, expected_node_public_key)?;
+            let JournalEventV2::MigrationTransition { transition } = &receipt.entry.event else {
+                bail!("migration response is not a signed migration transition");
+            };
+            if receipt.entry.session_id != request.credentials.session_id
+                || !transition.terminal
+                || transition.client_sequence != request.client_sequence
+                || transition.client_request_id != request.client_request_id
+                || transition.request_sha256 != canonical_hosted_sha256(request)?
+                || transition.warrant_sha256 != request.warrant.sha256()?
+                || transition.state.plan != request.warrant.plan
+                || transition.state.peer_receipt_sha256 != request.warrant.peer_receipt_sha256
+                || transition.placement_lease_sha256
+                    != request
+                        .placement_lease
+                        .authority
+                        .semantic_digest()?
+                        .to_string()
+                || transition.placement_lease_nonce
+                    != request.placement_lease.authority.lease_nonce().to_string()
+            {
+                bail!("migration response differs from exact authorized request");
+            }
+            let valid = match request.warrant.action {
+                MigrationActionV2::Prepare => transition.state.phase == MigrationPhaseV2::Prepared,
+                MigrationActionV2::Install => matches!(
+                    transition.state.phase,
+                    MigrationPhaseV2::Installed | MigrationPhaseV2::InstallFailed
+                ),
+                MigrationActionV2::Fence => transition.state.phase == MigrationPhaseV2::Fenced,
+                MigrationActionV2::Activate => matches!(
+                    transition.state.phase,
+                    MigrationPhaseV2::Activated | MigrationPhaseV2::ActivationFailed
+                ),
+                MigrationActionV2::Abort => transition.state.phase == MigrationPhaseV2::Aborted,
+                MigrationActionV2::Cancel => transition.state.phase == MigrationPhaseV2::Cancelled,
+            };
+            if !valid
+                || snapshot.is_some() != (request.warrant.action == MigrationActionV2::Prepare)
+            {
+                bail!("migration response phase or snapshot does not match the request");
+            }
+            if let Some(snapshot) = snapshot {
+                if snapshot.snapshot_sha256()? != transition.state.plan.checkpoint_sha256
+                    || snapshot.encoded_len()? as u64 != transition.state.checkpoint_bytes
+                {
+                    bail!("migration response snapshot differs from signed checkpoint");
+                }
+            }
+            Ok(())
+        }
         (_, HostedResponseV2::Error { .. }) => Ok(()),
         (
             HostedRequestV2::OpenSession { request, .. },

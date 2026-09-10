@@ -110,6 +110,13 @@ CC="$compiler_wrapper" \
 TMPDIR="$build_tmp" \
     "$olangc" "$input" -o "$output" --shim-dir "$shim_dir"
 
+for support_asset in o_shim_common.py o_native_objects.py; do
+    if ! cmp -s "$shim_dir/$support_asset" "${output}.shims/$support_asset"; then
+        echo "test_olangc_paths: generated bundle omitted or changed $support_asset" >&2
+        exit 1
+    fi
+done
+
 program_output=$("$output")
 assert_no_shell_evaluation
 case $program_output in
@@ -174,6 +181,28 @@ if [ -e "$missing_out" ]; then
 fi
 if ! grep -q 'missing required shim asset' "$missing_log"; then
     echo "test_olangc_paths: missing-shim diagnostic was not explicit" >&2
+    cat "$missing_log" >&2
+    exit 1
+fi
+
+# An available Python shim is insufficient when an imported support module is
+# absent. Reject the incomplete closure before publishing either bundle member.
+incomplete_shims="$case_dir/incomplete shims"
+mkdir -p "$incomplete_shims"
+cp -R "$c_root/../backends/." "$incomplete_shims/"
+rm "$incomplete_shims/o_native_objects.py"
+if CC="$real_cc" TMPDIR="$build_tmp" \
+    "$olangc" "$input" -o "$missing_out" --shim-dir "$incomplete_shims" \
+    >"$missing_log" 2>&1; then
+    echo "test_olangc_paths: missing Python support module unexpectedly compiled" >&2
+    exit 1
+fi
+if [ -e "$missing_out" ] || [ -e "${missing_out}.shims" ]; then
+    echo "test_olangc_paths: incomplete Python closure published a bundle member" >&2
+    exit 1
+fi
+if ! grep -q 'missing required shim asset: .*o_native_objects.py' "$missing_log"; then
+    echo "test_olangc_paths: missing Python support diagnostic was not explicit" >&2
     cat "$missing_log" >&2
     exit 1
 fi

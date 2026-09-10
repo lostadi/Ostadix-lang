@@ -7,7 +7,7 @@
 
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{CallToolResult, Content, ServerCapabilities, ServerInfo},
+    model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo},
     schemars, tool, tool_handler, tool_router,
     transport::stdio,
     ErrorData as McpError, ServerHandler, ServiceExt,
@@ -1168,11 +1168,11 @@ fn discover_runtimes(search: &RuntimeSearchPath, root: &Path) -> RuntimeDiscover
 }
 
 fn text_ok(s: impl Into<String>) -> Result<CallToolResult, McpError> {
-    Ok(CallToolResult::success(vec![Content::text(s.into())]))
+    Ok(CallToolResult::success(vec![ContentBlock::text(s.into())]))
 }
 
 fn text_err(s: impl Into<String>) -> Result<CallToolResult, McpError> {
-    Ok(CallToolResult::error(vec![Content::text(s.into())]))
+    Ok(CallToolResult::error(vec![ContentBlock::text(s.into())]))
 }
 
 async fn run_cmd(
@@ -2417,21 +2417,17 @@ impl OstadixMcp {
     }
 }
 
-#[tool_handler]
+#[tool_handler(router = self.tool_router)]
 impl ServerHandler for OstadixMcp {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            instructions: Some(
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_instructions(
                 "Ostadix-lang / O-lang MCP (Rust). Use o_env/o_runtimes/o_doctor first. \
 Use o_analyze_intent then o_execute_intent for a one-use same-intent gate; o_run remains direct ungated compatibility execution. \
 Use o_information_inspect only for bounded descriptive reads of an existing local Information V1 head; it grants no authority. \
 Always run .O programs through an MCP O tool so backends is absolute. \
 Never pass the literal string O_BACKENDS_DIR; never put $VAR inside .O sources (O splices $IDENT)."
-                    .into(),
-            ),
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            ..Default::default()
-        }
+            )
     }
 }
 
@@ -3125,6 +3121,41 @@ mod tests {
         let schema = rmcp::handler::server::tool::schema_for_type::<EmptyArgs>();
         assert_eq!(schema.get("type"), Some(&serde_json::json!("object")));
         assert_eq!(schema.get("properties"), Some(&serde_json::json!({})));
+    }
+
+    #[test]
+    fn text_tool_results_preserve_content_and_error_wire_fields() {
+        use super::{text_err, text_ok};
+        for (result, is_error) in [(text_ok("value=42\n"), false), (text_err("refused"), true)] {
+            let result = serde_json::to_value(result.unwrap()).unwrap();
+            assert_eq!(result["isError"], is_error);
+            assert_eq!(
+                result["content"],
+                serde_json::json!([{
+                    "type": "text",
+                    "text": if is_error { "refused" } else { "value=42\n" }
+                }])
+            );
+            assert!(result.get("structuredContent").is_none());
+        }
+    }
+
+    #[test]
+    fn server_info_preserves_tools_and_execution_instructions() {
+        use rmcp::{model::ServerInfo, ServerHandler};
+        let search = RuntimeSearchPath::new(RuntimePathMode::InheritedOnly, Vec::new()).unwrap();
+        let info = OstadixMcp::new(search).get_info();
+        let defaults = ServerInfo::default();
+        assert_eq!(info.protocol_version, defaults.protocol_version);
+        assert_eq!(info.server_info, defaults.server_info);
+        assert_eq!(
+            serde_json::to_value(&info.capabilities).unwrap(),
+            serde_json::json!({"tools": {}})
+        );
+        let instructions = info.instructions.unwrap();
+        assert!(instructions.contains("one-use same-intent gate"));
+        assert!(instructions.contains("o_run remains direct ungated compatibility execution"));
+        assert!(instructions.contains("it grants no authority"));
     }
 
     #[test]

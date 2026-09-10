@@ -9,6 +9,7 @@ pub mod from_oir;
 pub mod graph;
 pub mod kinds;
 pub mod schedule;
+pub mod semantics;
 pub mod solve;
 
 pub use graph::{
