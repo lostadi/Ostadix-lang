@@ -94,12 +94,14 @@ class ContractSurfacesTests(unittest.TestCase):
         )
 
     def test_rust_suite_projects_openssl_from_one_manifest(self) -> None:
-        result = self.run_contracts("required-executables", "--suite", "rust-hosted")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(
-            result.stdout.splitlines(),
-            ["bash", "clang", "ip", "openssl", "python3", "sqlite3"],
-        )
+        for suite, executables in (
+            ("rust-hosted", ["bash", "clang", "ip", "openssl", "python3", "readelf", "sqlite3"]),
+            ("rust-tests", ["bash", "clang", "node", "openssl", "python3", "sqlite3"]),
+        ):
+            with self.subTest(suite=suite):
+                result = self.run_contracts("required-executables", "--suite", suite)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.splitlines(), executables)
 
     def test_rust_hosted_requires_the_non_loopback_lan_smoke(self) -> None:
         workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")

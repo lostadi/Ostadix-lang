@@ -66,7 +66,7 @@ target = "resource_identity"
 [[root]]
 name = "api"
 layer = 14
-allowed_dependencies = ["backend_morphism", "eval", "evidence", "execution_contract", "hosted_remote", "information_bridge", "ir", "parser", "value", "version", "world"]
+allowed_dependencies = ["backend_morphism", "eval", "evidence", "execution_contract", "hosted_remote", "information_bridge", "ir", "parser", "shims", "value", "version", "world"]
 
 [[root]]
 name = "backend"
@@ -81,7 +81,7 @@ allowed_dependencies = ["placement_protocol", "resource_identity", "syntax_diale
 [[root]]
 name = "backend_morphism"
 layer = 3
-allowed_dependencies = ["backend_catalog", "value"]
+allowed_dependencies = ["backend_catalog", "backend_state", "value"]
 
 [[root]]
 name = "backend_state"
@@ -111,7 +111,7 @@ allowed_dependencies = ["canonical_cbor", "resource_identity"]
 [[root]]
 name = "computation"
 layer = 15
-allowed_dependencies = ["canonical_cbor", "computation_core", "evidence", "execution_contract", "hgraph", "ir", "parser", "placement", "project", "resource_identity"]
+allowed_dependencies = ["canonical_cbor", "computation_core", "eval", "eval_core", "evidence", "execution_contract", "executor", "hgraph", "ir", "parser", "placement", "project", "resource_identity", "value"]
 
 [[root]]
 name = "dispatch_model"
@@ -131,7 +131,7 @@ allowed_dependencies = []
 [[root]]
 name = "eval"
 layer = 11
-allowed_dependencies = ["backend_catalog", "backend_state", "capability", "environment", "eval_core", "evidence", "execution_contract", "executor", "hgraph", "ir", "nix_ops", "nixos_ops", "parser", "placement", "process", "resource_identity", "runtime_exec", "scheduler", "value"]
+allowed_dependencies = ["backend_catalog", "backend_morphism", "backend_state", "capability", "environment", "eval_core", "evidence", "execution_contract", "executor", "hgraph", "ir", "nix_ops", "nixos_ops", "parser", "placement", "process", "resource_identity", "runtime_exec", "scheduler", "shims", "value"]
 
 [[root]]
 name = "eval_core"
@@ -141,7 +141,7 @@ allowed_dependencies = ["backend_catalog", "backend_morphism", "capability", "ev
 [[root]]
 name = "evidence"
 layer = 8
-allowed_dependencies = ["backend_catalog", "dispatch_model", "effects", "execution_contract", "hgraph", "ir", "placement", "runtime_exec", "value"]
+allowed_dependencies = ["backend_catalog", "dispatch_model", "effects", "execution_contract", "hgraph", "ir", "placement", "runtime_exec", "shims", "value"]
 
 [[root]]
 name = "execution_contract"
@@ -241,7 +241,7 @@ allowed_dependencies = ["resource_identity"]
 [[root]]
 name = "process"
 layer = 8
-allowed_dependencies = ["backend_state", "capability", "environment", "runtime_exec", "value", "wire"]
+allowed_dependencies = ["backend_morphism", "backend_state", "capability", "environment", "runtime_exec", "value", "wire"]
 
 [[root]]
 name = "project"

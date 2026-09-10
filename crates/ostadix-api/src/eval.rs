@@ -36,6 +36,7 @@ use crate::backend_state::{
     ensure_evaluator_snapshot_bound, sandbox_policy_sha256, EvaluatorActorCheckpointV1,
     EvaluatorStateSnapshotV1,
 };
+pub mod migration;
 use crate::capability::{fresh_bearer_identity, BackendAuthorityBroker, BackendSandboxPolicy};
 use crate::environment::EnvironmentRefV2;
 use crate::eval_core::{
@@ -956,6 +957,17 @@ impl Evaluator {
         self
     }
 
+    /// Require the executable plain-data crossing contract at every foreign
+    /// dispatch, including deferred execution and recursive callbacks. Only
+    /// the Python adapter currently implements this stronger opt-in contract.
+    pub fn with_morphism_contract(
+        mut self,
+        contract: crate::backend_morphism::BackendCrossingContractV1,
+    ) -> Self {
+        self.registry.set_morphism_contract(contract);
+        self
+    }
+
     /// Evidence-bound admission compiled before the most recent execution.
     pub fn last_execution_admission(&self) -> Option<&crate::evidence::ExecutionAdmissionV6> {
         self.last_execution_admission.as_ref()
@@ -1008,17 +1020,18 @@ impl Evaluator {
         registered.sort();
         let registered = registered.join(",");
         let policy = self.policy.name();
-        admitted.verify_runtime_context(
-            &self.shim_dir,
-            &[
-                ("policy", policy),
-                ("registered-backends", registered.as_str()),
-                (
-                    "default-backend-authority-policy",
-                    DEFAULT_BACKEND_AUTHORITY_POLICY_V1,
-                ),
-            ],
-        )
+        let mut context = vec![
+            ("policy", policy),
+            ("registered-backends", registered.as_str()),
+            (
+                "default-backend-authority-policy",
+                DEFAULT_BACKEND_AUTHORITY_POLICY_V1,
+            ),
+        ];
+        if let Some(contract) = self.registry.morphism_contract() {
+            context.push(("backend-morphism-contract", contract.name()));
+        }
+        admitted.verify_runtime_context(&self.shim_dir, &context)
     }
 
     /// Whether the persistent backend actor `(lang, env)` is currently
@@ -1049,7 +1062,7 @@ impl Evaluator {
         registered.sort();
         let registered = registered.join(",");
         let policy = self.policy.name();
-        let context = [
+        let mut context = vec![
             ("policy", policy),
             ("registered-backends", registered.as_str()),
             (
@@ -1057,6 +1070,9 @@ impl Evaluator {
                 DEFAULT_BACKEND_AUTHORITY_POLICY_V1,
             ),
         ];
+        if let Some(contract) = self.registry.morphism_contract() {
+            context.push(("backend-morphism-contract", contract.name()));
+        }
         let binding = match &self.runtime_executable_override {
             Some(executable) => {
                 crate::evidence::runtime_binding_from_directory_with_current_executable(
@@ -1099,7 +1115,7 @@ impl Evaluator {
         })
     }
 
-    fn install_backend_launch_generations(
+    pub(crate) fn install_backend_launch_generations(
         &mut self,
         generations: Option<HashMap<String, String>>,
     ) -> Option<HashMap<String, String>> {
@@ -1124,9 +1140,9 @@ impl Evaluator {
         shim_path: &std::path::Path,
         executable_leases: &Arc<crate::runtime_exec::ExecutableLeaseSet>,
         launch_generation_sha256: &str,
-    ) -> Result<()> {
+    ) -> Result<Option<crate::backend_state::BackendRestoreReceiptV1>> {
         if environment_id > crate::environment::MAX_PERSISTENT_ENV_ID {
-            return Ok(());
+            return Ok(None);
         }
         let sandbox_policy_sha256 = sandbox_policy_sha256(sandbox.permissions())?;
         let key = (
@@ -1144,7 +1160,7 @@ impl Evaluator {
                     "state.restore-incompatible: pending backend `{backend}[{environment_id}]` does not match admitted sandbox {sandbox_policy_sha256}"
                 );
             }
-            return Ok(());
+            return Ok(None);
         };
 
         actor.validate()?;
@@ -1179,7 +1195,8 @@ impl Evaluator {
             );
         }
 
-        self.registry
+        let receipt = self
+            .registry
             .restore_env(
                 backend,
                 environment_id,
@@ -1197,7 +1214,7 @@ impl Evaluator {
         self.pending_backend_restores
             .remove(&key)
             .expect("successfully restored pending actor disappeared");
-        Ok(())
+        Ok(Some(receipt))
     }
 
     /// Mint a live capability for embedding-specific activation guards.
@@ -1992,6 +2009,11 @@ impl Evaluator {
             },
             ExecutionMode::Shim => {
                 let runtime_lang = backend.canonical.as_str();
+                if let Some(contract) = self.registry.morphism_contract() {
+                    contract
+                        .validate_bindings(runtime_lang, &HashMap::new())
+                        .map_err(anyhow::Error::msg)?;
+                }
                 let environment = EnvironmentRefV2::from_encoded(env_id);
                 let runtime_env_id = environment.runtime_env_id();
                 let shim =
@@ -2964,6 +2986,13 @@ impl Evaluator {
                 OIr::Load(_) | OIr::Exec { .. } | OIr::Invoke { .. } => {
                     let raw = frame.value(*child_id)?.clone();
                     let resolved = self.resolve_for_splice(raw)?;
+                    if backend.execution == ExecutionMode::Shim {
+                        if let Some(contract) = self.registry.morphism_contract() {
+                            contract
+                                .validate_value(&backend.canonical, &resolved)
+                                .map_err(anyhow::Error::msg)?;
+                        }
+                    }
                     buf.push_str(&render_with(backend.renderer, &resolved));
                     if constructs_thunk {
                         deps.push(resolved);
@@ -3001,6 +3030,11 @@ impl Evaluator {
 
         debug_assert_eq!(backend.execution, ExecutionMode::Shim);
         let runtime_lang = backend.canonical.as_str();
+        if let Some(contract) = self.registry.morphism_contract() {
+            contract
+                .validate_bindings(runtime_lang, &local_scope)
+                .map_err(anyhow::Error::msg)?;
+        }
         let shim = BackendRegistry::global().resolve_shim_path(&self.shim_dir, runtime_lang);
         let environment = EnvironmentRefV2::from_encoded(env_id);
         let runtime_env_id = environment.runtime_env_id();
@@ -3140,10 +3174,37 @@ impl Evaluator {
                         if let Some(key) = &suspended_key {
                             self.suspended_actors.insert(key.clone());
                         }
-                        let eval_outcome = self.eval_source_with_scope(&src, &callback_scope);
+                        let fresh_suspension = environment
+                            .is_fresh()
+                            .then(|| {
+                                self.registry.suspend_fresh_actor(
+                                    runtime_lang,
+                                    runtime_env_id,
+                                    &sandbox,
+                                )
+                            })
+                            .transpose()?;
+                        let eval_outcome =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                self.eval_source_with_scope(&src, &callback_scope)
+                            }));
                         if let Some(key) = &suspended_key {
                             self.suspended_actors.remove(key);
                         }
+                        let eval_outcome = match eval_outcome {
+                            Ok(outcome) => {
+                                if let Some(token) = fresh_suspension {
+                                    self.registry.resume_fresh_actor(token)?;
+                                }
+                                outcome
+                            }
+                            Err(panic) => {
+                                if let Some(token) = fresh_suspension {
+                                    self.registry.cancel_fresh_callback_after_panic(token);
+                                }
+                                std::panic::resume_unwind(panic)
+                            }
+                        };
                         match eval_outcome {
                             Ok(result) => {
                                 self.registry
@@ -3156,6 +3217,15 @@ impl Evaluator {
                                     .with_context(|| format!("[{}] send_eval_result", env_label))?;
                             }
                             Err(e) => {
+                                if src.starts_with("native_") {
+                                    self.registry.send_eval_result(
+                                        runtime_lang,
+                                        runtime_env_id,
+                                        OValue::error(format!("{e:#}")),
+                                        &sandbox,
+                                    )?;
+                                    continue;
+                                }
                                 return Err(e).with_context(|| {
                                     format!(
                                         "[{}] O.eval() failed while evaluating quoted source",
@@ -3255,6 +3325,34 @@ impl Evaluator {
         scope: HashMap<String, OValue>,
     ) -> Result<OValue> {
         match fn_name {
+            "native_call" | "native_get" | "native_set" | "native_release" => {
+                if self.prepared_fragment_callbacks_forbidden {
+                    bail!("native.admission-refused: prepared placement cannot acquire owner operation authority");
+                }
+                let count = match fn_name {
+                    "native_set" => 3,
+                    "native_release" => 1,
+                    _ => 2,
+                };
+                if arg_vals.len() != count {
+                    bail!("{fn_name} requires {count} arguments");
+                }
+                let mut values = arg_vals.into_iter();
+                let handle = values.next().unwrap();
+                let arguments = if fn_name == "native_call" {
+                    match values.next().unwrap() {
+                        OValue::List { v } => v,
+                        _ => bail!("native_call arguments must be an O list"),
+                    }
+                } else {
+                    values.collect()
+                };
+                self.execute_native_operation(
+                    handle,
+                    fn_name.trim_start_matches("native_"),
+                    arguments,
+                )
+            }
             "instantiate" => {
                 if arg_vals.len() != 1 {
                     bail!(
@@ -3422,6 +3520,56 @@ impl Evaluator {
         }
     }
 
+    fn execute_native_operation(
+        &mut self,
+        handle: OValue,
+        operation: &str,
+        arguments: Vec<OValue>,
+    ) -> Result<OValue> {
+        let deadline = Instant::now()
+            .checked_add(crate::process::backend_operation_timeout())
+            .context("native operation deadline overflow")?;
+        let deadline = self
+            .callback_operation_deadline
+            .map_or(deadline, |outer| outer.min(deadline));
+        let mut ticket = self
+            .registry
+            .begin_native_operation(handle, operation, arguments)?;
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<OValue> {
+                loop {
+                    let remaining = deadline
+                        .checked_duration_since(Instant::now())
+                        .context("native.operation-timeout: owner operation deadline expired")?;
+                    match self
+                        .registry
+                        .recv_native_operation(&mut ticket, remaining)?
+                    {
+                        ExecStep::Done(OValue::Error { msg }) => bail!("{msg}"),
+                        ExecStep::Done(value) => return Ok(value),
+                        ExecStep::EvalRequest { src, scope } => {
+                            let scope = match scope {
+                                Some(OValue::Scope { bindings }) => bindings,
+                                None => HashMap::new(),
+                                _ => bail!("native.invalid-callback-scope: expected an O scope"),
+                            };
+                            let value =
+                                match self.eval_source_with_scope_until(&src, &scope, deadline) {
+                                    Ok(value) => value,
+                                    Err(error) => OValue::error(format!("{error:#}")),
+                                };
+                            self.registry.send_native_callback_result(&ticket, value)?;
+                        }
+                    }
+                }
+            }));
+        self.registry.abort_native_operation(&ticket);
+        match outcome {
+            Ok(result) => result,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // render_child — language-native splice representation
     //
@@ -3582,24 +3730,24 @@ fn prepared_backend_implementation(
             "admitted Ostadix proxy adapter",
             &backend.canonical,
         )?,
-        BackendAdapterKind::LegacyPythonShim => {
-            let common_name = "o_shim_common.py";
-            let common_hex = hex::encode(common_name.as_bytes());
-            unique_admitted_sha256(
-                admitted
-                    .admission()
-                    .backend_artifacts()
-                    .iter()
-                    .filter(|artifact| artifact.canonical_backend == backend.canonical)
-                    .filter(|artifact| {
-                        !artifact.resolved_identity.ends_with(common_name)
-                            && !artifact.resolved_identity.ends_with(&common_hex)
+        BackendAdapterKind::LegacyPythonShim => unique_admitted_sha256(
+            admitted
+                .admission()
+                .backend_artifacts()
+                .iter()
+                .filter(|artifact| artifact.canonical_backend == backend.canonical)
+                .filter(|artifact| {
+                    !crate::shims::BUNDLED_SHIM_SUPPORT_NAMES.iter().any(|name| {
+                        artifact.resolved_identity.ends_with(name)
+                            || artifact
+                                .resolved_identity
+                                .ends_with(&hex::encode(name.as_bytes()))
                     })
-                    .filter_map(|artifact| artifact.state.sha256()),
-                "admitted legacy shim adapter",
-                &backend.canonical,
-            )?
-        }
+                })
+                .filter_map(|artifact| artifact.state.sha256()),
+            "admitted legacy shim adapter",
+            &backend.canonical,
+        )?,
         BackendAdapterKind::Inline => {
             bail!(
                 "placement fragment backend `{}` has no hosted adapter",
@@ -3723,6 +3871,10 @@ impl GraphEvaluationHost for Evaluator {
 
     fn crossing_observations_enabled(&self) -> bool {
         self.crossing_observations
+    }
+
+    fn morphism_contract(&self) -> Option<crate::backend_morphism::BackendCrossingContractV1> {
+        self.registry.morphism_contract()
     }
 
     fn flush_autonomous_buffer(&mut self) -> Result<()> {
@@ -5160,7 +5312,7 @@ mod tests {
     fn prepared_placement_fragment_rejects_stale_runtime_before_dispatch() -> Result<()> {
         let source_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("backends");
         let temp = tempfile::tempdir()?;
-        for file in ["python_shim.py", "o_shim_common.py"] {
+        for file in ["python_shim.py", "o_shim_common.py", "o_native_objects.py"] {
             std::fs::copy(source_dir.join(file), temp.path().join(file))?;
         }
         let mut evaluator = placement_evaluator(temp.path().to_path_buf());

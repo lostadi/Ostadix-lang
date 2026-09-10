@@ -142,11 +142,11 @@ pub fn runtime_binding_from_adapter_bytes(
                     })
                     .unwrap_or(BackendArtifactStateV1::Missing),
             }];
-            if by_name
+            for selected in by_name
                 .get(&selected)
-                .is_some_and(|bytes| shim_imports_common(bytes))
+                .map(|bytes| shim_support_files(bytes))
+                .unwrap_or_default()
             {
-                let selected = "o_shim_common.py";
                 artifacts.push(BackendArtifactV1 {
                     canonical_backend: artifacts[0].canonical_backend.clone(),
                     resolved_identity: format!("adapter:{selected}"),
@@ -316,15 +316,23 @@ fn legacy_python_shim_backends(plan: &ExecutionPlan) -> BTreeSet<String> {
         .collect()
 }
 
-fn shim_imports_common(bytes: &[u8]) -> bool {
-    std::str::from_utf8(bytes).ok().is_some_and(|source| {
-        source.lines().any(|line| {
-            let line = line.trim_start();
-            line.starts_with("from o_shim_common import ")
-                || line == "import o_shim_common"
-                || line.starts_with("import o_shim_common as ")
+fn shim_support_files(bytes: &[u8]) -> Vec<&'static str> {
+    let Ok(source) = std::str::from_utf8(bytes) else {
+        return Vec::new();
+    };
+    crate::shims::BUNDLED_SHIM_SUPPORT_NAMES
+        .iter()
+        .copied()
+        .filter(|name| {
+            let module = name.trim_end_matches(".py");
+            source.lines().any(|line| {
+                let line = line.trim_start();
+                line.starts_with(&format!("from {module} import "))
+                    || line == format!("import {module}")
+                    || line.starts_with(&format!("import {module} as "))
+            })
         })
-    })
+        .collect()
 }
 
 fn legacy_python_artifacts_from_directory(
@@ -339,16 +347,20 @@ fn legacy_python_artifacts_from_directory(
         resolved_identity: path_identity(&shim_path),
         state: shim_state,
     }];
-    if shim_bytes.is_some_and(|bytes| shim_imports_common(&bytes)) {
+    for support_name in shim_bytes
+        .as_deref()
+        .map(shim_support_files)
+        .unwrap_or_default()
+    {
         // Python resolves the sibling import from Path(__file__).resolve(), so
         // bind the same directory even when the selected shim is a symlink.
         let common_path = shim_path
             .canonicalize()
             .ok()
-            .and_then(|path| path.parent().map(|parent| parent.join("o_shim_common.py")))
-            .unwrap_or_else(|| shim_dir.join("o_shim_common.py"));
+            .and_then(|path| path.parent().map(|parent| parent.join(support_name)))
+            .unwrap_or_else(|| shim_dir.join(support_name));
         artifacts.push(BackendArtifactV1 {
-            canonical_backend: backend,
+            canonical_backend: backend.clone(),
             resolved_identity: path_identity(&common_path),
             state: backend_artifact_state(&common_path),
         });

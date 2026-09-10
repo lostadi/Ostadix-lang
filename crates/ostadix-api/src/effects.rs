@@ -876,6 +876,41 @@ mod tests {
     }
 
     #[test]
+    fn native_object_operations_keep_opaque_evaluator_effects() {
+        for fn_name in ["native_call", "native_get", "native_set", "native_release"] {
+            let kind = PlanNodeKind::Call {
+                fn_name: fn_name.into(),
+                mode: crate::ir::InvokeMode::Eager,
+                arg_count: 2,
+            };
+            let effect = effect_summary_for_plan_node(PlanNodeId(0), &kind).unwrap();
+            // Property reads may invoke arbitrary user descriptors. Even get
+            // must not become pure, cacheable, or a replayable worker task.
+            assert!(effect.unknown);
+            assert!(!effect.deterministic);
+            assert_eq!(effect.fallibility, Fallibility::MayFail);
+            assert!(effect.reads.contains(&ResourceKey::EvaluatorState));
+            assert!(effect.writes.contains(&ResourceKey::EvaluatorState));
+            assert!(effect.writes.contains(&ResourceKey::HostWorld));
+            assert!(!effect.is_verified_pure_infallible());
+            assert!(kind.eval_cache_policy().is_none());
+            let program = crate::ir::OIrProgram {
+                nodes: vec![crate::ir::OIr::Invoke {
+                    fn_name: fn_name.into(),
+                    mode: crate::ir::InvokeMode::Eager,
+                    args: vec![],
+                }],
+            };
+            assert!(crate::dispatch_model::classify(
+                &program.plan(),
+                &program.nodes[0],
+                PlanNodeId(0)
+            )
+            .is_none());
+        }
+    }
+
+    #[test]
     fn parser_rejects_malformed_resources() {
         assert!(EffectDeclaration::parse(Some("reads=project:/absolute")).is_err());
         assert!(EffectDeclaration::parse(Some("reads=env:bad-name")).is_err());
