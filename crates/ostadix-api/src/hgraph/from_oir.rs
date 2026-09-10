@@ -173,8 +173,8 @@ fn add_execute_edges(
             inputs.push(predecessor_completion);
         }
 
-        // Only direct members of a group inside an explicit autonomous region
-        // may opt into non-strict hosted-effect overlap. Ordinary ephemeral
+        // Fresh hosted members and their fresh nested expansions inside an
+        // explicit autonomous region may opt into unordered overlap. Ordinary ephemeral
         // blocks retain HostWorld/EvaluatorState state chains and strict source
         // sequencing exactly like the serial reference executor.
         if crate::dispatch_model::autonomous_ephemeral_group(plan, id, oir_nodes[id.0]).is_none() {
@@ -354,6 +354,17 @@ pub(super) fn sequence_can_relax(
 ) -> bool {
     if direct_members_of_concurrent_group(plan, predecessor, successor) {
         return true;
+    }
+    if let (Some((left_group, left_member)), Some((right_group, right_member))) = (
+        crate::dispatch_model::autonomous_member(plan, predecessor),
+        crate::dispatch_model::autonomous_member(plan, successor),
+    ) {
+        if left_group == right_group && left_member != right_member {
+            // Explicit unordered semantics apply across complete member
+            // expansions. Within-member ordering and all value dependencies
+            // remain intact, including nested input evaluation before launch.
+            return true;
+        }
     }
     let Some(left) = summaries.get(&predecessor) else {
         return false;

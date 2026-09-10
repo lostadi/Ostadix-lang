@@ -1215,7 +1215,7 @@ fn validate_prerequisite_acyclicity(bundle: &ProjectBundle) -> Result<(), String
 fn bundle_digest(bundle: &ProjectBundle) -> Result<String, String> {
     let bytes = bundle::serialize(bundle)
         .map_err(|error| format!("failed to serialize project bundle for planning: {error}"))?;
-    Ok(format!("{:x}", Sha256::digest(bytes)))
+    Ok(hex::encode(Sha256::digest(bytes)))
 }
 
 /// Policies that explicitly request concurrent alternative execution. Ordinary

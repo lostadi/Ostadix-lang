@@ -764,6 +764,9 @@ impl ExecutionAdmissionV5 {
             "admission-note verified-pure infallible local-worker outputs may provisionally unlock only equally safe worker dependents; dependent NodeStarted may precede producer NodeFinished, durable settlement remains serial-topological, and any earlier failure revokes provisionally published outputs\n",
         );
         out.push_str(
+            "admission-note successful explicit-autonomous worker outputs may provisionally unlock admitted worker descendants within the same autonomous group; pure descendants retain that group restriction, coordinator consumers await ordered settlement, and failure revokes provisional outputs\n",
+        );
+        out.push_str(
             "admission-note ambient-world-sha256 is descriptive HostWorld context, not governed authority\n",
         );
         out.push_str(
@@ -1200,6 +1203,9 @@ fn render_schedule_explanation_v2(
     );
     out.push_str(
         "admission-note verified-pure infallible local-worker outputs may provisionally unlock only equally safe worker dependents; dependent NodeStarted may precede producer NodeFinished, durable settlement remains serial-topological, and any earlier failure revokes provisionally published outputs\n",
+    );
+    out.push_str(
+        "admission-note successful explicit-autonomous worker outputs may provisionally unlock admitted worker descendants within the same autonomous group; pure descendants retain that group restriction, coordinator consumers await ordered settlement, and failure revokes provisional outputs\n",
     );
     out.push_str(
         "admission-note ambient-world-sha256 is descriptive HostWorld context, not governed authority\n",
