@@ -99,7 +99,7 @@ fn extract() -> Result<RuntimeBundle> {
         fs::create_dir_all(guard.0.join(name))?;
     }
     for (name, bytes, mode, expected) in FILES {
-        if format!("{:x}", Sha256::digest(bytes)) != *expected {
+        if hex::encode(Sha256::digest(bytes)) != *expected {
             bail!("embedded runtime digest mismatch: {name}");
         }
         let dest = guard.0.join(name);
