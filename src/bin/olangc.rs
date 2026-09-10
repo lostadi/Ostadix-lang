@@ -1612,7 +1612,8 @@ fn write_runtime_sources(src_dir: &Path) -> Result<()> {
     }
     fs::write(src_dir.join("eval_core.rs"), RUNTIME_EVAL_CORE_RS)?;
     fs::write(src_dir.join("eval.rs"), RUNTIME_EVAL_RS)?;
-    fs::write(src_dir.join("migration.rs"), RUNTIME_MIGRATION_RS)?;
+    fs::create_dir_all(src_dir.join("eval"))?;
+    fs::write(src_dir.join("eval/migration.rs"), RUNTIME_MIGRATION_RS)?;
     fs::write(src_dir.join("process.rs"), RUNTIME_PROCESS_RS)?;
     fs::write(src_dir.join("backend.rs"), RUNTIME_BACKEND_RS)?;
     fs::write(

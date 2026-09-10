@@ -26,6 +26,12 @@ fn evaluator(workers: usize) -> Evaluator {
 }
 
 #[test]
+fn physical_boundary_preserves_coordinator_thread_mobility() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<o_lang::executor::Coordinator<'static>>();
+}
+
+#[test]
 fn parsed_program_automatically_plans_every_operation_and_moves_real_values() {
     let program = program("let base = python^(40)_python\nlet answer = python^($base + 2)_python\ntext^($answer)_text");
     let schedule = ReadySchedule::derive(&program.hgraph()).unwrap();

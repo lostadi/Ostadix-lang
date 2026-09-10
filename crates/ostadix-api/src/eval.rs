@@ -36,7 +36,6 @@ use crate::backend_state::{
     ensure_evaluator_snapshot_bound, sandbox_policy_sha256, EvaluatorActorCheckpointV1,
     EvaluatorStateSnapshotV1,
 };
-#[path = "migration.rs"]
 pub mod migration;
 use crate::capability::{fresh_bearer_identity, BackendAuthorityBroker, BackendSandboxPolicy};
 use crate::environment::EnvironmentRefV2;

@@ -775,7 +775,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "// fixture multi-operation realization planning\n"
             ),
             "crates/ostadix-api/src/hgraph/semantics.rs": "// fixture execution observations\n",
-            "crates/ostadix-api/src/migration.rs": "// fixture acknowledged actor migration\n",
+            "crates/ostadix-api/src/eval/migration.rs": "// fixture acknowledged actor migration\n",
             "crates/ostadix-api/tests/graph_realization_execution.rs": (
                 "#[test] fn graph_realization_execution_fixture() {}\n"
             ),
@@ -783,7 +783,7 @@ class SourceReleaseTests(unittest.TestCase):
             "src/bin/olangc/runtime_bundle.rs": "// fixture runtime bundle collection\n",
             "crates/ostadix-api/src/computation/oir_physical_execution.rs": "// fixture executable runtime capability\n",
             "crates/ostadix-api/src/hosted_remote/v2/migration_protocol.rs": "// fixture executable runtime capability\n",
-            "crates/ostadix-api/src/hosted_remote/v2/migration_runtime.rs": "// fixture executable runtime capability\n",
+            "crates/ostadix-api/src/hosted_remote/v2/runtime/migration_runtime.rs": "// fixture executable runtime capability\n",
             "src/bin/olangc/linux_rootfs.rs": "// fixture executable runtime capability\n",
             "scripts/collect_runtime_rootfs.py": "# fixture executable runtime capability\n",
             "docs/OIR_PHYSICAL_EXECUTION_V1.md": "# fixture executable runtime capability\n",
@@ -1654,13 +1654,13 @@ class SourceReleaseTests(unittest.TestCase):
                 "crates/ostadix-api/tests/public_surface.rs",
                 "crates/ostadix-api/src/computation/graph_realization_plan.rs",
                 "crates/ostadix-api/src/hgraph/semantics.rs",
-                "crates/ostadix-api/src/migration.rs",
+                "crates/ostadix-api/src/eval/migration.rs",
                 "crates/ostadix-api/tests/graph_realization_execution.rs",
                 "src/bin/olangc/embedded_runtime.rs",
                 "src/bin/olangc/runtime_bundle.rs",
                 "crates/ostadix-api/src/computation/oir_physical_execution.rs",
                 "crates/ostadix-api/src/hosted_remote/v2/migration_protocol.rs",
-                "crates/ostadix-api/src/hosted_remote/v2/migration_runtime.rs",
+                "crates/ostadix-api/src/hosted_remote/v2/runtime/migration_runtime.rs",
                 "src/bin/olangc/linux_rootfs.rs",
                 "scripts/collect_runtime_rootfs.py",
                 "docs/OIR_PHYSICAL_EXECUTION_V1.md",
@@ -3260,13 +3260,13 @@ class SourceReleaseTests(unittest.TestCase):
             "crates/ostadix-api/backends/o_native_objects.py",
             "crates/ostadix-api/src/computation/graph_realization_plan.rs",
             "crates/ostadix-api/src/hgraph/semantics.rs",
-            "crates/ostadix-api/src/migration.rs",
+            "crates/ostadix-api/src/eval/migration.rs",
             "crates/ostadix-api/tests/graph_realization_execution.rs",
             "src/bin/olangc/embedded_runtime.rs",
             "src/bin/olangc/runtime_bundle.rs",
             "crates/ostadix-api/src/computation/oir_physical_execution.rs",
             "crates/ostadix-api/src/hosted_remote/v2/migration_protocol.rs",
-            "crates/ostadix-api/src/hosted_remote/v2/migration_runtime.rs",
+            "crates/ostadix-api/src/hosted_remote/v2/runtime/migration_runtime.rs",
             "src/bin/olangc/linux_rootfs.rs",
             "scripts/collect_runtime_rootfs.py",
             "docs/OIR_PHYSICAL_EXECUTION_V1.md",
@@ -4059,12 +4059,25 @@ class SourceReleaseTests(unittest.TestCase):
         # Exercise the actual working-tree release surface even when a caller
         # intentionally asks us to validate changes before committing them.
         # The main checkout remains untouched; this private clone receives a
-        # synthetic commit containing every currently required release path.
-        for relative in release.REQUIRED_RELEASE_PATHS:
+        # synthetic commit containing the current tracked release surface,
+        # including optional embedded sources and deletions from module moves.
+        paths = set(release.REQUIRED_RELEASE_PATHS)
+        for repository in (PROJECT_ROOT, live_repo):
+            tracked = subprocess.check_output(
+                ["git", "-C", os.fspath(repository), "ls-files", "-z"]
+            ).decode("utf-8").split("\0")
+            paths.update(
+                path for path in tracked if path and release.is_allowed_release_path(path)
+            )
+        for relative in sorted(paths):
             source = PROJECT_ROOT / relative
             destination = live_repo / relative
-            self.assertTrue(source.is_file(), relative)
-            self.assertFalse(source.is_symlink(), relative)
+            if relative in release.REQUIRED_RELEASE_PATHS:
+                self.assertTrue(source.is_file(), relative)
+                self.assertFalse(source.is_symlink(), relative)
+            elif not source.exists() and not source.is_symlink():
+                destination.unlink(missing_ok=True)
+                continue
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, destination, follow_symlinks=False)
         subprocess.run(

@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use super::{graph_realization_plan::*, realization_plan::*};
 use crate::computation_core::*;
 use crate::eval::Evaluator;
-use crate::eval_core::GraphEvalFrame;
+use crate::eval_core::{GraphEvalFrame, GraphExecutionBoundary, GraphInputRestore};
 use crate::evidence::AdmittedExecution;
 use crate::execution_contract::Policy;
 use crate::hgraph::{HNodeKind, NodeId, ReadyInputPolicy, ReadyOp, ReadySchedule};
@@ -464,7 +464,7 @@ impl WireInput {
     }
 }
 
-pub(crate) struct OirPhysicalSession {
+struct OirPhysicalSession {
     plan: Option<GraphRealizationPlanV1>,
     ops: Vec<ReadyOp>,
     graph_digest: String,
@@ -473,20 +473,6 @@ pub(crate) struct OirPhysicalSession {
     completed: BTreeSet<usize>,
     transport: Arc<dyn OirPhysicalTransportV1>,
     observations: Arc<Mutex<ExecutionObservations>>,
-}
-
-pub(crate) struct PhysicalInputRestore {
-    values: Vec<(PlanNodeId, OValue)>,
-    scope: HashMap<String, OValue>,
-}
-
-impl PhysicalInputRestore {
-    pub(crate) fn restore(self, frame: &mut GraphEvalFrame) {
-        for (id, value) in self.values {
-            frame.values[id.0] = Some(value);
-        }
-        frame.base_scope = self.scope;
-    }
 }
 
 impl OirPhysicalSession {
@@ -597,11 +583,21 @@ impl OirPhysicalSession {
         result
     }
 
-    pub(crate) fn prepare_inputs(
+    fn task(&self, task: PhysicalTaskIdV1, transition: PhysicalTaskTransitionV1) {
+        self.observations
+            .lock()
+            .expect("observation lock")
+            .tasks
+            .push(PhysicalTaskObservationV1 { task, transition });
+    }
+}
+
+impl GraphExecutionBoundary for OirPhysicalSession {
+    fn prepare_inputs(
         &mut self,
         index: usize,
         frame: &mut GraphEvalFrame,
-    ) -> Result<PhysicalInputRestore> {
+    ) -> Result<GraphInputRestore> {
         let op = self.ops[index].clone();
         if !op
             .blocked_by
@@ -645,35 +641,17 @@ impl OirPhysicalSession {
         let OValue::Scope { bindings } = *value else {
             bail!("physical ambient scope changed carrier");
         };
-        let scope = std::mem::replace(&mut frame.base_scope, bindings);
-        let mut values = Vec::new();
-        for (id, value) in replacements {
-            values.push((
-                id,
-                frame.values[id.0]
-                    .replace(value)
-                    .expect("materialized source"),
-            ));
-        }
-        Ok(PhysicalInputRestore { values, scope })
+        Ok(GraphInputRestore::replace(frame, replacements, bindings))
     }
 
-    fn task(&self, task: PhysicalTaskIdV1, transition: PhysicalTaskTransitionV1) {
-        self.observations
-            .lock()
-            .expect("observation lock")
-            .tasks
-            .push(PhysicalTaskObservationV1 { task, transition });
-    }
-
-    pub(crate) fn started(&self, index: usize) {
+    fn started(&self, index: usize) {
         self.task(
             PhysicalTaskIdV1::Operation(LogicalOperationNodeIdV2(index as u64)),
             PhysicalTaskTransitionV1::Started,
         );
     }
 
-    pub(crate) fn completed(&mut self, index: usize, success: bool) {
+    fn completed(&mut self, index: usize, success: bool) {
         if success {
             self.completed.insert(index);
         }
@@ -738,7 +716,7 @@ pub fn execute_oir_physical_v1(
             })
             .collect::<Result<HashMap<_, _>>>()?;
         let coordinator =
-            crate::executor::Coordinator::new(admitted)?.with_physical_session(session);
+            crate::executor::Coordinator::new(admitted)?.with_execution_boundary(session);
         let previous_leases = evaluator.install_executable_leases(Some(leases));
         let previous_generations = evaluator.install_backend_launch_generations(Some(generations));
         let execution = coordinator.run_host(evaluator, scope, None);
