@@ -165,10 +165,13 @@ const GENERATED_RUNTIME_DEPENDENCY_NAMES: &[&str] = &[
 
 // Cargo.lock records the workspace-wide union of optional dependency edges.
 // The emitted AOT runtime excludes hosted_remote and therefore does not enable
-// the PAKE-only features that add these edges. Strip them before reachability
+// the pairing-only features that add these edges. Strip them before reachability
 // pruning so Cargo sees the exact smaller feature graph under --locked.
-const GENERATED_RUNTIME_UNUSED_FEATURE_EDGES: &[(&str, &str)] =
-    &[("curve25519-dalek", "rand_core"), ("digest", "subtle")];
+const GENERATED_RUNTIME_UNUSED_FEATURE_EDGES: &[(&str, &str)] = &[
+    ("curve25519-dalek", "rand_core"),
+    ("digest", "subtle"),
+    ("digest", "ctutils"),
+];
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CLI
@@ -2938,7 +2941,7 @@ base64     = "0.22"
 toml       = "0.8"
 which      = "6"
 semver     = {{ version = "1", features = ["serde"] }}
-sha2       = "0.10"
+sha2       = "0.11"
 hex        = "0.4"
 ed25519-dalek = "2"
 num-bigint = {{ version = "0.4", features = ["serde"] }}
@@ -4199,25 +4202,31 @@ mod tests {
                     "the engine package must be projected out of generated-runtime locks"
                 );
                 for &(package_name, excluded_dependency) in GENERATED_RUNTIME_UNUSED_FEATURE_EDGES {
-                    let package = packages
+                    let matching_packages = packages
                         .iter()
                         .filter_map(toml::Value::as_table)
-                        .find(|package| {
+                        .filter(|package| {
                             package.get("name").and_then(toml::Value::as_str) == Some(package_name)
                         })
-                        .unwrap_or_else(|| panic!("missing projected package {package_name}"));
-                    let dependencies = package
-                        .get("dependencies")
-                        .and_then(toml::Value::as_array)
-                        .into_iter()
-                        .flatten()
-                        .filter_map(toml::Value::as_str)
-                        .map(|coordinate| coordinate.split(' ').next().unwrap())
-                        .collect::<HashSet<_>>();
+                        .collect::<Vec<_>>();
                     assert!(
-                        !dependencies.contains(excluded_dependency),
-                        "generated lock retained workspace-only feature edge {package_name} -> {excluded_dependency}"
+                        !matching_packages.is_empty(),
+                        "missing projected package {package_name}"
                     );
+                    for package in matching_packages {
+                        let dependencies = package
+                            .get("dependencies")
+                            .and_then(toml::Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(toml::Value::as_str)
+                            .map(|coordinate| coordinate.split(' ').next().unwrap())
+                            .collect::<HashSet<_>>();
+                        assert!(
+                            !dependencies.contains(excluded_dependency),
+                            "generated lock retained workspace-only feature edge {package_name} -> {excluded_dependency}"
+                        );
+                    }
                 }
                 assert!(!packages
                     .iter()

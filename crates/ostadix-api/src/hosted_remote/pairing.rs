@@ -15,7 +15,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use base64::engine::general_purpose::STANDARD_NO_PAD;
 use base64::Engine as _;
 use hkdf::Hkdf;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use spake2::{Ed25519Group, Identity, Password, Spake2};
@@ -770,7 +770,7 @@ fn confirmation_tag(
     certificate_for_offer: Option<&str>,
     certificate_for_joiner: Option<&str>,
 ) -> Result<String> {
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(key)
+    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(key)
         .map_err(|_| anyhow!("failed to initialize pairing confirmation"))?;
     update_mac_field(&mut mac, PAIRING_CONFIRMATION_DOMAIN_V1);
     update_mac_field(&mut mac, LAN_PAIRING_SCHEMA_V1.as_bytes());
@@ -797,7 +797,8 @@ fn verify_confirmation(
     received: &str,
 ) -> Result<()> {
     let received = decode_fixed_hex::<32>(received).map_err(|_| authentication_failure())?;
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(key).map_err(|_| authentication_failure())?;
+    let mut mac =
+        <HmacSha256 as KeyInit>::new_from_slice(key).map_err(|_| authentication_failure())?;
     update_mac_field(&mut mac, PAIRING_CONFIRMATION_DOMAIN_V1);
     update_mac_field(&mut mac, LAN_PAIRING_SCHEMA_V1.as_bytes());
     update_mac_field(&mut mac, LAN_PAIRING_SUITE_V1.as_bytes());
@@ -1096,6 +1097,62 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.to_string(), PAIRING_AUTHENTICATION_FAILURE);
         assert!(offer.join().unwrap().is_err());
+    }
+
+    #[test]
+    fn confirmation_keys_and_tags_preserve_v1_known_answers() {
+        // Frozen V1 vectors independently computed with Python hashlib/hmac.
+        // Dependency upgrades must preserve both direction keys and the exact
+        // length-prefixed confirmation transcript, including certificates.
+        let transcript = b"canonical pairing transcript fixture";
+        let keys = derive_confirmation_keys(
+            b"test shared secret",
+            "00aa00aa00aa00aa00aa00aa00aa00aa",
+            transcript,
+        )
+        .unwrap();
+        for (key, expected_key, expected_tag) in [
+            (
+                keys.offer_to_join.as_slice(),
+                "5f816948363eed2192e77a20c642adcee4e90ce0f8938b3bcb691237e6b9a705",
+                "ed084dda2ec9b3418786f9009a60b3ab902717bd6aaa4d7190d9247072d8c786",
+            ),
+            (
+                keys.join_to_offer.as_slice(),
+                "c34e6587be707a741622490377a7822fbbbe8a1b0ba66b6818e4fb0ed8e465b3",
+                "5873fca49a011db5872dce36f0093280e92e6e60241ea7712afe571154083884",
+            ),
+        ] {
+            assert_eq!(hex::encode(key), expected_key);
+            let tag = confirmation_tag(
+                key,
+                "offer-auth",
+                transcript,
+                Some("offer certificate fixture"),
+                Some("joiner certificate fixture"),
+            )
+            .unwrap();
+            assert_eq!(tag, expected_tag);
+            verify_confirmation(
+                key,
+                "offer-auth",
+                transcript,
+                Some("offer certificate fixture"),
+                Some("joiner certificate fixture"),
+                expected_tag,
+            )
+            .unwrap();
+            let error = verify_confirmation(
+                key,
+                "offer-auth",
+                transcript,
+                Some("altered offer certificate"),
+                Some("joiner certificate fixture"),
+                expected_tag,
+            )
+            .unwrap_err();
+            assert_eq!(error.to_string(), PAIRING_AUTHENTICATION_FAILURE);
+        }
     }
 
     #[test]
