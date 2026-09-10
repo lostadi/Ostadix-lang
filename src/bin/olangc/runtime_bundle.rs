@@ -186,7 +186,7 @@ pub(super) fn embed(root: &Path, build_dir: &Path) -> Result<()> {
     for (index, (name, bytes, mode)) in entries.iter().enumerate() {
         let file = format!("payload-{index}");
         fs::write(bundle_dir.join(&file), bytes)?;
-        let digest = format!("{:x}", Sha256::digest(bytes));
+        let digest = hex::encode(Sha256::digest(bytes));
         data.push_str(&format!(
             "({name:?}, include_bytes!({file:?}), {mode}, {digest:?}),\n"
         ));
@@ -214,7 +214,7 @@ pub(super) fn embed(root: &Path, build_dir: &Path) -> Result<()> {
         "symlinks":symlinks.iter().map(|(path, target, mode)| serde_json::json!({"path":path,"target":target,"target_mode":mode})).collect::<Vec<_>>(),
         "files":inventory
     });
-    let digest = format!("{:x}", Sha256::digest(serde_json::to_vec(&inventory)?));
+    let digest = hex::encode(Sha256::digest(serde_json::to_vec(&inventory)?));
     data.push_str(&format!(
         "const ROOTFS_IMAGE: Option<&str> = {};\n",
         if rootfs {
@@ -298,7 +298,7 @@ mod tests {
         );
         let inventory = fs::read(out.path().join("runtime-bundle-manifest.json")).unwrap();
         let value: serde_json::Value = serde_json::from_slice(&inventory).unwrap();
-        let digest = format!("{:x}", Sha256::digest(serde_json::to_vec(&value).unwrap()));
+        let digest = hex::encode(Sha256::digest(serde_json::to_vec(&value).unwrap()));
         assert!(
             fs::read_to_string(out.path().join("src/runtime_bundle/data.rs"))
                 .unwrap()
@@ -335,7 +335,7 @@ mod tests {
             .any(|dir| dir["path"] == "lib/empty"));
         assert_eq!(
             inventory["files"][0]["sha256"],
-            format!("{:x}", Sha256::digest(b"runtime payload"))
+            hex::encode(Sha256::digest(b"runtime payload"))
         );
         assert!(fs::read_to_string(out.path().join("src/main.rs"))
             .unwrap()
