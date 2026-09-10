@@ -29,7 +29,9 @@ use super::auth::{
     AuthorizedPlacementV2, PlacementAuthorizationContextV2, SharedPlacementAuthorizerV2,
 };
 use super::crypto::{constant_time_eq, decode_fixed_hex, salted_bearer_hash};
+use super::migration_protocol::{MigrateSessionRequestV2, MigrationTransitionV2};
 use super::protocol::*;
+mod migration_runtime;
 use super::store::{DurableSessionStoreV2, DurableStoreReopenRequiredV2, JournalReadV2};
 
 const TERMINAL_RECORD_OVERHEAD_RESERVATION: u64 = 64 * 1024;
@@ -421,6 +423,7 @@ struct SessionRecordV2 {
     placement_identity: HostedPlacementIdentityV2,
     checkpoint: Option<DurableCheckpointV2>,
     recovery_attempt: Option<RecoveryAttemptV2>,
+    migration: Option<MigrationTransitionV2>,
     durable_bytes: u64,
     operations: BTreeMap<String, OperationRecordV2>,
     commits: BTreeMap<u64, ClientCommitV2>,
@@ -498,6 +501,10 @@ struct ClientCommitV2 {
 }
 
 enum ActorCommandV2 {
+    CheckpointForMigration {
+        limit: u64,
+        reply: mpsc::Sender<std::result::Result<EvaluatorStateSnapshotV1, String>>,
+    },
     Prepare {
         operation: PreparedOperationV2,
         reply: mpsc::Sender<std::result::Result<PreparedPlacementFragmentV2, String>>,
@@ -659,6 +666,13 @@ impl Drop for HostedV2RuntimeOwner {
 }
 
 impl HostedV2RuntimeHandle {
+    pub fn migrate_session(
+        &self,
+        principal: &str,
+        request: MigrateSessionRequestV2,
+    ) -> Result<HostedResponseV2> {
+        self.runtime.migrate_session(principal, request)
+    }
     pub fn node_id(&self) -> Result<&str> {
         self.runtime.node_id()
     }
@@ -1115,6 +1129,9 @@ impl HostedV2Runtime {
             };
         }
         let outcome = match request {
+            HostedRequestV2::MigrateSession { request, .. } => {
+                self.migrate_session(principal_sha256, *request)
+            }
             HostedRequestV2::OpenSession { request, .. } => {
                 self.open_session(principal_sha256, request)
             }
@@ -1495,6 +1512,7 @@ impl HostedV2Runtime {
                 placement_identity: authorized.placement_identity,
                 checkpoint: None,
                 recovery_attempt: None,
+                migration: None,
                 durable_bytes: written,
                 operations: BTreeMap::new(),
                 commits: BTreeMap::new(),
@@ -2172,6 +2190,16 @@ impl HostedV2Runtime {
         }
         require_next_sequence(&state, &session_id, request.client_sequence)?;
         let session = state.sessions.get(&session_id).unwrap();
+        if matches!(
+            session.status,
+            SessionStatusV2::Migrating | SessionStatusV2::Migrated
+        ) {
+            return Err(reject(
+                "migration-fenced",
+                "session ownership is reserved or transferred by a durable migration",
+                false,
+            ));
+        }
         if session.preparation.is_some() {
             return Err(reject(
                 "session-preparing",
@@ -3331,6 +3359,13 @@ impl HostedV2Runtime {
         }
         require_next_sequence(&state, &session_id, request.client_sequence)?;
         let session = state.sessions.get(&session_id).unwrap();
+        if session.status == SessionStatusV2::Migrating {
+            return Err(reject(
+                "migration-fenced",
+                "session ownership is reserved or transferred by a durable migration",
+                false,
+            ));
+        }
         if session.preparation.is_some() {
             return Err(reject(
                 "session-preparing",
@@ -3677,6 +3712,9 @@ impl HostedV2Runtime {
         let ids = state.sessions.keys().cloned().collect::<Vec<_>>();
         for session_id in ids {
             let classified: Result<()> = (|| {
+                if self.repair_migration_restart_locked(&mut state, &session_id)? {
+                    return Ok(());
+                }
                 let interrupted_recovery = state.sessions[&session_id].recovery_attempt.clone();
                 if let Some(attempt) = interrupted_recovery {
                     let session = &state.sessions[&session_id];
@@ -4036,6 +4074,12 @@ fn actor_loop(
     let mut scope = HashMap::<String, OValue>::new();
     while let Ok(command) = receiver.recv() {
         match command {
+            ActorCommandV2::CheckpointForMigration { limit, reply } => {
+                let result = evaluator
+                    .checkpoint_persistent_actors(limit)
+                    .map_err(|error| format!("{error:#}"));
+                let _ = reply.send(result);
+            }
             ActorCommandV2::Prepare { operation, reply } => {
                 let Some(inner) = runtime.upgrade() else {
                     let _ = reply.send(Err("hosted runtime stopped during preparation".to_owned()));
@@ -5536,6 +5580,7 @@ fn reconstruct_session(
         placement_identity: placement_identity.clone(),
         checkpoint: None,
         recovery_attempt: None,
+        migration: None,
         durable_bytes: 0,
         operations: BTreeMap::new(),
         commits: BTreeMap::new(),
@@ -5552,6 +5597,9 @@ fn reconstruct_session(
         }
         match &receipt.entry.event {
             JournalEventV2::SessionOpened { .. } => bail!("duplicate SessionOpened record"),
+            JournalEventV2::MigrationTransition { transition } => {
+                migration_runtime::apply_migration_transition(&mut session, transition, receipt)?;
+            }
             JournalEventV2::OperationAccepted {
                 client_sequence,
                 client_request_id,
@@ -6409,10 +6457,12 @@ fn session_view(session: &SessionRecordV2, observed: u64) -> SessionViewV2 {
 fn actor_observation(session: &SessionRecordV2, observed: u64) -> ActorObservationV2 {
     let health = match session.status {
         SessionStatusV2::Ready => ActorHealthV2::Ready,
-        SessionStatusV2::Executing | SessionStatusV2::Closing => ActorHealthV2::Busy,
+        SessionStatusV2::Executing | SessionStatusV2::Closing | SessionStatusV2::Migrating => {
+            ActorHealthV2::Busy
+        }
         SessionStatusV2::RecoveryRequired => ActorHealthV2::RecoveryRequired,
         SessionStatusV2::Quarantined => ActorHealthV2::Quarantined,
-        SessionStatusV2::Closed => ActorHealthV2::Closed,
+        SessionStatusV2::Closed | SessionStatusV2::Migrated => ActorHealthV2::Closed,
     };
     ActorObservationV2 {
         actor_id: session.actor_id.clone(),

@@ -436,11 +436,56 @@ impl BackendStateErrorV1 {
     }
 }
 
+/// Wire identity for an opt-in executable crossing contract. It observes exact
+/// plain-data values (including numeric bits), not object identity, retained
+/// environments, or arbitrary future interactions with a Python object. The
+/// adapter rejects objects outside that carrier before lifting them into OValue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BackendCrossingContractV1 {
+    PythonPlainDataLossless,
+}
+
+impl BackendCrossingContractV1 {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::PythonPlainDataLossless => "python-plain-data-lossless",
+        }
+    }
+}
+
+/// Receipt emitted by the trusted adapter after checking the actual native
+/// input and output carriers. A matching request id and input witnesses are
+/// required before the process registry can publish the result. This is not a
+/// proof about arbitrary code, host effects, or future contextual equivalence.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackendMorphismReceiptV1 {
+    pub contract: BackendCrossingContractV1,
+    pub request_id: String,
+    pub input_witnesses: HashMap<String, OValue>,
+    pub value: OValue,
+}
+
 /// Internal backend wire V2. Legacy variants intentionally match the serde
 /// shape of `value::OWireCommand`; tests lock that compatibility down.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "lowercase")]
 pub enum BackendWireCommandV2 {
+    #[serde(rename = "native_operation_v1")]
+    NativeOperationV1 {
+        request_id: String,
+        handle: OValue,
+        operation: String,
+        arguments: Vec<OValue>,
+    },
+    #[serde(rename = "exec_morphism_v1")]
+    ExecMorphismV1 {
+        code: String,
+        bindings: HashMap<String, OValue>,
+        contract: BackendCrossingContractV1,
+        request_id: String,
+    },
     Exec {
         code: String,
         bindings: HashMap<String, OValue>,
@@ -467,6 +512,15 @@ pub enum BackendWireCommandV2 {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "lowercase")]
 pub enum BackendWireResponseV2 {
+    #[serde(rename = "native_operation_result_v1")]
+    NativeOperationResultV1 {
+        request_id: String,
+        value: OValue,
+    },
+    #[serde(rename = "morphism_result_v1")]
+    MorphismResultV1 {
+        receipt: BackendMorphismReceiptV1,
+    },
     Ok {
         value: OValue,
     },
@@ -619,6 +673,46 @@ fn validate_canonical_sha256(field: &str, value: &str) -> Result<()> {
 mod tests {
     use super::*;
     use crate::value::{BackendAuthority, OWireCommand, OWireResponse};
+
+    #[test]
+    fn morphism_wire_shapes_and_strict_receipt_decoding_are_preserved() {
+        let command_json = serde_json::json!({
+            "cmd": "exec_morphism_v1",
+            "code": "payload",
+            "bindings": {"payload": {"t": "null"}},
+            "contract": "python-plain-data-lossless",
+            "request_id": "invocation-1"
+        });
+        let command: BackendWireCommandV2 = serde_json::from_value(command_json.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&command).unwrap(), command_json);
+        assert_eq!(
+            crate::wire::encode_message(&command).unwrap(),
+            crate::wire::encode_message(&command_json).unwrap()
+        );
+
+        let response_json = serde_json::json!({
+            "status": "morphism_result_v1",
+            "receipt": {
+                "contract": "python-plain-data-lossless",
+                "request_id": "invocation-1",
+                "input_witnesses": {"payload": {"t": "null"}},
+                "value": {"t": "null"}
+            }
+        });
+        let response: BackendWireResponseV2 =
+            serde_json::from_value(response_json.clone()).unwrap();
+        let bytes = crate::wire::encode_message(&response).unwrap();
+        assert_eq!(bytes, crate::wire::encode_message(&response_json).unwrap());
+        let decoded: BackendWireResponseV2 = crate::wire::decode_message(&bytes).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), response_json);
+
+        let mut unknown_field = response_json.clone();
+        unknown_field["receipt"]["unchecked"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<BackendWireResponseV2>(unknown_field).is_err());
+        let mut unknown_contract = response_json;
+        unknown_contract["receipt"]["contract"] = serde_json::json!("invented-contract");
+        assert!(serde_json::from_value::<BackendWireResponseV2>(unknown_contract).is_err());
+    }
 
     fn evaluator_actor(environment_id: u32, launch_byte: &str) -> EvaluatorActorCheckpointV1 {
         EvaluatorActorCheckpointV1::new(
