@@ -35,6 +35,9 @@ fn copy_adapter(backends: &Path, name: &str) {
         .join("backends")
         .join(name);
     fs::copy(source, backends.join(name)).unwrap();
+    if name == "python_shim.py" {
+        copy_adapter(backends, "o_native_objects.py");
+    }
 }
 
 fn start_program(
@@ -206,6 +209,32 @@ fn imported_common_shim_mutation_stales_admission_before_python_launch() {
     let (child, _) = start_program(temp.path(), &source, &backends, None, &[]);
     fs::write(
         backends.join("o_shim_common.py"),
+        b"# substituted after admission\n",
+    )
+    .unwrap();
+    let output = finish(child);
+    assert_rejected_before_marker(&output, &marker, "backend artifacts");
+}
+
+#[test]
+fn imported_native_support_mutation_stales_admission_before_python_launch() {
+    if which::which("python3").is_err() || which::which("bash").is_err() {
+        eprintln!("SKIP-OPTIONAL: python3 and bash are required");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let backends = temp.path().join("backends");
+    fs::create_dir(&backends).unwrap();
+    copy_adapter(&backends, "python_shim.py");
+    copy_adapter(&backends, "o_shim_common.py");
+    let marker = temp.path().join("python.marker");
+    let source = format!(
+        "bash^(sleep 1.5)_bash\npython^(\nfrom pathlib import Path\nPath({:?}).write_text('unsafe')\n__oval_result__ = 'done'\n)_python\n",
+        marker.display().to_string()
+    );
+    let (child, _) = start_program(temp.path(), &source, &backends, None, &[]);
+    fs::write(
+        backends.join("o_native_objects.py"),
         b"# substituted after admission\n",
     )
     .unwrap();
