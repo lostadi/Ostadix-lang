@@ -1,10 +1,10 @@
-//! Bounded, shadow-mode backend morphism contracts.
+//! Bounded backend morphism contracts and opt-in adapter enforcement.
 //!
 //! This V1 kernel describes only crossings the current adapters can actually
-//! demonstrate. Catalog V5 binds the selected profile name, while evidence,
-//! admission, and dispatch remain unchanged. The HGraph solver can query the
-//! shadow assessment beside its compatibility fidelity result without changing
-//! execution behavior.
+//! demonstrate. The HGraph solver can query the static shadow assessment
+//! without changing compatibility execution. `BackendCrossingContractV1`
+//! separately opts into real adapter checks, binds that choice in admission,
+//! and requires an invocation-matched receipt before publishing a value.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -15,10 +15,73 @@ use thiserror::Error;
 
 pub use crate::backend_catalog::BackendMorphismProfileV1;
 use crate::backend_catalog::BackendRegistry;
+pub use crate::backend_state::{BackendCrossingContractV1, BackendMorphismReceiptV1};
 use crate::value::{AnnotationKind, FidelityAssessmentV2, FloatFormat, ONumber, OText, OValue};
 
 pub const BACKEND_MORPHISM_SCHEMA_V1: &str = "ostadix.backend-morphism/v1";
 pub const MAX_BACKEND_MORPHISM_DEPTH_V1: usize = 64;
+
+impl BackendCrossingContractV1 {
+    pub fn validate_value(self, backend: &str, value: &OValue) -> Result<(), String> {
+        if !matches!(
+            BackendMorphismKernelV1::for_backend(backend),
+            Some(BackendMorphismKernelV1::Python)
+        ) {
+            return Err(format!(
+                "morphism.unsupported-backend: {backend} has no executable {} contract",
+                self.name()
+            ));
+        }
+        let round_trip = BackendMorphismKernelV1::Python
+            .round_trip(value)
+            .map_err(|error| format!("morphism.input-rejected: {error}"))?;
+        if round_trip.composed_fidelity != FidelityAssessmentV2::Lossless {
+            return Err(format!(
+                "morphism.fidelity-rejected: {} requires lossless input",
+                self.name()
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn validate_bindings(
+        self,
+        backend: &str,
+        bindings: &HashMap<String, OValue>,
+    ) -> Result<(), String> {
+        self.validate_value(backend, &OValue::Null)?;
+        let mut names = bindings.keys().collect::<Vec<_>>();
+        names.sort();
+        for name in names {
+            self.validate_value(backend, &bindings[name])
+                .map_err(|error| format!("binding {name:?}: {error}"))?;
+        }
+        Ok(())
+    }
+}
+
+impl BackendMorphismReceiptV1 {
+    pub(crate) fn verify(
+        &self,
+        contract: BackendCrossingContractV1,
+        request_id: &str,
+        bindings: &HashMap<String, OValue>,
+    ) -> Result<(), String> {
+        if self.contract != contract
+            || self.request_id != request_id
+            || &self.input_witnesses != bindings
+        {
+            return Err(
+                "morphism.receipt-mismatch: contract, invocation, or actual input witness differs"
+                    .to_string(),
+            );
+        }
+        contract.validate_bindings("python", &self.input_witnesses)?;
+        contract
+            .validate_value("python", &self.value)
+            .map_err(|error| format!("morphism.output-rejected: {error}"))
+    }
+}
 
 /// An execution observation is separate from both the static compatibility
 /// judgment and admission authority. Inputs are the prepared OValue bindings;

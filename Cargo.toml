@@ -100,7 +100,7 @@ toml        = "0.8"
 which       = "6"
 
 # CLI hashing and artifact verification
-sha2        = "0.10"
+sha2        = "0.11"
 hex         = "0.4"
 
 # Operating-system entropy for live bearer capability identities

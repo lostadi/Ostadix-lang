@@ -400,6 +400,56 @@ fn explicit_autonomous_ephemeral_python_blocks_overlap() {
 }
 
 #[test]
+fn autonomous_shims_with_nested_evaluator_inputs_overlap() {
+    if !support::require_runtime("python3") {
+        return;
+    }
+    // Nested hosted evaluators and inline renderers produce real child values
+    // before either parent is prepared. Their data edges must survive worker
+    // classification; the parent callbacks still run in owned fresh actors.
+    let source = INTERVAL_BATCH
+        .replace(
+            "start = time.monotonic_ns()",
+            "assert python^(6 * 7)_python == 42\nstart = time.monotonic_ns()",
+        )
+        .replace(
+            "__oval_result__ = \"left\"",
+            "__oval_result__ = text^(left)_text",
+        )
+        .replace(
+            "__oval_result__ = \"right\"",
+            "__oval_result__ = text^(right)_text",
+        );
+    let run = run_graph_bounded(&source, 2);
+    assert_success(&run, "autonomous nested evaluator inputs");
+    let left = read_interval(&run.workdir.path().join("left.interval"));
+    let right = read_interval(&run.workdir.path().join("right.interval"));
+    assert!(
+        left.0.max(right.0) < left.1.min(right.1),
+        "nested-input tasks did not overlap: {left:?}, {right:?}"
+    );
+}
+
+#[test]
+fn autonomous_shims_with_scope_load_inputs_overlap() {
+    if !support::require_runtime("python3") {
+        return;
+    }
+    let source = format!(
+        "let delay = text^(0.75)_text\n{}",
+        INTERVAL_BATCH.replace("time.sleep(0.75)", "time.sleep(float($delay))")
+    );
+    let run = run_graph_bounded(&source, 2);
+    assert_success(&run, "autonomous materialized scope inputs");
+    let left = read_interval(&run.workdir.path().join("left.interval"));
+    let right = read_interval(&run.workdir.path().join("right.interval"));
+    assert!(
+        left.0.max(right.0) < left.1.min(right.1),
+        "scope-input tasks did not overlap: {left:?}, {right:?}"
+    );
+}
+
+#[test]
 fn autonomous_worker_pool_refills_24_tasks_without_exceeding_capacity() {
     if !support::require_runtime("python3") {
         return;

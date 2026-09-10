@@ -111,7 +111,9 @@ impl PlacementProofAuthorizerV2 for LanOpenPlacementAuthorizerV2 {
             }
             (
                 HostedPlacementAuthorityV2::StateControl(lease),
-                PlacementPurposeV2::OpenSession | PlacementPurposeV2::Recover,
+                PlacementPurposeV2::OpenSession
+                | PlacementPurposeV2::Recover
+                | PlacementPurposeV2::Migrate,
             ) => (lease.issued_at().get(), lease.expires_at().get()),
             (HostedPlacementAuthorityV2::Execution(_), _) => {
                 bail!("OpenSession and Recover require a state-control lease")
@@ -196,7 +198,9 @@ impl PlacementProofAuthorizerV2 for LanOpenPlacementAuthorizerV2 {
 
         let actor_generation = match command.purpose {
             PlacementPurposeV2::OpenSession => None,
-            PlacementPurposeV2::Recover => context.current_actor_generation.clone(),
+            PlacementPurposeV2::Recover | PlacementPurposeV2::Migrate => {
+                context.current_actor_generation.clone()
+            }
             PlacementPurposeV2::Execute
                 if context.session_state_tier == SessionStateTierV2::Stateless =>
             {
@@ -407,7 +411,9 @@ impl PlacementProofAuthorizerV2 for PinnedEd25519PlacementAuthorizerV2 {
                 }
                 Some(observation_digest)
             }
-            PlacementPurposeV2::Execute | PlacementPurposeV2::Recover => {
+            PlacementPurposeV2::Execute
+            | PlacementPurposeV2::Recover
+            | PlacementPurposeV2::Migrate => {
                 if envelope.state_capacity_observation.is_some() {
                     bail!("existing-session envelope unexpectedly carries a capacity observation");
                 }
@@ -459,7 +465,7 @@ impl PlacementProofAuthorizerV2 for PinnedEd25519PlacementAuthorizerV2 {
             logical_environment_requirement(&evidence.requirement_footprint)?;
         let authorized_actor = match command.purpose {
             PlacementPurposeV2::OpenSession => None,
-            PlacementPurposeV2::Recover => {
+            PlacementPurposeV2::Recover | PlacementPurposeV2::Migrate => {
                 let actor = context
                     .current_actor_generation
                     .clone()
@@ -581,7 +587,9 @@ impl PlacementProofAuthorizerV2 for PinnedEd25519PlacementAuthorizerV2 {
             }
             (
                 HostedPlacementAuthorityV2::StateControl(lease),
-                PlacementPurposeV2::OpenSession | PlacementPurposeV2::Recover,
+                PlacementPurposeV2::OpenSession
+                | PlacementPurposeV2::Recover
+                | PlacementPurposeV2::Migrate,
             ) => {
                 if context.prepared_fragment.is_some() {
                     bail!("state-control authorization unexpectedly carries an execution fragment");
@@ -720,7 +728,7 @@ fn validate_command_actor_lifecycle(
             }
             (Some(_), Some(_)) => {}
         },
-        PlacementPurposeV2::Recover => {
+        PlacementPurposeV2::Recover | PlacementPurposeV2::Migrate => {
             let current =
                 current_actor.context("recovery requires an established actor generation")?;
             if signed_actor != Some(current) {
