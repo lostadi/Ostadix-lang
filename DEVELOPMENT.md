@@ -62,11 +62,12 @@ c_cpp/O examples/hello.O backends
 - `crates/ostadix-api/src/nix_ops.rs` and `crates/ostadix-api/src/nixos_ops.rs` implement Nix and NixOS operations used by builtins.
 - `crates/ostadix-api/src/ocore/` contains the O-core lexer, parser, AST, HIR, type checker, MIR, codegen, driver, and capability bridge.
 - Binaries: `src/main.rs` is `O`; `src/bin/o-cli.rs` owns validated intent
-  `run`/`plan`/`explain`/`inspect`; `olangc.rs`, `ocorec.rs`, `olink.rs`
-  (`o-link`), `ounlink.rs` (`o-unlink`), `ogit.rs`, and `o-notebook.rs` provide
-  compiler, native, linker, Git, and notebook entry points. The Bash
-  `scripts/o-cli.sh` dispatcher remains the installed lowercase `o` front door
-  so macOS case-insensitivity cannot collapse `O` and `o`.
+  `run`, `routes`, `optimize`, `plan`, `explain`, `inspect`, `object`, and
+  `operation`; `olangc.rs`, `ocorec.rs`, `olink.rs` (`o-link`), `ounlink.rs`
+  (`o-unlink`), `ogit.rs`, and `o-notebook.rs` provide compiler, native,
+  linker, Git, and notebook entry points. The Bash `scripts/o-cli.sh`
+  dispatcher remains the installed lowercase `o` front door so macOS
+  case-insensitivity cannot collapse `O` and `o`.
 
 ## Environment semantics
 
@@ -149,7 +150,16 @@ ctest --test-dir build/c_cpp-cmake
 # Documentation/release-claim guard
 bash scripts/check_release_claims.sh
 python3 -m unittest -v tests.test_source_release
+python3 -m unittest -v tests.test_offline_kit
+python3 -m unittest -v tests.test_olang_browser_bundle
+node apps/olang-browser-wasi/test-host.mjs
 ```
+
+The source-release gate covers the browser host assets embedded by `olangc`.
+The offline-kit suite uses fixture toolchains and vendor trees to test archive
+closure, determinism, host rejection, no-clobber extraction, and tamper
+detection without downloading dependencies. A real per-host kit additionally
+requires the union-vendor procedure in `docs/OFFLINE_AI_BUILD_KIT.md`.
 
 `smoke-project-hgraph.sh` is the composite hosted PR7 planning and generated
 project-adapter gate. Its planning phase uses a real fixture to prove exact

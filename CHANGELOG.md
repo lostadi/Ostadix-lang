@@ -9,6 +9,62 @@ Package SemVer is only one of the independent coordinates documented in
 
 ### Added
 
+- Experimental `OperationContractV1`, `OperationInterfaceV1`,
+  `RealizationDescriptorV1`, and `RealizationSetV1` records add four bounded,
+  canonical, independently domain-separated descriptions of one logical
+  operation and its declared realizations. `o operation inspect` validates one
+  explicitly typed JSON or canonical-CBOR record; `o operation verify` checks
+  one exact supplied referential closure. This surface is descriptive and
+  authority-free: it does not plan, select, prove behavioral equivalence,
+  authenticate evidence, determine placement, execute, recover, or authorize
+  work. `docs/OPERATION_REALIZATION_V1.md` defines the complete boundary and is
+  a required source-release member.
+
+- `o routes TARGET [--json] [--route-decl DECL]...` provides a read-only
+  route-discovery UI for project directories and lifted project bundles. It
+  reports ordered route IDs, kinds, result codecs, explicitly declared route
+  sets, reference routes,
+  structural optimization readiness, and later-winner declared-effect
+  readiness as either human text or one
+  `ostadix.route-catalog/v1` object. It never executes a route, creates a run
+  record, infers equivalence from shared `provides`, or exposes commands,
+  environment values, guards, labels, or source bytes.
+
+- `o optimize TARGET --route ROUTE_SET [--receipt PATH] [--progress auto|always|never] [--json]`
+  provides the initial evidence-gated optimization UI. It requires an explicit
+  route set and durable run record, runs and validates every candidate against
+  the first declared reference, reports the fastest eligible route as a human
+  summary or `ostadix.optimize-summary/v1` JSON, and can export the canonical
+  receipt outside the project. `--progress auto|always|never` adds a
+  credential-minimized candidate-settlement view on terminal stderr without
+  contaminating captured outputs or JSON stdout. The evidence-gathering
+  invocation itself is not accelerated and does not claim universal semantic
+  equivalence.
+
+- `o run TARGET --selection-run RUN_ID` and the corresponding typed Rust API
+  execute the explicit winner from one exact verified local optimization run.
+  Admission binds the unchanged bundle, benchmark plans, route declarations,
+  ordered alternatives, reference, winner, and expected declared output;
+  requires transitive `pure = true` declarations; seals the in-process token;
+  pins the preflighted compatibility executor; dispatches no other top-level
+  candidate branch; and produces a fresh typed postcondition. The CLI front
+  door durably records it; the library API returns it to the embedder, which
+  must persist it itself when durable audit evidence is required. Failure or
+  output drift is terminal with no replay or fallback. This is an opt-in,
+  non-transactional declared-effect boundary, not proof against undeclared side
+  effects.
+
+- Project route policy `benchmark_validate_and_select` runs the first declared
+  alternative as a reference and measures every candidate in an isolated
+  workspace. It rejects unsuccessful or declared-output-divergent candidates,
+  selects the fastest eligible complete branch, and binds canonical result,
+  artifact-manifest, timing, and decision evidence into a content-addressed
+  `ostadix.project-validated-selection/v1` receipt and durable run record. The
+  accompanying FFmpeg, ImageMagick, and CPython benchmark suite checks outputs
+  independently and reports paired whole-process measurements without claiming
+  universal speedup, fixed-rate ceiling capture, or acceleration of the
+  evidence-gathering invocation itself.
+
 - Backend Catalog V6 admits `wasm-tools+wasmtime` and
   `wasm-tools+wasmer` as complete WebAssembly alternatives while preserving
   every published V3, V4, and V5 whole-catalog, source, and per-backend
@@ -118,6 +174,40 @@ Package SemVer is only one of the independent coordinates documented in
   packaged engine rather than workspace-relative root sources. Registry
   publication order is reversed: publish and verify `ostadix-api` first, then
   publish its exact-version `o-lang` shell dependent.
+- `FidelityAssessmentV2` now exposes interval validation and allocation-free
+  concrete-membership checks. Generated laws bind its exact `Fidelity` point
+  embedding, sequential composition, conservative upper projection, and the
+  lossless/structural path hull. Invalid directly assembled bounds can no
+  longer be serialized; graph and solver boundaries also reject invalid bounds
+  or a mismatched conservative V1 projection. Render fidelity remains a
+  separate descriptive domain;
+  no conversion, common carrier, or Galois connection to `Fidelity` or
+  `FidelityAssessmentV2` is introduced. The render classifier's complete
+  six-renderer matrix now asserts classifications for one
+  representative of all 30 `OValue` variants. Targeted cases cover
+  payload-sensitive Python Decimal/F64 and Nix integer/text rendering,
+  collection subtype collapse, recursive child propagation, map-key rendering,
+  and media-less bytes, rather than only checking that each renderer emits
+  output.
+
+### Fixed
+
+- Splice renderers and diagnostics now abbreviate public or deserialized
+  fingerprints without panicking on short or non-ASCII input. The renderer
+  classifier now limits Nix typed integers to the signed 64-bit range and typed
+  text to explicit UTF-8 metadata without NUL, and limits Python typed
+  Decimal/F64 values to renderer-admitted exact shapes. It classifies values
+  whose portable payload survives the default renderer as structural, while
+  retaining opaque classifications for Nix `Graph`/`Native`, media-less
+  `Bytes` under Nix and the default renderer, and explicit marker-only values.
+  Nix NUL-bearing strings now use a tagged code-point structure, and keyed
+  containers with such keys use entries form, avoiding source collisions.
+  Python checkpoint integers and rational parts now share the chunked decimal
+  codec used at the execution boundary, including values above CPython's
+  configurable decimal-digit ceiling.
+  Scheduler cache keys preserve canonical lowercase SHA-256 filenames while
+  mapping every noncanonical input to a bounded domain-separated hash inside
+  the cache directory.
 
 ### Release boundary
 
@@ -252,6 +342,10 @@ or a live World.
 Release entries must be dated and linked to the exact released commit or tag
 when a release is cut.
 
-[Unreleased]: https://github.com/lostadi/Ostadix-lang/compare/v0.3.0...HEAD
+After the 2026-09-03 attribution-only history rewrite, the immutable `v0.3.0`
+tag remains on its archival lineage. The Unreleased comparison therefore starts
+from its tree-identical rewritten commit recorded in the sealed provenance map.
+
+[Unreleased]: https://github.com/lostadi/Ostadix-lang/compare/2083d83f9eaaf4a88a277d348779b00967d50bc8...HEAD
 [0.3.0]: https://github.com/lostadi/Ostadix-lang/tree/v0.3.0
 [0.2.0]: https://github.com/lostadi/Ostadix-lang/tree/v0.2.0

@@ -109,7 +109,7 @@ pub(crate) fn adapter_matches(
 }
 
 /// Return the explicit coordination group authorizing non-strict execution of
-/// one bare hosted shim.
+/// one fresh hosted shim, after its child values and scope are materialized.
 ///
 /// This is a policy classification, not an effect-independence proof: the shim
 /// remains effect-unknown, and only the nearest explicit `autonomous(...)`
@@ -123,7 +123,6 @@ pub(crate) fn autonomous_ephemeral_group(
         env_id,
         attr,
         backend,
-        body,
         ..
     } = oir
     else {
@@ -132,21 +131,55 @@ pub(crate) fn autonomous_ephemeral_group(
     if !EnvironmentRefV2::from_encoded(*env_id).is_fresh()
         || attr.is_some()
         || backend.execution != ExecutionMode::Shim
-        || !body
-            .iter()
-            .all(|child| matches!(child, OIr::Text(_) | OIr::Store { .. }))
     {
         return None;
     }
 
-    let group = plan.edges.iter().find_map(|edge| {
-        (edge.kind == PlanEdgeKind::Structural
-            && edge.from == node
-            && matches!(plan.nodes[edge.to.0].kind, PlanNodeKind::Group { .. }))
-        .then_some(edge.to)
-    })?;
+    autonomous_member(plan, node).map(|(group, _)| group)
+}
 
-    nearest_policy_schedule_is_autonomous(plan, group).then_some(group)
+/// Find the direct member containing this operation in an explicit autonomous
+/// group. Nested fresh shim expansion belongs to that member; persistent,
+/// attributed, lazy and O left-to-right regions retain their own boundary.
+pub(crate) fn autonomous_member(
+    plan: &ExecutionPlan,
+    node: PlanNodeId,
+) -> Option<(PlanNodeId, PlanNodeId)> {
+    let mut current = node;
+    let mut visited = HashSet::new();
+    let (group, member) = loop {
+        if !visited.insert(current) {
+            return None;
+        }
+        let parents = plan
+            .edges
+            .iter()
+            .filter_map(|edge| {
+                (edge.kind == PlanEdgeKind::Structural && edge.from == current).then_some(edge.to)
+            })
+            .collect::<Vec<_>>();
+        let [parent] = parents.as_slice() else {
+            return None;
+        };
+        match plan.nodes[parent.0].kind {
+            PlanNodeKind::Group { .. } => break (*parent, current),
+            PlanNodeKind::Store { .. } => current = *parent,
+            PlanNodeKind::Exec {
+                ref backend,
+                env_id,
+                ref attr,
+                ..
+            } if EnvironmentRefV2::from_encoded(env_id).is_fresh()
+                && attr.is_none()
+                && (backend.execution == ExecutionMode::Shim
+                    || (backend.pure && backend.execution == ExecutionMode::InlineValue)) =>
+            {
+                current = *parent
+            }
+            _ => return None,
+        }
+    };
+    nearest_policy_schedule_is_autonomous(plan, group).then_some((group, member))
 }
 
 fn nearest_policy_schedule_is_autonomous(plan: &ExecutionPlan, node: PlanNodeId) -> bool {
@@ -175,6 +208,24 @@ fn nearest_policy_schedule_is_autonomous(plan: &ExecutionPlan, node: PlanNodeId)
                 kind: PlanScheduleKind::Lazy,
                 ..
             } => return false,
+            PlanNodeKind::Group { .. } | PlanNodeKind::Store { .. } => current = *parent,
+            PlanNodeKind::Exec {
+                ref backend,
+                env_id,
+                ref attr,
+                ..
+            } if EnvironmentRefV2::from_encoded(env_id).is_fresh()
+                && attr.is_none()
+                && (backend.execution == ExecutionMode::Shim
+                    || (backend.pure && backend.execution == ExecutionMode::InlineValue)) =>
+            {
+                current = *parent;
+            }
+            // An inner group must not make a persistent/attributed/O region
+            // transparent merely by hiding that ancestor above the group.
+            PlanNodeKind::Exec { .. } => return false,
+            // Force and ordinary invocations preserve their inherited policy.
+            // They must not silently remove established autonomous capacity.
             _ => current = *parent,
         }
     }
@@ -199,11 +250,16 @@ pub(crate) fn renderer_inputs_statically_preparable(oir: &OIr) -> bool {
             backend.canonical.as_str(),
             "html" | "markdown" | "text" | "latex"
         )
-        && body.iter().all(|child| match child {
-            OIr::Text(_) | OIr::Store { .. } => true,
-            OIr::Exec { .. } => renderer_inputs_statically_preparable(child),
-            OIr::Load(_) | OIr::Invoke { .. } => false,
-        })
+        && body.iter().all(renderer_input_statically_preparable)
+}
+
+fn renderer_input_statically_preparable(input: &OIr) -> bool {
+    match input {
+        OIr::Text(_) => true,
+        OIr::Store { expr, .. } => renderer_input_statically_preparable(expr),
+        OIr::Exec { .. } => renderer_inputs_statically_preparable(input),
+        OIr::Load(_) | OIr::Invoke { .. } => false,
+    }
 }
 
 /// Hard effect/failure predicate shared by evidence and runtime verification.
@@ -234,5 +290,104 @@ pub(crate) fn effect_contract_worker_safe(summary: &EffectSummary, oir: &OIr) ->
                 && !summary.clock
         }
         _ => summary.is_verified_pure_infallible(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::backend_catalog::BackendRegistry;
+
+    use super::*;
+
+    fn exec(lang: &str, body: Vec<OIr>) -> OIr {
+        OIr::Exec {
+            lang: lang.into(),
+            env_id: 0,
+            attr: None,
+            backend: BackendRegistry::global().interface_for(lang),
+            body,
+        }
+    }
+
+    fn store(expr: OIr) -> OIr {
+        OIr::Store {
+            name: "answer".into(),
+            expr: Box::new(expr),
+        }
+    }
+
+    #[test]
+    fn trusted_renderer_recurses_through_store_expressions() {
+        let safe = exec("html", vec![store(OIr::Text("42".into()))]);
+        assert!(renderer_inputs_statically_preparable(&safe));
+
+        let scope_dependent = exec("html", vec![store(OIr::Load("answer".into()))]);
+        assert!(!renderer_inputs_statically_preparable(&scope_dependent));
+
+        let foreign_execution = exec(
+            "html",
+            vec![store(exec("python", vec![OIr::Text("6 * 7".into())]))],
+        );
+        assert!(!renderer_inputs_statically_preparable(&foreign_execution));
+
+        let nested_renderer = exec(
+            "html",
+            vec![store(exec("markdown", vec![OIr::Text("safe".into())]))],
+        );
+        assert!(renderer_inputs_statically_preparable(&nested_renderer));
+    }
+
+    #[test]
+    fn inner_group_does_not_hide_restricted_autonomous_ancestors() {
+        use crate::ir::{InvokeMode, OIrProgram};
+        let invoke = |name: &str, mode, args| OIr::Invoke {
+            fn_name: name.into(),
+            mode,
+            args,
+        };
+        for case in 0..6 {
+            let mut leaf = exec("python", vec![OIr::Text("42".into())]);
+            if let OIr::Exec { env_id, .. } = &mut leaf {
+                *env_id = u32::MAX;
+            }
+            let group = invoke(
+                "batch",
+                InvokeMode::Group(crate::value::GroupMode::Batch),
+                vec![leaf],
+            );
+            let wrapper = match case {
+                0..=3 => {
+                    let mut wrapper = exec(if case == 3 { "O" } else { "python" }, vec![group]);
+                    if let OIr::Exec { env_id, attr, .. } = &mut wrapper {
+                        *env_id = if case == 1 { 1 } else { u32::MAX };
+                        if case == 2 {
+                            *attr = Some("lazy".into());
+                        }
+                    }
+                    wrapper
+                }
+                4 => invoke("lazy", InvokeMode::Lazy, vec![group]),
+                _ => invoke("now", InvokeMode::Eager, vec![group]),
+            };
+            let program = OIrProgram {
+                nodes: vec![invoke("autonomous", InvokeMode::Autonomous, vec![wrapper])],
+            };
+            let plan = program.plan();
+            let flat = program.flatten_for_plan();
+            let leaf_id = flat
+                .iter()
+                .enumerate()
+                .filter_map(|(index, node)| {
+                    matches!(node, OIr::Exec { backend, .. } if backend.canonical == "python")
+                        .then_some(PlanNodeId(index))
+                })
+                .next_back()
+                .unwrap();
+            assert_eq!(
+                autonomous_ephemeral_group(&plan, leaf_id, flat[leaf_id.0]).is_some(),
+                case == 0 || case == 5,
+                "restricted ancestor case {case}"
+            );
+        }
     }
 }

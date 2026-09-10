@@ -13,10 +13,20 @@
 
 I created Ostadix-lang to make a whole polyglot program one typed expression
 tree. A language boundary appears where computation changes language, and the
-result crosses that boundary as an `OValue`. The same source becomes an
-admitted operation graph, receives an explicit placement, executes through
-persistent evaluators or native machinery, and leaves evidence that can be
-inspected independently of the prose describing it.
+result crosses that boundary as an `OValue`. The same source can become an
+admitted operation graph, execute through persistent evaluators or native
+machinery, and leave evidence that can be inspected independently of the prose
+describing it.
+
+An experimental operation-project layer now keeps one logical operation
+invariant while comparing explicitly supplied realization, target,
+representation, and residency tuples. Its authority-free planner selects a
+statically compatible tuple deterministically; the marked-project bridge binds
+the descriptor to exact captured implementation bytes and a deterministic,
+versioned serialized route-pipeline projection before `o run` enters the existing admission
+and executor path. Those separate joins do not prove that the route loads the
+named artifact, behavioral equivalence, live target eligibility, placement
+authority, or execution on the described physical target.
 
 ```O
 html^(
@@ -75,10 +85,10 @@ discovered `.O` examples. The in-checkout MCP server exposes 10 tools. Native
 release evidence contains 26 required portable QEMU gates and one supplemental
 hardware gate.
 
-The isolated current-master Rust audit recorded 1,351 passing tests and three
-ignored tests. The current-master portable native aggregate recorded 26 of 26
-required gates passing. The exact validation scope and the checked-in G0
-historical evidence continuity defect are recorded in
+The isolated audit of that pinned snapshot recorded 1,351 passing tests and
+three ignored tests. Its portable native aggregate recorded 26 of 26 required
+gates passing. The exact historical validation scope and the then-observed G0
+evidence continuity defect are recorded in
 [Validation at the audited master](#validation-at-the-audited-master) and
 [Exact implementation boundaries](#exact-implementation-boundaries).
 
@@ -173,6 +183,13 @@ was admitted and placed. Hosted V2 journals and World receipt formats bind
 longer-lived execution facts. The native gate manifest binds positive claims
 to exact transcript markers.
 
+`O --crossing-evidence` also records direct admitted backend operations: the
+prepared binding hashes, bounded directional input-profile assessments,
+and returned OValue hashes, with publication and discarded completion reported
+separately. These opt-in diagnostics bind the admission and adapter launch
+generation; they do not infer native egress fidelity from an already lifted
+result. See [bounded semantic custody](docs/SEMANTIC_CUSTODY.md).
+
 The evidence layer turns an implementation claim into a reproducible route
 from source bytes to observed execution.
 
@@ -204,6 +221,30 @@ O version --json
 
 `O version --json` reports the package, toolchain, admission, catalog, Hosted,
 and World schema coordinates compiled into that executable.
+
+### Offline AI build ZIPs
+
+The normal source archive pins source and Cargo resolution, but deliberately
+does not pretend that one native Rust compiler can run on every host. For an AI
+or another offline recipient, build a **per-host offline kit** instead. That ZIP
+contains the allowlisted repository source, Cargo, `rustc`, the complete pinned
+Cargo registry closure from all four released lockfiles, and the
+`wasm32-wasip1` standard library. After extraction, the recipient runs:
+
+```bash
+./bootstrap-offline.sh check
+./bootstrap-offline.sh all-supported
+./bootstrap-offline.sh wasm-std-check
+```
+
+The archive verifies its exact member hashes, rejects the wrong OS/architecture,
+uses a sealed kit-local Cargo home and target directory, and forces Cargo
+offline with `--frozen --locked`. `all-supported` builds the authoritative
+hosted Rust binaries and the separately locked MCP server. Android APKs,
+nightly fuzzing, O-core/QEMU media, the C17 edition, system linkers/SDKs, and
+hosted language runtimes have separate toolchain requirements and are not
+misrepresented as part of that profile. Build and redistribution instructions
+are in [Per-host offline AI build kit](docs/OFFLINE_AI_BUILD_KIT.md).
 
 ### Zero-configuration LAN execution
 
@@ -409,7 +450,7 @@ let mut runtime = Runtime::new("/absolute/path/to/backends");
 let value: OValue = runtime.evaluate("text^(hello)_text")?;
 ```
 
-Direct engine users may import the 38 public runtime modules from
+Direct engine users may import the 41 public runtime modules from
 `ostadix_api`, including `parser`, `ir`, `hgraph`, `evidence`, `eval`,
 `execution_fabric`, `execution_fabric_authority`, `executor`, `hosted_remote`,
 `project`, and `world`. Historical
@@ -431,6 +472,7 @@ Choose the next path according to what you want to inspect:
 | Learn typed-parenthesis syntax | [Gentle introduction](#gentle-introduction) |
 | Build all supported local tools | [Full setup guide](#getting-started-full-setup-guide) |
 | Inspect source -> OIR -> HGraph -> observed-result custody | [Bounded semantic custody](docs/SEMANTIC_CUSTODY.md) |
+| Inspect or plan an operation's realization declarations | [Operation planning and observation V1](docs/OPERATION_PLANNING_V1.md) |
 | Run durable signed sessions | [Hosted V2 development quickstart](#hosted-v2-development-quickstart) |
 | Compile freestanding native code | [O-core native systems language](#o-core-native-systems-language) |
 | Run the repository gates | [Running the tests](#running-the-tests) |
@@ -443,6 +485,7 @@ Choose the next path according to what you want to inspect:
 | OIR, ExecutionPlan, Graph V2, Evidence/Admission V6, local executor | Supported core under hardening |
 | Explicit Graph V1 / Evidence and Admission V5 / Why V1 | Archival inspection and compatibility verification only |
 | Information Kernel V1 and backend-morphism V1 | Experimental local shadow surfaces; non-authorizing |
+| Operation semantics and realization planning V1/V2 | Experimental canonical records, deterministic single-operation static ranking, and exact project-route binding; non-authorizing |
 | Hosted V2 durable sessions and direct-node placement | Experimental integration with dedicated lifecycle and recovery tests |
 | Authenticated pure Execution Fabric M3 | Experimental same-host, two-real-process proof; coordinator-only graph authority |
 | Project lifting, route execution, and live supervision | Experimental integration |
@@ -453,6 +496,96 @@ Experimental surfaces have executable implementations and tests. Their
 compatibility, operational, and distributed guarantees are still being
 hardened around the supported hosted core. See
 [claims and evidence](docs/CLAIMS.md) for the exact qualification boundary.
+
+### Experimental operation and realization planning
+
+The independent engine defines four canonical, authority-free semantic records:
+`OperationContractV1`, `OperationInterfaceV1`,
+`RealizationDescriptorV1`, and `RealizationSetV1`. They give stable content
+identities to one declared logical operation, its named ports, and declarations
+of possible realizations without turning those declarations into executable
+objects.
+
+The lowercase front door can validate one record or check one exact supplied
+reference closure:
+
+```bash
+o operation inspect contract contract.json
+o operation inspect interface interface.cbor --json
+o operation inspect descriptor descriptor.cbor
+o operation inspect set realization-set.cbor --json
+
+o operation verify \
+  --contract contract.cbor \
+  --interface interface.cbor \
+  --descriptor realization-a.cbor \
+  --descriptor realization-b.json \
+  --set realization-set.cbor
+```
+
+`inspect` performs single-record validation and leaves references unresolved.
+`verify` checks only exact contract/interface/descriptor/set referential
+consistency. Neither command plans or selects a realization. See the
+[four-record V1 contract](docs/OPERATION_REALIZATION_V1.md) for canonical
+encoding, identity, exit status, and its exact boundary.
+
+The additive planner accepts one bounded, explicit list of complete
+realization/target/representation/residency tuples for exactly one logical
+operation. It checks the semantic closure, exact fidelity and target-footprint
+references, static target facts, port representations, and complete cost-profile
+binding. It rejects dynamic environment, effect, and capacity requirements,
+then selects the lowest checked component-plus-uncertainty cost with a canonical
+tie break. It does not construct a Cartesian product.
+
+The bundled normalize operation exercises the marked-project front door:
+
+```bash
+cd examples
+o operation normalize
+o realizations normalize
+o plan normalize --explain
+o run normalize
+o observe normalize
+o replan normalize --without-target gpu-1
+```
+
+`operation` and `realizations` validate the descriptor's implementation digest
+against one captured regular file, its execution-pipeline reference against the
+`ostadix.project-route-pipeline/v1` projection of one manifest route, and the
+complete candidate's cost-profile binding. They do not select or execute.
+`plan` ranks and selects without dispatch. `run` repeats exact preflight, pins
+the selected project route and its project HGraph/deployment identities,
+executes through the existing project path, and requires a durable run record.
+
+`run` freezes the original operation decision before dispatch and retains the
+original planning request, operation `DeploymentPlanV2`, and selected candidate
+in its content-addressed terminal record. `observe` verifies these retained
+records against the frozen decision and unchanged bundle, checks the recorded
+project-route identities, and emits a `RuntimeGraphV2` without reranking the
+historical selection. Older records without the optional operation fields use
+explicitly labeled current-planner reconstruction. `replan` applies caller-supplied
+exclusions and emits a recomputed, non-executing `DeploymentPlanV2`. It emits a
+descriptive `RecoveryPlanV1` only when the exact source observation failed and
+selection changed; a successful source run is not a recovery event. Recovery
+planning is not recovery execution, and no alternative is dispatched.
+In the displayed successful flow, `gpu-1` is declared unavailable but has no
+offer, so the exclusion is a no-op and emits no recovery plan.
+
+Static rankability is not live target eligibility. State and actor requirements,
+objective ruleset content, cost and validation evidence, and physical residency
+feasibility remain unresolved. Local execution observations distinguish a
+captured artifact submitted as a direct entrypoint from an indirect route whose
+artifact use is not established. They compare the local process platform with
+declared target facts, without claiming authenticated physical target identity.
+A manifest route binding still does not prove behavioral equivalence or that an
+interpreter loaded the submitted artifact. The example's two ambient
+Python targets are descriptive static alternatives, not distinct observed
+machines or failure domains. None of these records or inspection/planning
+commands grants admission, capability, reservation, lease, dispatch, retry,
+checkpoint, effect-fencing, or World authority. See the
+[operation planning and observation contract](docs/OPERATION_PLANNING_V1.md)
+for the complete schema, runtime/recovery-record, execution, and nonclaim
+boundaries.
 
 ## Hosted Placement V6
 
@@ -514,6 +647,9 @@ execution behavior at that rollover. V6 retains the V5 projection shape and
 adds ordered `wasm-tools+wasmtime` and `wasm-tools+wasmer` WebAssembly runtime
 alternatives after the two frozen WABT alternatives. Package 0.3 separately makes Graph
 V2/Evidence V6 current; morphism profiles remain shadow metadata on that path.
+An explicit [Python plain-data crossing contract](docs/BACKEND_MORPHISM_ENFORCEMENT_V1.md)
+now enforces supported conversions at actual dispatch boundaries. It does not
+change those catalog profiles into universal proofs.
 Rebuild the runtime and MCP server, then regenerate
 short-lived profiles and all derived placement evidence after this rollover. The
 exact boundary and regeneration sequence are in [Hosted Placement
@@ -1100,6 +1236,10 @@ The base Rust build needs:
 - Python 3 for the `python^` compatibility bridge and Python-backed legacy adapters
 - Git and standard POSIX command-line tools
 
+The pinned `rust-toolchain.toml` also names `wasm32-wasip1`. A connected rustup
+checkout installs that target with Rust 1.97.1; an offline AI kit carries the
+same target's standard library and Cargo directly inside its host-specific ZIP.
+
 Each hosted backend uses the real local runtime named in the backend table.
 You only install the runtimes your `.O` program actually uses. Nix is needed
 for the Nix lattice and NixOS tests. Node.js is needed for `javascript^`.
@@ -1550,6 +1690,8 @@ o kernel smoke-hosted-live "$HOSTED_LIVE_ISO"
 That re-smoke command snapshots the exact ISO bytes once and requires the
 hosted serial/toolchain/node/notebook gate, the Openbox/Firefox/Xterm
 framebuffer and USB-input gate, and the separately selected direct O-core gate.
+Within the expanded hosted marker closure, it still requires all seven in-guest markers in order:
+O smoke, Bash, SQLite, Olangc IR, O-CLI, O-Link, and Hosted Live Ready.
 All three child results must report the snapshot's byte count and SHA-256 before
 one aggregate v2 result is emitted. It does not select the direct Alpine entry
 or the four nested foreign-system entries. Hosted and O-core timeout overrides
@@ -1598,11 +1740,11 @@ WASM, notebook state, and user work go to `/workspace`, volatile `/tmp`, or the
 tmpfs overlay; this is an enforced initial live-system posture, not a claim
 that privileged root could never deliberately change mounts.
 
-The workstation separately builds and installs all 14 declared root binaries:
+The workstation separately builds and installs all 15 declared root binaries:
 `O`, `o-cli`, `olangc`, `ocorec`, `o-link`, `o-unlink`, `o-notebook`, `ogit`,
-`o-live-host`, `o-node`, `octl`, `o-registry`, `o-info`, and
-`ocore-kernel-world-record`. `ostadix-mcp` is built from its separately locked
-MCP crate and installed alongside them. Their sizes and SHA-256 identities are
+`o-live-host`, `o-node`, `octl`, `o-registry`, `o-info`,
+`ostadix-device`, and `ocore-kernel-world-record`. `ostadix-mcp` is built from
+its separately locked MCP crate and installed alongside them. Their sizes and SHA-256 identities are
 receipt-bound. Source inclusion and runnable-product admission remain separate,
 so an arbitrary tracked file does not become executable merely by appearing in
 the source tree or object store.
@@ -1652,8 +1794,9 @@ Python-backed O-notebook cell. Alpine v3.24 ships the in-image Rust commands at
 toolchain, so this is not a second full root-plus-MCP rebuild. The graphical
 gate starts O-notebook in Firefox ESR,
 requires the real Firefox X11 window, then starts the Xterm workstation shell,
-rejects a black, unchanged, or insufficiently chromatic framebuffer, injects
-USB-keyboard input, and requires the command result over serial.
+rejects a black or unchanged framebuffer, also rejects an insufficiently
+chromatic framebuffer, injects USB-keyboard input, and requires the command
+result over serial.
 
 The hosted QEMU gates deliberately retain a 4 GiB guest-RAM bound. This is a
 regression gate proving that the complete workstation can boot without
@@ -2391,8 +2534,7 @@ source-format-insensitive identity.
 World PR8-2 adds canonical `PlacementSnapshotV1` and `DeploymentPlanV1`
 records. For policies implemented by the current hosted coordinator, the
 ordinary hosted plan binds workspace/route work to `ambient_host` and
-in-process work to `hosted_coordinator`; unsupported hosted policies remain
-explicit `unresolved`. The hosted plan preserves residual `HostWorld` and
+in-process work to `hosted_coordinator`; all ten current policies are supported. The hosted plan preserves residual `HostWorld` and
 contains no World, task, node, domain, process, or provider identity.
 Optionally, a caller may supply an exact World-epoch placement snapshot plus
 one exact `TaskIdentity` per logical operation. The deterministic
@@ -2411,7 +2553,7 @@ runtime placement. `require_current_world` checks only the supplied World
 identity and epoch, not nested generation freshness. Structural/canonical
 decode is not a trusted source comparison; callers must use the trusted hosted
 or snapshot validator. `olangc --target ir` prints both canonical digests.
-The ordinary opt-in executor binds the canonical hosted-unbound plan into trace
+The ordinary configured executor binds the canonical hosted-unbound plan into trace
 v5. A separate explicit hosted-reference World entry point consumes the exact
 snapshot-derived plan. `HostedWorldLaunchV1` plus a caller-supplied current view
 re-derive and fence the logical/deployment/snapshot bindings, exact
@@ -2440,8 +2582,8 @@ comparison documented above, not native project execution, native Ed25519
 verification, physical-hardware evidence, G1, or Workstream A acceptance. G1
 remains defined and unpassed.
 
-ProjectExec-A adds a separate, opt-in hosted executor for one resolved
-`Explicit` or `Default` alternative. ProjectExec-B extends it to serial ordered
+The strict ProjectExec-A contract covers a hosted executor for one resolved
+`Explicit` or `Default` alternative. ProjectExec-B extends that strict contract to ordered
 `Fallback` and `AnySuccess` alternatives:
 
 ```bash
@@ -2467,16 +2609,16 @@ branch-terminal result from it. A settled nonzero route still publishes its
 result and conservative
 `HostWorld` successor, but not its success-completion token; infrastructure
 abort publishes no route result and stops the policy. Guard skips continue to
-the next alternative when no route child executed. The unsigned trace v5 binds
+the next alternative when no route child executed. The unsigned trace v7 binds
 the canonical `LogicalHGraphV1` schema/digest and distinguishes
 `SettledSuccess`, `SettledFailure`, `Skipped`, and `Aborted` and binds each run
 to stable source/graph digests plus a fresh execution-attempt identifier. It
 also records the assessed route prefix, proposed next route,
 `no_execution`/`declared_idempotent`/`unproven_effects` evidence, and the
-allow/deny decision. On this ordinary opt-in path, trace v5 additionally binds
+allow/deny decision. On this explicit strict path, trace v7 additionally binds
 the canonical hosted-unbound `DeploymentPlanV1` schema/digest before execution;
 plan-aware replay recomputes it and rejects substitution of that exact artifact.
-The ordinary opt-in trace binds the canonical hosted-unbound plan and a fresh
+The explicit strict trace binds the canonical hosted-unbound plan and a fresh
 diagnostic execution-attempt identifier. The snapshot-derived World launch
 path supplies World identity and explicit `TaskIdentity` values. A denied
 decision is persisted before the command reports
@@ -2486,19 +2628,34 @@ the evidence and exact next branch, requires complete causally ordered
 lifecycle coverage for every transitive route prerequisite, and rejects missing
 decisions or execution after denial. Every complete coordinator trace passes
 that semantic replay.
-The compatibility runtime remains the default when `O_PROJECT_EXECUTOR` is
-unset.
+Unset `O_PROJECT_EXECUTOR` now uses the Project HGraph with a canonical
+`LegacyCompatibility` continuation contract. An executed failure can continue
+under explicit `legacy_unchecked` evidence, preserving existing route behavior
+without claiming idempotence. `O_PROJECT_EXECUTOR=hgraph` retains the strict
+contract described above; `O_PROJECT_EXECUTOR=legacy` explicitly selects the
+previous runtime. The contract is bound through the logical/deployment digests
+and checked against the trusted caller before materialization.
 
-Materialization and route commands remain fallible `HostWorld` operations even
-when a manifest says `pure=true`. Race, aggregate, equivalence, and benchmark
-policies fail closed. This bounded hosted gate does not establish parallel
-race/cancellation, retry, authenticated or actual remote placement, Governor
-authority or commit, capability/lease enforcement, reservation, recovery,
-exactly-once effects, native project execution, native Ed25519 verification,
-physical hardware, G1, Workstream A acceptance, or G0--G13 passage.
-`declared_idempotent` is a bundle-bound author declaration, not verified
-idempotency, sandboxing, effect journaling, fencing, compensation, or an
-exactly-once guarantee.
+The coordinator implements all ten route policies. Explicit race, equivalence,
+and benchmark policies dispatch graph-ready alternatives concurrently. Their
+`ConcurrentProjectBranch` marker records permission for unordered ambient
+effects; isolated workspace paths carry branch identity, while explicit shared
+host resources still order access. The logical source explicitly binds
+`concurrent_branches_v1` scheduling. Archived records without that field retain
+`serial_host_world_v1`, their original graph bytes, and their original digest.
+Both modes reconstruct against the trusted bundle. Unknown effects remain
+unknown and still require ambient host admission. Races
+request cooperative cancellation on the first qualifying settlement, drain
+started workers, and record the cause of cancellation before final selection.
+Trace v7 retains candidate outcomes, measurements, the selected route, and the
+existing validated-selection receipt when that policy is used; semantic replay
+checks the decision and lifecycle prerequisites.
+
+This hosted path does not establish retry, remote placement, Governor commit,
+capability enforcement, exactly-once effects, native project execution,
+physical hardware, G1, or G0--G13 passage. `declared_idempotent` is a bundle-bound
+author declaration. Explicit ambient concurrency is not host isolation or
+strict effect equivalence.
 
 ### Docker
 
@@ -2576,7 +2733,7 @@ toolchain/cache health:
 ```bash
 ostadix-device status
 ostadix-device doctor
-o doctor --json
+o device doctor --json
 ostadix-device run -- examples/hello.O
 ostadix-device build rust
 ostadix-device root status
@@ -2611,8 +2768,8 @@ products so every public command surface has an explicit home.
 | Binary | Location | What it does |
 |--------|----------|--------------|
 | `O` | `target/release/O` | Runs `.O` documents and provides the interactive REPL. |
-| `o-cli` | `target/release/o-cli` | Compiled intent orchestrator for validated `run`, static/live `plan`, verified `explain`, and strict JSON `inspect`. |
-| `o` | `scripts/o-cli.sh` through an installed wrapper | Routes the stateful intent commands to `o-cli`, preserves device/doctor, `why`, node, registry, information, live, receipt, and kernel tools, and retains evaluator compatibility for unknown command forms. |
+| `o-cli` | `target/release/o-cli` | Compiled intent orchestrator for validated `run`, read-only `routes`, evidence-gated `optimize`, static/live `plan`, verified `explain`, strict JSON `inspect`, typed read-only boot-CAS `object`, and experimental referential-only `operation` inspection and verification. |
+| `o` | `scripts/o-cli.sh` through an installed wrapper | Routes `run`, `routes`, `optimize`, `plan`, `explain`, `inspect`, `object`, and `operation` to `o-cli`; preserves the explicit `device` namespace, `why`, node, registry, information, live, receipt, and kernel tools; and retains evaluator compatibility for unknown command forms. |
 | `olangc` | `target/release/olangc` | Produces native hosted binaries, WASI modules, script execution, OIR dumps, or Graphviz DOT hypergraph export. |
 | `ocorec` | `target/release/ocorec` | Compiles `.oc` modules through AST, typed HIR, and SSA MIR to freestanding ELF64 objects for the primary x86_64 and bounded AArch64 targets. |
 | `o-link` | `target/release/o-link` | Recursively literal-links and runs a bare single directory; `--project` creates an inert route-preserving bundle. |
@@ -2828,7 +2985,12 @@ Python.render_child(ONumber::Int(42))
 With N languages and this single protocol, interoperability costs O(N) code,
 one renderer per language, instead of O(N squared) bridges between every
 pair. The canonical exchange form is explicit and inspectable rather than
-hidden in a compiler pass.
+hidden in a compiler pass. Python's explicit [native object handles](docs/PYTHON_NATIVE_HANDLES.md)
+retain arbitrary objects in their owner process and carry checked opaque
+descriptors through O. They preserve owner identity without claiming portable
+reconstruction in other runtimes. O, Python, and the Unix JavaScript adapter can
+invoke, inspect, modify, and release those objects through the exact admitted
+owner using `native_call`, `native_get`, `native_set`, and `native_release`.
 
 ### 3. Explicit persistent environments
 
@@ -3548,7 +3710,7 @@ data, live references, and authority-bearing values.
 |--------|---------|
 | ONull | Absence of a result. |
 | OBool | Boolean true/false. |
-| ONumber | Supports arbitrary-precision integers, exact rationals, and binary floats; the legacy OInt alias is retained for wire compatibility. |
+| ONumber | Supports arbitrary-precision integers, exact rationals, decimal and binary floats, big floats, and complex numbers; legacy `int`/`float` wire tags normalize here. |
 | OText | Text with explicit encoding metadata. |
 | OChar | A single Unicode scalar value. |
 | OHtml | Trusted HTML fragment, kept distinct from escaped text. |
@@ -3569,17 +3731,19 @@ data, live references, and authority-bearing values.
 | OError | Captured failed outcome used by batch results. |
 | OSystem | Live reference to a system profile. |
 | OCapability | Authority-bearing reference to a resource. |
-| OSnapshot | Inert captured world state suitable for persistence. |
+| OSnapshot | Inert captured world state whose replay and persistence eligibility still depends on its nested values. |
 | ONative | Same-backend native capsule with explicit rehydration policy. |
 
 Legacy wire tags `int`, `float`, and `str` are still accepted for hosted IPC
-compatibility, but they deserialize into `ONumber` and `OText`. New runtime code
-emits the canonical variants.
+compatibility, but they deserialize into `ONumber` and `OText`. Rust OValue
+serialization emits the canonical variants; compatibility adapters may still
+send the accepted legacy forms.
 
 The runtime classifies values into three groups:
 
-- **Pure values** are serializable, replayable, cacheable when their contents
-  are cache-safe, and suitable for persistence.
+- **Pure values** expose no live-world reference or effect at this boundary.
+  Cache, replay, and persistence eligibility remain separate predicates; a
+  pure native capsule can still be unsafe to replay or persist.
 - **Referential values** name live world objects whose state can change.
   OSystem identity is the profile reference, not a frozen system state.
 - **Effectful values** carry authority, scope, or orchestration semantics.
@@ -3595,11 +3759,11 @@ Representative wire values are:
 
 ```json
 {"t":"null"}
-{"t":"int","v":42}
-{"t":"str","v":"hello"}
+{"t":"number","v":{"kind":"int","v":"42"}}
+{"t":"text","v":{"utf8":"hello","encoding":"utf-8"}}
 {"t":"blob","v":"<base64>","mime":"image/png"}
 {"t":"expr","src":"python^(6 * 7)_python"}
-{"t":"scope","bindings":{"answer":{"t":"int","v":42}}}
+{"t":"scope","bindings":{"answer":{"t":"number","v":{"kind":"int","v":"42"}}}}
 {"t":"nix_expr","body":"...","deps":[],"fingerprint":"..."}
 {"t":"request","kind":"instantiate","source":{"t":"nix_expr","body":"...","deps":[],"fingerprint":"..."},"fingerprint":"..."}
 {"t":"group","mode":"batch","members":[],"fingerprint":"..."}
@@ -3621,34 +3785,70 @@ computations are equivalent exactly when they return the same OValue, take
 `Beh_O = OValue`. Each backend's OValue lifting map is then its unique arrow to
 the terminal carrier.
 
+This restricted return-value contract does not establish equivalence under
+callbacks, retained environments, live resources, or arbitrary future
+interactions. Each enlarged boundary needs a compatibility argument connecting
+its lifting to those interactions. The [execution observation contract](docs/EXECUTION_OBSERVATION_CONTRACT.md)
+states the transition/trace model and finite DAG commutation theorem, and
+documents the executable finite-model checker and its limits.
+
 The terminal-object statement applies to backend-to-OValue lifting, not to
 every `render_child` projection back into source. Rendering is deliberately
 consumer-specific and some consumers only have a presentation or marker for a
-value. The implemented matrix is:
+value. The implemented matrix is below. Scalar rows enumerate every possible
+result; a slash marks a payload-dependent classification. Container rows give
+the starting classification before recursive child folding.
 
 | OValue family | Python | Nix | HTML | LaTeX | Markdown | Default |
 |---------------|--------|-----|------|-------|----------|---------|
-| Null, bool, number | T | T | P | P | P | S |
-| Text | S | T | P | P | P | S |
-| Char, bytes, symbol, keyword | S | S | P | P | P | S |
-| HTML, store path, expr, derivation, system | T | S | P | P | P | O |
-| Blob | S | S | P | P | P | O |
-| NixExpr | T | T | P | P | P | O |
-| List, map, seq, set, object | T | T | P | P | P | S |
+| Null, bool | T | T | P | P | P | S |
+| Integer | T | T/S | P | P | P | S |
+| Decimal, binary float F64 | T/S | S | P | P | P | S |
+| Rational, binary float F32, BigFloat, complex | S | S | P | P | P | S |
+| Text | S | T/S | P | P | P | S |
+| Char, symbol, keyword | S | S | P | P | P | S |
+| Bytes with media type | S | S | P | P | P | S |
+| Bytes without media type | S | O | P | P | P | O |
+| HTML, store path, expr, derivation, system | T | S | P | P | P | S |
+| Blob | S | S | P | P | P | S |
+| NixExpr, thunk | T | S | P | P | P | S |
+| List, map | T | T/S | P | P | P | S |
+| Tuple sequence | T | S | P | P | P | S |
+| List/vector sequence, set, object | S | S | P | P | P | S |
 | EntriesMap | S | S | P | P | P | S |
-| Scope | T | O | O | O | O | O |
-| Graph, native | T | S | O | O | O | O |
-| Thunk | T | O | O | O | O | O |
+| Scope, graph, native | T | O | O | O | O | O |
 | Error | T | O | P | P | P | O |
 | Request, capability, snapshot, group | T | O | O | O | O | O |
 
-`T` means the consumer syntax preserves the O-level type, `S` means the
-payload or structure survives but its O tag does not, `P` means an intentional
-human-facing presentation, and `O` means an opaque marker or summary. Container
-fidelity is bounded by the least faithfully rendered child. The Rust
-`RenderFidelity` match and its exhaustive matrix test cover every current
-OValue variant and every renderer. Adding a value or renderer requires the
-classification to be updated.
+`T` means the consumer syntax preserves the value and its O-level type. `S`
+means portable payload or structure survives, but O-level tags or auxiliary
+metadata may be erased. `P` means an intentional human-facing presentation,
+and `O` means an opaque marker or summary. Python classifies a Decimal as `T`
+only for a renderer-admitted exact Decimal shape within its portable bounds,
+and an F64 as `T` only with an eight-byte payload; otherwise those forms are
+`S`. Nix classifies an integer as `T` only in the signed 64-bit range and Text
+as `T` only with explicit `utf-8` encoding metadata and no NUL; otherwise each
+is `S`. A Nix map starts at `S`, rather than `T`, when any key contains NUL;
+such keyed containers use an entries list with domain-separated Unicode
+code-point keys so otherwise-colliding payloads remain reconstructible.
+
+Every recursive container is folded with all child classifications;
+`EntriesMap` includes both keys and values. Thus a container can be weaker than
+the base cell shown in the table, including `O` when a child is opaque. The Rust
+`RenderFidelity` match and its exhaustive matrix test bind one representative
+of every current OValue variant to all six renderers. Targeted cases
+additionally exercise numeric payload validity and range, text encoding and
+escaping, collection subtypes and child propagation, map-key rendering, and
+media-less bytes. Adding a value or renderer requires both the classification
+and expected matrix to be updated.
+
+Render fidelity can be recomputed on demand as a source-projection description,
+not the backend-crossing `Fidelity` domain or its `FidelityAssessmentV2`
+interval extension. No conversion or Galois connection between those domains
+is implemented: an opaque render does not report an exact annotation-loss set,
+and presentation intent is not an independent field.
+On Graph V2, a present `fidelity_assessment` requires legacy `fidelity` to
+equal its conservative possible-loss projection.
 
 Python closes its non-native cells with `OOpaqueValue`, a lossless handle over
 the complete tagged wire value. It can pass requests, capabilities, snapshots,
@@ -3762,14 +3962,22 @@ with `O`.
 | Target | Command | Result |
 |--------|---------|--------|
 | `binary` | `olangc app.O -o target/app` | Builds a native hosted executable containing the program and Rust O runtime. |
-| `wasm` | `olangc app.O --target wasm -o target/app.wasm` | Builds a `wasm32-wasip1` module. Compilation succeeds at the audited master; the produced program currently exits under Wasmtime on this host when it tries to locate `O`. |
+| `wasm` | `olangc app.O --target wasm -o target/app.wasm` | Builds a source-bound `wasm32-wasip1` command module. Inline-only plans execute through the WASI serial executor; shim-backed plans still require an admitted host provider. |
 | `script` | `olangc app.O --target script` | Parses and executes directly inside the `olangc` process. |
 | `ir` | `olangc app.O --target ir` | Prints lowered OIR, its ExecutionPlan, and its directed executable HGraph; for a directory or lifted project, prints the deterministic ProjectExecutionPlan and project HGraph. Nothing executes. |
 | `dot` | `olangc app.O --target dot` | Emits Graphviz DOT for an ordinary OIR HGraph or a directory/lifted-project HGraph. Pipe to `dot -Tsvg` for a scalable rendered graph. Nothing executes. |
 
 Native hosted binaries contain the `.O` source, runtime modules, lockfile
 dependency versions, and bundled core shims. Python, Nix, and other language
-runtimes remain explicit host dependencies. `--shim-dir` overlays or adds
+runtimes remain explicit host dependencies by default. The optional
+[`--runtime-bundle`](docs/EMBEDDED_RUNTIME_BUNDLES.md) embeds a supplied runtime
+tree and uses its `bin/` exclusively for command lookup; host OS, dynamic
+libraries, and external services still require separate qualification.
+Its Linux rootfs profile uses the [runtime closure collector](docs/LINUX_RUNTIME_ROOTFS.md)
+and private filesystem/network namespaces to run embedded foreign runtimes
+inside an immutable image, with writable scratch space and ordinary subprocess
+support. Runtime data and services still need explicit closure qualification.
+`--shim-dir` overlays or adds
 shim files before packaging. `--keep-build-dir` retains the generated Cargo
 project for inspection. `--backend-grant` may be repeated for script mode and
 native hosted binaries as a compatibility hook. Compiled binaries mint fresh
@@ -3778,6 +3986,40 @@ serialized authority. Generated Cargo builds disable disposable incremental
 state. They honor an explicitly configured `RUSTC_WRAPPER` such as an absolute
 `sccache` path, so equivalent AOT work can be reused without silently selecting
 another executable or sharing generated target directories.
+
+#### Browser WASI payloads
+
+`--browser-bundle` turns one ordinary `.O` file into a self-contained browser
+directory instead of a bare module:
+
+```bash
+olangc examples/wasm_hello.O --target wasm \
+  --browser-bundle target/wasm-hello-browser
+python3 -m http.server --directory target/wasm-hello-browser 8000
+```
+
+Open `http://localhost:8000/`; module loading and `fetch` are not promised from
+`file://`. The directory contains the exact source, `program.wasm`, a
+dependency-free WASI Preview 1 browser host, runner, UI, and a manifest binding
+source, artifact, plan, ABI, compatibility decision, selected shim adapters
+(including `--shim-dir` overrides), and asset digests.
+Those asset digests prove bundle consistency after the runner is trusted; they
+cannot authenticate HTML and JavaScript that were replaced together with the
+manifest. Serve the directory through an authenticated origin or verify an
+externally authenticated archive/commit digest before publishing it.
+
+Every valid ordinary UTF-8 `.O` file is parsed and lowered before compilation.
+Invalid syntax fails before Cargo runs. A plan whose executable leaves are
+`InlineAst` or `InlineValue` runs locally with captured stdout/stderr, clocks,
+cryptographic randomness, empty stdin, and no preopened filesystem. A `Shim`
+backend such as Python, Nix, shell, or WebAssembly, and every effectful O
+request, is packaged but marked `requires-whole-program-provider`; the browser
+runner refuses local execution unless the caller explicitly supplies the
+versioned provider interface. The provider receives the exact digest-verified
+source, immutable manifest, and fresh byte copies of every selected adapter. It
+is responsible for its own authentication, authority, adapter execution,
+limits, and result integrity. Browser bundle v1 does not yet accept a project
+directory or lifted project.
 
 #### Public output forms
 
@@ -3971,6 +4213,67 @@ the complete candidate branch call: local materialization, prerequisites,
 terminal execution, output draining, and artifact capture are included; mesh
 dispatch, retry, and result retrieval are included when the mesh runs it.
 
+The initial user-facing optimization command fixes those choices behind one
+explicit interface:
+
+```text
+o routes TARGET [--json] [--route-decl DECL]...
+o optimize TARGET --route ROUTE_SET [--receipt PATH] [--progress auto|always|never] [--json]
+o run TARGET --selection-run RUN_ID [--json]
+```
+
+`o routes` is the inert discovery step for a project directory or lifted
+project bundle. It lists routes and explicitly declared route sets in their
+declaration order, identifies each set's first alternative as its reference,
+and reports both validated-optimization readiness and whether a later winner
+can satisfy the transitive declared-pure reuse boundary.
+It does not execute routes, open or create run history, infer a route set from
+shared `provides`, or reveal route commands, environment values, guards,
+labels, or source bytes. `--json` emits one
+`ostadix.route-catalog/v1` object. Each route set includes separate
+`optimize_ready`/`optimize_rejection` and
+`reuse_ready`/`reuse_rejection` fields; repeated `--route-decl DECL` values
+apply only to this in-memory inspection.
+
+`--route` is required in v1: `TARGET` must expose the named project route set,
+and Ostadix does not infer which alternatives the user intended to compare.
+`o optimize` implies project execution, forces
+`benchmark_validate_and_select`, and requires a durable run record. It exposes
+no executor, mesh, parallelism, policy, or no-record switch. Repeated
+`--route-decl DECL` values remain available for explicit project route
+declarations, and `--receipt-out` is an alias for `--receipt`.
+
+For human output, `--progress auto` streams a compact candidate-settlement view
+to the original terminal stderr; `always` enables it for non-terminal stderr
+and `never` disables it. Progress contains only route IDs, ordinal counts,
+durations, and typed outcomes. It never enters candidate stdout/stderr capture,
+the declared-output comparison, or JSON stdout. `--json --progress always` is
+rejected before execution.
+
+Without `--json`, the command prints `Ostadix optimization evidence` followed
+by every candidate in declaration order. The summary labels the reference and
+selected routes, shows each route's eligibility or sanitized rejection reason
+and complete-branch duration, names the selected route, and reports its
+measured ratio against the reference when defined. It also prints the
+declared-output contract, receipt SHA-256, durable run ID for `o inspect`, an
+optional receipt export path, and an explicit reminder that every candidate
+ran. If the reference remains fastest, the summary says that no eligible
+candidate beat it in this validation run.
+
+`--json` emits exactly one `ostadix.optimize-summary/v1` envelope. Its fields
+are `schema`, `run` (the existing `ostadix.run-summary/v1` object), `receipt`
+(the typed validated-selection receipt or `null`), `receipt_sha256`, and
+`receipt_export_path`. Structured preflight and record-start failures use the
+same envelope with unavailable receipt fields set to `null`.
+
+`--receipt PATH` optionally exports the exact canonical validated-selection
+receipt. The destination must be outside the project input (and must not be
+the lifted project file); the durable run record remains mandatory whether or
+not a separate receipt file is requested.
+
+The underlying policy is also available through the lower-level project-run
+interface:
+
 ```bash
 o run src/ --project --route main \
   --routes-policy benchmark_validate_and_select \
@@ -3995,6 +4298,55 @@ comparison/selection contract. Its printed receipt SHA-256 is the ordinary
 SHA-256 of the emitted file bytes, and recorded `o run` executions embed the
 typed receipt in the durable run record. It is still an unsigned observation,
 not a proof of full semantic equivalence or authority to reuse the decision.
+
+An exact successful optimization run can be applied on a later CLI invocation
+with `o run TARGET --selection-run RUN_ID`. Ostadix reads that exact terminal run
+through the verified private run store (the mutable `last-run` alias and loose
+receipt files are not accepted), rebuilds the current bundle and benchmark
+contract, and derives one explicit winner branch from the same in-memory
+bundle. The source bundle, ordered alternatives, reference, winner, route
+declarations, benchmark plan identities, and expected declared-output digest
+must all still match. Execution is pinned to the local compatibility engine;
+only the selected top-level branch is dispatched, although its declared
+prerequisites may run. The CLI front door requires and finalizes a new durable
+run record for this invocation.
+
+Reuse is admitted only when every alternative and transitive prerequisite has
+the bundle author's explicit `pure = true` declaration. That declaration is an
+auditable trust boundary, not sandbox proof. After execution, Ostadix
+recomputes the selected branch's declared-output digest. Failure or drift is a
+typed terminal failure with no replay and no fallback to another candidate.
+Because a postcondition cannot undo undeclared host or network effects, this is
+not universal semantic substitution; systems should use it for computations
+whose effects fit the declared-pure boundary.
+
+Embedders can use the same mechanism without parsing CLI output:
+
+```rust
+use o_lang::intent::{
+    execute_prepared_intent, prepare_selection_reuse_intent,
+    PrepareExecutionOptionsV1, RunSelectorV1, RunStoreReaderV1,
+};
+
+let source = RunStoreReaderV1::open_default_existing()?
+    .read_terminal_verified(RunSelectorV1::RunId(run_id.into()), false)?;
+let prepared = prepare_selection_reuse_intent(
+    target,
+    PrepareExecutionOptionsV1::default(),
+    &source,
+)?;
+let observed = execute_prepared_intent(&prepared)?;
+```
+
+`PreparedSelectionReuseV1` is opaque and non-serializable. The library
+revalidates its binding and all mutable prepared-project coordinates immediately
+before dispatch, so changing the bundle, route, policy, plan, executor, or mesh
+configuration after admission fails before a command runs. Unlike the CLI front
+door, these library calls do not begin or finalize a run-store transaction:
+`execute_prepared_intent` returns the typed reuse observation to the embedder,
+which must durably persist that observation itself when durable audit evidence
+is required.
+
 Hidden filesystem, network, device, and other undeclared effects are not traced
 by this policy. Errors before a route settles (including launch, timeout, and
 prerequisite errors) and artifact-capture failures after an otherwise
@@ -4006,9 +4358,13 @@ remain lossless diagnostics and can retain bounded process stdout/stderr and
 typed runtime failure details, so they should be handled as potentially
 sensitive execution logs.
 
-This policy is an autotuning/evidence run: it executes every candidate, so it
-does not reduce the latency of that same invocation. A separate receipt-gated
-reuse path is required before a learned winner can accelerate later runs.
+The optimization command is an autotuning/evidence run: it executes every
+candidate, so it does not reduce the latency of that same invocation. It does
+not cache candidate result values. Its durable evidence can instead admit the
+separate, explicit `--selection-run RUN_ID` path described above so a learned
+winner accelerates a later run. Matching complete captured results and declared
+artifact manifests is strong declared-output evidence, not a universal
+semantic-equivalence claim about hidden effects.
 
 The second command is the project-lift DOT route: `o-link --project` preserves
 the route table inside `project.O`, and `olangc --target dot --route main`
@@ -4023,7 +4379,8 @@ or command.
 `olangc --target ir` remains the direct compiler planner interface.
 `scripts/o-cli.sh` is the repository-owned lowercase dispatcher: `setup.sh`
 installs an `o` wrapper that delegates to it, and the dispatcher routes `run`,
-`plan`, `explain`, and `inspect` to the compiled `o-cli` orchestrator. The
+`routes`, `optimize`, `plan`, `explain`, `inspect`, `object`, and `operation` to
+the compiled `o-cli` orchestrator. The
 orchestrator reuses the exact `olangc` planning renderers; static planning does
 not execute, discover peers, or open run history. Other command families and
 unknown arguments retain their historical compatibility behavior. Keep
@@ -4174,7 +4531,7 @@ Native computation
 ```text
 Ostadix-lang/
 ├── crates/ostadix-api/src/
-│   ├── lib.rs                  # 44 engine modules, 38 public
+│   ├── lib.rs                  # 47 engine modules, 41 public
 │   ├── parser.rs               # hosted typed-parenthesis parser
 │   ├── value.rs                # OValue and hosted wire protocol
 │   ├── ir.rs                   # OIR and ExecutionPlan
@@ -4191,9 +4548,9 @@ Ostadix-lang/
 │   ├── live_system/            # package CAS, policy, and supervisor oracle
 │   └── ocore/                  # native front end, IRs, codegen, capability bridge
 ├── src/
-│   ├── lib.rs                  # 38 public compatibility reexports
+│   ├── lib.rs                  # 41 public compatibility reexports
 │   ├── main.rs                 # O interpreter and REPL
-│   └── bin/                    # the other 13 declared root binaries
+│   └── bin/                    # the other 14 declared root binaries
 ├── mcp/ostadix_lang_mcp_server/ # separate locked MCP crate with 10 tools
 ├── backends/                   # compatibility hosted-language adapters
 ├── ocore/                      # freestanding runtime and kernel proof
@@ -4460,14 +4817,15 @@ Project inputs take a direct, typed
 synthesizing OIR. The project-specific validator reconstructs the exact plan
 from the bundle and selected policy before checking its operation, dependency,
 effect, and HGraph projection. Unlike ordinary OIR execution, this project
-HGraph has its own opt-in coordinator: `O_PROJECT_EXECUTOR=hgraph` executes one
-resolved `Explicit`/`Default` branch or serial ordered `Fallback`/`AnySuccess`
-alternatives through graph-governed materialization, typed prerequisite
-readiness, route settlement, and selection. Ordered first-success selectors
-retain attempted results and stop before later branches start. The compatibility
-hosted project runtime remains the default; parallel races and aggregate,
-equivalence, and benchmark policies are not yet implemented by the Project
-HGraph coordinator.
+HGraph has its own coordinator, which now executes every route policy.
+Default project execution uses a bound compatibility continuation contract;
+`O_PROJECT_EXECUTOR=hgraph` selects strict continuation and `legacy` selects the
+previous runtime. The graph controls materialization, prerequisite and resource
+readiness, concurrent alternative execution, comparison, cancellation, and
+selection. Ordered first-success policies preserve attempted-result prefixes.
+Parallel policies explicitly allow unordered ambient effects while retaining
+isolated branch workspaces and declared shared-resource ordering. Completed
+traces undergo policy-aware semantic replay before results are returned.
 
 OIR is not SSA and does not model native pointer mutation. Those semantics
 belong to O-core MIR.
@@ -5174,7 +5532,7 @@ is a checked projection.
 | `m6a-scalar-personality` | yes | M6A | [ocore/kernel/smoke-personality-qemu.sh](ocore/kernel/smoke-personality-qemu.sh) (`portable_tcg`) | Four packaged CPL3 ELFs exercise health-gated scalar personality RPC, deterministic terminal arbitration, and one supervised restart<br>Generation-1 authority stays stale after generation-2 rebind while an unrelated observer survives and resources return to baseline | Pointer-bearing calls and request-scoped foreign memory views are disabled<br>The native test personality is not a Linux or other foreign operating-system ABI |
 | `m6b-bounded-copy` | yes | M6B mechanism | [ocore/kernel/smoke-m6b-qemu.sh](ocore/kernel/smoke-m6b-qemu.sh) (`portable_tcg`) | Generation-tagged bounded-copy request views enforce snapshot input, written-prefix output, typed rights, quotas, and revoke-before-terminal ordering<br>Five delegated lease classes support transactional create-bind rollback and request-wide revocation while unrelated scope survives | The mechanism is not integrated with the live M6A CPL3 RPC path<br>It does not establish pinned windows, streaming, signals, a Linux oracle, or concrete delegated services |
 | `m6b-live-bounded-personality` | yes | M6B Mode 24 live | [ocore/kernel/smoke-live-bounded-personality-qemu.sh](ocore/kernel/smoke-live-bounded-personality-qemu.sh) (`portable_tcg`) | Four digest-pinned CPL3 ELFs exercise one-shot four-byte INOUT bounded personality RPC across health-gated publication, one contained daemon fault, and a generation-2 rebind<br>The live terminal corpus covers cancellation, timeout, service death, and supervisor-triggered pre-terminal unmap, request-revoke, delegated-resource-revoke, and caller-exit dispositions with stale and duplicate denial plus bounded cleanup | Mode 24 is a native test personality, not a Linux or Plan 9 boot, general foreign ABI, or general guest-agent path<br>The generation-2 lifecycle operations are supervisor-triggered pre-terminal dispositions; the gate does not mutate a mapping, observe an external resource event, or cover the post-reply/pre-consume process-exit or unmap race<br>The delegated device resource is one internal typed lease; this is not KVM, PCI or physical-device assignment, DMA, IOMMU, interrupt-remapping, or physical-device evidence |
-| `m6-linux-minimal-live` | yes | M6 Linux Mode 25 live | [ocore/kernel/smoke-live-linux-personality-qemu.sh](ocore/kernel/smoke-live-linux-personality-qemu.sh) (`portable_tcg`) | One exact digest-pinned static Linux x86-64 ELF and three native service principals load from immutable OVFS data into isolated CPL3 address spaces<br>Bounded fd 1/fd 2 writes, exact -ENOSYS, and exit_group(42) survive one contained daemon fault, health-gated generation-2 replacement, stale generation-1 denial, and complete authority/resource reclamation | The pinned four-call success path, with a fifth failure-only exit site, is not Linux or Plan 9 boot, a distribution, root filesystem, dynamic linker, general foreign ABI, or arbitrary Linux binary compatibility<br>QEMU TCG CPL3 execution is not KVM/SVM or physical-hardware evidence<br>The gate has no PCI or physical-device assignment, DMA mapping/isolation, IOMMU isolation, interrupt remapping, or hardware reset |
+| `m6-linux-minimal-live` | yes | M6 Linux Mode 25 live | [ocore/kernel/smoke-live-linux-personality-qemu.sh](ocore/kernel/smoke-live-linux-personality-qemu.sh) (`portable_tcg`) | One exact digest-pinned static Linux x86-64 ELF and three native service principals load from immutable OVFS data into isolated CPL3 address spaces<br>Bounded fd 1/fd 2 writes, exact -ENOSYS, and exit_group(42) survive one contained daemon fault, health-gated generation-2 replacement, stale generation-1 denial, and complete authority/resource reclamation<br>Seven Linux-adapter and four bounded-bridge injected preparation failures leave the same request waiting with observable accounting unchanged before one successful retry; after reply publication, commitment is deterministic no-fail or fail-stop | The pinned four-call success path, with a fifth failure-only exit site, is not Linux or Plan 9 boot, a distribution, root filesystem, dynamic linker, general foreign ABI, or arbitrary Linux binary compatibility<br>QEMU TCG CPL3 execution is not KVM/SVM or physical-hardware evidence<br>The gate has no PCI or physical-device assignment, DMA mapping/isolation, IOMMU isolation, interrupt remapping, or hardware reset |
 | `m7-linux-plan9-9p2000-live` | yes | M7 Linux/Plan 9 Mode 26 live | [ocore/kernel/smoke-live-linux-plan9-qemu.sh](ocore/kernel/smoke-live-linux-plan9-qemu.sh) (`portable_tcg`) | One exact digest-pinned static Linux x86-64 ELF, an unprivileged native Linux 9P2000 server, a native supervisor, and a Plan-9-style native 9P2000 client load from immutable OVFS data into four isolated CPL3 address spaces<br>The Linux ELF's bounded stdout/stderr results are read through exact 9P2000 version, attach, walk, open, read, and clunk exchanges at /srv/linux/status across namespace withdrawal, one contained server fault, generation-2 replacement, stale generation-1 denial, and complete resource reclamation | Mode 26 executes the same bounded Linux-ABI ELF and a native O-core Plan-9-style client; it does not boot Linux or Plan 9, run a Plan 9 binary, provide a distribution, root filesystem, or dynamic linker, or establish a general foreign ABI<br>The exact 128-byte 9P2000 corpus exposes only the generation-bound /srv/linux/status path; it is not a general 9P server, Plan 9 namespace or mount environment, network transport, persistent filesystem, or guest-agent framework<br>Generation 2 is the same server implementation serving a later, different snapshot after generation 1 completed; this is not two-provider routing for one immutable object, requester-local fallback, fresh provider-B session/fid reconstruction, causal multi-attempt tracing, or live OWRECEIPT emission<br>QEMU TCG CPL3 execution is not KVM/SVM or physical-hardware evidence<br>The gate has no PCI or physical-device assignment, DMA mapping or isolation, IOMMU isolation, interrupt remapping, or hardware reset |
 | `m7b-logical-read-fallback-live` | yes | M7B-1 native LogicalRead Mode 31 | [ocore/kernel/smoke-m7b-logical-read-qemu.sh](ocore/kernel/smoke-m7b-logical-read-qemu.sh) (`portable_tcg`) | One deterministic provider ELF is instantiated as two generation-distinct isolated CPL3 provider principals; distinct A/B service bindings, endpoints, and client call capabilities are admitted before one requester-local LogicalRead for an exact immutable 20-byte object<br>Provider A returns a valid terminal 9P Rerror, faults, and has its local route and call authority withdrawn; the client proves A stale before staged provider-B activation, then completes a fresh B-local version/attach/walk/open/read/clunk sequence with different fids, verifies the pinned SHA-256, and reaches separate cleanup, full reclamation, witness-survival, and post-timer evidence | This is the bounded M7B-1 local mechanism, not complete M7B: requester and router are one principal, both providers instantiate one implementation artifact, and the route set is fixed local configuration rather than a general route registry<br>The kernel causal state and serial transcript are non-persisted unsigned diagnostics, not a live OWRECEIPT, attestation, Governor commitment, lease protocol, or distributed consensus evidence<br>The exact read-only 9P2000 corpus is not general 9P, WorldFS, a writable filesystem, fid migration, exactly-once effects, network transport, persistence, Linux or Plan 9 boot, or a foreign KernelWorld<br>Forced QEMU TCG CPL3 execution is not KVM/SVM, physical-hardware, G7/G8, PCI/device assignment, DMA/IOMMU isolation, interrupt-remapping, or hardware-reset evidence |
 | `kernel-world-mode20-objects` | yes | KernelWorld Mode 20 | [ocore/kernel/smoke-kernel-world-qemu.sh](ocore/kernel/smoke-kernel-world-qemu.sh) (`portable_tcg`) | The exact hash-pinned V2 record is parsed under default-deny package, manifest, request, export, and typed-rights binding<br>Generation-bound nonexecuting VM, vCPU, and guest-page objects enforce quota, stale denial, exact-world reclaim, and unrelated-VM survival | Mode 20 does not enter a guest, execute firmware, or publish a provider export<br>It does not establish device assignment, DMA mapping, or IOMMU isolation |
@@ -5191,15 +5549,19 @@ python3 scripts/release_evidence.py validate
 ```
 <!-- END GENERATED: REQUIRED_QEMU_EVIDENCE -->
 
-### Validation at the audited master
+### Validation at the historical audited master
 
-This README and the accompanying whitepaper use master commit
+This section preserves the results of a historical audit; it is not a fresh
+measurement of the current checkout. The README and accompanying whitepaper
+used pre-rewrite `master` commit
 `36787b16476bc0c8c4ddf665c7228b314d04e716`, tree
 `5bd6625fc0cac91b414caec9f6a4aad027d28cfd`, as their implementation snapshot.
+The sealed 2026-09-03 attribution-rewrite map resolves that commit to rewritten
+`master` commit `b6122c914ed5a8d30028b503b4f686e80767e6b6`, which has the same Git tree.
 
 | Validation surface | Observed result |
 |---|---|
-| Isolated current-master Rust audit | 1,351 passed, 3 ignored |
+| Isolated Rust audit at the historical snapshot | 1,351 passed, 3 ignored |
 | Root Rust quality gates | `cargo fmt --check`, locked all-target/all-feature check, and clippy with warnings denied passed |
 | Release binary surface | `cargo build --release --workspace --bins --all-features --locked` passed in 3 minutes 13 seconds |
 | Root binary boundary audit | All 14 binaries executed: 13 accepted `--help`; `o-notebook` served its UI and API successfully |
@@ -5209,7 +5571,7 @@ This README and the accompanying whitepaper use master commit
 | C17 CMake suite | 4 of 4 tests passed |
 | Python edition | 18 parser tests and 46 evaluator tests passed; `compileall` passed |
 | Rust example manifest | 39 examples passed and 5 manifest-declared examples skipped |
-| Recursive `.O` inventory | All 44 current-master tracked examples were discovered and classified |
+| Recursive `.O` inventory | All 44 examples tracked at the historical snapshot were discovered and classified |
 | Source-release validation | 77 of 77 required release entries passed |
 | `olangc` target matrix | All five public targets were exercised: binary, wasm, script, IR, and DOT |
 | Hosted integration smokes | Hosted Live, Project HGraph, and World smoke suites passed |
@@ -5220,24 +5582,30 @@ This README and the accompanying whitepaper use master commit
 | Portable native aggregate duration | 361.11 seconds wall time on the audited host |
 | `olangc --target wasm` | `wasm32-wasip1` compilation succeeded and repeated builds were byte-identical |
 | Wasmtime execution on the audited host | The produced module started and failed while locating `O` |
-| Direct World-alpha validator | Historical evidence continuity failure described below |
+| Direct World-alpha validator before the provenance-bridge repair | Historical evidence continuity failure described below |
 
-The current execution result is complete for the required portable native
-manifest: every required gate passed. The checked-in World-alpha historical
-registry has a separate continuity defect. Direct execution of
-`scripts/world_alpha_evidence.py` reports:
+The recorded execution result was complete for the required portable native
+manifest at that historical snapshot: every required gate passed. After the
+attribution-only rewrite, but before the sealed provenance bridge was added,
+direct execution of `scripts/world_alpha_evidence.py` reported:
 
 ```text
 evidence/world/g0-independent-engine-2026-08-17.toml.source digests do not resolve to one working tree, base commit, or descendant commit
 ```
 
-The focused World-alpha tests recorded 30 passes, one failure, and one error.
-The checked-in registry therefore cannot validate G0 or its dependent G2 for
-that source-digest lineage. The schema-v2 validator snapshot digest beginning
-`c25d38c` also does not resolve to accepted repository history. This is a
-checked-in historical evidence continuity defect. It does not change the fresh
-current-master observation that all 26 required portable QEMU execution gates
-passed.
+The focused pre-repair World-alpha tests recorded 30 passes, one failure, and
+one error. This was a commit-coordinate continuity defect: the immutable
+evidence bytes still named pre-rewrite commits, while rewritten `master` no
+longer shared their ancestry.
+
+Commit `4b8d83d2f748b2376570ad05db7e4479be6e5d70` added the SHA-256-sealed
+598-row provenance bridge without moving the immutable `v0.2.0` or `v0.3.0`
+tags or weakening source-digest validation. A fresh G0 run at that exact clean
+commit emitted all seven PASS markers and six typed evidence observations. The
+append-only ledger now supersedes the old G0 head with that new schema-v3
+attestation, and the direct World-alpha validator passes. This repair does not
+rerun the 26 historical portable QEMU gates or turn their recorded results into
+fresh current-`master` observations.
 
 The binary boundary audit exercised every root Cargo binary. Thirteen binaries
 accepted their public `--help` boundary. `o-notebook`, whose first argument is
@@ -5443,8 +5811,8 @@ stopped.
   `--backend-grant` and `cap=...` syntax still accepted for compatibility.
 - Policy-keyed hosted processes with Python audit enforcement and a macOS
   operating-system sandbox layer.
-- Exhaustive producer-to-consumer rendering fidelity classification for every
-  OValue variant and renderer.
+- A variant-complete 30-by-six renderer-fidelity matrix, plus targeted
+  payload, subtype, map-key, and recursive-container cases.
 - Byte-reproducible O-core object emission for identical modules across source
   directories, enforced by a named test and CI.
 - Raw-byte and structured adversarial parser properties plus a cargo-fuzz
@@ -5495,11 +5863,12 @@ confuse with the implemented mechanisms described above.
   admitted `O` proxy and fails closed when that executable authority cannot be
   captured. Hosted-live publication separately requires Wasmtime to execute the
   exact source-bound Olangc module.
-- The World-alpha registry's checked-in G0 source-digest lineage is not
-  continuous in accepted repository history. G0 and dependent G2 therefore do
-  not validate through `scripts/world_alpha_evidence.py` at this snapshot. This
-  historical registry defect is separate from the 26 of 26 fresh portable
-  native execution gates that passed at the same master commit.
+- The attribution-only rewrite initially disconnected the World-alpha
+  registry's immutable G0 commit coordinates from rewritten `master`. The
+  sealed 598-row provenance bridge and append-only replacement G0 attestation
+  now restore source-digest validation; the registry derives only G0 and G2 as
+  passed. This repair does not refresh the historical 26-of-26 portable native
+  execution-gate observation.
 - The standalone MCP crate passed all 29 Rust tests, and the real built server
   passed a smoke of all ten tools. Separately, root Python
   `tests.test_mcp_smoke` recorded four passes and one brittle assertion failure:

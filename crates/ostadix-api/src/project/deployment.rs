@@ -608,6 +608,12 @@ fn hosted_coordinator_supports(policy: &LogicalRoutePolicyV1) -> bool {
             | LogicalRoutePolicyV1::Default
             | LogicalRoutePolicyV1::Fallback
             | LogicalRoutePolicyV1::AnySuccess
+            | LogicalRoutePolicyV1::All
+            | LogicalRoutePolicyV1::RaceSuccess
+            | LogicalRoutePolicyV1::RaceSettle
+            | LogicalRoutePolicyV1::VerifyEquivalent
+            | LogicalRoutePolicyV1::BenchmarkAndSelect
+            | LogicalRoutePolicyV1::BenchmarkValidateAndSelect
     )
 }
 
@@ -705,7 +711,14 @@ fn requirements_from_operation(
         residual_host_world: operation
             .effects
             .scheduler_resources
-            .contains(&LogicalResourceV1::HostWorld),
+            .iter()
+            .any(|resource| {
+                matches!(
+                    resource,
+                    LogicalResourceV1::HostWorld
+                        | LogicalResourceV1::ConcurrentProjectBranch { .. }
+                )
+            }),
         runtime_contract_complete,
     }
 }

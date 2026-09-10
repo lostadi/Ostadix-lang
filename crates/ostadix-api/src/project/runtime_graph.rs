@@ -33,11 +33,11 @@ use super::logical::{
     LogicalRoutePolicyV1, LOGICAL_HGRAPH_SCHEMA_V1,
 };
 use super::model::{OExecutionResult, RouteExecutionDisposition, RoutePolicy};
-use super::plan::ProjectHGraph;
+use super::plan::{ProjectExecutionContract, ProjectHGraph, ProjectSchedulingContract};
 use super::trace::{
     ProjectAttemptEvent, ProjectAttemptState, ProjectAttemptTrace, ProjectAttemptTraceHeader,
-    ProjectContinuationDecision, ProjectRouteOutcome, ProjectTraceError,
-    PROJECT_ATTEMPT_TRACE_VERSION,
+    ProjectContinuationDecision, ProjectContinuationEvidence, ProjectRouteOutcome,
+    ProjectTraceError, PROJECT_ATTEMPT_TRACE_VERSION,
 };
 
 pub const RUNTIME_GRAPH_SCHEMA_V1: u16 = 1;
@@ -46,6 +46,7 @@ pub const MAX_RUNTIME_GRAPH_OPERATIONS: usize = MAX_DEPLOYMENT_OPERATIONS;
 pub const MAX_RUNTIME_GRAPH_OBSERVATIONS: usize = MAX_RUNTIME_GRAPH_OPERATIONS * 3;
 
 const MAX_RUNTIME_GRAPH_TEXT_BYTES: usize = 4_096;
+const ARCHIVED_PROJECT_TRACE_VERSION: u32 = 6;
 const RUNTIME_GRAPH_DIGEST_DOMAIN: &[u8] = b"ostadix.world.runtime-graph/v1\0";
 
 #[derive(Debug, Error)]
@@ -131,6 +132,10 @@ pub struct RuntimeGraphObservationV1 {
     pub failure_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continuation: Option<ProjectContinuationDecision>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<super::trace::ProjectPolicySelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancelled_by_ordinal: Option<u64>,
 }
 
 impl RuntimeGraphObservationV1 {
@@ -152,6 +157,8 @@ impl RuntimeGraphObservationV1 {
             outcome: event.outcome.clone(),
             failure_sha256: event.failure_sha256.clone(),
             continuation: event.continuation.clone(),
+            selection: event.selection.clone(),
+            cancelled_by_ordinal: event.cancelled_by_ordinal,
         }
     }
 
@@ -169,6 +176,8 @@ impl RuntimeGraphObservationV1 {
             outcome: self.outcome.clone(),
             failure_sha256: self.failure_sha256.clone(),
             continuation: self.continuation.clone(),
+            selection: self.selection.clone(),
+            cancelled_by_ordinal: self.cancelled_by_ordinal,
         })
     }
 }
@@ -393,7 +402,7 @@ impl RuntimeGraphV1 {
             project_bundle: logical.source.bundle.clone(),
             target: logical.source.target.clone(),
             policy: logical_policy_token(&logical.source.policy),
-            trace_format_version: PROJECT_ATTEMPT_TRACE_VERSION,
+            trace_format_version: trace.format_version(),
             trace_execution_attempt_id: trace_header.execution_attempt_id.clone(),
             world: launch.world.clone(),
             governor_context: launch.governor.clone(),
@@ -404,6 +413,7 @@ impl RuntimeGraphV1 {
             terminal,
         };
         graph.validate()?;
+        graph.validate_archived_project_contract(project)?;
         Ok(graph)
     }
 
@@ -445,12 +455,7 @@ impl RuntimeGraphV1 {
             &self.trace_execution_attempt_id,
             "trace execution attempt id",
         )?;
-        if self.trace_format_version != PROJECT_ATTEMPT_TRACE_VERSION {
-            return Err(invalid(format!(
-                "trace format version must be {PROJECT_ATTEMPT_TRACE_VERSION}, got {}",
-                self.trace_format_version
-            )));
-        }
+        self.validate_trace_profile(&policy)?;
         if self.governor_context.world() != &self.world {
             return Err(invalid(
                 "Governor context belongs to a different exact World",
@@ -573,9 +578,10 @@ impl RuntimeGraphV1 {
         if matches!(
             &self.terminal,
             RuntimeGraphTerminalV1::RouteSettlement { .. }
-        ) && trace_events
-            .iter()
-            .any(|event| event.state == ProjectAttemptState::Aborted)
+        ) && !matches!(policy, RoutePolicy::RaceSuccess | RoutePolicy::RaceSettle)
+            && trace_events
+                .iter()
+                .any(|event| event.state == ProjectAttemptState::Aborted)
         {
             return Err(invalid(
                 "route-settlement RuntimeGraph contains an aborted operation before a completed selector",
@@ -607,18 +613,6 @@ impl RuntimeGraphV1 {
                 outcome,
                 residual_host_world,
             } => {
-                if !matches!(
-                    &policy,
-                    RoutePolicy::Explicit(_)
-                        | RoutePolicy::Default
-                        | RoutePolicy::Fallback
-                        | RoutePolicy::AnySuccess
-                ) {
-                    return Err(invalid(format!(
-                        "route-settlement RuntimeGraph uses unsupported policy `{}`",
-                        self.policy
-                    )));
-                }
                 if let RoutePolicy::Explicit(expected_route) = &policy {
                     if route_id != expected_route {
                         return Err(invalid(
@@ -759,7 +753,9 @@ impl RuntimeGraphV1 {
         result: &OExecutionResult,
     ) -> Result<(), RuntimeGraphError> {
         self.validate()?;
-        let expected = Self::from_project_result(project, deployment, launch, trace, result)?;
+        self.validate_archived_project_contract(project)?;
+        let mut expected = Self::from_project_result(project, deployment, launch, trace, result)?;
+        self.preserve_archived_version(&mut expected)?;
         if self != &expected {
             return Err(invalid(
                 "RuntimeGraph differs from its trusted project-result execution inputs",
@@ -779,12 +775,82 @@ impl RuntimeGraphV1 {
         failure_detail: impl AsRef<[u8]>,
     ) -> Result<(), RuntimeGraphError> {
         self.validate()?;
-        let expected =
+        self.validate_archived_project_contract(project)?;
+        let mut expected =
             Self::from_coordinator_failure(project, deployment, launch, trace, failure_detail)?;
+        self.preserve_archived_version(&mut expected)?;
         if self != &expected {
             return Err(invalid(
                 "RuntimeGraph differs from its trusted coordinator-failure inputs",
             ));
+        }
+        Ok(())
+    }
+
+    // Version 6 had only strict ordered execution. Standalone inspection can
+    // check its recorded vocabulary; the digest-bound source contracts still
+    // require the trusted Project HGraph in validate_trusted_*.
+    fn validate_trace_profile(&self, policy: &RoutePolicy) -> Result<(), RuntimeGraphError> {
+        if self.trace_format_version == PROJECT_ATTEMPT_TRACE_VERSION {
+            return Ok(());
+        }
+        if self.trace_format_version != ARCHIVED_PROJECT_TRACE_VERSION {
+            return Err(invalid(format!(
+                "trace format version must be {PROJECT_ATTEMPT_TRACE_VERSION} or archived {ARCHIVED_PROJECT_TRACE_VERSION}, got {}",
+                self.trace_format_version
+            )));
+        }
+        if !matches!(
+            policy,
+            RoutePolicy::Explicit(_)
+                | RoutePolicy::Default
+                | RoutePolicy::Fallback
+                | RoutePolicy::AnySuccess
+        ) {
+            return Err(invalid(
+                "trace format 6 permits only archived ordered policies",
+            ));
+        }
+        if self
+            .operations
+            .iter()
+            .flat_map(|operation| &operation.observations)
+            .any(|observation| {
+                observation.selection.is_some()
+                    || observation.cancelled_by_ordinal.is_some()
+                    || observation
+                        .continuation
+                        .as_ref()
+                        .is_some_and(|continuation| {
+                            continuation.evidence == ProjectContinuationEvidence::LegacyUnchecked
+                        })
+            })
+        {
+            return Err(invalid("trace format 6 cannot carry selection, race cancellation, or compatibility continuation observations"));
+        }
+        Ok(())
+    }
+
+    fn validate_archived_project_contract(
+        &self,
+        project: &ProjectHGraph,
+    ) -> Result<(), RuntimeGraphError> {
+        if self.trace_format_version == ARCHIVED_PROJECT_TRACE_VERSION
+            && (project.plan.execution_contract != ProjectExecutionContract::Strict
+                || project.plan.scheduling_contract != ProjectSchedulingContract::SerialHostWorldV1)
+        {
+            return Err(invalid("trace format 6 requires the trusted strict execution and serial HostWorld scheduling contracts"));
+        }
+        Ok(())
+    }
+
+    fn preserve_archived_version(&self, expected: &mut Self) -> Result<(), RuntimeGraphError> {
+        if self.trace_format_version == ARCHIVED_PROJECT_TRACE_VERSION {
+            // Semantic trace replay uses the current in-memory trace type.
+            // Retain the archive's version while checking every other field
+            // against the exact trusted inputs; do not rewrite its bytes/ID.
+            expected.trace_format_version = ARCHIVED_PROJECT_TRACE_VERSION;
+            expected.validate()?;
         }
         Ok(())
     }
@@ -1033,7 +1099,15 @@ fn project_result_terminal(
         RoutePolicy::Explicit(_) | RoutePolicy::Default => {
             (alternatives.len() == 1).then(|| alternatives[0])
         }
-        _ => None,
+        _ => trace_events
+            .iter()
+            .find_map(|event| event.selection.as_ref())
+            .and_then(|selection| {
+                alternatives
+                    .iter()
+                    .copied()
+                    .find(|event| event.route_id.as_ref() == Some(&selection.selected_route_id))
+            }),
     }
     .ok_or_else(|| invalid("trace does not identify one selected terminal alternative"))?;
     let expected_disposition = if event.state == ProjectAttemptState::Skipped {
@@ -1129,6 +1203,35 @@ fn validate_observed_branch_sequence(
     policy: &RoutePolicy,
     selector_completed: bool,
 ) -> Result<(), RuntimeGraphError> {
+    for event in events
+        .iter()
+        .filter(|event| event.cancelled_by_ordinal.is_some())
+    {
+        let cause = events
+            .iter()
+            .find(|cause| Some(cause.coordinator_ordinal) == event.cancelled_by_ordinal)
+            .ok_or_else(|| invalid("cancelled RuntimeGraph operation names no observed cause"))?;
+        let qualifying = match policy {
+            RoutePolicy::RaceSuccess => cause.state == ProjectAttemptState::SettledSuccess,
+            RoutePolicy::RaceSettle => matches!(
+                cause.state,
+                ProjectAttemptState::SettledSuccess
+                    | ProjectAttemptState::SettledFailure
+                    | ProjectAttemptState::Skipped
+                    | ProjectAttemptState::Aborted
+            ),
+            _ => false,
+        };
+        if !qualifying
+            || cause.coordinator_ordinal >= event.coordinator_ordinal
+            || cause.branch.is_none()
+            || cause.branch == event.branch
+        {
+            return Err(invalid(
+                "cancelled RuntimeGraph operation has an invalid race cause",
+            ));
+        }
+    }
     let branches = events
         .iter()
         .filter_map(|event| event.branch)
@@ -1269,7 +1372,7 @@ fn validate_observed_branch_sequence(
         }
         _ => {}
     }
-    if selector_completed {
+    if selector_completed && !matches!(policy, RoutePolicy::RaceSuccess | RoutePolicy::RaceSettle) {
         for (branch, (top_level_plan_node, _)) in &top_level_by_branch {
             if events.iter().any(|event| {
                 event.branch == Some(*branch)
@@ -1406,7 +1509,15 @@ fn policy_selected_route_settlement<'a>(
             .copied()
             .find(|event| event.state == ProjectAttemptState::SettledSuccess)
             .or_else(|| alternatives.last().copied()),
-        _ => None,
+        _ => events
+            .iter()
+            .find_map(|event| event.selection.as_ref())
+            .and_then(|selection| {
+                alternatives
+                    .iter()
+                    .copied()
+                    .find(|event| event.route_id.as_ref() == Some(&selection.selected_route_id))
+            }),
     }
 }
 

@@ -66,6 +66,7 @@ OSTADIX_API_ALLOWED_PREFIXES = (
     f"{OSTADIX_API_SOURCE_ROOT}/",
     f"{OSTADIX_API_ROOT}/backends/",
     f"{OSTADIX_API_ROOT}/test-assets/",
+    f"{OSTADIX_API_ROOT}/tests/",
 )
 
 # Keep this list intentionally narrow.  Adding a new top-level project surface
@@ -187,6 +188,7 @@ OSTADIX_API_RUNTIME_ASSET_PATHS = frozenset(
             "nix_store_shim.py",
             "nixos_test_shim.py",
             "o_shim_common.py",
+            "o_native_objects.py",
             "ocaml_shim.py",
             "python_shim.py",
             "racket_shim.py",
@@ -369,6 +371,38 @@ EXCLUDED_SUFFIXES = (
     ".wasm",
 )
 
+# Native executors and the real-Linux guest remain independently reproducible
+# from a source release. Generated kernels, initramfs archives and transcripts
+# are deliberately not substituted for these reviewed source/build surfaces.
+NATIVE_DISTRIBUTED_LINUX_RELEASE_PATHS = frozenset(
+    {
+        "docs/NATIVE_DISTRIBUTED_LINUX_STATUS.md",
+        "ocore/guest/linux/README.md",
+        "ocore/guest/linux/build-initramfs.sh",
+        "ocore/guest/linux/init.c",
+        "ocore/kernel/aarch64/kernel_world/guest.dts",
+        "ocore/kernel/aarch64/kernel_world/linker.ld",
+        "ocore/kernel/aarch64/kernel_world/monitor.S",
+        "ocore/kernel/build-aarch64-kernel-world-linux.sh",
+        "ocore/kernel/smoke-aarch64-kernel-world-linux-qemu.py",
+        "ocore/kernel/native-cluster/boot.S",
+        "ocore/kernel/native-cluster/build.sh",
+        "ocore/kernel/native-cluster/linker.ld",
+        "ocore/kernel/native-cluster/main.oc",
+        "ocore/kernel/native-cluster/README.md",
+        "ocore/kernel/native-cluster/verify.py",
+        "ocore/runtime/aarch64/kernel_world_monitor.oc",
+        "ocore/runtime/aarch64/kernel_world_virtio.oc",
+        "ocore/runtime/aarch64/kernel_world_virtio_selftest.oc",
+        "ocore/runtime/x86_64/rtl8139.oc",
+        "ocore/world/native_distributed.oc",
+        "ocore/world/native_session.oc",
+        "scripts/build-real-linux-payload.sh",
+        "tests/test_native_cluster_harness.py",
+        "tests/test_kernel_world_real_linux.py",
+    }
+)
+
 REQUIRED_RELEASE_PATHS = frozenset(
     {
         ".github/workflows/ci.yml",
@@ -385,6 +419,8 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "CITATION.cff",
         "Cargo.lock",
         "Cargo.toml",
+        "apps/android-terminal/runtime/Cargo.lock",
+        "apps/android-terminal/runtime/Cargo.toml",
         "CHANGELOG.md",
         "CODE_OF_CONDUCT.md",
         "CONTRIBUTING.md",
@@ -395,16 +431,29 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "mcp/ostadix_lang_mcp_server/Cargo.toml",
         "mcp/ostadix_lang_mcp_server/README.md",
         "mcp/ostadix_lang_mcp_server/src/main.rs",
+        "fuzz/Cargo.lock",
+        "fuzz/Cargo.toml",
         "Ostadix-lang_Technical_Whitepaper.pdf",
         "README.md",
         "SECURITY.md",
         "boot-and-test.sh",
+        "apps/olang-browser-wasi/browser-main.mjs",
+        "apps/olang-browser-wasi/browser-process.mjs",
+        "apps/olang-browser-wasi/index.html",
+        "apps/olang-browser-wasi/runner.mjs",
+        "apps/olang-browser-wasi/test-bundle.mjs",
+        "apps/olang-browser-wasi/test-browser.mjs",
+        "apps/olang-browser-wasi/test-browser-harness.mjs",
+        "apps/olang-browser-wasi/test-direct-wasm.mjs",
+        "apps/olang-browser-wasi/test-host.mjs",
+        "apps/olang-browser-wasi/wasi-preview1-host.mjs",
         "ci/architecture-roots.toml",
         "ci/required-jobs.toml",
         "ci/test-suites.toml",
         "rust-toolchain.toml",
         "setup.sh",
         "docs/HOSTED_PLACEMENT_V6.md",
+        "docs/OFFLINE_AI_BUILD_KIT.md",
         "docs/PROJECT_MESH_V1.md",
         "docs/UNIFIED_INTENT_FRONT_DOOR_V1.md",
         "docs/OIR_EXECUTION_FABRIC_V1.md",
@@ -417,12 +466,15 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "docs/INFORMATION_KERNEL_V1.md",
         "docs/releases/v0.3.0.md",
         "docs/O_MACHINE_CONTRACT.md",
+        "docs/OPERATION_PLANNING_V1.md",
+        "docs/OPERATION_REALIZATION_V1.md",
         "docs/OSTADIX_BOOT.md",
         "docs/OSTADIX_BOOT_OBJECTS.md",
         "docs/OSTADIX_WORLD.md",
         "docs/SEMANTIC_CUSTODY.md",
         "docs/VERSIONING.md",
         "evidence/gates.toml",
+        "evidence/attribution-rewrite-2026-09-03.commit-map",
         "evidence/world_alpha_gates.toml",
         "evidence/world_contract_v1.toml",
         "evidence/world_contract_v2.toml",
@@ -444,6 +496,8 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "evidence/world/g0-ostadix-alpha-branding-supersession-2026-08-09.toml",
         "evidence/world/g0-independent-engine-2026-08-17.toml",
         "evidence/world/g0-independent-engine-supersession-2026-08-17.toml",
+        "evidence/world/g0-attribution-history-continuity-2026-09-03.toml",
+        "evidence/world/g0-attribution-history-continuity-supersession-2026-09-03.toml",
         "evidence/world/g2-aarch64-qemu.toml",
         "evidence/world/g2-aarch64-qemu-2026-08-03.toml",
         "evidence/world/g2-derivation-rederive-2026-08-03.toml",
@@ -453,10 +507,16 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "evidence/world/transcripts/g0-repository-conformance-2026-08-03-v2.log",
         "evidence/world/transcripts/g0-ostadix-alpha-branding-2026-08-09.log",
         "evidence/world/transcripts/g0-independent-engine-2026-08-17.log",
+        "evidence/world/transcripts/g0-attribution-history-continuity-2026-09-03.log",
         "evidence/world/transcripts/g2-aarch64-qemu.log",
         "evidence/world/transcripts/g2-aarch64-qemu-2026-08-03.log",
         "examples/manifest.json",
         "examples/docker_literal/main.py",
+        "examples/normalize/input.json",
+        "examples/normalize/normalize_chunked.py",
+        "examples/normalize/normalize_scalar.py",
+        "examples/normalize/olang.project.toml",
+        "examples/normalize/operation-planning-request.json",
         "examples/semantic_custody.O",
         "examples/wasm_hello.O",
         "examples/webassembly_hello.O",
@@ -476,6 +536,8 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "ocore/kernel/build-x86_64-uefi-iso.sh",
         "ocore/kernel/build-x86_64-uefi-media.sh",
         "ocore/kernel/build.sh",
+        "ocore/kernel/capability_boot_test.oc",
+        "ocore/kernel/capability_boot_test_stub.oc",
         "ocore/kernel/main.oc",
         "ocore/kernel/m6_mode25_diagnostics.oc",
         "ocore/kernel/m6_mode25_diagnostics_stub.oc",
@@ -505,6 +567,10 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "ocore/kernel/world_identity_semantics_stub.oc",
         "ocore/kernel/world_project_receipt_semantics.oc",
         "ocore/kernel/world_project_receipt_semantics_stub.oc",
+        "ocore/kernel/world_native_scalar_semantics.oc",
+        "ocore/kernel/world_native_scalar_semantics_stub.oc",
+        "ocore/kernel/smoke-world-native-scalar-qemu.sh",
+        "ocore/kernel/verify-native-scalar.py",
         "ocore/kernel/world_receipt_semantics.oc",
         "ocore/kernel/world_receipt_semantics_stub.oc",
         "ocore/kernel/x86_64/grub-iso.cfg",
@@ -520,10 +586,13 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "ocore/world/protocol.oc",
         "ocore/world/receipt.oc",
         "ocore/world/receipt_codec.oc",
+        "ocore/world/native_scalar.oc",
         "ocore/world/sha256.oc",
         "ocore/world/value.oc",
         "ocore/world/value_codec.oc",
         "scripts/smoke_ostadix_mcp.py",
+        "scripts/bootstrap_offline_kit.sh",
+        "scripts/build_offline_kit.py",
         "scripts/smoke-docker.sh",
         "scripts/smoke-execution-fabric-v1.sh",
         "scripts/smoke-zero-config-lan-netns.sh",
@@ -558,6 +627,7 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "scripts/release_evidence.py",
         "scripts/world_alpha_evidence.py",
         "backends/o_shim_common.py",
+        "backends/o_native_objects.py",
         "crates/ostadix-api/src/backend.rs",
         "crates/ostadix-api/src/backend_morphism.rs",
         "crates/ostadix-api/src/api.rs",
@@ -568,6 +638,8 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "crates/ostadix-api/src/computation/build_oir.rs",
         "crates/ostadix-api/src/computation/build_project.rs",
         "crates/ostadix-api/src/computation/mod.rs",
+        "crates/ostadix-api/src/computation/realization_plan.rs",
+        "crates/ostadix-api/src/computation/graph_realization_plan.rs",
         "crates/ostadix-api/src/computation/verify.rs",
         "crates/ostadix-api/src/computation_core.rs",
         "crates/ostadix-api/src/dispatch_model.rs",
@@ -579,6 +651,7 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "crates/ostadix-api/src/evidence/profile.rs",
         "crates/ostadix-api/src/effects.rs",
         "crates/ostadix-api/src/eval.rs",
+        "crates/ostadix-api/src/migration.rs",
         "crates/ostadix-api/src/eval_core.rs",
         "crates/ostadix-api/src/execution_contract.rs",
         "crates/ostadix-api/src/execution_fabric/mod.rs",
@@ -664,6 +737,20 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "src/bin/octl.rs",
         "src/bin/olink.rs",
         "src/bin/olangc.rs",
+        "src/bin/olangc/runtime_bundle.rs",
+        "crates/ostadix-api/src/computation/oir_physical_execution.rs",
+        "crates/ostadix-api/src/hosted_remote/v2/migration_protocol.rs",
+        "crates/ostadix-api/src/hosted_remote/v2/migration_runtime.rs",
+        "src/bin/olangc/linux_rootfs.rs",
+        "scripts/collect_runtime_rootfs.py",
+        "docs/OIR_PHYSICAL_EXECUTION_V1.md",
+        "docs/HOSTED_ACTOR_MIGRATION.md",
+        "docs/LINUX_RUNTIME_ROOTFS.md",
+        "tests/oir_physical_execution.rs",
+        "tests/hosted_actor_migration.rs",
+        "tests/linux_runtime_rootfs.rs",
+        "tests/test_runtime_rootfs_collection.py",
+        "src/bin/olangc/embedded_runtime.rs",
         "src/bin/ocorec.rs",
         "crates/ostadix-api/src/ocore/codegen.rs",
         "crates/ostadix-api/src/ocore/codegen_aarch64.rs",
@@ -678,6 +765,21 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "crates/ostadix-api/src/hgraph/kinds.rs",
         "crates/ostadix-api/src/hgraph/from_oir.rs",
         "crates/ostadix-api/src/hgraph/solve.rs",
+        "crates/ostadix-api/src/hgraph/semantics.rs",
+        "docs/EXECUTION_OBSERVATION_CONTRACT.md",
+        "docs/EMBEDDED_RUNTIME_BUNDLES.md",
+        "docs/BACKEND_MORPHISM_ENFORCEMENT_V1.md",
+        "docs/LOCAL_ACTOR_MIGRATION.md",
+        "docs/PHYSICAL_GRAPH_EXECUTION_V1.md",
+        "docs/PYTHON_NATIVE_HANDLES.md",
+        "tests/actor_migration.rs",
+        "tests/backend_morphism_enforcement.rs",
+        "tests/embedded_runtime_bundle.rs",
+        "tests/hgraph_observational_confluence.rs",
+        "tests/test_morphism_enforcement_protocol.py",
+        "tests/python_native_handles.rs",
+        "tests/test_python_native_handles.py",
+        "crates/ostadix-api/tests/graph_realization_execution.rs",
         "crates/ostadix-api/src/project/mod.rs",
         "crates/ostadix-api/src/project/model.rs",
         "crates/ostadix-api/src/project/executor.rs",
@@ -724,6 +826,9 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "tests/test_ostadix_hosted_live_vga_smoke.py",
         "tests/test_ostadix_ventoy_installer.py",
         "tests/test_ostadix_wasm_release.py",
+        "tests/test_offline_kit.py",
+        "tests/test_olang_browser_bundle.py",
+        "tests/qualify_offline_kit_recipient.py",
         "tests/test_ostadix_boot_iso.py",
         "tests/test_ostadix_boot_media.py",
         "tests/test_ostadix_boot_info_qemu.py",
@@ -733,6 +838,8 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "tests/test_o_cli_dispatch.py",
         "tests/unified_intent_acceptance.rs",
         "tests/o_cli_intent_blackbox.rs",
+        "tests/o_cli_operation_blackbox.rs",
+        "tests/o_cli_operation_planner_blackbox.rs",
         "tests/unified_plan_boundaries.rs",
         "tests/test_setup.py",
         "tests/test_contract_surfaces.py",
@@ -767,6 +874,7 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "tests/world_identity_wire.rs",
         "tests/world_protocol.rs",
         "tests/world_receipt.rs",
+        "tests/world_native_scalar.rs",
         "tests/world_value.rs",
     }
 ) | (
@@ -774,8 +882,15 @@ REQUIRED_RELEASE_PATHS = frozenset(
     | REAL_WORLD_BENCHMARK_RELEASE_PATHS
     | OSTADIX_API_RELEASE_PATHS
     | frozenset(OSTADIX_API_ROOT_MODULE_PATHS.values())
+    | NATIVE_DISTRIBUTED_LINUX_RELEASE_PATHS
 )
 VALID_GIT_MODES = frozenset({"100644", "100755"})
+REQUIRED_EXECUTABLE_RELEASE_PATHS = frozenset(
+    {
+        "scripts/bootstrap_offline_kit.sh",
+        "scripts/build_offline_kit.py",
+    }
+)
 SAFE_PREFIX = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 HEX_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 HEX_COMMIT = re.compile(r"[0-9a-f]{40,64}\Z")
@@ -868,8 +983,19 @@ WORLD_CLAIM_POLICY_SHA256 = (
 WORLD_DERIVATION_HASH = (
     "sha256:3a017fee12f6cc7b3c9ef9ec099407f39b5bb143251c21b9937abe47409c9d06"
 )
-WORLD_VALIDATOR_SHA256 = (
-    "e3a5adab37962db94ccda38db9ac62570f6ba06dbb9995d16af233af63c8295f"
+WORLD_ATTRIBUTION_REWRITE_MAP_PATH = (
+    "evidence/attribution-rewrite-2026-09-03.commit-map"
+)
+WORLD_ATTRIBUTION_REWRITE_MAP_SHA256 = (
+    "861abe06048f9e3fc25ce95ab0ceb65d9b31b0d44460a83cba5df2949ceeb383"
+)
+WORLD_HISTORICAL_VALIDATOR_SHA256_BY_ATTESTATION = {
+    "evidence/world/g0-independent-engine-2026-08-17.toml": (
+        "e3a5adab37962db94ccda38db9ac62570f6ba06dbb9995d16af233af63c8295f"
+    ),
+}
+WORLD_CURRENT_VALIDATOR_SHA256 = (
+    "1f68cdb6a1f4cf418836d768fe5b24855008a5b7cadd23d88090f5b05d741ff9"
 )
 WORLD_REDERIVE_PAYLOAD_DOMAIN = "ostadix.world.evidence.rederive.v1"
 WORLD_WITNESS_PAYLOAD_DOMAIN = "ostadix.world.evidence.witness.v1"
@@ -886,6 +1012,9 @@ WORLD_HISTORICAL_ATTESTATION_SHA256 = {
     "evidence/world/g0-ostadix-alpha-branding-2026-08-09.toml": (
         "32b76b190aab1c51ba73beccee350ea2a20928798605e980173c86da916450df"
     ),
+    "evidence/world/g0-independent-engine-2026-08-17.toml": (
+        "2c48ef0100bf944e2ce50a70162adff2078836e5e755c92177f366714e7b21be"
+    ),
     "evidence/world/g2-aarch64-qemu.toml": (
         "99414f1cf356b3666c163e0e28172eaf2b46e3f14c8f13f2ce12fa24cc9d30d7"
     ),
@@ -894,14 +1023,17 @@ WORLD_HISTORICAL_ATTESTATION_SHA256 = {
     ),
 }
 WORLD_CURRENT_ATTESTATION_SHA256 = {
-    "evidence/world/g0-independent-engine-2026-08-17.toml": (
-        "2c48ef0100bf944e2ce50a70162adff2078836e5e755c92177f366714e7b21be"
+    "evidence/world/g0-attribution-history-continuity-2026-09-03.toml": (
+        "262ff3db77adc827126e4edde4a3d38a344aecf1c5d881a1c786b82f95693dbd"
     ),
 }
 # Repository-authored lifecycle and derivation events are immutable ledger
 # records.  The release verifier seals their complete bytes independently of
 # the payload hash carried by a rederive event.
 WORLD_EVIDENCE_EVENT_SHA256 = {
+    "evidence/world/g0-attribution-history-continuity-supersession-2026-09-03.toml": (
+        "5594d94cb9355bb50b5de6d2dccdc51b8fce649cb2bb6204444453426ba20d73"
+    ),
     "evidence/world/g0-independent-engine-supersession-2026-08-17.toml": (
         "aeec68018bd7416cc7b24b1a4d8b102e3df31122a56856784796b73f4a1d90ce"
     ),
@@ -1092,7 +1224,10 @@ def is_allowed_release_path(path: str) -> bool:
         return False
     if basename.endswith("~") or basename.startswith(".#"):
         return False
-    if basename.endswith(EXCLUDED_SUFFIXES):
+    # Browser bundles need one reviewed HTML launcher in the source closure.
+    # Keep the general generated-HTML exclusion intact rather than allowing
+    # arbitrary HTML anywhere under apps/.
+    if basename.endswith(EXCLUDED_SUFFIXES) and path != "apps/olang-browser-wasi/index.html":
         return False
     return True
 
@@ -1217,6 +1352,17 @@ def collect_source_entries(repo: Path, commit: str) -> list[SourceEntry]:
         )
     if len(paths) != len(selected):
         raise ReleaseError("Git tree contains duplicate release paths")
+    modes = {path: mode for path, mode, _oid in selected}
+    wrong_executable_modes = sorted(
+        path
+        for path in REQUIRED_EXECUTABLE_RELEASE_PATHS
+        if modes.get(path) != "100755"
+    )
+    if wrong_executable_modes:
+        raise ReleaseError(
+            "source release requires executable mode 100755 for: "
+            + ", ".join(wrong_executable_modes)
+        )
 
     entries = [
         SourceEntry(path=path, mode=mode, data=_git(repo, "cat-file", "blob", oid))
@@ -2768,14 +2914,14 @@ def _validate_world_attestation_release_surface(
     schema_version = attestation.get("schema_version")
     if type(schema_version) is not int or schema_version not in {1, 2, 3}:
         raise ReleaseError(f"{path} schema_version must be 1, 2, or 3")
-    if schema_version <= 2:
-        expected_historical_digest = WORLD_HISTORICAL_ATTESTATION_SHA256.get(path)
-        if expected_historical_digest is None:
-            raise ReleaseError(
-                f"{path} historical attestation lacks a trusted exact-byte seal"
-            )
+    expected_historical_digest = WORLD_HISTORICAL_ATTESTATION_SHA256.get(path)
+    if expected_historical_digest is not None:
         if hashlib.sha256(files[path]).hexdigest() != expected_historical_digest:
             raise ReleaseError(f"{path} historical attestation bytes differ from seal")
+    elif schema_version <= 2:
+        raise ReleaseError(
+            f"{path} historical attestation lacks a trusted exact-byte seal"
+        )
     current_attestation = path in WORLD_CURRENT_ATTESTATION_SHA256
     if schema_version == 1:
         version_keys = {"claims"}
@@ -2969,6 +3115,17 @@ def _validate_world_attestation_release_surface(
         for field in ("claim_rule_policy_sha256", "registry_semantics_sha256"):
             if HEX_DIGEST.fullmatch(str(attestation[field])) is None:
                 raise ReleaseError(f"{path}.{field} must be a SHA-256 digest")
+        expected_historical_validator = (
+            WORLD_HISTORICAL_VALIDATOR_SHA256_BY_ATTESTATION.get(path)
+        )
+        if (
+            expected_historical_validator is not None
+            and validator_digest != expected_historical_validator
+        ):
+            raise ReleaseError(
+                f"{path}.validator_sha256 differs from the trusted validator bytes "
+                "for this historical attestation"
+            )
         if schema_version == 3:
             derivation_hash = _required_string(
                 attestation["derivation_hash"], f"{path}.derivation_hash"
@@ -2978,7 +3135,7 @@ def _validate_world_attestation_release_surface(
             ) is None:
                 raise ReleaseError(f"{path}.derivation_hash must be a SHA-256 identifier")
             if current_attestation:
-                if validator_digest != WORLD_VALIDATOR_SHA256:
+                if validator_digest != WORLD_CURRENT_VALIDATOR_SHA256:
                     raise ReleaseError(
                         f"{path}.validator_sha256 differs from the trusted validator bytes"
                     )
@@ -3512,6 +3669,16 @@ def _validate_world_evidence_ledger_release_surface(
 def _validate_world_alpha_release_surface(
     files: dict[str, bytes], modes: dict[str, str]
 ) -> None:
+    rewrite_map = files.get(WORLD_ATTRIBUTION_REWRITE_MAP_PATH)
+    if (
+        rewrite_map is None
+        or modes.get(WORLD_ATTRIBUTION_REWRITE_MAP_PATH) != "100644"
+        or hashlib.sha256(rewrite_map).hexdigest()
+        != WORLD_ATTRIBUTION_REWRITE_MAP_SHA256
+    ):
+        raise ReleaseError(
+            f"{WORLD_ATTRIBUTION_REWRITE_MAP_PATH} differs from the trusted history-rewrite map"
+        )
     texts = {
         path: _sealed_world_alpha_text(files, modes, path)
         for path in SEALED_WORLD_ALPHA_SHA256
@@ -3520,7 +3687,7 @@ def _validate_world_alpha_release_surface(
     if (
         validator_path not in files
         or hashlib.sha256(files[validator_path]).hexdigest()
-        != WORLD_VALIDATOR_SHA256
+        != WORLD_CURRENT_VALIDATOR_SHA256
     ):
         raise ReleaseError(
             f"{validator_path} differs from the trusted World evidence validator bytes"

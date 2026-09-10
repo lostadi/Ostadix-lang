@@ -1,5 +1,5 @@
 use anyhow::{anyhow, bail, Context, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error as StdError;
 use std::fmt;
 use std::fs::OpenOptions;
@@ -256,14 +256,25 @@ pub enum ExecStep {
     EvalRequest { src: String, scope: Option<OValue> },
 }
 
+struct PendingMorphismV1 {
+    contract: crate::backend_morphism::BackendCrossingContractV1,
+    request_id: String,
+    bindings: HashMap<String, OValue>,
+}
+
 struct BackendProcess {
     language: String,
+    session_id: String,
+    native_instance: String,
     child: Child,
     stdin: Option<BufWriter<ChildStdin>>,
     responses: mpsc::Receiver<std::result::Result<BackendWireResponseV2, String>>,
     reader: Option<JoinHandle<()>>,
     terminal: bool,
     exec_pending: bool,
+    pending_morphism: Option<PendingMorphismV1>,
+    awaiting_callback: bool,
+    native_operation_depth: usize,
 }
 
 pub(crate) fn backend_operation_timeout() -> Duration {
@@ -703,7 +714,14 @@ impl BackendProcess {
             ordinal,
             lang
         )));
-        Self::new_with_session(lang, shim_path, sandbox, executable_leases, &session_id)
+        Self::new_with_session(
+            lang,
+            shim_path,
+            sandbox,
+            executable_leases,
+            &session_id,
+            "unmanaged",
+        )
     }
 
     fn new_with_session(
@@ -712,6 +730,7 @@ impl BackendProcess {
         sandbox: &BackendSandboxPolicy,
         executable_leases: Option<&crate::runtime_exec::ExecutableLeaseSet>,
         session_id: &str,
+        launch_generation: &str,
     ) -> Result<Self> {
         if session_id.len() != 64 || !session_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             bail!("backend session identity must be a 64-character SHA-256 digest");
@@ -737,7 +756,11 @@ impl BackendProcess {
             })?,
         )?;
 
-        command.env("O_BACKEND_SESSION_ID", session_id);
+        let native_instance = fresh_registry_identity();
+        command
+            .env("O_BACKEND_SESSION_ID", session_id)
+            .env("O_BACKEND_LAUNCH_GENERATION", launch_generation)
+            .env("O_BACKEND_NATIVE_INSTANCE_ID", &native_instance);
 
         #[cfg(unix)]
         command.process_group(0);
@@ -822,12 +845,17 @@ impl BackendProcess {
 
         Ok(Self {
             language: lang.to_string(),
+            session_id: session_id.to_owned(),
+            native_instance,
             child,
             stdin: Some(BufWriter::new(stdin)),
             responses,
             reader: Some(reader),
             terminal: false,
             exec_pending: false,
+            pending_morphism: None,
+            awaiting_callback: false,
+            native_operation_depth: 0,
         })
     }
 
@@ -840,7 +868,8 @@ impl BackendProcess {
     }
 
     fn recv_step(&mut self) -> Result<ExecStep> {
-        let step = Self::response_step(self.recv_response()?);
+        let response = self.recv_response()?;
+        let step = self.response_step(response);
         if !matches!(&step, Ok(ExecStep::EvalRequest { .. })) {
             self.exec_pending = false;
         }
@@ -855,7 +884,8 @@ impl BackendProcess {
     }
 
     fn recv_step_timeout(&mut self, timeout: Duration) -> Result<ExecStep> {
-        let step = Self::response_step(self.recv_response_timeout(timeout)?);
+        let response = self.recv_response_timeout(timeout)?;
+        let step = self.response_step(response);
         if !matches!(&step, Ok(ExecStep::EvalRequest { .. })) {
             self.exec_pending = false;
         }
@@ -878,8 +908,32 @@ impl BackendProcess {
             .map_err(anyhow::Error::msg)
     }
 
-    fn response_step(response: BackendWireResponseV2) -> Result<ExecStep> {
+    fn response_step(&mut self, response: BackendWireResponseV2) -> Result<ExecStep> {
+        self.awaiting_callback = matches!(response, BackendWireResponseV2::EvalRequest { .. });
+        if !matches!(response, BackendWireResponseV2::EvalRequest { .. }) {
+            if let Some(PendingMorphismV1 {
+                contract,
+                request_id,
+                bindings,
+            }) = self.pending_morphism.take()
+            {
+                return match response {
+                    BackendWireResponseV2::MorphismResultV1 { receipt } => {
+                        receipt.verify(contract, &request_id, &bindings).map_err(anyhow::Error::msg)?;
+                        Ok(ExecStep::Done(receipt.value))
+                    }
+                    BackendWireResponseV2::Err { message } => Err(anyhow::Error::new(BackendSemanticError(message))),
+                    _ => bail!("morphism.missing-receipt: enforced execution returned an unverified response"),
+                };
+            }
+        }
         match response {
+            BackendWireResponseV2::NativeOperationResultV1 { .. } => {
+                bail!("native.unexpected-receipt: no native operation is pending")
+            }
+            BackendWireResponseV2::MorphismResultV1 { .. } => {
+                bail!("morphism.unexpected-receipt: no enforced execution is pending")
+            }
             BackendWireResponseV2::Ok { value } => Ok(ExecStep::Done(value)),
             BackendWireResponseV2::Err { message } => {
                 Err(anyhow::Error::new(BackendSemanticError(message)))
@@ -898,26 +952,61 @@ impl BackendProcess {
     }
 
     fn send_eval_result(&mut self, value: OValue) -> Result<()> {
-        if !self.exec_pending {
+        if !self.exec_pending && self.native_operation_depth == 0 {
             bail!("backend has no pending execution awaiting eval_result");
         }
-        self.send_command(&BackendWireCommandV2::EvalResult { value })
+        self.send_command(&BackendWireCommandV2::EvalResult { value })?;
+        self.awaiting_callback = false;
+        Ok(())
     }
 
-    fn begin_exec(&mut self, code: &str, bindings: HashMap<String, OValue>) -> Result<()> {
-        if self.exec_pending {
+    fn begin_exec_with_morphism(
+        &mut self,
+        code: &str,
+        bindings: HashMap<String, OValue>,
+        contract: Option<crate::backend_morphism::BackendCrossingContractV1>,
+    ) -> Result<()> {
+        if self.exec_pending || self.native_operation_depth > 0 {
             bail!("backend already has a pending execution");
         }
-        self.send_command(&BackendWireCommandV2::Exec {
-            code: code.to_string(),
-            bindings,
-        })?;
+        if let Some(contract) = contract {
+            contract
+                .validate_bindings(&self.language, &bindings)
+                .map_err(anyhow::Error::msg)?;
+            let request_id = fresh_registry_identity();
+            self.send_command(&BackendWireCommandV2::ExecMorphismV1 {
+                code: code.to_string(),
+                bindings: bindings.clone(),
+                contract,
+                request_id: request_id.clone(),
+            })?;
+            self.pending_morphism = Some(PendingMorphismV1 {
+                contract,
+                request_id,
+                bindings,
+            });
+        } else {
+            self.send_command(&BackendWireCommandV2::Exec {
+                code: code.to_string(),
+                bindings,
+            })?;
+        }
         self.exec_pending = true;
         Ok(())
     }
 
+    #[cfg(test)]
     fn exec(&mut self, code: &str, bindings: HashMap<String, OValue>) -> Result<OValue> {
-        self.begin_exec(code, bindings)?;
+        self.exec_with_morphism(code, bindings, None)
+    }
+
+    fn exec_with_morphism(
+        &mut self,
+        code: &str,
+        bindings: HashMap<String, OValue>,
+        contract: Option<crate::backend_morphism::BackendCrossingContractV1>,
+    ) -> Result<OValue> {
+        self.begin_exec_with_morphism(code, bindings, contract)?;
         match self.recv_step()? {
             ExecStep::Done(v) => Ok(v),
             ExecStep::EvalRequest { src, .. } => Err(anyhow!(
@@ -1001,13 +1090,16 @@ impl BackendProcess {
     }
 
     fn ensure_state_boundary(&self) -> Result<()> {
-        if self.exec_pending {
+        if self.exec_pending || self.native_operation_depth > 0 {
             bail!("state.not-settled: backend execution is still pending");
         }
         Ok(())
     }
 
     fn shutdown(&mut self, timeout: Duration) -> Result<()> {
+        // Retirement cancels publication of any unfinished execution. Its
+        // shutdown acknowledgement is not an execution result or receipt.
+        self.pending_morphism = None;
         let deadline = bounded_deadline(timeout, "backend shutdown")?;
         if let Err(error) = self.send_command(&BackendWireCommandV2::Shutdown) {
             let termination = self.force_terminate(BACKEND_FALLBACK_REAP_TIMEOUT);
@@ -1147,7 +1239,7 @@ impl BackendProcess {
                 }
             })?
             .map_err(anyhow::Error::msg)?;
-        Self::response_step(response)
+        self.response_step(response)
     }
 
     fn finish_graceful_shutdown(&mut self, deadline: Instant, timeout: Duration) -> Result<()> {
@@ -1329,6 +1421,8 @@ impl BackendProcess {
 
 fn unexpected_state_response(operation: &str, response: BackendWireResponseV2) -> anyhow::Error {
     let kind = match response {
+        BackendWireResponseV2::NativeOperationResultV1 { .. } => "native_operation_result_v1",
+        BackendWireResponseV2::MorphismResultV1 { .. } => "morphism_result_v1",
         BackendWireResponseV2::Ok { .. } => "ok",
         BackendWireResponseV2::Err { .. } => "err",
         BackendWireResponseV2::EvalRequest { .. } => "eval_request",
@@ -1364,19 +1458,23 @@ pub(crate) fn run_ephemeral_with_eval_callback<F>(
     language: &str,
     code: &str,
     bindings: HashMap<String, OValue>,
-    shim_path: &Path,
-    sandbox: &BackendSandboxPolicy,
-    executable_leases: Option<&Arc<crate::runtime_exec::ExecutableLeaseSet>>,
+    launch: BackendLaunchContext<'_>,
+    morphism_contract: Option<crate::backend_morphism::BackendCrossingContractV1>,
     mut evaluate: F,
 ) -> Result<OValue>
 where
     F: FnMut(String, Option<OValue>, Duration) -> Result<OValue>,
 {
+    if let Some(contract) = morphism_contract {
+        contract
+            .validate_bindings(language, &bindings)
+            .map_err(anyhow::Error::msg)?;
+    }
     let mut process = BackendProcess::new(
         language,
-        shim_path,
-        sandbox,
-        executable_leases.map(AsRef::as_ref),
+        launch.shim_path,
+        launch.sandbox,
+        launch.executable_leases.map(AsRef::as_ref),
     )
     .with_context(|| format!("failed to start ephemeral backend `{language}`"))
     .map_err(infrastructure_error)?;
@@ -1387,7 +1485,7 @@ where
 
     let execution = (|| {
         process
-            .begin_exec(code, bindings)
+            .begin_exec_with_morphism(code, bindings, morphism_contract)
             .map_err(infrastructure_error)?;
         lifecycle_trace(
             "worker.exec_sent",
@@ -1479,8 +1577,28 @@ fn positive_usize_from_env(name: &str, default: usize) -> usize {
 
 pub struct ProcessRegistry {
     registry: HashMap<(String, u32, BackendSandboxPolicy, String), BackendProcess>,
+    suspended_fresh: Vec<SuspendedFreshActor>,
+    // Ownership tombstones survive cleanup and prevent the old evaluator
+    // from silently recreating actors after an acknowledged migration.
+    migrated_actors: HashSet<(String, u32, BackendSandboxPolicy)>,
     session_limits: BackendSessionLimits,
     registry_identity_sha256: String,
+    morphism_contract: Option<crate::backend_morphism::BackendCrossingContractV1>,
+}
+
+pub(crate) struct FreshActorSuspension(String);
+
+pub(crate) struct NativeOperationTicket {
+    instance: String,
+    request_id: String,
+    previous_callback: bool,
+    pub(crate) settled: bool,
+}
+
+struct SuspendedFreshActor {
+    token: String,
+    key: (String, u32, BackendSandboxPolicy, String),
+    process: BackendProcess,
 }
 
 /// Admission-scoped physical launch authority shared by persistent and
@@ -1503,11 +1621,163 @@ impl Default for ProcessRegistry {
 }
 
 impl ProcessRegistry {
+    fn native_process_mut(&mut self, instance: &str) -> Result<&mut BackendProcess> {
+        if let Some(process) = self
+            .registry
+            .values_mut()
+            .find(|p| p.native_instance == instance)
+        {
+            return Ok(process);
+        }
+        self.suspended_fresh
+            .iter_mut()
+            .find(|p| p.process.native_instance == instance)
+            .map(|p| &mut p.process)
+            .context("native.owner-expired: exact physical owner is no longer live")
+    }
+
+    pub(crate) fn begin_native_operation(
+        &mut self,
+        handle: OValue,
+        operation: &str,
+        arguments: Vec<OValue>,
+    ) -> Result<NativeOperationTicket> {
+        if self.morphism_contract.is_some() {
+            bail!("morphism.unsupported-native: native operations are outside the plain-data contract");
+        }
+        let OValue::Native { v } = &handle else {
+            bail!("native.invalid-handle: expected an owner-resident native descriptor");
+        };
+        if v.lang != "python" || v.codec != "ostadix.python-owner-handle/v1" {
+            bail!("native.unsupported-owner: only Python owner handles support these operations");
+        }
+        let metadata = |key: &str| -> Result<String> {
+            match v.metadata.get(key) {
+                Some(OValue::Text { v }) => Ok(v.utf8.clone()),
+                _ => bail!("native.invalid-handle: missing owner {key}"),
+            }
+        };
+        let instance = metadata("instance")?;
+        let session = metadata("session")?;
+        let generation = metadata("generation")?;
+        let matching = self.registry.iter().any(|(key, process)| {
+            key.0 == "python"
+                && key.3 == generation
+                && process.session_id == session
+                && process.native_instance == instance
+        }) || self.suspended_fresh.iter().any(|entry| {
+            entry.key.0 == "python"
+                && entry.key.3 == generation
+                && entry.process.session_id == session
+                && entry.process.native_instance == instance
+        });
+        if !matching {
+            bail!(
+                "native.owner-expired: no exact owner/session/generation is live in this evaluator"
+            );
+        }
+        let process = self.native_process_mut(&instance)?;
+        if process.terminal
+            || ((process.exec_pending || process.native_operation_depth > 0)
+                && !process.awaiting_callback)
+        {
+            bail!("native.owner-busy: owner is not idle or suspended at a callback boundary");
+        }
+        if process.native_operation_depth >= 64 {
+            bail!("native.recursion-limit: owner operation nesting exceeds 64");
+        }
+        let request_id = fresh_registry_identity();
+        let previous_callback = process.awaiting_callback;
+        process.send_command(&BackendWireCommandV2::NativeOperationV1 {
+            request_id: request_id.clone(),
+            handle,
+            operation: operation.to_owned(),
+            arguments,
+        })?;
+        process.native_operation_depth += 1;
+        process.awaiting_callback = false;
+        Ok(NativeOperationTicket {
+            instance,
+            request_id,
+            previous_callback,
+            settled: false,
+        })
+    }
+
+    pub(crate) fn recv_native_operation(
+        &mut self,
+        ticket: &mut NativeOperationTicket,
+        timeout: Duration,
+    ) -> Result<ExecStep> {
+        let process = self.native_process_mut(&ticket.instance)?;
+        match process.recv_response_timeout(timeout)? {
+            BackendWireResponseV2::NativeOperationResultV1 { request_id, value }
+                if request_id == ticket.request_id =>
+            {
+                process.native_operation_depth -= 1;
+                process.awaiting_callback = ticket.previous_callback;
+                ticket.settled = true;
+                Ok(ExecStep::Done(value))
+            }
+            BackendWireResponseV2::EvalRequest { src, scope } => {
+                process.awaiting_callback = true;
+                Ok(ExecStep::EvalRequest { src, scope })
+            }
+            _ => bail!("native.invalid-receipt: owner returned an unmatched operation response"),
+        }
+    }
+
+    pub(crate) fn send_native_callback_result(
+        &mut self,
+        ticket: &NativeOperationTicket,
+        value: OValue,
+    ) -> Result<()> {
+        self.native_process_mut(&ticket.instance)?
+            .send_eval_result(value)
+    }
+
+    pub(crate) fn abort_native_operation(&mut self, ticket: &NativeOperationTicket) {
+        if ticket.settled {
+            return;
+        }
+        if let Some(key) = self
+            .registry
+            .iter()
+            .find(|(_, p)| p.native_instance == ticket.instance)
+            .map(|(key, _)| key.clone())
+        {
+            self.registry.remove(&key);
+        }
+        if let Some(index) = self
+            .suspended_fresh
+            .iter()
+            .position(|p| p.process.native_instance == ticket.instance)
+        {
+            self.suspended_fresh.remove(index);
+        }
+    }
+
+    pub(crate) fn set_morphism_contract(
+        &mut self,
+        contract: crate::backend_morphism::BackendCrossingContractV1,
+    ) {
+        self.morphism_contract = Some(contract);
+    }
+
+    pub(crate) fn morphism_contract(
+        &self,
+    ) -> Option<crate::backend_morphism::BackendCrossingContractV1> {
+        self.morphism_contract
+    }
+
     pub fn new() -> Self {
         Self {
             registry: HashMap::new(),
+            suspended_fresh: Vec::new(),
+            migrated_actors: HashSet::new(),
             session_limits: BackendSessionLimits::from_env(),
             registry_identity_sha256: fresh_registry_identity(),
+            morphism_contract: None,
         }
     }
 
@@ -1516,8 +1786,11 @@ impl ProcessRegistry {
         assert!(total > 0 && per_backend > 0 && per_backend <= total);
         Self {
             registry: HashMap::new(),
+            suspended_fresh: Vec::new(),
+            migrated_actors: HashSet::new(),
             session_limits: BackendSessionLimits { total, per_backend },
             registry_identity_sha256: fresh_registry_identity(),
+            morphism_contract: None,
         }
     }
 
@@ -1532,6 +1805,11 @@ impl ProcessRegistry {
         bindings: HashMap<String, OValue>,
         launch: BackendLaunchContext<'_>,
     ) -> Result<()> {
+        if let Some(contract) = self.morphism_contract {
+            contract
+                .validate_bindings(lang, &bindings)
+                .map_err(anyhow::Error::msg)?;
+        }
         let launch_generation_sha256 = actor_launch_generation(&launch, lang)?;
         self.reject_generation_conflict(lang, env_id, launch.sandbox, &launch_generation_sha256)?;
         let key = (
@@ -1542,7 +1820,7 @@ impl ProcessRegistry {
         );
         if !self.registry.contains_key(&key) {
             self.ensure_session_capacity(lang)?;
-            let session_id = actor_session_identity(
+            let session_id = fresh_or_persistent_session_identity(
                 &self.registry_identity_sha256,
                 lang,
                 env_id,
@@ -1554,6 +1832,7 @@ impl ProcessRegistry {
                 launch.sandbox,
                 launch.executable_leases.map(AsRef::as_ref),
                 &session_id,
+                &key.3,
             )
             .with_context(|| format!("failed to start backend for language `{lang}`"))?;
             self.registry.insert(key.clone(), process);
@@ -1561,7 +1840,7 @@ impl ProcessRegistry {
         self.registry
             .get_mut(&key)
             .expect("backend was just inserted but is missing")
-            .begin_exec(code, bindings)
+            .begin_exec_with_morphism(code, bindings, self.morphism_contract)
             .with_context(|| format!("failed to send Exec to backend `{lang}`"))?;
         lifecycle_trace(
             "worker.exec_sent",
@@ -1684,6 +1963,104 @@ impl ProcessRegistry {
             })
     }
 
+    /// Park a fresh invocation while it awaits O.eval. Nested fresh calls may
+    /// use the same public environment tag but own different physical actors.
+    pub(crate) fn suspend_fresh_actor(
+        &mut self,
+        lang: &str,
+        env_id: u32,
+        sandbox: &BackendSandboxPolicy,
+    ) -> Result<FreshActorSuspension> {
+        if env_id <= crate::environment::MAX_PERSISTENT_ENV_ID {
+            bail!("only fresh actors can be detached for callback recursion");
+        }
+        let key = self.process_key(lang, env_id, sandbox)?;
+        let process = self
+            .registry
+            .remove(&key)
+            .expect("resolved fresh actor exists");
+        let token = fresh_registry_identity();
+        self.suspended_fresh.push(SuspendedFreshActor {
+            token: token.clone(),
+            key,
+            process,
+        });
+        Ok(FreshActorSuspension(token))
+    }
+
+    pub(crate) fn resume_fresh_actor(&mut self, token: FreshActorSuspension) -> Result<()> {
+        if self
+            .suspended_fresh
+            .last()
+            .map(|actor| actor.token.as_str())
+            != Some(token.0.as_str())
+        {
+            bail!("fresh callback actor suspension stack is inconsistent");
+        }
+        let actor = self
+            .suspended_fresh
+            .pop()
+            .expect("checked suspension exists");
+        // Normally the nested invocation has already retired. Still reclaim
+        // every residual inner actor before restoring the outer full key.
+        let residual = self
+            .registry
+            .keys()
+            .filter(|key| key.0 == actor.key.0 && key.1 == actor.key.1 && key.2 == actor.key.2)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut failures = Vec::new();
+        for key in residual {
+            if let Some(mut process) = self.registry.remove(&key) {
+                if let Err(error) = process.force_terminate(BACKEND_FALLBACK_REAP_TIMEOUT) {
+                    failures.push(format!("{error:#}"));
+                }
+            }
+        }
+        self.registry.insert(actor.key, actor.process);
+        if !failures.is_empty() {
+            bail!(
+                "fresh callback residual actor cleanup failed: {}",
+                failures.join(" | ")
+            );
+        }
+        Ok(())
+    }
+
+    /// An unwinding callback cannot publish a result or leave its parked
+    /// actors consuming capacity after a caller catches the Rust panic.
+    pub(crate) fn cancel_fresh_callback_after_panic(&mut self, token: FreshActorSuspension) {
+        let Some(index) = self
+            .suspended_fresh
+            .iter()
+            .position(|actor| actor.token == token.0)
+        else {
+            return;
+        };
+        let mut processes = self
+            .suspended_fresh
+            .split_off(index)
+            .into_iter()
+            .map(|actor| actor.process)
+            .collect::<Vec<_>>();
+        let active = self
+            .registry
+            .keys()
+            .filter(|key| key.1 > crate::environment::MAX_PERSISTENT_ENV_ID)
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in active {
+            if let Some(process) = self.registry.remove(&key) {
+                processes.push(process);
+            }
+        }
+        for mut process in processes {
+            if let Err(error) = process.force_terminate(BACKEND_FALLBACK_REAP_TIMEOUT) {
+                lifecycle_trace("callback.panic_cleanup_failed", format!("{error:#}"));
+            }
+        }
+    }
+
     pub(crate) fn exec(
         &mut self,
         lang: &str,
@@ -1692,6 +2069,11 @@ impl ProcessRegistry {
         bindings: HashMap<String, OValue>,
         launch: BackendLaunchContext<'_>,
     ) -> Result<OValue> {
+        if let Some(contract) = self.morphism_contract {
+            contract
+                .validate_bindings(lang, &bindings)
+                .map_err(anyhow::Error::msg)?;
+        }
         let launch_generation_sha256 = actor_launch_generation(&launch, lang)?;
         self.reject_generation_conflict(lang, env_id, launch.sandbox, &launch_generation_sha256)?;
         let key = (
@@ -1703,7 +2085,7 @@ impl ProcessRegistry {
 
         if !self.registry.contains_key(&key) {
             self.ensure_session_capacity(lang)?;
-            let session_id = actor_session_identity(
+            let session_id = fresh_or_persistent_session_identity(
                 &self.registry_identity_sha256,
                 lang,
                 env_id,
@@ -1715,6 +2097,7 @@ impl ProcessRegistry {
                 launch.sandbox,
                 launch.executable_leases.map(AsRef::as_ref),
                 &session_id,
+                &key.3,
             )
             .with_context(|| format!("failed to start backend for language `{lang}`"))?;
             self.registry.insert(key.clone(), process);
@@ -1724,7 +2107,7 @@ impl ProcessRegistry {
             .registry
             .get_mut(&key)
             .expect("backend was just inserted but is missing")
-            .exec(code, bindings);
+            .exec_with_morphism(code, bindings, self.morphism_contract);
 
         if result
             .as_ref()
@@ -1867,6 +2250,11 @@ impl ProcessRegistry {
     ) -> Result<()> {
         for actor in actors {
             let sandbox = BackendSandboxPolicy::new(actor.sandbox_permissions.iter().copied());
+            self.ensure_actor_not_migrated(
+                &actor.canonical_backend,
+                actor.environment_id,
+                &sandbox,
+            )?;
             if self
                 .registry
                 .keys()
@@ -1897,6 +2285,7 @@ impl ProcessRegistry {
         checkpoint: BackendCheckpointV1,
         launch: BackendLaunchContext<'_>,
     ) -> Result<BackendRestoreReceiptV1> {
+        self.ensure_actor_not_migrated(lang, env_id, launch.sandbox)?;
         checkpoint.validate()?;
         if checkpoint.backend != lang {
             bail!(
@@ -1933,6 +2322,7 @@ impl ProcessRegistry {
             launch.sandbox,
             launch.executable_leases.map(AsRef::as_ref),
             &session_id,
+            &key.3,
         )
         .with_context(|| format!("failed to start restore target for `{lang}[{env_id}]`"))?;
         match process.restore(checkpoint) {
@@ -1972,7 +2362,12 @@ impl ProcessRegistry {
     /// Explicitly shut down every persistent backend, attempting all entries
     /// and reporting the combined physical teardown failures to the caller.
     pub fn shutdown_all(&mut self, timeout: Duration) -> Result<()> {
-        let processes: Vec<_> = self.registry.drain().map(|(_, process)| process).collect();
+        let processes: Vec<_> = self
+            .registry
+            .drain()
+            .map(|(_, process)| process)
+            .chain(self.suspended_fresh.drain(..).map(|actor| actor.process))
+            .collect();
         let mut failures = Vec::new();
         for mut process in processes {
             if let Err(error) = process.shutdown(timeout) {
@@ -2014,7 +2409,7 @@ impl ProcessRegistry {
     }
 
     fn ensure_session_capacity(&self, lang: &str) -> Result<()> {
-        if self.registry.len() >= self.session_limits.total {
+        if self.registry.len() + self.suspended_fresh.len() >= self.session_limits.total {
             bail!(
                 "session.capacity-exhausted: open backend sessions reached configured total quota {}",
                 self.session_limits.total
@@ -2024,7 +2419,12 @@ impl ProcessRegistry {
             .registry
             .keys()
             .filter(|(candidate_lang, _, _, _)| candidate_lang == lang)
-            .count();
+            .count()
+            + self
+                .suspended_fresh
+                .iter()
+                .filter(|actor| actor.key.0 == lang)
+                .count();
         if backend_count >= self.session_limits.per_backend {
             bail!(
                 "session.capacity-exhausted: backend `{lang}` reached configured per-backend quota {}",
@@ -2041,6 +2441,7 @@ impl ProcessRegistry {
         sandbox: &BackendSandboxPolicy,
         launch_generation_sha256: &str,
     ) -> Result<()> {
+        self.ensure_actor_not_migrated(lang, env_id, sandbox)?;
         let conflicting_generation = self
             .registry
             .keys()
@@ -2059,6 +2460,62 @@ impl ProcessRegistry {
             );
         }
         Ok(())
+    }
+
+    fn ensure_actor_not_migrated(
+        &self,
+        lang: &str,
+        env_id: u32,
+        sandbox: &BackendSandboxPolicy,
+    ) -> Result<()> {
+        if self
+            .migrated_actors
+            .contains(&(lang.to_string(), env_id, sandbox.clone()))
+        {
+            bail!("state.actor-migrated: backend `{lang}[{env_id}]` ownership left this evaluator");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn migration_origin(&self) -> &str {
+        &self.registry_identity_sha256
+    }
+
+    /// Remove exactly the transaction's actors. During commit, fence every
+    /// source actor before physical teardown; rollback removes only restored
+    /// destination actors and leaves their logical identities reusable.
+    pub(crate) fn retire_migration_actors(
+        &mut self,
+        actors: &[EvaluatorActorCheckpointV1],
+        fence: bool,
+    ) -> Vec<String> {
+        let mut retired = Vec::new();
+        for actor in actors {
+            let sandbox = BackendSandboxPolicy::new(actor.sandbox_permissions.iter().copied());
+            if fence {
+                self.migrated_actors.insert((
+                    actor.canonical_backend.clone(),
+                    actor.environment_id,
+                    sandbox.clone(),
+                ));
+            }
+            let key = (
+                actor.canonical_backend.clone(),
+                actor.environment_id,
+                sandbox,
+                actor.launch_generation_sha256.clone(),
+            );
+            if let Some(process) = self.registry.remove(&key) {
+                retired.push(process);
+            }
+        }
+        let mut failures = Vec::new();
+        for mut process in retired {
+            if let Err(error) = process.shutdown(backend_shutdown_timeout()) {
+                failures.push(format!("{error:#}"));
+            }
+        }
+        failures
     }
 }
 
@@ -2120,6 +2577,19 @@ fn actor_session_identity(
     hex::encode(digest.finalize())
 }
 
+fn fresh_or_persistent_session_identity(
+    registry: &str,
+    lang: &str,
+    env_id: u32,
+    sandbox: &BackendSandboxPolicy,
+) -> String {
+    if env_id > crate::environment::MAX_PERSISTENT_ENV_ID {
+        fresh_registry_identity()
+    } else {
+        actor_session_identity(registry, lang, env_id, sandbox)
+    }
+}
+
 impl Drop for ProcessRegistry {
     fn drop(&mut self) {
         // `BackendProcess::drop` performs only bounded best-effort local
@@ -2162,6 +2632,71 @@ mod tests {
             executable_leases: None,
             launch_generation_sha256: Some(launch_generation_sha256),
         }
+    }
+
+    #[test]
+    fn suspended_fresh_actor_preserves_identity_pending_state_and_capacity() -> Result<()> {
+        let mut registry = ProcessRegistry::with_session_limits(2, 1);
+        let shim = python_shim_path();
+        let sandbox = BackendSandboxPolicy::none();
+        registry.send_exec(
+            "python",
+            u32::MAX,
+            "O.eval('callback')",
+            HashMap::new(),
+            test_launch_context(&shim, &sandbox, &"ab".repeat(32)),
+        )?;
+        assert!(matches!(
+            registry.recv_exec_step("python", u32::MAX, &sandbox)?,
+            ExecStep::EvalRequest { .. }
+        ));
+        let pid = registry.registry.values().next().unwrap().child.id();
+        let token = registry.suspend_fresh_actor("python", u32::MAX, &sandbox)?;
+        assert!(registry.registry.is_empty());
+        assert!(registry
+            .ensure_session_capacity("python")
+            .unwrap_err()
+            .to_string()
+            .contains("session.capacity-exhausted"));
+        registry.ensure_session_capacity("javascript")?;
+        registry.resume_fresh_actor(token)?;
+        assert_eq!(registry.registry.values().next().unwrap().child.id(), pid);
+        registry.send_eval_result("python", u32::MAX, OValue::int(42), &sandbox)?;
+        assert!(
+            matches!(registry.recv_exec_step("python", u32::MAX, &sandbox)?, ExecStep::Done(value) if value == OValue::int(42))
+        );
+        registry.cleanup_env("python", u32::MAX)?;
+        registry.ensure_session_capacity("python")?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn suspended_fresh_panic_cancellation_reaps_process_and_releases_capacity() -> Result<()> {
+        let mut registry = ProcessRegistry::with_session_limits(1, 1);
+        let shim = python_shim_path();
+        let sandbox = BackendSandboxPolicy::none();
+        registry.send_exec(
+            "python",
+            u32::MAX,
+            "O.eval('callback')",
+            HashMap::new(),
+            test_launch_context(&shim, &sandbox, &"cd".repeat(32)),
+        )?;
+        assert!(matches!(
+            registry.recv_exec_step("python", u32::MAX, &sandbox)?,
+            ExecStep::EvalRequest { .. }
+        ));
+        let pid = registry.registry.values().next().unwrap().child.id() as i32;
+        let token = registry.suspend_fresh_actor("python", u32::MAX, &sandbox)?;
+        registry.cancel_fresh_callback_after_panic(token);
+        assert!(registry.registry.is_empty());
+        assert!(registry.suspended_fresh.is_empty());
+        registry.ensure_session_capacity("python")?;
+        // SAFETY: signal zero only observes this exact owned child PID.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+        Ok(())
     }
 
     fn spawn_python_shim() -> Result<BackendProcess> {
@@ -2233,6 +2768,92 @@ mod tests {
             }
             other => panic!("expected number/int OValue, got {other:?}"),
         }
+        process.shutdown(backend_shutdown_timeout())?;
+        Ok(())
+    }
+
+    #[test]
+    fn exec_python_huge_numbers_bypass_decimal_digit_limits() -> Result<()> {
+        use crate::backend_catalog::SpliceRenderer;
+        use crate::eval_core::render_with;
+        use crate::value::ONumber;
+
+        let mut process = spawn_python_shim()?;
+        let digits = "9".repeat(5_000);
+        let decimal_coefficient = num_bigint::BigInt::parse_bytes(digits.as_bytes(), 10).unwrap();
+        let hex_digits = "f".repeat(5_000);
+        let integer_value =
+            OValue::big_int(num_bigint::BigInt::parse_bytes(hex_digits.as_bytes(), 16).unwrap());
+        let integer_source = render_with(SpliceRenderer::Python, &integer_value);
+
+        let integer = process.exec(
+            &format!("int = None\n__oval_result__ = {integer_source}"),
+            HashMap::new(),
+        )?;
+        assert_eq!(integer, integer_value.clone());
+
+        let decimal_value = OValue::number(ONumber::Decimal {
+            coeff: decimal_coefficient,
+            exp10: 0,
+            special: None,
+        });
+        let decimal_source = render_with(SpliceRenderer::Python, &decimal_value);
+        let decimal = process.exec(
+            &format!("__oval_result__ = {decimal_source}"),
+            HashMap::new(),
+        )?;
+        assert_eq!(decimal, decimal_value);
+
+        let bindings = HashMap::from([("huge".to_string(), integer_value)]);
+        assert_eq!(
+            process.exec(
+                &format!("__oval_result__ = huge == {integer_source}"),
+                bindings,
+            )?,
+            OValue::bool_(true),
+        );
+
+        process.shutdown(backend_shutdown_timeout())?;
+        Ok(())
+    }
+
+    #[test]
+    fn python_scope_with_invalid_nested_numbers_round_trips_without_crashing() -> Result<()> {
+        use crate::backend_catalog::SpliceRenderer;
+        use crate::eval_core::render_with;
+        use crate::value::{FloatFormat, ONumber};
+
+        let scope = OValue::scope(HashMap::from([
+            (
+                "zero_denominator".to_string(),
+                OValue::number(ONumber::Rational {
+                    num: 1.into(),
+                    den: 0.into(),
+                }),
+            ),
+            (
+                "malformed_float".to_string(),
+                OValue::number(ONumber::BinaryFloat {
+                    format: FloatFormat::F64,
+                    bits: vec![0],
+                }),
+            ),
+            (
+                "malformed_blob".to_string(),
+                OValue::Blob {
+                    v: "a".to_string(),
+                    mime: "application/octet-stream".to_string(),
+                },
+            ),
+        ]));
+        let source = render_with(SpliceRenderer::Python, &scope);
+        let mut process = spawn_python_shim()?;
+
+        assert_eq!(
+            process.exec(&format!("__oval_result__ = {source}"), HashMap::new())?,
+            scope,
+        );
+
         process.shutdown(backend_shutdown_timeout())?;
         Ok(())
     }
@@ -2361,6 +2982,39 @@ mod tests {
     }
 
     #[test]
+    fn python_checkpoint_restore_preserves_unbounded_integers_and_fractions() -> Result<()> {
+        let mut source = spawn_python_shim()?;
+        source.exec(
+            concat!(
+                "huge = 10 ** 5000\n",
+                "ratio = __import__('fractions').Fraction(huge, 3)\n",
+                "__oval_result__ = 'ready'",
+            ),
+            HashMap::new(),
+        )?;
+        let checkpoint = source.checkpoint(1024 * 1024)?;
+        source.shutdown(backend_shutdown_timeout())?;
+
+        let mut target = spawn_python_shim()?;
+        target.restore(checkpoint)?;
+        assert_eq!(
+            target.exec(
+                concat!(
+                    "__oval_result__ = (\n",
+                    "    huge == 10 ** 5000\n",
+                    "    and ratio.numerator == huge\n",
+                    "    and ratio.denominator == 3\n",
+                    ")",
+                ),
+                HashMap::new(),
+            )?,
+            OValue::bool_(true)
+        );
+        target.shutdown(backend_shutdown_timeout())?;
+        Ok(())
+    }
+
+    #[test]
     fn unsupported_python_checkpoint_pins_and_keeps_actor_live() -> Result<()> {
         let mut process = spawn_python_shim()?;
         process.exec("f = lambda: 42\n__oval_result__ = 'ready'", HashMap::new())?;
@@ -2400,6 +3054,16 @@ mod tests {
         let shim = temp.path().join("delayed_shutdown.py");
         let common = Path::new(env!("CARGO_MANIFEST_DIR")).join("backends/o_shim_common.py");
         std::fs::copy(python_shim_path(), &shim)?;
+        for &support in crate::shims::BUNDLED_SHIM_SUPPORT_NAMES {
+            if support != "o_shim_common.py" {
+                std::fs::copy(
+                    Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("backends")
+                        .join(support),
+                    temp.path().join(support),
+                )?;
+            }
+        }
 
         let source = std::fs::read_to_string(&common)?;
         let original = concat!(

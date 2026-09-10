@@ -64,7 +64,7 @@ public final class OReplController implements AutoCloseable {
     public void start() {
         emit("\u001b[2J\u001b[H"
                 + "\u001b[1;38;5;81mOstadix Console\u001b[0m  "
-                + "\u001b[2mengine " + OstadixRuntime.version() + "\u001b[0m\r\n"
+                + "\u001b[2mJNI bridge " + OstadixRuntime.version() + "\u001b[0m\r\n"
                 + "Native, offline evaluation · :help for commands\r\n\r\n"
                 + PROMPT);
     }

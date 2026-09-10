@@ -16,6 +16,23 @@ pub struct TraceSink {
 }
 
 impl TraceSink {
+    pub(crate) fn crossing_submitted(
+        &mut self,
+        observation: crate::backend_morphism::BackendCrossingObservationV1,
+    ) {
+        self.trace.backend_crossings.push(observation);
+    }
+
+    pub(crate) fn crossing_mut(
+        &mut self,
+        id: PlanNodeId,
+    ) -> Option<&mut crate::backend_morphism::BackendCrossingObservationV1> {
+        self.trace
+            .backend_crossings
+            .iter_mut()
+            .find(|observation| observation.plan_node == id.0)
+    }
+
     pub fn new() -> Self {
         Self {
             trace: ExecutionTrace::new(),
@@ -31,6 +48,9 @@ impl TraceSink {
     }
 
     pub fn finished(&mut self, id: PlanNodeId, value_type: String, fingerprint: Option<String>) {
+        if let Some(crossing) = self.crossing_mut(id) {
+            crossing.published = crossing.result.is_some();
+        }
         self.trace.events.push(TraceEvent::NodeFinished {
             id,
             value_type,
@@ -45,6 +65,10 @@ impl TraceSink {
     }
 
     pub fn discarded(&mut self, id: PlanNodeId, reason: String) {
+        if let Some(crossing) = self.crossing_mut(id) {
+            crossing.discarded = true;
+            crossing.published = false;
+        }
         self.trace
             .events
             .push(TraceEvent::NodeDiscarded { id, reason });

@@ -11,22 +11,27 @@ use std::time::Instant;
 
 use anyhow::{bail, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
+use num_traits::ToPrimitive;
 
 use crate::backend_catalog::{BackendInterface, SpliceRenderer};
 use crate::capability::BackendSandboxPolicy;
 use crate::evidence::AdmittedExecution;
 use crate::execution_contract::Policy;
 use crate::ir::{ExecutionPlan, InvokeMode, OIr, PlanEdgeKind, PlanNodeId, PlanNodeKind};
-use crate::value::{DecimalSpecial, FloatFormat, FloatSpecial, ONumber, OValue, SeqKind};
+use crate::value::{fingerprint_preview, DecimalSpecial, FloatFormat, ONumber, OValue, SeqKind};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionTrace {
     pub events: Vec<TraceEvent>,
+    pub backend_crossings: Vec<crate::backend_morphism::BackendCrossingObservationV1>,
 }
 
 impl ExecutionTrace {
     pub fn new() -> Self {
-        Self { events: Vec::new() }
+        Self {
+            events: Vec::new(),
+            backend_crossings: Vec::new(),
+        }
     }
 }
 
@@ -117,21 +122,17 @@ impl GraphEvalFrame {
 /// This trait is deliberately crate-private and has no `Send` bound: the
 /// process registry and live actor state stay on the coordinator thread.
 pub(crate) trait GraphEvaluationHost {
+    fn morphism_contract(&self) -> Option<crate::backend_morphism::BackendCrossingContractV1> {
+        None
+    }
+
+    fn crossing_observations_enabled(&self) -> bool {
+        false
+    }
+
     fn verify_admitted_runtime_context(&self, admitted: &AdmittedExecution<'_>) -> Result<()>;
 
     fn local_worker_parallelism_override(&self) -> Option<usize>;
-
-    /// Borrow a process-local worker pool for one graph evaluation. An
-    /// embedding with stable thread authority may explicitly retain idle pools
-    /// so short O programs do not repeatedly create and join the same workers.
-    fn take_local_worker_pool(
-        &mut self,
-        capacity: usize,
-    ) -> Result<crate::executor::pool::WorkerPool>;
-
-    /// Return a pool after a graph evaluation. Implementations may discard a
-    /// pool that is not idle or no longer matches their configured capacity.
-    fn return_local_worker_pool(&mut self, pool: crate::executor::pool::WorkerPool);
 
     fn shim_path(&self, language: &str) -> PathBuf;
 
@@ -268,12 +269,32 @@ pub(crate) fn render_with(renderer: SpliceRenderer, val: &OValue) -> String {
 pub enum RenderFidelity {
     /// The consumer syntax retains the value and its O-level type.
     Typed,
-    /// The payload is retained, but one or more O-level type tags are erased.
+    /// Portable payload or structure survives, but O-level tags or auxiliary
+    /// metadata may be erased.
     Structural,
     /// The renderer intentionally produces a human-facing presentation.
     Presentation,
     /// Only an identifying marker or summary survives.
     Opaque,
+}
+
+/// Select the weaker classification while folding children of one renderer.
+///
+/// This is deliberately not a public cross-renderer order. `Structural` is
+/// reachable only for source-oriented renderers while `Presentation` is
+/// reachable only for human-facing renderers, so their relative branch below
+/// is defensive rather than a claimed semantic comparison.
+const fn weaker_for_container(left: RenderFidelity, right: RenderFidelity) -> RenderFidelity {
+    match (left, right) {
+        (RenderFidelity::Opaque, _) | (_, RenderFidelity::Opaque) => RenderFidelity::Opaque,
+        (RenderFidelity::Presentation, _) | (_, RenderFidelity::Presentation) => {
+            RenderFidelity::Presentation
+        }
+        (RenderFidelity::Structural, _) | (_, RenderFidelity::Structural) => {
+            RenderFidelity::Structural
+        }
+        _ => RenderFidelity::Typed,
+    }
 }
 
 fn container_fidelity<'a>(
@@ -284,16 +305,7 @@ fn container_fidelity<'a>(
     children
         .into_iter()
         .map(|child| render_fidelity(renderer, child))
-        .fold(base, |current, child| match (current, child) {
-            (RenderFidelity::Opaque, _) | (_, RenderFidelity::Opaque) => RenderFidelity::Opaque,
-            (RenderFidelity::Presentation, _) | (_, RenderFidelity::Presentation) => {
-                RenderFidelity::Presentation
-            }
-            (RenderFidelity::Structural, _) | (_, RenderFidelity::Structural) => {
-                RenderFidelity::Structural
-            }
-            _ => RenderFidelity::Typed,
-        })
+        .fold(base, weaker_for_container)
 }
 
 fn entry_container_fidelity(
@@ -308,6 +320,12 @@ fn entry_container_fidelity(
     )
 }
 
+/// Recompute the descriptive source projection for one value and renderer
+/// under that backend's standard shim prelude.
+///
+/// Recursive containers inherit their weakest child classification within the
+/// same renderer. This is neither an admission check nor a conversion to the
+/// value-crossing [`crate::value::Fidelity`] domains.
 pub fn render_fidelity(renderer: SpliceRenderer, val: &OValue) -> RenderFidelity {
     use OValue::*;
     use RenderFidelity::*;
@@ -316,7 +334,6 @@ pub fn render_fidelity(renderer: SpliceRenderer, val: &OValue) -> RenderFidelity
         SpliceRenderer::Python => match val {
             Null
             | Bool { .. }
-            | Number { .. }
             | Html { .. }
             | StorePath { .. }
             | Expr { .. }
@@ -332,30 +349,69 @@ pub fn render_fidelity(renderer: SpliceRenderer, val: &OValue) -> RenderFidelity
             | Graph { .. }
             | Native { .. }
             | Error { .. } => Typed,
+            Number {
+                v: ONumber::Int { .. },
+            } => Typed,
+            Number {
+                v:
+                    ONumber::Decimal {
+                        coeff,
+                        exp10,
+                        special,
+                    },
+            } if python_decimal_round_trips_exactly(coeff, *exp10, *special) => Typed,
+            Number {
+                v:
+                    ONumber::BinaryFloat {
+                        format: FloatFormat::F64,
+                        bits,
+                    },
+            } if bits.len() == 8 => Typed,
+            Number { .. } => Structural,
             Text { .. } | Char { .. } | Bytes { .. } | Symbol { .. } | Keyword { .. } => Structural,
             List { v } => container_fidelity(renderer, v, Typed),
             Map { v } => container_fidelity(renderer, v.values(), Typed),
-            Seq { items, .. } | Set { items, .. } => container_fidelity(renderer, items, Typed),
-            Object { fields } => container_fidelity(renderer, fields.values(), Typed),
+            Seq {
+                kind: SeqKind::Tuple,
+                items,
+            } => container_fidelity(renderer, items, Typed),
+            Seq { items, .. } | Set { items, .. } => {
+                container_fidelity(renderer, items, Structural)
+            }
+            Object { fields } => container_fidelity(renderer, fields.values(), Structural),
             EntriesMap { entries } => entry_container_fidelity(renderer, entries, Structural),
             Blob { .. } => Structural,
         },
         SpliceRenderer::Nix => match val {
-            Null | Bool { .. } | Number { .. } | Text { .. } | NixExpr { .. } => Typed,
+            Null | Bool { .. } => Typed,
+            Number {
+                v: ONumber::Int { v },
+            } if v.to_i64().is_some() => Typed,
+            Text { v } if v.encoding.as_deref() == Some("utf-8") && !v.utf8.contains('\0') => Typed,
+            Number { .. } | Text { .. } => Structural,
             List { v } => container_fidelity(renderer, v, Typed),
-            Map { v } => container_fidelity(renderer, v.values(), Typed),
-            Seq { items, .. } | Set { items, .. } => container_fidelity(renderer, items, Typed),
-            Object { fields } => container_fidelity(renderer, fields.values(), Typed),
+            Map { v } => container_fidelity(
+                renderer,
+                v.values(),
+                if v.keys().all(|key| !key.contains('\0')) {
+                    Typed
+                } else {
+                    Structural
+                },
+            ),
+            Seq { items, .. } | Set { items, .. } => {
+                container_fidelity(renderer, items, Structural)
+            }
+            Object { fields } => container_fidelity(renderer, fields.values(), Structural),
             EntriesMap { entries } => entry_container_fidelity(renderer, entries, Structural),
-            Char { .. }
-            | Bytes { .. }
-            | Symbol { .. }
-            | Keyword { .. }
-            | Graph { .. }
-            | Native { .. } => Structural,
+            Char { .. } | Symbol { .. } | Keyword { .. } => Structural,
+            Bytes { v } if v.media_type.is_some() => Structural,
+            Bytes { .. } | Graph { .. } | Native { .. } => Opaque,
             Html { .. }
             | StorePath { .. }
             | Blob { .. }
+            | NixExpr { .. }
+            | Thunk { .. }
             | Derivation { .. }
             | System { .. }
             | Expr { .. } => Structural,
@@ -363,7 +419,6 @@ pub fn render_fidelity(renderer: SpliceRenderer, val: &OValue) -> RenderFidelity
             | Request { .. }
             | Capability { .. }
             | Snapshot { .. }
-            | Thunk { .. }
             | Group { .. }
             | Error { .. } => Opaque,
         },
@@ -382,6 +437,7 @@ pub fn render_fidelity(renderer: SpliceRenderer, val: &OValue) -> RenderFidelity
             | NixExpr { .. }
             | Derivation { .. }
             | System { .. }
+            | Thunk { .. }
             | Expr { .. }
             | Error { .. } => Presentation,
             List { v } => container_fidelity(renderer, v, Presentation),
@@ -395,7 +451,6 @@ pub fn render_fidelity(renderer: SpliceRenderer, val: &OValue) -> RenderFidelity
             | Request { .. }
             | Capability { .. }
             | Snapshot { .. }
-            | Thunk { .. }
             | Group { .. }
             | Graph { .. }
             | Native { .. } => Opaque,
@@ -406,9 +461,10 @@ pub fn render_fidelity(renderer: SpliceRenderer, val: &OValue) -> RenderFidelity
             | Number { .. }
             | Text { .. }
             | Char { .. }
-            | Bytes { .. }
             | Symbol { .. }
             | Keyword { .. } => Structural,
+            Bytes { v } if v.media_type.is_some() => Structural,
+            Bytes { .. } => Opaque,
             List { v } => container_fidelity(renderer, v, Structural),
             Map { v } => container_fidelity(renderer, v.values(), Structural),
             Seq { items, .. } | Set { items, .. } => {
@@ -418,16 +474,16 @@ pub fn render_fidelity(renderer: SpliceRenderer, val: &OValue) -> RenderFidelity
             EntriesMap { entries } => entry_container_fidelity(renderer, entries, Structural),
             Html { .. }
             | StorePath { .. }
-            | Expr { .. }
-            | Scope { .. }
             | Blob { .. }
             | NixExpr { .. }
             | Derivation { .. }
+            | Thunk { .. }
+            | Expr { .. }
+            | System { .. } => Structural,
+            Scope { .. }
             | Request { .. }
-            | System { .. }
             | Capability { .. }
             | Snapshot { .. }
-            | Thunk { .. }
             | Group { .. }
             | Graph { .. }
             | Native { .. }
@@ -440,6 +496,117 @@ fn sorted_map_entries(values: &HashMap<String, OValue>) -> Vec<(&String, &OValue
     let mut entries = values.iter().collect::<Vec<_>>();
     entries.sort_by_key(|(key, _)| *key);
     entries
+}
+
+fn python_decimal_round_trips_exactly(
+    coeff: &num_bigint::BigInt,
+    exp10: i64,
+    special: Option<DecimalSpecial>,
+) -> bool {
+    const PORTABLE_MAX_EMAX: i64 = 425_000_000;
+    const PORTABLE_MIN_ETINY: i64 = -849_999_999;
+    const PORTABLE_MAX_PREC: usize = 425_000_000;
+    let coeff_is_zero = coeff == &num_bigint::BigInt::from(0);
+    match special {
+        None => {
+            let coefficient_digits = coeff.to_str_radix(10).trim_start_matches('-').len();
+            let adjusted_exponent = i64::try_from(coefficient_digits)
+                .ok()
+                .and_then(|digits| exp10.checked_add(digits - 1));
+            !coeff_is_zero
+                && coefficient_digits <= PORTABLE_MAX_PREC
+                && exp10 >= PORTABLE_MIN_ETINY
+                && adjusted_exponent.is_some_and(|adjusted| adjusted <= PORTABLE_MAX_EMAX)
+        }
+        Some(_) => coeff_is_zero && exp10 == 0,
+    }
+}
+
+fn render_python_bigint(value: &num_bigint::BigInt) -> String {
+    // CPython permits the decimal conversion ceiling to be configured as low
+    // as 640 digits. Power-of-two bases are exempt, so larger integers use an
+    // exact hexadecimal constructor instead of an invalid decimal literal.
+    const PORTABLE_DECIMAL_DIGITS: usize = 640;
+    let decimal = value.to_string();
+    if decimal.trim_start_matches('-').len() <= PORTABLE_DECIMAL_DIGITS {
+        decimal
+    } else {
+        let hex = value.to_str_radix(16);
+        match hex.strip_prefix('-') {
+            Some(magnitude) => format!("-0x{magnitude}"),
+            None => format!("0x{hex}"),
+        }
+    }
+}
+
+fn python_render_is_hashable(value: &OValue) -> bool {
+    match value {
+        OValue::List { .. }
+        | OValue::Map { .. }
+        | OValue::Object { .. }
+        | OValue::EntriesMap { .. }
+        | OValue::Set { .. }
+        | OValue::Blob { .. } => false,
+        OValue::Seq {
+            kind: SeqKind::Tuple,
+            items,
+        } => items.iter().all(python_render_is_hashable),
+        OValue::Seq { .. } => false,
+        _ => true,
+    }
+}
+
+fn render_nix_string(value: &str) -> String {
+    if value.contains('\0') {
+        // Nix strings cannot contain NUL. A tagged Unicode-scalar sequence is
+        // syntactically valid, reconstructible, and domain-separated from
+        // every ordinary string (including the old JSON-spelling fallback).
+        let codepoints = value
+            .chars()
+            .map(|ch| u32::from(ch).to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        return format!(
+            "{{ __ostadix_string_encoding = \"unicode-codepoints-v1\"; codepoints = [ {codepoints} ]; }}"
+        );
+    }
+
+    let mut rendered = String::with_capacity(value.len() + 2);
+    rendered.push('"');
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => rendered.push_str("\\\""),
+            '\\' => rendered.push_str("\\\\"),
+            '\n' => rendered.push_str("\\n"),
+            '\r' => rendered.push_str("\\r"),
+            '\t' => rendered.push_str("\\t"),
+            '$' if chars.peek() == Some(&'{') => rendered.push_str("\\$"),
+            _ => rendered.push(ch),
+        }
+    }
+    rendered.push('"');
+    rendered
+}
+
+fn render_nix_attr_name(value: &str) -> String {
+    debug_assert!(!value.contains('\0'));
+    render_nix_string(value)
+}
+
+fn render_nix_keyed_entries(entries: &[(&String, &OValue)]) -> String {
+    let items = entries
+        .iter()
+        .map(|(key, value)| {
+            format!(
+                "{{ key = {}; value = {}; }}",
+                render_nix_string(key),
+                render_nix(value)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("[ {items} ]")
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -459,24 +626,24 @@ fn render_nix(val: &OValue) -> String {
             }
         }
         OValue::Number { v } => render_nix_number(v),
-        OValue::Text { v } => serde_json::to_string(&v.utf8).unwrap_or_else(|_| "\"".to_string()),
-        OValue::Char { scalar } => {
-            serde_json::to_string(&scalar.to_string()).unwrap_or_else(|_| "\"".to_string())
-        }
-        OValue::Html { v } => serde_json::to_string(v).unwrap_or_else(|_| "\"".to_string()),
-        OValue::StorePath { path } => {
-            serde_json::to_string(path).unwrap_or_else(|_| "\"".to_string())
-        }
+        OValue::Text { v } => render_nix_string(&v.utf8),
+        OValue::Char { scalar } => render_nix_string(&scalar.to_string()),
+        OValue::Html { v } => render_nix_string(v),
+        OValue::StorePath { path } => render_nix_string(path),
         OValue::List { v } => {
             let items = v.iter().map(render_nix).collect::<Vec<_>>().join(" ");
             format!("[ {} ]", items)
         }
         OValue::Map { v } => {
-            let items = sorted_map_entries(v)
+            let entries = sorted_map_entries(v);
+            if entries.iter().any(|(key, _)| key.contains('\0')) {
+                return render_nix_keyed_entries(&entries);
+            }
+            let items = entries
                 .into_iter()
                 .map(|(k, val)| {
-                    let key = serde_json::to_string(k).unwrap_or_else(|_| "\"\"".to_string());
-                    format!("{} = {};", key, render_nix(val))
+                    let key = render_nix_attr_name(k);
+                    format!("{key} = {};", render_nix(val))
                 })
                 .collect::<Vec<_>>()
                 .join(" ");
@@ -487,11 +654,15 @@ fn render_nix(val: &OValue) -> String {
             format!("[ {} ]", items)
         }
         OValue::Object { fields } => {
-            let items = fields
+            let entries = fields.iter().collect::<Vec<_>>();
+            if entries.iter().any(|(key, _)| key.contains('\0')) {
+                return render_nix_keyed_entries(&entries);
+            }
+            let items = entries
                 .iter()
                 .map(|(k, val)| {
-                    let key = serde_json::to_string(k).unwrap_or_else(|_| "\"\"".to_string());
-                    format!("{} = {};", key, render_nix(val))
+                    let key = render_nix_attr_name(k);
+                    format!("{key} = {};", render_nix(val))
                 })
                 .collect::<Vec<_>>()
                 .join(" ");
@@ -511,73 +682,72 @@ fn render_nix(val: &OValue) -> String {
                 .join(" ");
             format!("[ {} ]", items)
         }
-        OValue::Symbol { .. } | OValue::Keyword { .. } => {
-            serde_json::to_string(&val.splice_repr()).unwrap_or_else(|_| "\"\"".to_string())
-        }
+        OValue::Symbol { .. } | OValue::Keyword { .. } => render_nix_string(&val.splice_repr()),
         OValue::Scope { bindings } => {
             format!("\"<scope bindings={}>\"", bindings.len())
         }
-        OValue::Blob { v, .. } => serde_json::to_string(v).unwrap_or_else(|_| "\"".to_string()),
+        OValue::Blob { v, .. } => render_nix_string(v),
         OValue::Bytes { .. } | OValue::Graph { .. } | OValue::Native { .. } => {
-            serde_json::to_string(&val.splice_repr()).unwrap_or_else(|_| "\"\"".to_string())
+            render_nix_string(&val.splice_repr())
         }
-        // An ONixExpr spliced into a Nix context is its already-assembled body —
-        // it is a valid Nix expression that can be parenthesised inline.
-        OValue::NixExpr { body, .. } => format!("({})", body),
+        // An ONixExpr spliced into a Nix context is its already-assembled body.
+        // Internal producers expect valid Nix; the public/deserialized carrier
+        // intentionally retains that backend parse obligation. Empty public
+        // bodies still fall back to an inert, syntactically valid string.
+        OValue::NixExpr { body, .. } if !body.trim().is_empty() => format!("({body})"),
+        OValue::NixExpr { body, .. } => render_nix_string(body),
         // A Derivation in a Nix context is its .drv path literal.
-        OValue::Derivation { drv_path, .. } => {
-            serde_json::to_string(drv_path).unwrap_or_else(|_| "\"".to_string())
-        }
-        // A Request rendered into Nix source is almost certainly a user error —
-        // the user spliced a control value into source text. We embed the
-        // splice marker; STEP3 can elevate this to a hard error or auto-resolve.
+        OValue::Derivation { drv_path, .. } => render_nix_string(drv_path),
+        // A Request rendered into Nix source is almost certainly a user error:
+        // the user spliced a control value into source text. Preserve that fact
+        // as an inert marker; STEP3 can elevate it or auto-resolve it earlier.
         OValue::Request { fingerprint, .. } => {
             // STEP-3.5: in a Nix context, an unforced Request is almost
-            // always a user error. We emit a string marker that nix eval
-            // will reject loudly. {lazy} Eval requests should have been
+            // always a user error. We emit an inert string marker. {lazy} Eval
+            // requests should have been
             // auto-forced before reaching here; {defer} should have errored;
             // Instantiate/Realise have no sensible Nix-context splice form.
-            format!("\"<request fp={}>\"", &fingerprint[..8])
+            render_nix_string(&format!(
+                "<request fp={}>",
+                fingerprint_preview(fingerprint)
+            ))
         }
-        // A Thunk in a Nix context renders as its body, parenthesised. Same
-        // treatment as NixExpr — if the lang matches Nix syntax, this is
-        // safe; otherwise the user composed two different languages and
-        // gets predictable Nix parse errors.
-        OValue::Thunk { body, .. } => format!("({})", body),
+        // A Thunk does not carry its source language (that lives on its
+        // wrapping Request), so an unforced cross-language thunk is preserved
+        // as inert source text rather than guessed to be a Nix expression.
+        OValue::Thunk { body, .. } => render_nix_string(body),
 
-        // A Group is a control/topology value with no Nix splice form — render
-        // a string marker that nix eval will reject loudly, same treatment as
-        // an unforced Request. Force the group with `now(...)` before splicing.
+        // A Group is a control/topology value with no Nix splice form. Render
+        // an inert marker, as for an unforced Request. Force the group with
+        // `now(...)` before splicing.
         OValue::Group {
             mode, fingerprint, ..
-        } => {
-            format!("\"<group:{} fp={}>\"", mode.name(), &fingerprint[..8])
-        }
+        } => render_nix_string(&format!(
+            "<group:{} fp={}>",
+            mode.name(),
+            fingerprint_preview(fingerprint)
+        )),
 
         // A System in a Nix context renders as its profile path as a string
         // literal. Useful for Nix expressions that want to inspect or compare
         // against the live profile location.
-        OValue::System { profile_path } => {
-            serde_json::to_string(profile_path).unwrap_or_else(|_| "\"\"".to_string())
-        }
+        OValue::System { profile_path } => render_nix_string(profile_path),
 
         OValue::Capability { kind, identity, .. } => {
-            serde_json::to_string(&format!("<capability:{} {}>", kind.name(), identity))
-                .unwrap_or_else(|_| "\"\"".to_string())
+            render_nix_string(&format!("<capability:{} {}>", kind.name(), identity))
         }
 
         OValue::Snapshot { kind, identity, .. } => {
-            serde_json::to_string(&format!("<snapshot:{} {}>", kind.name(), identity))
-                .unwrap_or_else(|_| "\"\"".to_string())
+            render_nix_string(&format!("<snapshot:{} {}>", kind.name(), identity))
         }
 
         // An Expr in Nix context renders its quoted source as a Nix string
         // literal. Rarely useful — the user almost always wants O.eval first.
-        OValue::Expr { src } => serde_json::to_string(src).unwrap_or_else(|_| "\"\"".to_string()),
+        OValue::Expr { src } => render_nix_string(src),
 
-        // An error outcome in a Nix context renders as a string marker that
-        // nix eval will reject loudly — errors should not reach Nix source.
-        OValue::Error { msg } => format!("\"<error: {}>\"", msg.replace('"', "\\\"")),
+        // Preserve an error outcome as an inert string marker; errors normally
+        // should not reach Nix source.
+        OValue::Error { msg } => render_nix_string(&format!("<error: {msg}>")),
     }
 }
 
@@ -673,12 +843,17 @@ fn render_python(val: &OValue) -> String {
             format!("[{}]", items)
         }
         OValue::Set { items, .. } => {
-            let items = items
+            let all_hashable = items.iter().all(python_render_is_hashable);
+            let rendered = items
                 .iter()
                 .map(render_python)
                 .collect::<Vec<_>>()
                 .join(", ");
-            format!("set([{}])", items)
+            if all_hashable {
+                format!("set([{rendered}])")
+            } else {
+                format!("[{rendered}]")
+            }
         }
         OValue::Symbol { .. } | OValue::Keyword { .. } => {
             serde_json::to_string(&val.splice_repr()).unwrap_or_else(|_| "''".to_string())
@@ -741,14 +916,23 @@ fn render_python_opaque(val: &OValue) -> String {
 
 fn render_nix_number(value: &ONumber) -> String {
     match value {
-        ONumber::Int { v } => v.to_string(),
+        ONumber::Int { v } if v.to_i64() == Some(i64::MIN) => {
+            "(-9223372036854775807 - 1)".to_string()
+        }
+        ONumber::Int { v } if v.to_i64().is_some() => v.to_string(),
+        ONumber::Int { v } => render_nix_string(&v.to_string()),
         ONumber::BinaryFloat {
             format: FloatFormat::F32,
             bits,
         } if bits.len() == 4 => {
             let mut raw = [0_u8; 4];
             raw.copy_from_slice(bits);
-            render_float_literal(f32::from_bits(u32::from_be_bytes(raw)) as f64)
+            let decoded = f32::from_bits(u32::from_be_bytes(raw)) as f64;
+            if decoded.is_finite() {
+                render_float_literal(decoded)
+            } else {
+                render_nix_string(&render_number_fallback(value))
+            }
         }
         ONumber::BinaryFloat {
             format: FloatFormat::F64,
@@ -756,10 +940,14 @@ fn render_nix_number(value: &ONumber) -> String {
         } if bits.len() == 8 => {
             let mut raw = [0_u8; 8];
             raw.copy_from_slice(bits);
-            render_float_literal(f64::from_bits(u64::from_be_bytes(raw)))
+            let decoded = f64::from_bits(u64::from_be_bytes(raw));
+            if decoded.is_finite() {
+                render_float_literal(decoded)
+            } else {
+                render_nix_string(&render_number_fallback(value))
+            }
         }
-        other => serde_json::to_string(&render_number_fallback(other))
-            .unwrap_or_else(|_| "\"\"".to_string()),
+        other => render_nix_string(&render_number_fallback(other)),
     }
 }
 
@@ -812,10 +1000,15 @@ fn render_float_literal(value: f64) -> String {
 
 fn render_python_number(value: &ONumber) -> String {
     match value {
-        ONumber::Int { v } => v.to_string(),
-        ONumber::Rational { num, den } => {
-            format!("__import__('fractions').Fraction({}, {})", num, den)
+        ONumber::Int { v } => render_python_bigint(v),
+        ONumber::Rational { num, den } if den != &num_bigint::BigInt::from(0) => {
+            format!(
+                "__import__('fractions').Fraction({}, {})",
+                render_python_bigint(num),
+                render_python_bigint(den)
+            )
         }
+        ONumber::Rational { .. } => py_string_literal(&render_number_fallback(value)),
         ONumber::Decimal {
             coeff,
             exp10,
@@ -829,10 +1022,14 @@ fn render_python_number(value: &ONumber) -> String {
                 Some(DecimalSpecial::NegZero) => "-0".to_string(),
                 None => format!("{coeff}e{exp10}"),
             };
-            format!(
-                "__import__('decimal').Decimal({})",
-                py_string_literal(&literal)
-            )
+            if special.is_none() && !python_decimal_round_trips_exactly(coeff, *exp10, *special) {
+                py_string_literal(&render_number_fallback(value))
+            } else {
+                format!(
+                    "__import__('decimal').Decimal({})",
+                    py_string_literal(&literal)
+                )
+            }
         }
         ONumber::BinaryFloat {
             format: FloatFormat::F32,
@@ -868,54 +1065,9 @@ fn render_python_number(value: &ONumber) -> String {
                 .join(", ");
             format!("__import__('struct').unpack('>d', bytes([{bytes}]))[0]")
         }
-        ONumber::BinaryFloat { format, bits } => {
-            let unpack = match format {
-                FloatFormat::F32 => ">f",
-                FloatFormat::F64 => ">d",
-            };
-            let bytes = bits
-                .iter()
-                .map(u8::to_string)
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("__import__('struct').unpack('{unpack}', bytes([{bytes}]))[0]")
-        }
-        ONumber::BigFloat {
-            mantissa,
-            exp2,
-            precision: _,
-            special,
-        } => {
-            if let Some(special) = special {
-                let literal = match special {
-                    FloatSpecial::Nan => "NaN",
-                    FloatSpecial::PosInf => "Infinity",
-                    FloatSpecial::NegInf => "-Infinity",
-                    FloatSpecial::PosZero => "0",
-                    FloatSpecial::NegZero => "-0",
-                };
-                return format!(
-                    "__import__('decimal').Decimal({})",
-                    py_string_literal(literal)
-                );
-            }
-
-            let mantissa_expr = format!(
-                "__import__('decimal').Decimal({})",
-                py_string_literal(&mantissa.to_string())
-            );
-            if *exp2 == 0 {
-                mantissa_expr
-            } else {
-                format!("({mantissa_expr} * (__import__('decimal').Decimal(2) ** {exp2}))")
-            }
-        }
-        ONumber::Complex { re, im } => {
-            format!(
-                "complex({}, {})",
-                render_python_number(re),
-                render_python_number(im)
-            )
+        ONumber::BinaryFloat { .. } => py_string_literal(&render_number_fallback(value)),
+        ONumber::BigFloat { .. } | ONumber::Complex { .. } => {
+            py_string_literal(&render_number_fallback(value))
         }
     }
 }
@@ -1049,7 +1201,7 @@ fn render_html(val: &OValue) -> String {
         OValue::Request { fingerprint, .. } => {
             format!(
                 "<code class=\"o-request\" data-fp=\"{}\">&lt;request&gt;</code>",
-                html_escape(&fingerprint[..8]),
+                html_escape(fingerprint_preview(fingerprint)),
             )
         }
         OValue::Thunk {
@@ -1057,7 +1209,7 @@ fn render_html(val: &OValue) -> String {
         } => {
             format!(
                 "<code class=\"o-thunk\" data-fp=\"{}\">{}</code>",
-                html_escape(&fingerprint[..8]),
+                html_escape(fingerprint_preview(fingerprint)),
                 html_escape(body),
             )
         }
@@ -1100,7 +1252,7 @@ fn render_html(val: &OValue) -> String {
             format!(
                 "<code class=\"o-group\" data-mode=\"{}\" data-fp=\"{}\">&lt;group n={}&gt;</code>",
                 html_escape(mode.name()),
-                html_escape(&fingerprint[..8]),
+                html_escape(fingerprint_preview(fingerprint)),
                 members.len(),
             )
         }
@@ -1220,7 +1372,10 @@ fn render_latex(val: &OValue) -> String {
             format!("\\texttt{{{}}}", drv_path.replace("_", "\\_"))
         }
         OValue::Request { fingerprint, .. } => {
-            format!("\\texttt{{<request fp={}>}}", &fingerprint[..8])
+            format!(
+                "\\texttt{{<request fp={}>}}",
+                fingerprint_preview(fingerprint)
+            )
         }
         OValue::Thunk { body, .. } => {
             format!("\\texttt{{{}}}", body.replace("_", "\\_"))
@@ -1251,7 +1406,7 @@ fn render_latex(val: &OValue) -> String {
                 "\\texttt{{<group:{} n={} fp={}>}}",
                 mode.name(),
                 members.len(),
-                &fingerprint[..8]
+                fingerprint_preview(fingerprint)
             )
         }
         OValue::Expr { src } => {
@@ -1304,7 +1459,7 @@ fn render_markdown(val: &OValue) -> String {
         OValue::NixExpr { body, .. } => format!("`{}`", body),
         OValue::Derivation { drv_path, .. } => format!("`{}`", drv_path),
         OValue::Request { fingerprint, .. } => {
-            format!("`<request fp={}>`", &fingerprint[..8])
+            format!("`<request fp={}>`", fingerprint_preview(fingerprint))
         }
         OValue::Thunk { body, .. } => {
             format!("`{}`", body)
@@ -1327,7 +1482,7 @@ fn render_markdown(val: &OValue) -> String {
                 "`<group:{} n={} fp={}>`",
                 mode.name(),
                 members.len(),
-                &fingerprint[..8]
+                fingerprint_preview(fingerprint)
             )
         }
         OValue::Expr { src } => {
@@ -1343,7 +1498,36 @@ fn render_markdown(val: &OValue) -> String {
 mod tests {
     use std::any::TypeId;
 
-    use super::{ExecutionTrace, RenderFidelity, TraceEvent};
+    use super::{weaker_for_container, ExecutionTrace, RenderFidelity, TraceEvent};
+
+    #[test]
+    fn renderer_local_container_combiner_obeys_semilattice_laws() {
+        let renderer_local_domains: [&[RenderFidelity]; 4] = [
+            &[RenderFidelity::Typed, RenderFidelity::Structural],
+            &[
+                RenderFidelity::Typed,
+                RenderFidelity::Structural,
+                RenderFidelity::Opaque,
+            ],
+            &[RenderFidelity::Presentation, RenderFidelity::Opaque],
+            &[RenderFidelity::Structural, RenderFidelity::Opaque],
+        ];
+
+        for domain in renderer_local_domains {
+            for &a in domain {
+                assert_eq!(weaker_for_container(a, a), a);
+                for &b in domain {
+                    assert_eq!(weaker_for_container(a, b), weaker_for_container(b, a),);
+                    for &c in domain {
+                        assert_eq!(
+                            weaker_for_container(weaker_for_container(a, b), c),
+                            weaker_for_container(a, weaker_for_container(b, c)),
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn eval_compatibility_exports_are_the_canonical_core_types() {

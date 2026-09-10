@@ -1,0 +1,448 @@
+{
+  "schema": "ostadix.operation-planning-request/v1",
+  "graph": {
+    "schema": "ostadix.logical-hgraph/v2",
+    "operations": [
+      {
+        "id": 0,
+        "interface": "d81b9bc158e63385c9045074a50411cc3aebe4db3250c4ca0460534c4c361775",
+        "contract": "a175bcff4cfcf96065431279db0e77b8c2480e1a896f82149fe5831963ac8180",
+        "realization_set": "a8f9e18ef52033f8f1a25aa7406dacf26851c07b872660ca9d7e01567b36d960",
+        "input_geometry": {
+          "schema": "ostadix.example/five-element-json-array/v1",
+          "content": "93daf56ee124201cab063daf8df13d7e56492397c42a8a2640ca53d456db6d44"
+        }
+      }
+    ],
+    "edges": [],
+    "roots": [
+      0
+    ]
+  },
+  "contract": {
+    "schema": "ostadix.operation-contract/v1",
+    "operation": "tensor/normalize",
+    "semantic_version": 1,
+    "preconditions": {
+      "schema": "ostadix.example/finite-nonempty-positive-maximum-precondition/v1",
+      "content": "7f4a2ae076eec7a9bd826f13db3019c05b4753ea618f7c6a2a7e116d65e52d00"
+    },
+    "postconditions": {
+      "schema": "ostadix.example/divide-each-value-by-maximum-postcondition/v1",
+      "content": "8e9b0945d27fa26c33d540d53d9b00de25376497809e5ff4b9c4b33b190bddbc"
+    },
+    "state_model": {
+      "schema": "ostadix.example/stateless-model/v1",
+      "content": "784ee233fae4e2fea85079641a9cf27566e3fb4b2e2256e03dbc4ea033551684"
+    },
+    "effect_model": {
+      "schema": "ostadix.example/pure-effect-model/v1",
+      "content": "a92fc9d49e0b7c2be16e11582773109bd7c991e2f5f071b33f6a6788c4488cd7"
+    },
+    "ordering": {
+      "schema": "ostadix.example/input-order-preserved/v1",
+      "content": "f33651901b3b8efbd7e7e1dd34bcf52ae21a698562c094bbb0f6fa43bb0f1fec"
+    },
+    "determinism": {
+      "schema": "ostadix.example/deterministic-python-f64/v1",
+      "content": "9525f7d7a332ace6fdfd93be34d6054dd1cf778cf90464fe24f0a73cb6032221"
+    },
+    "required_fidelity": {
+      "schema": "ostadix.example/exact-json-f64-normalization/v1",
+      "content": "e6fc3f7bca348fde052cc86818d7da1f53c2146b1afc913ea33db99d3a281825"
+    }
+  },
+  "interface": {
+    "schema": "ostadix.operation-interface/v1",
+    "operation": "tensor/normalize",
+    "semantic_version": 1,
+    "contract": "a175bcff4cfcf96065431279db0e77b8c2480e1a896f82149fe5831963ac8180",
+    "shape_parameters": [],
+    "inputs": [
+      {
+        "name": "input",
+        "value_type": {
+          "schema": "ostadix.example/json-array-f64/v1",
+          "content": "6fb58a14ebb3a9607dc1026ca77d0b160d3d359a11805c035524fdcfe3bf01b7"
+        }
+      }
+    ],
+    "outputs": [
+      {
+        "name": "output",
+        "value_type": {
+          "schema": "ostadix.example/json-array-f64/v1",
+          "content": "6fb58a14ebb3a9607dc1026ca77d0b160d3d359a11805c035524fdcfe3bf01b7"
+        }
+      }
+    ]
+  },
+  "descriptors": [
+    {
+      "schema": "ostadix.realization-descriptor/v1",
+      "realization": "normalize/python-scalar/v1",
+      "interface": "d81b9bc158e63385c9045074a50411cc3aebe4db3250c4ca0460534c4c361775",
+      "contract": "a175bcff4cfcf96065431279db0e77b8c2480e1a896f82149fe5831963ac8180",
+      "implementation": "4e1d08cda1fda01e96f0670192de89ddb429148343d0757adb7bec4cd257a921",
+      "execution_pipeline": {
+        "schema": "ostadix.project-route-pipeline/v1",
+        "content": "9353e9041d7da17f044c46cde7030a923a7cfa50dff02a6b11c9d28fde1ef82e"
+      },
+      "input_representations": [
+        {
+          "port": "input",
+          "representations": [
+            {
+              "schema": "ostadix.physical-representation/v1",
+              "content": "d614322aefc7749d12eaef756200e1f257c9fc521e38000c6f11438bddfff399"
+            }
+          ]
+        }
+      ],
+      "output_representations": [
+        {
+          "port": "output",
+          "representations": [
+            {
+              "schema": "ostadix.physical-representation/v1",
+              "content": "d614322aefc7749d12eaef756200e1f257c9fc521e38000c6f11438bddfff399"
+            }
+          ]
+        }
+      ],
+      "target_requirements": {
+        "schema": "ostadix.placement.requirement-footprint/v1",
+        "content": "257972165701c606cf4dae3a592909d3d82958c19d2db8c0c7c74d8deefe91e6"
+      },
+      "state_requirements": {
+        "schema": "ostadix.example/no-retained-state-requirement/v1",
+        "content": "aec320ca534258dfdf32ac6835bc8d02f495540336d5c7d81757443457d3fe5d"
+      },
+      "actor_requirements": {
+        "schema": "ostadix.example/no-actor-affinity-requirement/v1",
+        "content": "f393f930d83ecab51bab9e597cf61f610ff688ef532bea29ce796a6e199da26c"
+      },
+      "supplied_fidelity": {
+        "schema": "ostadix.example/exact-json-f64-normalization/v1",
+        "content": "e6fc3f7bca348fde052cc86818d7da1f53c2146b1afc913ea33db99d3a281825"
+      },
+      "cost_model": null,
+      "validation_evidence": [
+        {
+          "schema": "ostadix.example/normalize/python-scalar/v1-example-validation/v1",
+          "content": "1666aea41f602cca1e486a1aa4913d93ff9a0f9f8f5dcf5051b3c06272f73558"
+        }
+      ]
+    },
+    {
+      "schema": "ostadix.realization-descriptor/v1",
+      "realization": "normalize/python-chunked/v1",
+      "interface": "d81b9bc158e63385c9045074a50411cc3aebe4db3250c4ca0460534c4c361775",
+      "contract": "a175bcff4cfcf96065431279db0e77b8c2480e1a896f82149fe5831963ac8180",
+      "implementation": "bade3624a13c04010d0055e31d40d1afec6845304c54718657e18e11933aa1fa",
+      "execution_pipeline": {
+        "schema": "ostadix.project-route-pipeline/v1",
+        "content": "d95539cb9a903e2ee8a67dc00ee4fcb341af544fe783acf73cea04dee1ac5a8d"
+      },
+      "input_representations": [
+        {
+          "port": "input",
+          "representations": [
+            {
+              "schema": "ostadix.physical-representation/v1",
+              "content": "d614322aefc7749d12eaef756200e1f257c9fc521e38000c6f11438bddfff399"
+            }
+          ]
+        }
+      ],
+      "output_representations": [
+        {
+          "port": "output",
+          "representations": [
+            {
+              "schema": "ostadix.physical-representation/v1",
+              "content": "d614322aefc7749d12eaef756200e1f257c9fc521e38000c6f11438bddfff399"
+            }
+          ]
+        }
+      ],
+      "target_requirements": {
+        "schema": "ostadix.placement.requirement-footprint/v1",
+        "content": "257972165701c606cf4dae3a592909d3d82958c19d2db8c0c7c74d8deefe91e6"
+      },
+      "state_requirements": {
+        "schema": "ostadix.example/no-retained-state-requirement/v1",
+        "content": "aec320ca534258dfdf32ac6835bc8d02f495540336d5c7d81757443457d3fe5d"
+      },
+      "actor_requirements": {
+        "schema": "ostadix.example/no-actor-affinity-requirement/v1",
+        "content": "f393f930d83ecab51bab9e597cf61f610ff688ef532bea29ce796a6e199da26c"
+      },
+      "supplied_fidelity": {
+        "schema": "ostadix.example/exact-json-f64-normalization/v1",
+        "content": "e6fc3f7bca348fde052cc86818d7da1f53c2146b1afc913ea33db99d3a281825"
+      },
+      "cost_model": null,
+      "validation_evidence": [
+        {
+          "schema": "ostadix.example/normalize/python-chunked/v1-example-validation/v1",
+          "content": "d916ea08ed7cb01cc492208fbcc121096da6e3bc46fa11a5ee7e143fade0e357"
+        }
+      ]
+    }
+  ],
+  "realization_set": {
+    "schema": "ostadix.realization-set/v1",
+    "interface": "d81b9bc158e63385c9045074a50411cc3aebe4db3250c4ca0460534c4c361775",
+    "contract": "a175bcff4cfcf96065431279db0e77b8c2480e1a896f82149fe5831963ac8180",
+    "realizations": [
+      "35b5aab91c82acacb5a6afa6c98075b3f8e57edde6cd86374d2543e190d237a7",
+      "70793496c4d48f03e2678cb1eaada83fafff2d79b3f175a32b83558622e73ffb"
+    ]
+  },
+  "objective": {
+    "schema": "ostadix.objective/v1",
+    "kind": "minimize_predicted_total_nanoseconds",
+    "ruleset": {
+      "schema": "ostadix.example/declared-cost-minimum-objective/v1",
+      "content": "bef65a9b708f1fa11a90b5af9d426d766aed72bab136b062f0a2ccdd41633cf8"
+    },
+    "maximum_total_ns": null,
+    "tie_break": "canonical_candidate_tuple"
+  },
+  "offers": [
+    {
+      "logical_operation": 0,
+      "descriptor": "35b5aab91c82acacb5a6afa6c98075b3f8e57edde6cd86374d2543e190d237a7",
+      "target": {
+        "node_id": "ambient-python-fallback",
+        "display_name": "Ambient Python Fallback",
+        "node_generation": 1,
+        "capability_model": "downward-closed-ideal",
+        "platform": {
+          "operating_system": "posix",
+          "architecture": "portable",
+          "abi": "python3",
+          "endianness": "little",
+          "pointer_width": 64
+        },
+        "capabilities": [],
+        "raw_cpu_features": [],
+        "backend_implementations": []
+      },
+      "target_requirements": {
+        "state": "complete",
+        "atoms": []
+      },
+      "inputs": [
+        {
+          "port": "input",
+          "representation": {
+            "schema": "ostadix.physical-representation/v1",
+            "name": "json-f64-vector",
+            "value_type": {
+              "schema": "ostadix.example/json-array-f64/v1",
+              "content": "6fb58a14ebb3a9607dc1026ca77d0b160d3d359a11805c035524fdcfe3bf01b7"
+            },
+            "format": {
+              "schema": "ostadix.example/json-f64-vector-format/v1",
+              "content": "ec8dc92199d85fc25cf11f17fce89b98789ab44b503a5d9c2a598995c575e7eb"
+            },
+            "storage": "portable_value",
+            "ownership": "owned",
+            "mutable": false
+          },
+          "residency": {
+            "kind": "portable"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "port": "output",
+          "representation": {
+            "schema": "ostadix.physical-representation/v1",
+            "name": "json-f64-vector",
+            "value_type": {
+              "schema": "ostadix.example/json-array-f64/v1",
+              "content": "6fb58a14ebb3a9607dc1026ca77d0b160d3d359a11805c035524fdcfe3bf01b7"
+            },
+            "format": {
+              "schema": "ostadix.example/json-f64-vector-format/v1",
+              "content": "ec8dc92199d85fc25cf11f17fce89b98789ab44b503a5d9c2a598995c575e7eb"
+            },
+            "storage": "portable_value",
+            "ownership": "owned",
+            "mutable": false
+          },
+          "residency": {
+            "kind": "portable"
+          }
+        }
+      ],
+      "cost_profile": {
+        "schema": "ostadix.cost-profile/v1",
+        "descriptor": "35b5aab91c82acacb5a6afa6c98075b3f8e57edde6cd86374d2543e190d237a7",
+        "realization": "normalize/python-scalar/v1",
+        "interface": "d81b9bc158e63385c9045074a50411cc3aebe4db3250c4ca0460534c4c361775",
+        "contract": "a175bcff4cfcf96065431279db0e77b8c2480e1a896f82149fe5831963ac8180",
+        "target": "89ca2e344336767a0e0e28700f43157e70048989d10cb31919a4daafa9a2bc05",
+        "input_geometry": {
+          "schema": "ostadix.example/five-element-json-array/v1",
+          "content": "93daf56ee124201cab063daf8df13d7e56492397c42a8a2640ca53d456db6d44"
+        },
+        "inputs": [
+          {
+            "port": "input",
+            "representation": "2f1d003e9e683fd6f351cb87331257a56d066c814ac33fff83849472ec104cb4",
+            "residency": {
+              "kind": "portable"
+            }
+          }
+        ],
+        "outputs": [
+          {
+            "port": "output",
+            "representation": "2f1d003e9e683fd6f351cb87331257a56d066c814ac33fff83849472ec104cb4",
+            "residency": {
+              "kind": "portable"
+            }
+          }
+        ],
+        "components": {
+          "compute_ns": 200000,
+          "startup_ns": 20000,
+          "conversion_ns": 0,
+          "transfer_ns": 0,
+          "queue_ns": 0,
+          "checkpoint_ns": 0
+        },
+        "uncertainty_ns": 5000,
+        "sample_count": 1,
+        "evidence": [
+          {
+            "schema": "ostadix.example/illustrative-declared-cost-not-benchmark-evidence/v1",
+            "content": "75308654f2cca041cfb1fc07d9a5ba1e3a09dc693458ddf1d2823bfb5bdb9188"
+          }
+        ]
+      }
+    },
+    {
+      "logical_operation": 0,
+      "descriptor": "70793496c4d48f03e2678cb1eaada83fafff2d79b3f175a32b83558622e73ffb",
+      "target": {
+        "node_id": "ambient-python-primary",
+        "display_name": "Ambient Python Primary",
+        "node_generation": 1,
+        "capability_model": "downward-closed-ideal",
+        "platform": {
+          "operating_system": "posix",
+          "architecture": "portable",
+          "abi": "python3",
+          "endianness": "little",
+          "pointer_width": 64
+        },
+        "capabilities": [],
+        "raw_cpu_features": [],
+        "backend_implementations": []
+      },
+      "target_requirements": {
+        "state": "complete",
+        "atoms": []
+      },
+      "inputs": [
+        {
+          "port": "input",
+          "representation": {
+            "schema": "ostadix.physical-representation/v1",
+            "name": "json-f64-vector",
+            "value_type": {
+              "schema": "ostadix.example/json-array-f64/v1",
+              "content": "6fb58a14ebb3a9607dc1026ca77d0b160d3d359a11805c035524fdcfe3bf01b7"
+            },
+            "format": {
+              "schema": "ostadix.example/json-f64-vector-format/v1",
+              "content": "ec8dc92199d85fc25cf11f17fce89b98789ab44b503a5d9c2a598995c575e7eb"
+            },
+            "storage": "portable_value",
+            "ownership": "owned",
+            "mutable": false
+          },
+          "residency": {
+            "kind": "portable"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "port": "output",
+          "representation": {
+            "schema": "ostadix.physical-representation/v1",
+            "name": "json-f64-vector",
+            "value_type": {
+              "schema": "ostadix.example/json-array-f64/v1",
+              "content": "6fb58a14ebb3a9607dc1026ca77d0b160d3d359a11805c035524fdcfe3bf01b7"
+            },
+            "format": {
+              "schema": "ostadix.example/json-f64-vector-format/v1",
+              "content": "ec8dc92199d85fc25cf11f17fce89b98789ab44b503a5d9c2a598995c575e7eb"
+            },
+            "storage": "portable_value",
+            "ownership": "owned",
+            "mutable": false
+          },
+          "residency": {
+            "kind": "portable"
+          }
+        }
+      ],
+      "cost_profile": {
+        "schema": "ostadix.cost-profile/v1",
+        "descriptor": "70793496c4d48f03e2678cb1eaada83fafff2d79b3f175a32b83558622e73ffb",
+        "realization": "normalize/python-chunked/v1",
+        "interface": "d81b9bc158e63385c9045074a50411cc3aebe4db3250c4ca0460534c4c361775",
+        "contract": "a175bcff4cfcf96065431279db0e77b8c2480e1a896f82149fe5831963ac8180",
+        "target": "742beeb198868664078a9cf8e17a4f84574166f4702e6c05003d3603c82338f4",
+        "input_geometry": {
+          "schema": "ostadix.example/five-element-json-array/v1",
+          "content": "93daf56ee124201cab063daf8df13d7e56492397c42a8a2640ca53d456db6d44"
+        },
+        "inputs": [
+          {
+            "port": "input",
+            "representation": "2f1d003e9e683fd6f351cb87331257a56d066c814ac33fff83849472ec104cb4",
+            "residency": {
+              "kind": "portable"
+            }
+          }
+        ],
+        "outputs": [
+          {
+            "port": "output",
+            "representation": "2f1d003e9e683fd6f351cb87331257a56d066c814ac33fff83849472ec104cb4",
+            "residency": {
+              "kind": "portable"
+            }
+          }
+        ],
+        "components": {
+          "compute_ns": 100000,
+          "startup_ns": 20000,
+          "conversion_ns": 0,
+          "transfer_ns": 0,
+          "queue_ns": 0,
+          "checkpoint_ns": 0
+        },
+        "uncertainty_ns": 5000,
+        "sample_count": 1,
+        "evidence": [
+          {
+            "schema": "ostadix.example/illustrative-declared-cost-not-benchmark-evidence/v1",
+            "content": "75308654f2cca041cfb1fc07d9a5ba1e3a09dc693458ddf1d2823bfb5bdb9188"
+          }
+        ]
+      }
+    }
+  ],
+  "transfer_plans": []
+}

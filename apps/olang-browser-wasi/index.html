@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Olang browser WASI payload</title>
+    <style>
+      :root { color-scheme: dark; font-family: "Fira Code", ui-monospace, monospace; }
+      body { max-width: 72rem; margin: 3rem auto; padding: 0 1.25rem; background: #11111b; color: #cdd6f4; }
+      button { padding: .65rem 1rem; background: #cba6f7; color: #11111b; border: 0; border-radius: .4rem; font: inherit; }
+      pre { min-height: 10rem; padding: 1rem; white-space: pre-wrap; background: #181825; border: 1px solid #45475a; }
+    </style>
+  </head>
+  <body>
+    <h1>Olang browser WASI payload</h1>
+    <p>This bundle runs browser-compatible O locally and rejects undeclared hosted effects.</p>
+    <button id="run" type="button">Run program</button>
+    <pre id="output" aria-live="polite">Ready.</pre>
+    <script type="module" src="./browser-main.mjs"></script>
+  </body>
+</html>

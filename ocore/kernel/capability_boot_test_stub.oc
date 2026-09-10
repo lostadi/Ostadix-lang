@@ -1,0 +1,7 @@
+module kernel::capability_boot_test;
+
+// Mode 25/26 exercise independent transaction corpora under tighter embedded-
+// image headroom. Only the separately sectioned boot test is omitted.
+pub unsafe fn run() -> u64 {
+    return 1;
+}

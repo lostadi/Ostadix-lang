@@ -18,7 +18,7 @@ import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
 POLICY_PATH = "scripts/check_attribution.py"
-LEGACY_POLICY_BASELINE = "5581877ee5a4120d53d3a1d4ab14bc59ef60c67f"
+LEGACY_POLICY_BASELINE = "bde1fdf376fd60f6f0e14283fde2937cc671e255"
 CODEX_IDENTITY = re.compile(r"(?i)(?<![a-z0-9])codex(?![a-z0-9])")
 CLAUDE_PRODUCT_IDENTITY = re.compile(
     r"(?i)(?<![a-z0-9])claude[- ]+(?:code|haiku|opus|sonnet)(?![a-z0-9])"

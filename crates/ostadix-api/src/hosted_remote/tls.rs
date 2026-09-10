@@ -793,6 +793,19 @@ fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
         .context("private-key PEM contains no supported private key")
 }
 
+fn load_roots(path: &Path) -> Result<RootCertStore> {
+    let mut roots = RootCertStore::empty();
+    for certificate in load_certificates(path)? {
+        roots
+            .add(certificate)
+            .context("CA PEM contains a certificate unusable as a trust anchor")?;
+    }
+    if roots.is_empty() {
+        bail!("CA PEM contains no usable trust anchors");
+    }
+    Ok(roots)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -958,17 +971,4 @@ mod tests {
             .to_string()
             .contains("no peer leaf certificate"));
     }
-}
-
-fn load_roots(path: &Path) -> Result<RootCertStore> {
-    let mut roots = RootCertStore::empty();
-    for certificate in load_certificates(path)? {
-        roots
-            .add(certificate)
-            .context("CA PEM contains a certificate unusable as a trust anchor")?;
-    }
-    if roots.is_empty() {
-        bail!("CA PEM contains no usable trust anchors");
-    }
-    Ok(roots)
 }

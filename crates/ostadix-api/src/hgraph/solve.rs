@@ -66,6 +66,12 @@ impl fmt::Display for BudgetDiagnostics {
 #[derive(Debug, Error, PartialEq)]
 #[non_exhaustive]
 pub enum SolveError {
+    #[error("value node {node:?} has invalid fidelity bounds: {reason}")]
+    InvalidFidelityAssessment { node: NodeId, reason: String },
+    #[error(
+        "value node {node:?} has a legacy fidelity projection inconsistent with its V2 assessment"
+    )]
+    InconsistentFidelityProjection { node: NodeId },
     #[error(
         "DataFlow edge {edge:?} must have exactly one ordinary Value input and at least one ordinary Value output (found {value_inputs} input(s), {value_outputs} output(s), and {non_value_ports} missing or non-Value port(s))"
     )]
@@ -98,7 +104,24 @@ pub enum SolveError {
     BudgetExhausted(Box<BudgetDiagnostics>),
 }
 
-const GENERATED_FIDELITY_KINDS: usize = 5;
+/// The solver's closed vocabulary of synthesized losses. Both synthesis and
+/// the convergence bound use this table; adding a loss must extend it.
+macro_rules! generated_losses {
+    ($($kind:ident),+ $(,)?) => {
+        #[derive(Clone, Copy)]
+        enum GeneratedLoss { $($kind),+ }
+
+        const GENERATED_LOSSES: &[AnnotationKind] = &[$(AnnotationKind::$kind),+];
+
+        impl GeneratedLoss {
+            fn annotation(self) -> AnnotationKind {
+                match self { $(Self::$kind => AnnotationKind::$kind),+ }
+            }
+        }
+    };
+}
+
+generated_losses! { Identity, Capability, NumericPrecision, NumericExactness, TypeTag }
 const MAX_SOLVE_PASSES: usize = 1_000_000;
 const RECENT_CHANGED_EDGE_LIMIT: usize = 16;
 
@@ -136,6 +159,7 @@ fn solve_types_with_limits(
     derived_pass_bound: usize,
     applied_pass_limit: usize,
 ) -> Result<(), SolveError> {
+    validate_fidelity_assessments(graph)?;
     validate_dataflow_constraints(graph)?;
     hydrate_fidelity_assessments(graph);
     let mut trace = SolveTrace::default();
@@ -162,6 +186,29 @@ fn solve_types_with_limits(
             }
             if !changed {
                 break;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_fidelity_assessments(graph: &HGraph) -> Result<(), SolveError> {
+    for (node, value) in &graph.nodes {
+        if let Some(assessment) = &value.fidelity_assessment {
+            assessment
+                .validate()
+                .map_err(|error| SolveError::InvalidFidelityAssessment {
+                    node: *node,
+                    reason: error.to_string(),
+                })?;
+            let projected = assessment.try_possible_fidelity().map_err(|error| {
+                SolveError::InvalidFidelityAssessment {
+                    node: *node,
+                    reason: error.to_string(),
+                }
+            })?;
+            if value.fidelity.as_ref() != Some(&projected) {
+                return Err(SolveError::InconsistentFidelityProjection { node: *node });
             }
         }
     }
@@ -298,7 +345,7 @@ fn derived_iteration_budget(graph: &HGraph) -> usize {
     // None -> a concrete fidelity, each distinct structural loss, then the
     // NativeCapsule and Unsupported top states.
     let fidelity_height = existing_fidelity_kinds
-        .saturating_add(GENERATED_FIDELITY_KINDS)
+        .saturating_add(GENERATED_LOSSES.len())
         .saturating_add(3);
     let per_node_height = domain_height
         .saturating_add(rep_height)
@@ -888,8 +935,8 @@ pub(super) fn fidelity_for_value_with_capabilities(
     match value {
         OValue::Native { .. } => Fidelity::NativeCapsule,
         OValue::Number { v } => fidelity_for_number(v, capabilities),
-        OValue::Graph { .. } => Fidelity::structural([AnnotationKind::Identity]),
-        OValue::Capability { .. } => Fidelity::structural([AnnotationKind::Capability]),
+        OValue::Graph { .. } => Fidelity::structural([GeneratedLoss::Identity.annotation()]),
+        OValue::Capability { .. } => Fidelity::structural([GeneratedLoss::Capability.annotation()]),
         _ => Fidelity::Lossless,
     }
 }
@@ -900,7 +947,7 @@ fn fidelity_for_number(number: &ONumber, capabilities: &BackendValueCapabilities
     if let ONumber::Int { v } = number {
         match integer_exceeds_capability(v, &capabilities.integer_exactness) {
             Some(true) => {
-                lost.insert(AnnotationKind::NumericPrecision);
+                lost.insert(GeneratedLoss::NumericPrecision.annotation());
             }
             Some(false) => {}
             None => return Fidelity::Unsupported,
@@ -910,8 +957,8 @@ fn fidelity_for_number(number: &ONumber, capabilities: &BackendValueCapabilities
     match capabilities.rich_numbers {
         RichNumberPreservation::Preserved => {}
         RichNumberPreservation::Collapsed => {
-            lost.insert(AnnotationKind::NumericExactness);
-            lost.insert(AnnotationKind::TypeTag);
+            lost.insert(GeneratedLoss::NumericExactness.annotation());
+            lost.insert(GeneratedLoss::TypeTag.annotation());
         }
         RichNumberPreservation::Unknown => return Fidelity::Unsupported,
     }
@@ -982,7 +1029,7 @@ pub(super) fn fidelity_for_abstract(
         let mut lost = BTreeSet::new();
         match abstract_integer_exceeds_capability(numeric_rep, &capabilities.integer_exactness) {
             Some(true) => {
-                lost.insert(AnnotationKind::NumericPrecision);
+                lost.insert(GeneratedLoss::NumericPrecision.annotation());
             }
             Some(false) => {}
             None => return Fidelity::Unsupported,
@@ -990,8 +1037,8 @@ pub(super) fn fidelity_for_abstract(
         match capabilities.rich_numbers {
             RichNumberPreservation::Preserved => {}
             RichNumberPreservation::Collapsed => {
-                lost.insert(AnnotationKind::NumericExactness);
-                lost.insert(AnnotationKind::TypeTag);
+                lost.insert(GeneratedLoss::NumericExactness.annotation());
+                lost.insert(GeneratedLoss::TypeTag.annotation());
             }
             RichNumberPreservation::Unknown => return Fidelity::Unsupported,
         }

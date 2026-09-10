@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Bounded ProjectExec-A/ProjectExec-B smoke: Explicit/Default plus serial ordered
-# Fallback/AnySuccess selection. This does not establish parallel
-# race/cancellation, retry, placement, Governor authority, OWRECEIPT
-# attestation, exactly-once effects, native execution, or G1 passage.
+# Bounded hosted Project HGraph smoke: ordered and parallel policies, drained
+# race cancellation, validated selection, trace replay, and execution contracts.
+# This does not establish Governor authority, native execution, or G1 passage.
+# Retry, placement, OWRECEIPT attestation, and exactly-once effects remain outside
+# this hosted test corpus.
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT"

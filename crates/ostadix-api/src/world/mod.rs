@@ -55,11 +55,11 @@ pub use receipt::{
 };
 pub use receipt_codec::{
     decode_signed_receipt_v1, encode_signed_receipt_v1, inspect_signed_receipt_v1,
-    project_receipt_semantic_sha256_v1, receipt_signing_preimage_v1, receipt_v1_sha256,
-    verify_signed_receipt_v1, Ed25519ReceiptSigner, ReceiptKeyResolver, SignedExecutionReceiptV1,
-    VerifiedExecutionReceiptV1, ED25519_SIGNATURE_ALGORITHM_V1, MAX_WORLD_RECEIPT_BYTES,
-    PROJECT_RECEIPT_SEMANTIC_DOMAIN_V1, WORLD_RECEIPT_HEADER_BYTES, WORLD_RECEIPT_MAGIC,
-    WORLD_RECEIPT_SCHEMA_V1,
+    inspect_unsigned_receipt_v1, project_receipt_semantic_sha256_v1, receipt_signing_preimage_v1,
+    receipt_v1_sha256, verify_signed_receipt_v1, Ed25519ReceiptSigner, ReceiptKeyResolver,
+    SignedExecutionReceiptV1, VerifiedExecutionReceiptV1, ED25519_SIGNATURE_ALGORITHM_V1,
+    MAX_WORLD_RECEIPT_BYTES, PROJECT_RECEIPT_SEMANTIC_DOMAIN_V1, WORLD_RECEIPT_HEADER_BYTES,
+    WORLD_RECEIPT_MAGIC, WORLD_RECEIPT_SCHEMA_V1,
 };
 pub use value::{
     AdmittedExtension, ExtensionEnvelope, HostedValueError, PortableCodeRef, PortableError,

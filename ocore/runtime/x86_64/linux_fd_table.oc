@@ -294,6 +294,35 @@ pub unsafe fn lookup_write_object(
     return 0;
 }
 
+// Transactional callers use this read-only lookup during preparation and
+// publish the matching accounting only after their outer linearization point.
+pub unsafe fn prepare_write_object(
+    owner_process: u64,
+    service_process: u64,
+    service_generation: u64,
+    linux_fd: u64
+) -> u64 {
+    if !preflight()
+        || owner_process == 0
+        || service_process == 0
+        || service_generation == 0
+        || !supported_fd(linux_fd) {
+        return 0;
+    }
+    let mut slot: usize = 0;
+    while slot < MAX_LINUX_FD_OBJECTS {
+        if STATES[slot] == FD_LIVE
+            && OWNER_PROCESSES[slot] == owner_process
+            && SERVICE_PROCESSES[slot] == service_process
+            && SERVICE_GENERATIONS[slot] == service_generation
+            && LINUX_FDS[slot] as u64 == linux_fd {
+            return finish(make_handle(slot));
+        }
+        slot += 1;
+    }
+    return 0;
+}
+
 pub unsafe fn authorize_write(
     object: u64,
     owner_process: u64,
@@ -321,6 +350,67 @@ pub unsafe fn authorize_write(
     }
     USES += 1;
     return finish(SINKS[slot] as u64);
+}
+
+// Read-only authorization half for a composed prepare/publish/commit path.
+pub unsafe fn prepare_authorize_write(
+    object: u64,
+    owner_process: u64,
+    service_process: u64,
+    service_generation: u64,
+    linux_fd: u64
+) -> u64 {
+    if !preflight() || !supported_fd(linux_fd) {
+        return 0;
+    }
+    let slot: usize = checked_live(object);
+    if slot >= MAX_LINUX_FD_OBJECTS
+        || OWNER_PROCESSES[slot] != owner_process
+        || SERVICE_PROCESSES[slot] != service_process
+        || SERVICE_GENERATIONS[slot] != service_generation
+        || LINUX_FDS[slot] as u64 != linux_fd
+        || SINKS[slot] as u64 != sink_for_fd(linux_fd) {
+        return 0;
+    }
+    return finish(SINKS[slot] as u64);
+}
+
+// Successful lookup/authorization is preparatory. The Linux personality
+// reserves both accounting increments before publishing its reply, then calls
+// the no-fail commit helper exactly once after that publication succeeds.
+pub unsafe fn lookup_accounting_has_capacity() -> bool {
+    return LOOKUPS != MAX_COUNTER;
+}
+
+pub unsafe fn use_accounting_has_capacity() -> bool {
+    return USES != MAX_COUNTER;
+}
+
+pub unsafe fn denial_accounting_has_capacity(stale: bool) -> bool {
+    return DENIALS != MAX_COUNTER
+        && (!stale || STALE_DENIALS != MAX_COUNTER);
+}
+
+// The caller must preflight each selected increment. These assignments are
+// deliberately branch-only deterministic mutations with no failure result.
+pub unsafe fn commit_prepared_write_accounting_nofail(
+    lookup_succeeded: bool,
+    use_succeeded: bool,
+    denied: bool,
+    stale: bool
+) -> void {
+    if lookup_succeeded {
+        LOOKUPS += 1;
+    }
+    if use_succeeded {
+        USES += 1;
+    }
+    if denied {
+        DENIALS += 1;
+        if stale {
+            STALE_DENIALS += 1;
+        }
+    }
 }
 
 pub unsafe fn revoke_service_generation(

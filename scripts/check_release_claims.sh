@@ -155,6 +155,13 @@ check 'An open evaluator set' \
 check 'nix\{lazy\}\^' \
     "nix{lazy} is rejected; use nix{defer}^ or bare nix_expr^"
 
+check 'fresh current-master observation' \
+    "the preserved master audit is historical, not a fresh current-checkout observation"
+check 'G0 source-digest lineage is not continuous|G0 and dependent G2 therefore do not validate' \
+    "the sealed attribution-rewrite bridge restores current G0/G2 ledger validation"
+check '26 of 26 fresh portable native execution gates' \
+    "the 26-gate native result is a preserved historical observation, not a fresh result"
+
 # O-core Milestone 0.3 implements capability-returning anonymous/shared page
 # allocation. Historical baseline text may still mention the old bump
 # allocator, but active ABI text must not call syscall 3 reserved.
@@ -334,6 +341,15 @@ done
 require_fixed README.md \
     '*By Lee Daghlar Ostadi*' \
     'the README byline does not use the full release author name'
+require_fixed README.md \
+    '### Validation at the historical audited master' \
+    'the historical master audit is presented as current validation'
+require_fixed README.md \
+    'The focused pre-repair World-alpha tests recorded 30 passes, one failure, and' \
+    'the historical World-alpha failure observation was not preserved'
+require_fixed README.md \
+    'append-only ledger now supersedes the old G0 head with that new schema-v3' \
+    'the current World-alpha provenance-bridge repair is missing'
 require_fixed Cargo.toml \
     'authors     = ["Lee Daghlar Ostadi"]' \
     'Cargo package metadata does not use the full release author name'
@@ -422,6 +438,12 @@ require_fixed docs/CLAIMS.md \
 require_fixed docs/CLAIMS.md \
     'This is not O-core Mode 31,' \
     'the hosted PR6 corpus could be misread as native evidence'
+require_fixed docs/CLAIMS.md \
+    'verify` checks only exact contract/interface/descriptor/set referential' \
+    'the experimental operation verification surface lost its referential-only boundary'
+require_fixed docs/CLAIMS.md \
+    'grant of evidence, admission, capability, lease, or World authority.' \
+    'the experimental operation records could be misread as authorizing execution'
 require_fixed README.md \
     'World ResourceKey hosted repository-conformance gate' \
     'the executable hosted PR6 gate is missing from the public status'
@@ -439,9 +461,90 @@ require_fixed README.md \
 require_fixed README.md \
     'World PR8-2 adds canonical `PlacementSnapshotV1` and `DeploymentPlanV1`' \
     'the canonical project deployment-intention slice is missing from public status'
+# PROJECT_EXECUTION_CLAIMS_BEGIN
+# Current execution and historical-record boundaries are independently required.
 require_fixed README.md \
-    'unsupported hosted policies remain' \
-    'unsupported hosted policies could be misread as executable placements'
+    'The coordinator implements all ten route policies.' \
+    'current project policy coverage is missing'
+require_fixed docs/CLAIMS.md \
+    'all ten Project HGraph policies' \
+    'current hosted policy coverage is missing'
+require_fixed docs/CLAIMS.md \
+    'configured execution uses a canonical `LegacyCompatibility` contract;' \
+    'the default project compatibility contract is missing'
+require_fixed docs/CLAIMS.md \
+    '`O_PROJECT_EXECUTOR=hgraph` retains strict idempotence-gated continuation' \
+    'explicit strict execution could silently lose its continuation requirements'
+require_fixed docs/CLAIMS.md \
+    '`legacy` is the explicit previous-runtime opt-out. Graph errors never trigger' \
+    'legacy execution must require an explicit executor choice'
+require_fixed docs/CLAIMS.md \
+    'automatic legacy fallback; unsupported executor settings are rejected.' \
+    'graph errors or unknown executor settings could silently select legacy execution'
+require_fixed docs/CLAIMS.md \
+    'records `legacy_unchecked`; it does not assert safe repetition.' \
+    'compatibility continuation could be mislabeled as safe repetition'
+require_fixed docs/CLAIMS.md \
+    'is bound to logical/deployment identity and checked against the trusted' \
+    'untrusted trace metadata could become continuation authority'
+require_fixed docs/CLAIMS.md \
+    'contract encodes `concurrent_branches_v1` for new parallel graphs.' \
+    'parallel scheduling has lost its explicit versioned source contract'
+require_fixed docs/CLAIMS.md \
+    'field means `serial_host_world_v1`, preserving historical graph bytes and' \
+    'archival graph scheduling could be silently changed'
+require_fixed docs/CLAIMS.md \
+    'identity, while declared shared resources remain ordered.' \
+    'parallel execution could bypass explicit shared-resource ordering'
+require_fixed docs/CLAIMS.md \
+    'requires residual ambient-host admission in deployment and grounding.' \
+    'ambient parallel effects could be misread as governed or isolated effects'
+require_fixed docs/CLAIMS.md \
+    'cancelled cooperatively and drained before final result publication; trace' \
+    'race completion could precede loser drain'
+require_fixed docs/CLAIMS.md \
+    'v7 binds cancellation to its earlier qualifying settlement' \
+    'race cancellation could lose its recorded cause'
+require_fixed docs/CLAIMS.md \
+    'identifier is diagnostic and is not a World `TaskIdentity`' \
+    'a diagnostic trace identifier could be misread as a World task'
+require_fixed docs/CLAIMS.md \
+    'planner snapshot before dispatch. Observation verifies those records against' \
+    'public operation claims no longer require durable pre-dispatch planner state'
+require_fixed docs/CLAIMS.md \
+    '`ostadix.operation-runtime-binding/v2`. Only legacy records without an' \
+    'new operation observations could be downgraded to legacy reconstruction'
+require_fixed docs/OPERATION_PLANNING_V1.md \
+    'Before dispatch, `begin_with_operation_plan` also durably publishes' \
+    'operation dispatch could precede durable planner snapshot publication'
+require_fixed docs/OPERATION_PLANNING_V1.md \
+    'must preserve that exact decision.' \
+    'terminal recording could substitute the pre-dispatch operation choice'
+require_fixed docs/OPERATION_PLANNING_V1.md \
+    'Snapshot corruption fails verification instead of reconstructing missing history.' \
+    'corrupt planner history could silently become reconstruction'
+require_fixed docs/OPERATION_PLANNING_V1.md \
+    'but **does not rerank the historical operation selection**.' \
+    'historical observation could silently rerank the original choice'
+require_fixed docs/OPERATION_PLANNING_V1.md \
+    'never upgrades an old record into a persisted original choice.' \
+    'legacy reconstruction could be mislabeled as a retained original decision'
+require_fixed tests/o_cli_operation_planner_blackbox.rs \
+    '"retained_original_plan_matched_content_verified_run"' \
+    'operation tests no longer verify the retained original decision'
+require_fixed tests/o_cli_operation_planner_blackbox.rs \
+    '"current_binary_recomputed_plan_matched_content_verified_run"' \
+    'operation tests no longer exercise explicitly degraded legacy reconstruction'
+require_fixed tests/o_cli_operation_planner_blackbox.rs \
+    '.begin_with_operation_plan(frozen_seed.clone(), &initial_snapshot)' \
+    'operation tests no longer exercise a frozen pre-dispatch planner snapshot'
+require_fixed scripts/smoke-project-hgraph-exec.sh \
+    'does not establish Governor authority, native execution, or G1' \
+    'the hosted project smoke could be promoted to Governor authority, native execution, or G1 evidence'
+require_fixed scripts/smoke-project-hgraph-exec.sh \
+    'Retry, placement, OWRECEIPT attestation, and exactly-once effects remain outside' \
+    'the hosted project smoke could be promoted to retries, placement, receipts, or exactly-once effects'
+# PROJECT_EXECUTION_CLAIMS_END
 require_fixed README.md \
     'A separate explicit hosted-reference World entry point consumes the exact' \
     'the explicit snapshot-derived World executor input is missing'
@@ -449,7 +552,7 @@ require_fixed README.md \
     'not a whitespace-insensitive' \
     'the logical graph digest could be misread as source-format-insensitive'
 require_fixed docs/HGRAPH_EXECUTOR_PLAN.md \
-    '`ProjectAttemptTrace` version 5 binds events' \
+    '`ProjectAttemptTrace` version 7 binds events' \
     'the executor plan still describes an obsolete project trace version'
 require_fixed docs/HGRAPH_EXECUTOR_PLAN.md \
     'reconstructs the ordinary hosted-unbound deployment' \
@@ -460,6 +563,9 @@ require_fixed docs/HGRAPH_EXECUTOR_PLAN.md \
 require_fixed scripts/o-cli.sh \
     'exec "$OCLI_BIN" "$@"' \
     'the repository-owned intent commands no longer reach the compiled Ostadix front door'
+require_fixed scripts/o-cli.sh \
+    'inspect|object|operation|realizations|observe|replan)' \
+    'the repository dispatcher no longer routes the operation-project commands to o-cli'
 require_fixed src/bin/o-cli.rs \
     'Plan(PlanArgs)' \
     'the compiled Ostadix front door no longer owns the plan grammar'
@@ -470,7 +576,7 @@ require_fixed Dockerfile \
     'COPY --from=builder /src/target/release/o-cli  /usr/local/bin/o-cli' \
     'the runtime image no longer installs the compiled Ostadix front door'
 require_fixed scripts/o-cli.sh \
-    'exec "$OLANGC_BIN" "$1" --target ir --why "$2" "${@:3}"' \
+    'exec "$OLANGC_BIN" "$source" --target ir --why "$operation" "$@"' \
     'the repository-owned o why dispatcher no longer reaches the focused admission query'
 require_fixed docs/HGRAPH_EXECUTOR_PLAN.md \
     '`olangc FILE.O --target ir --why P3` projects the same evidence-bound admission' \
@@ -554,9 +660,6 @@ require_fixed docs/CLAIMS.md \
     'World PR8-2 adds bounded canonical `PlacementSnapshotV1` and' \
     'the bounded World PR8-2 deployment-intention claim is missing'
 require_fixed docs/CLAIMS.md \
-    'unsupported hosted policies `Unresolved`' \
-    'unsupported hosted policies could be promoted to executable placement'
-require_fixed docs/CLAIMS.md \
     'explicit hosted-reference World entry point consumes it together' \
     'the bounded snapshot-derived World entry point is missing'
 require_fixed docs/CLAIMS.md \
@@ -566,32 +669,14 @@ require_fixed docs/CLAIMS.md \
     'G1 remains' \
     'the bounded deployment-intention slice could be promoted to G1 passage'
 require_fixed docs/CLAIMS.md \
-    'identifier is diagnostic and is not a World `TaskIdentity`' \
-    'the hosted trace attempt identifier could be misread as a World task identity'
-require_fixed docs/CLAIMS.md \
-    'opt-in, ordered-alternative' \
-    'the bounded hosted project execution claim is missing'
-require_fixed docs/CLAIMS.md \
     'conservative fallible `HostWorld` effects' \
     'untrusted project purity could be misread as verified mediated execution'
 require_fixed docs/CLAIMS.md \
     'Logical alternative branches may therefore be serialized and' \
     'logical branches could be misread as independently mediated or parallel execution'
-require_fixed docs/CLAIMS.md \
-    'Parallel/racing, aggregate,' \
-    'unsupported project policies must fail closed rather than use legacy fallback'
 require_fixed scripts/smoke-project-hgraph-exec.sh \
     'Project HGraph ordered hosted execution: PASS' \
     'the exact ProjectExec-A/ProjectExec-B hosted execution evidence marker is missing'
-require_fixed scripts/smoke-project-hgraph-exec.sh \
-    'does not establish parallel' \
-    'the ProjectExec-A/ProjectExec-B smoke non-claim boundary is missing'
-require_fixed scripts/smoke-project-hgraph-exec.sh \
-    'retry, placement, Governor authority, OWRECEIPT' \
-    'the ordered hosted smoke could be promoted to retries, placement, governance, or receipts'
-require_fixed scripts/smoke-project-hgraph-exec.sh \
-    'exactly-once effects, native execution, or G1 passage' \
-    'the ordered hosted smoke could be promoted to exact-once, native, or World-gate evidence'
 require_fixed docs/RELEASE_CHECKLIST.md \
     'plus serial ordered' \
     'the release checklist omits the bounded ProjectExec-B ordered execution surface'
@@ -717,6 +802,122 @@ for coordinate in "${fabric_coordinates[@]}"; do
     require_fixed docs/VERSIONING.md "\`$coordinate_value\`" \
         "versioning omits M3 coordinate value $coordinate_value"
 done
+
+operation_coordinates=(
+    'OPERATION_CONTRACT_SCHEMA_V1|ostadix.operation-contract/v1'
+    'OPERATION_INTERFACE_SCHEMA_V1|ostadix.operation-interface/v1'
+    'REALIZATION_DESCRIPTOR_SCHEMA_V1|ostadix.realization-descriptor/v1'
+    'REALIZATION_SET_SCHEMA_V1|ostadix.realization-set/v1'
+    'PHYSICAL_REPRESENTATION_SCHEMA_V1|ostadix.physical-representation/v1'
+    'TRANSFER_PLAN_SCHEMA_V1|ostadix.transfer-plan/v1'
+    'COST_PROFILE_SCHEMA_V1|ostadix.cost-profile/v1'
+    'OBJECTIVE_SCHEMA_V1|ostadix.objective/v1'
+    'LOGICAL_HGRAPH_SCHEMA_V2|ostadix.logical-hgraph/v2'
+    'DEPLOYMENT_PLAN_SCHEMA_V2|ostadix.deployment-plan/v2'
+    'RUNTIME_GRAPH_SCHEMA_V2|ostadix.runtime-graph/v2'
+    'RECOVERY_PLAN_SCHEMA_V1|ostadix.recovery-plan/v1'
+    'OPERATION_PLANNING_REQUEST_SCHEMA_V1|ostadix.operation-planning-request/v1'
+    'REQUIREMENT_FOOTPRINT_CONTENT_SCHEMA_V1|ostadix.placement.requirement-footprint/v1'
+    'OPERATION_ROUTE_PIPELINE_SCHEMA_V1|ostadix.project-route-pipeline/v1'
+    'OPERATION_RUNTIME_BINDING_SCHEMA_V1|ostadix.operation-runtime-binding/v1'
+    'OPERATION_COMMAND_ERROR_SCHEMA_V1|ostadix.operation-command-error/v1'
+)
+for coordinate in "${operation_coordinates[@]}"; do
+    coordinate_name=${coordinate%%|*}
+    coordinate_value=${coordinate#*|}
+    require_fixed docs/VERSIONING.md "\`$coordinate_name\`" \
+        "versioning omits operation-realization coordinate name $coordinate_name"
+    require_fixed docs/VERSIONING.md "\`$coordinate_value\`" \
+        "versioning omits operation-realization coordinate value $coordinate_value"
+done
+for bridge_coordinate in \
+    'OPERATION_ROUTE_PIPELINE_SCHEMA_V1|ostadix.project-route-pipeline/v1' \
+    'OPERATION_RUNTIME_BINDING_SCHEMA_V1|ostadix.operation-runtime-binding/v1' \
+    'OPERATION_COMMAND_ERROR_SCHEMA_V1|ostadix.operation-command-error/v1'
+do
+    bridge_name=${bridge_coordinate%%|*}
+    bridge_value=${bridge_coordinate#*|}
+    require_fixed src/bin/o-cli.rs \
+        "const $bridge_name: &str = \"$bridge_value\";" \
+        "operation-project bridge coordinate drifted: $bridge_name"
+done
+require_fixed README.md \
+    '[Operation planning and observation V1](docs/OPERATION_PLANNING_V1.md)' \
+    'README omits the operation-planning contract'
+require_fixed docs/OPERATION_PLANNING_V1.md \
+    'The word *selected* in this document means only that a tuple won the declared' \
+    'operation-planning selection is no longer explicitly authority-free'
+require_fixed docs/OPERATION_PLANNING_V1.md \
+    'Replanning after a successful run is not recovery and must not be represented' \
+    'operation replanning is no longer separated from failed-run recovery'
+for demo_command in \
+    'cd examples' \
+    'o operation normalize' \
+    'o realizations normalize' \
+    'o plan normalize --explain' \
+    'o run normalize' \
+    'o observe normalize' \
+    'o replan normalize --without-target gpu-1'
+do
+    require_fixed docs/OPERATION_PLANNING_V1.md "$demo_command" \
+        "operation-planning contract lost flagship command: $demo_command"
+    require_fixed README.md "$demo_command" \
+        "README lost flagship operation command: $demo_command"
+done
+require_fixed docs/OPERATION_PLANNING_V1.md \
+    'implementation digest must equal the bytes of the named captured' \
+    'operation-project contract no longer states the exact implementation-artifact join'
+require_fixed docs/OPERATION_PLANNING_V1.md \
+    '`ostadix.project-route-pipeline/v1` projection of the bound' \
+    'operation-project contract no longer states the exact route-pipeline join'
+require_fixed docs/OPERATION_PLANNING_V1.md \
+    'Recovery planning is not recovery execution' \
+    'operation recovery planning is no longer separated from recovery execution'
+require_fixed docs/OPERATION_PLANNING_V1.md \
+    'they are not distinct observed machines or failure domains' \
+    'operation demo no longer disclaims independent observed failure domains'
+require_fixed docs/CLAIMS.md \
+    '`StaticallyCompatibleForRanking` is not live target' \
+    'public claims no longer distinguish static rankability from live eligibility'
+require_fixed docs/CLAIMS.md \
+    'Recovery planning is not recovery execution' \
+    'public claims no longer distinguish a recovery plan from recovery execution'
+require_fixed docs/CLAIMS.md \
+    'ambient-Python target offers are static descriptions' \
+    'public claims no longer disclose the ambient-target failure-domain boundary'
+require_fixed docs/CLAIMS.md \
+    'successful source run is not a recovery' \
+    'public claims no longer distinguish successful replanning from recovery'
+require_fixed tests/o_cli_operation_planner_blackbox.rs \
+    'fn marked_normalize_project_plans_runs_observes_and_replans_exactly()' \
+    'the compiled operation-project vertical-slice proof is missing'
+require_fixed tests/o_cli_operation_planner_blackbox.rs \
+    '"ostadix.runtime-graph/v2"' \
+    'the operation-project test no longer proves RuntimeGraphV2 emission'
+require_fixed tests/o_cli_operation_planner_blackbox.rs \
+    'recovery["recovery_plan_status"], "descriptive"' \
+    'the operation-project test no longer proves conditional RecoveryPlanV1 emission'
+require_fixed tests/o_cli_operation_planner_blackbox.rs \
+    '"implementation digest does not match captured"' \
+    'the operation-project test no longer proves exact implementation-artifact binding'
+require_fixed tests/o_cli_operation_planner_blackbox.rs \
+    'execution pipeline does not match the exact' \
+    'the operation-project test no longer proves exact route-pipeline binding'
+require_fixed tests/o_cli_operation_planner_blackbox.rs \
+    '"ostadix.operation-runtime-binding/v1"' \
+    'the operation-project test no longer proves runtime-binding evidence emission'
+require_fixed tests/o_cli_operation_planner_blackbox.rs \
+    '"descriptive_execution_context_not_verified_physical_node_or_failure_domain"' \
+    'the operation-project test no longer proves descriptive target semantics'
+require_fixed tests/o_cli_operation_planner_blackbox.rs \
+    '"statically_compatible_descriptive_offer_not_an_independent_failure_domain"' \
+    'the operation-project test no longer proves the alternative failure-domain nonclaim'
+require_fixed tests/o_cli_operation_planner_blackbox.rs \
+    'recovery["recovery_execution"], "not_performed"' \
+    'the operation-project test no longer proves recovery was not executed'
+require_fixed tests/o_cli_operation_planner_blackbox.rs \
+    '"invalid mapping reached dispatch"' \
+    'the operation-project test no longer proves invalid route binding fails before dispatch'
 require_fixed docs/VERSIONING.md \
     '`crates/ostadix-api/src/execution_fabric/protocol.rs`' \
     'versioning omits the frozen M2 record source coordinate'

@@ -41,6 +41,7 @@ COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates/ostadix-api ./crates/ostadix-api
 COPY src ./src
 COPY backends ./backends
+COPY apps/olang-browser-wasi ./apps/olang-browser-wasi
 
 # olangc embeds the runtime sources, Cargo.lock, and shim scripts at compile
 # time (include_str!/include_bytes!), so everything above must be present.
@@ -67,7 +68,7 @@ RUN printf '%s\n' \
     '#!/bin/sh' \
     'set -e' \
     'case "${1:-}" in' \
-    '  run|plan|explain|inspect|help|--help|-h) exec o-cli "$@" ;;' \
+    '  run|routes|optimize|plan|explain|inspect|object|operation|realizations|observe|replan|help|--help|-h) exec o-cli "$@" ;;' \
     '  *) exec O "$@" ;;' \
     'esac' \
     > /usr/local/bin/o \

@@ -347,6 +347,10 @@ def validate_manifest_versions() -> None:
     toolchain = load_toml(ROOT / "rust-toolchain.toml").get("toolchain", {})
     if toolchain.get("channel") != "1.97.1":
         raise ContractError("rust-toolchain.toml must pin release Rust 1.97.1")
+    if toolchain.get("targets") != ["wasm32-wasip1"]:
+        raise ContractError(
+            "rust-toolchain.toml must pin the wasm32-wasip1 browser payload target"
+        )
 
 
 def validate_action_pins() -> None:

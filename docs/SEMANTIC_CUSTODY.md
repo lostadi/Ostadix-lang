@@ -47,6 +47,35 @@ crossing: render fidelity, capability transfer, wire serialization, and World
 portability are separate checks. `BackendMorphism` is a law-bearing extension
 point; its unversioned declaration alone establishes no backend claim.
 
+The implemented relationship is specifically between concrete `Fidelity` and
+`FidelityAssessmentV2`. `from_concrete` is an exact point embedding: a concrete
+structural loss set `L` becomes the interval `[L, L]`, and the three
+non-structural cases remain singleton points. For concrete judgments `a` and
+`b`, generated properties establish
+`from_concrete(a.compose(b)) == from_concrete(a).then(from_concrete(b))`.
+`concretization_contains` implements membership in the corresponding interval
+without materializing its potentially exponential powerset, and generated
+witnesses establish that `then` conservatively contains concrete sequential
+composition. The compatibility upper projection is also compositional and is
+a left inverse on point embeddings.
+
+Structural intervals created through the checked constructor or wire decoder
+enforce `definite` as a subset of `possible`; serialization rejects an invalid
+interval assembled directly through the existing public enum fields.
+`join_paths` is a tested, conservative all-observable merge, but no production
+solver path currently calls it. Its concretization-as-hull claim is restricted
+to lossless/structural intervals: `NativeCapsule` and `Unsupported` are
+absorbing severity classes rather than a representation of cross-class
+disjunction.
+
+`RenderFidelity` is separate. It classifies a source-splice renderer as typed,
+structural, presentational, or opaque and can be recomputed descriptively on
+demand; it is not currently recorded or enforced by admission. Some
+typed/structural distinctions are payload-conditional for Python Decimal/F64
+and Nix integer/text/map values, and recursive containers fold child
+classifications within one renderer. No implemented conversion or Galois
+connection relates it to `Fidelity` or `FidelityAssessmentV2`.
+
 `BackendMorphismV1` adds a bounded semantic kernel for the current Python,
 JavaScript, and Rust adapters. It reports O-to-backend-input and profiled
 backend-output-to-O fidelity as distinct legs, composes them, checks the
@@ -77,6 +106,85 @@ to V6. The
 shadow result can therefore expose differences such as the compatibility
 solver's optimistic container classification without reducing current
 execution capacity.
+
+### Observed graph adapter boundaries
+
+`O --crossing-evidence program.O /absolute/backends` enables JSON observations
+for direct admitted graph backend operations. Embedders use
+`Evaluator::with_crossing_observations()` and read
+`last_execution_trace().backend_crossings`. Ordinary execution does not collect
+or hash these diagnostic payloads. The option requires graph execution; it is
+not a serial-reference or parse-only result.
+
+Each observation binds the admission and admitted graph digests, plan node,
+canonical backend, encoded environment identity, and the admission's launch
+generation. That generation binds the retained executable set, adapter artifact,
+and launch context. Sorted prepared bindings retain canonical OValue hashes and a
+directional bounded input-profile assessment. Preparation or worker submission
+does not prove adapter receipt: authority checks, splice resolution, actor
+reentrancy checks, or restoration can still fail before the send. Python plain data and JavaScript
+scalar binding claims use their existing kernels. JavaScript container inputs
+remain executable and explicitly report `outside-profile`; the Rust scalar
+source-constant profile is never misrepresented as a runtime binding profile.
+
+The result records the hash and type of the OValue actually returned by the
+adapter. Its boundary is `adapter-wire-response-ovalue`: the pre-lifting native
+object was not captured, so this is not a newly inferred native-egress fidelity
+claim. Neither input projection nor result observation asserts that arbitrary
+backend code is an identity function. Source-splice rendering, deferred request
+execution, and recursive callback graphs are outside this direct-operation
+coverage and must not be silently counted as observed binding crossings.
+
+Physical completion, semantic publication, and discarded speculative results
+are recorded separately. Failed operations never acquire a successful result
+or publication claim. Each record has a domain-separated digest and strict
+decoder; `verify` accepts a trusted external record digest and expected
+admission/graph identities. These unsigned observations do not grant authority
+or authenticate themselves. They augment the trace without changing scheduling,
+the compatibility solver, admission decisions, or out-of-profile execution.
+
+## Operation-description boundary
+
+Operation-realization V1 adds separate authority-free descriptive records.
+Their construction and reading progression is:
+
+```text
+OperationContractV1
+        -> OperationInterfaceV1
+        -> RealizationDescriptorV1...
+        -> RealizationSetV1
+```
+
+Those arrows are progression, not stored-reference direction. The actual
+checked back-references are:
+
+```text
+OperationInterfaceV1      -> OperationContractV1
+RealizationDescriptorV1   -> OperationInterfaceV1
+RealizationDescriptorV1   -> OperationContractV1
+RealizationSetV1          -> OperationInterfaceV1
+RealizationSetV1          -> OperationContractV1
+RealizationSetV1          -> RealizationDescriptorIdV1...
+```
+
+Each record has bounded canonical-CBOR bytes and an independently
+domain-separated typed record identity. An `OComputationManifestV1` facet uses
+the ordinary SHA-256 of those canonical bytes as its `content` identity; that
+raw facet digest is intentionally distinct from the typed record identity.
+`o operation inspect` validates one record while leaving its references
+unresolved. `o operation verify` requires one exact supplied closure and checks
+only interface-to-contract, descriptor-to-interface/contract, descriptor-port,
+and set-to-interface/contract/descriptor consistency. Empty validation evidence
+means declaration-only; nonempty evidence references are not resolved or
+authenticated.
+
+An `OComputationManifestV1` may name these bytes with the corresponding facet
+kinds and explicit derivations. Merely decoding a semantic record does not add
+it to a computation lineage, establish how it was derived, or make its claims
+true. Referential consistency is not planning, realization selection,
+behavioral equivalence, evidence authenticity, target eligibility, placement,
+execution, recovery, admission, capability, lease, or World authority. See
+`docs/OPERATION_REALIZATION_V1.md` for the complete V1 boundary.
 
 ## Executable artifact
 
@@ -128,5 +236,9 @@ their own authority, transport, and lifecycle contracts.
 - `OValue` is not synonymous with `PortableOValue`.
 - Hosted V2 currently executes prepared hosted fragments; it is not general
   graph migration or transparent fallback.
+- Operation-realization V1 records and `o operation inspect|verify` establish
+  descriptive identity and referential consistency only; they do not plan,
+  select, place, execute, recover, prove equivalence, authenticate evidence, or
+  grant authority.
 - O-core/native evidence is a related compiler/runtime chain, not evidence that
   every hosted operation passed through O-core.

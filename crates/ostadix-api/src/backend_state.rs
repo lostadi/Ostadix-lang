@@ -441,6 +441,20 @@ impl BackendStateErrorV1 {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "lowercase")]
 pub enum BackendWireCommandV2 {
+    #[serde(rename = "native_operation_v1")]
+    NativeOperationV1 {
+        request_id: String,
+        handle: OValue,
+        operation: String,
+        arguments: Vec<OValue>,
+    },
+    #[serde(rename = "exec_morphism_v1")]
+    ExecMorphismV1 {
+        code: String,
+        bindings: HashMap<String, OValue>,
+        contract: crate::backend_morphism::BackendCrossingContractV1,
+        request_id: String,
+    },
     Exec {
         code: String,
         bindings: HashMap<String, OValue>,
@@ -467,6 +481,15 @@ pub enum BackendWireCommandV2 {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "lowercase")]
 pub enum BackendWireResponseV2 {
+    #[serde(rename = "native_operation_result_v1")]
+    NativeOperationResultV1 {
+        request_id: String,
+        value: OValue,
+    },
+    #[serde(rename = "morphism_result_v1")]
+    MorphismResultV1 {
+        receipt: crate::backend_morphism::BackendMorphismReceiptV1,
+    },
     Ok {
         value: OValue,
     },

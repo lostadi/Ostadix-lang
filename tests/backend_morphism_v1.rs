@@ -20,6 +20,220 @@ use o_lang::value::{Fidelity, FidelityAssessmentV2, OValue};
 
 mod support;
 
+fn run_observed(source: &str) -> (Output, serde_json::Value) {
+    let output = Command::new(env!("CARGO_BIN_EXE_O"))
+        .args([
+            "--executor",
+            "graph",
+            "--crossing-evidence",
+            "--eval",
+            source,
+        ])
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("backends"))
+        .output()
+        .expect("launch observed O execution");
+    let envelope = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "invalid observed response: {error}\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    (output, envelope)
+}
+
+#[test]
+fn execution_records_directional_profile_limits_without_blocking_work() {
+    use o_lang::backend_morphism::{
+        observed_value_sha256, BackendCrossingObservationV1, RuntimeCrossingStateV1,
+        RuntimeInputProfileV1,
+    };
+    if !support::require_runtimes(&["node", "python3"]) {
+        return;
+    }
+    let source = r#"let payload = python^([1, 2])_python
+javascript^(console.log(payload.reduce((a, b) => a + b, 0));)_javascript"#;
+    let (output, envelope) = run_observed(source);
+    let value = successful_value(&output);
+    assert_eq!(
+        value,
+        successful_value(&run_o(source)),
+        "observation must preserve executable out-of-profile behavior"
+    );
+    let records = envelope["backend_crossings"].as_array().unwrap();
+    assert_eq!(records.len(), 2);
+    let record = records
+        .iter()
+        .find(|record| record["observation"]["backend"] == "javascript")
+        .unwrap();
+    let observation: BackendCrossingObservationV1 =
+        serde_json::from_value(record["observation"].clone()).unwrap();
+    assert_eq!(observation.state, RuntimeCrossingStateV1::ResultObserved);
+    assert!(observation.published && !observation.discarded);
+    assert_eq!(
+        observation.result.as_ref().unwrap().value_sha256,
+        observed_value_sha256(&value)
+    );
+    let input = observation
+        .bindings
+        .iter()
+        .find(|binding| binding.name == "payload")
+        .unwrap();
+    assert!(
+        matches!(&input.input_profile, RuntimeInputProfileV1::OutsideProfile { reason }
+        if reason.kind == BackendMorphismRejectionKindV1::CurrentAdapterDoesNotBindContainers)
+    );
+    let digest = record["sha256"].as_str().unwrap();
+    observation
+        .verify(
+            digest,
+            &observation.admission_sha256,
+            &observation.graph_sha256,
+        )
+        .unwrap();
+    let mut tampered = observation.clone();
+    tampered.plan_node += 1;
+    assert!(tampered
+        .verify(
+            digest,
+            &observation.admission_sha256,
+            &observation.graph_sha256
+        )
+        .is_err());
+    assert!(observation
+        .verify(digest, &"0".repeat(64), &observation.graph_sha256)
+        .is_err());
+    let mut forged = record["observation"].clone();
+    forged["invented_native_egress_guarantee"] = true.into();
+    assert!(serde_json::from_value::<BackendCrossingObservationV1>(forged).is_err());
+}
+
+#[test]
+fn runtime_crossings_distinguish_program_transformation_from_projection_loss() {
+    use o_lang::backend_morphism::{BackendCrossingObservationV1, RuntimeInputProfileV1};
+    if !support::require_runtime("python3") {
+        return;
+    }
+    let (output, envelope) =
+        run_observed("let input = python^(41)_python\npython^(input + 1)_python");
+    assert_eq!(successful_value(&output), OValue::int(42));
+    let records = envelope["backend_crossings"].as_array().unwrap();
+    let observation: BackendCrossingObservationV1 =
+        serde_json::from_value(records.last().unwrap()["observation"].clone()).unwrap();
+    assert!(matches!(
+        &observation.bindings[0].input_profile,
+        RuntimeInputProfileV1::Assessed {
+            fidelity: FidelityAssessmentV2::Lossless
+        }
+    ));
+    assert_ne!(
+        observation.bindings[0].value_sha256,
+        observation.result.unwrap().value_sha256,
+        "lossless adapter projection must not be confused with an identity backend program"
+    );
+}
+
+#[test]
+fn failed_crossing_retains_no_success_or_publication_claim() {
+    use o_lang::backend_morphism::{BackendCrossingObservationV1, RuntimeCrossingStateV1};
+    if !support::require_runtime("python3") {
+        return;
+    }
+    let (output, envelope) = run_observed("python^(raise ValueError('observed failure'))_python");
+    assert!(!output.status.success());
+    assert_eq!(envelope["ok"], false);
+    let record = &envelope["backend_crossings"][0];
+    let observation: BackendCrossingObservationV1 =
+        serde_json::from_value(record["observation"].clone()).unwrap();
+    assert_eq!(observation.state, RuntimeCrossingStateV1::Failed);
+    assert!(observation.result.is_none() && !observation.published);
+    observation
+        .verify(
+            record["sha256"].as_str().unwrap(),
+            &observation.admission_sha256,
+            &observation.graph_sha256,
+        )
+        .unwrap();
+}
+
+#[test]
+fn observations_preserve_worker_overlap_and_distinguish_discarded_results() {
+    use o_lang::backend_morphism::{BackendCrossingObservationV1, RuntimeCrossingStateV1};
+    if !support::require_runtime("python3") {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let member = |mine: &str, other: &str| {
+        format!(
+            r#"python^(
+import os, time
+from pathlib import Path
+root = Path(os.environ["O_TEST_WORKDIR"])
+(root / "{mine}").write_text("ready")
+deadline = time.monotonic() + 5
+while not (root / "{other}").exists():
+    if time.monotonic() > deadline:
+        raise RuntimeError("other admitted worker did not overlap")
+    time.sleep(0.01)
+__oval_result__ = "{mine}"
+)_python"#
+        )
+    };
+    let source = format!(
+        "autonomous(batch({}, {}))",
+        member("left", "right"),
+        member("right", "left")
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_O"))
+        .args([
+            "--executor",
+            "graph",
+            "--workers",
+            "2",
+            "--crossing-evidence",
+            "--eval",
+            &source,
+        ])
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("backends"))
+        .env("O_TEST_WORKDIR", directory.path())
+        .output()
+        .unwrap();
+    successful_value(&output);
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let records = envelope["backend_crossings"].as_array().unwrap();
+    assert_eq!(records.len(), 2);
+    for record in records {
+        let observation: BackendCrossingObservationV1 =
+            serde_json::from_value(record["observation"].clone()).unwrap();
+        assert!(observation.published && !observation.discarded);
+        observation
+            .verify(
+                record["sha256"].as_str().unwrap(),
+                &observation.admission_sha256,
+                &observation.graph_sha256,
+            )
+            .unwrap();
+    }
+    let (failed, envelope) = run_observed(
+        "autonomous(batch(python^(raise ValueError('first'))_python, python^(42)_python))",
+    );
+    assert!(!failed.status.success());
+    let observations = envelope["backend_crossings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|record| {
+            serde_json::from_value::<BackendCrossingObservationV1>(record["observation"].clone())
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert!(observations.iter().any(|observation| observation.state
+        == RuntimeCrossingStateV1::Failed
+        && !observation.published));
+    assert!(observations.iter().any(|observation| observation.state == RuntimeCrossingStateV1::ResultObserved && observation.discarded && !observation.published),
+        "a later physical result must not acquire semantic publication after the earlier failure: {observations:?}");
+}
+
 fn run_o(source: &str) -> Output {
     Command::new(env!("CARGO_BIN_EXE_O"))
         .args(["--json", "--eval", source])

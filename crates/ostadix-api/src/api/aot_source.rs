@@ -13,6 +13,8 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub const RUNTIME_VALUE_RS: &str = include_str!("../value.rs");
+/// Exact shared-helper names used by adapter admission in generated runtimes.
+pub const RUNTIME_SHIM_SUPPORT_NAMES: &[&str] = crate::shims::BUNDLED_SHIM_SUPPORT_NAMES;
 pub const RUNTIME_CAPABILITY_RS: &str = include_str!("../capability.rs");
 pub const RUNTIME_ENVIRONMENT_RS: &str = include_str!("../environment.rs");
 pub const RUNTIME_PARSER_RS: &str = include_str!("../parser.rs");
@@ -86,6 +88,7 @@ pub const RUNTIME_HOSTED_REMOTE_FABRIC_SOURCES: &[(&str, &str)] = &[
 ];
 pub const RUNTIME_EVAL_CORE_RS: &str = include_str!("../eval_core.rs");
 pub const RUNTIME_EVAL_RS: &str = include_str!("../eval.rs");
+pub const RUNTIME_MIGRATION_RS: &str = include_str!("../migration.rs");
 pub const RUNTIME_PROCESS_RS: &str = include_str!("../process.rs");
 pub const RUNTIME_BACKEND_RS: &str = include_str!("../backend.rs");
 pub const RUNTIME_BACKEND_MORPHISM_RS: &str = include_str!("../backend_morphism.rs");
@@ -94,6 +97,12 @@ pub const RUNTIME_NIX_OPS_RS: &str = include_str!("../nix_ops.rs");
 pub const RUNTIME_NIXOS_OPS_RS: &str = include_str!("../nixos_ops.rs");
 pub const RUNTIME_SCHEDULER_RS: &str = include_str!("../scheduler.rs");
 pub const RUNTIME_CANONICAL_CBOR_RS: &str = include_str!("../canonical_cbor.rs");
+pub const RUNTIME_COMPUTATION_CORE_RS: &str = include_str!("../computation_core.rs");
+pub const RUNTIME_REALIZATION_PLAN_RS: &str = include_str!("../computation/realization_plan.rs");
+pub const RUNTIME_GRAPH_REALIZATION_PLAN_RS: &str =
+    include_str!("../computation/graph_realization_plan.rs");
+pub const RUNTIME_OIR_PHYSICAL_EXECUTION_RS: &str =
+    include_str!("../computation/oir_physical_execution.rs");
 pub const RUNTIME_DISPATCH_MODEL_RS: &str = include_str!("../dispatch_model.rs");
 pub const RUNTIME_SYNTAX_DIALECT_RS: &str = include_str!("../syntax_dialect.rs");
 pub const RUNTIME_WIRE_RS: &str = include_str!("../wire.rs");
@@ -180,6 +189,7 @@ pub const RUNTIME_HGRAPH_GRAPH_RS: &str = include_str!("../hgraph/graph.rs");
 pub const RUNTIME_HGRAPH_KINDS_RS: &str = include_str!("../hgraph/kinds.rs");
 pub const RUNTIME_HGRAPH_FROM_OIR_RS: &str = include_str!("../hgraph/from_oir.rs");
 pub const RUNTIME_HGRAPH_SCHEDULE_RS: &str = include_str!("../hgraph/schedule.rs");
+pub const RUNTIME_HGRAPH_SEMANTICS_RS: &str = include_str!("../hgraph/semantics.rs");
 pub const RUNTIME_HGRAPH_SOLVE_RS: &str = include_str!("../hgraph/solve.rs");
 
 // executor: the readiness-driven graph coordinator used by eval.rs as the
@@ -210,6 +220,7 @@ pub const RUNTIME_PROJECT_SOURCES: &[(&str, &str)] = &[
     ("materialize.rs", include_str!("../project/materialize.rs")),
     ("model.rs", include_str!("../project/model.rs")),
     ("plan.rs", include_str!("../project/plan.rs")),
+    ("reuse.rs", include_str!("../project/reuse.rs")),
     ("runtime.rs", include_str!("../project/runtime.rs")),
     (
         "runtime_graph.rs",
