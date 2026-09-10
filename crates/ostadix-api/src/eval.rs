@@ -36,6 +36,8 @@ use crate::backend_state::{
     ensure_evaluator_snapshot_bound, sandbox_policy_sha256, EvaluatorActorCheckpointV1,
     EvaluatorStateSnapshotV1,
 };
+#[path = "migration.rs"]
+pub mod migration;
 use crate::capability::{fresh_bearer_identity, BackendAuthorityBroker, BackendSandboxPolicy};
 use crate::environment::EnvironmentRefV2;
 use crate::eval_core::{
@@ -60,7 +62,9 @@ use crate::process::{BackendLaunchContext, ExecStep, ProcessRegistry};
 use crate::scheduler::AutonomousScheduler;
 #[cfg(test)]
 use crate::value::ONumber;
-use crate::value::{BackendAuthority, CapabilityKind, GroupMode, OValue, RequestKind};
+use crate::value::{
+    fingerprint_preview, BackendAuthority, CapabilityKind, GroupMode, OValue, RequestKind,
+};
 
 /// Stable evidence projection of the built-in authority policy. The random
 /// bearer that realizes this policy remains process-local and is checked at
@@ -411,6 +415,7 @@ pub struct Evaluator {
 
     /// Deterministic lifecycle trace for the most recent OIR execution.
     last_execution_trace: Option<ExecutionTrace>,
+    crossing_observations: bool,
 
     /// Digest-bound pre-execution decision that authorized the most recent
     /// graph run (or was compiled for the serial differential oracle).
@@ -807,6 +812,7 @@ impl Evaluator {
             autonomous_buffer: Vec::new(),
             last_execution_plan: None,
             last_execution_trace: None,
+            crossing_observations: false,
             last_execution_admission: None,
             last_hgraph_schedule: None,
             activation_authorities: HashMap::new(),
@@ -944,6 +950,25 @@ impl Evaluator {
         self.last_execution_trace.as_ref()
     }
 
+    /// Retain directional adapter observations alongside the graph trace.
+    /// Disabled by default so ordinary execution does not hash payloads merely
+    /// for diagnostics. Unsupported profiles remain executable.
+    pub fn with_crossing_observations(mut self) -> Self {
+        self.crossing_observations = true;
+        self
+    }
+
+    /// Require the executable plain-data crossing contract at every foreign
+    /// dispatch, including deferred execution and recursive callbacks. Only
+    /// the Python adapter currently implements this stronger opt-in contract.
+    pub fn with_morphism_contract(
+        mut self,
+        contract: crate::backend_morphism::BackendCrossingContractV1,
+    ) -> Self {
+        self.registry.set_morphism_contract(contract);
+        self
+    }
+
     /// Evidence-bound admission compiled before the most recent execution.
     pub fn last_execution_admission(&self) -> Option<&crate::evidence::ExecutionAdmissionV6> {
         self.last_execution_admission.as_ref()
@@ -996,17 +1021,18 @@ impl Evaluator {
         registered.sort();
         let registered = registered.join(",");
         let policy = self.policy.name();
-        admitted.verify_runtime_context(
-            &self.shim_dir,
-            &[
-                ("policy", policy),
-                ("registered-backends", registered.as_str()),
-                (
-                    "default-backend-authority-policy",
-                    DEFAULT_BACKEND_AUTHORITY_POLICY_V1,
-                ),
-            ],
-        )
+        let mut context = vec![
+            ("policy", policy),
+            ("registered-backends", registered.as_str()),
+            (
+                "default-backend-authority-policy",
+                DEFAULT_BACKEND_AUTHORITY_POLICY_V1,
+            ),
+        ];
+        if let Some(contract) = self.registry.morphism_contract() {
+            context.push(("backend-morphism-contract", contract.name()));
+        }
+        admitted.verify_runtime_context(&self.shim_dir, &context)
     }
 
     /// Whether the persistent backend actor `(lang, env)` is currently
@@ -1037,7 +1063,7 @@ impl Evaluator {
         registered.sort();
         let registered = registered.join(",");
         let policy = self.policy.name();
-        let context = [
+        let mut context = vec![
             ("policy", policy),
             ("registered-backends", registered.as_str()),
             (
@@ -1045,6 +1071,9 @@ impl Evaluator {
                 DEFAULT_BACKEND_AUTHORITY_POLICY_V1,
             ),
         ];
+        if let Some(contract) = self.registry.morphism_contract() {
+            context.push(("backend-morphism-contract", contract.name()));
+        }
         let binding = match &self.runtime_executable_override {
             Some(executable) => {
                 crate::evidence::runtime_binding_from_directory_with_current_executable(
@@ -1087,7 +1116,7 @@ impl Evaluator {
         })
     }
 
-    fn install_backend_launch_generations(
+    pub(crate) fn install_backend_launch_generations(
         &mut self,
         generations: Option<HashMap<String, String>>,
     ) -> Option<HashMap<String, String>> {
@@ -1112,9 +1141,9 @@ impl Evaluator {
         shim_path: &std::path::Path,
         executable_leases: &Arc<crate::runtime_exec::ExecutableLeaseSet>,
         launch_generation_sha256: &str,
-    ) -> Result<()> {
+    ) -> Result<Option<crate::backend_state::BackendRestoreReceiptV1>> {
         if environment_id > crate::environment::MAX_PERSISTENT_ENV_ID {
-            return Ok(());
+            return Ok(None);
         }
         let sandbox_policy_sha256 = sandbox_policy_sha256(sandbox.permissions())?;
         let key = (
@@ -1132,7 +1161,7 @@ impl Evaluator {
                     "state.restore-incompatible: pending backend `{backend}[{environment_id}]` does not match admitted sandbox {sandbox_policy_sha256}"
                 );
             }
-            return Ok(());
+            return Ok(None);
         };
 
         actor.validate()?;
@@ -1167,7 +1196,8 @@ impl Evaluator {
             );
         }
 
-        self.registry
+        let receipt = self
+            .registry
             .restore_env(
                 backend,
                 environment_id,
@@ -1185,7 +1215,7 @@ impl Evaluator {
         self.pending_backend_restores
             .remove(&key)
             .expect("successfully restored pending actor disappeared");
-        Ok(())
+        Ok(Some(receipt))
     }
 
     /// Mint a live capability for embedding-specific activation guards.
@@ -1518,7 +1548,7 @@ impl Evaluator {
                 Some(result) => Ok(result),
                 None => {
                     let fp = match v {
-                        OValue::Request { fingerprint, .. } => &fingerprint[..8],
+                        OValue::Request { fingerprint, .. } => fingerprint_preview(fingerprint),
                         _ => "?",
                     };
                     bail!(
@@ -1597,7 +1627,7 @@ impl Evaluator {
                     anyhow::anyhow!(
                         "autonomous: scheduler failed to materialize \
                              request fp={}; cache miss after flush",
-                        &fingerprint[..8]
+                        fingerprint_preview(fingerprint)
                     )
                 }),
             },
@@ -1980,6 +2010,11 @@ impl Evaluator {
             },
             ExecutionMode::Shim => {
                 let runtime_lang = backend.canonical.as_str();
+                if let Some(contract) = self.registry.morphism_contract() {
+                    contract
+                        .validate_bindings(runtime_lang, &HashMap::new())
+                        .map_err(anyhow::Error::msg)?;
+                }
                 let environment = EnvironmentRefV2::from_encoded(env_id);
                 let runtime_env_id = environment.runtime_env_id();
                 let shim =
@@ -2952,6 +2987,13 @@ impl Evaluator {
                 OIr::Load(_) | OIr::Exec { .. } | OIr::Invoke { .. } => {
                     let raw = frame.value(*child_id)?.clone();
                     let resolved = self.resolve_for_splice(raw)?;
+                    if backend.execution == ExecutionMode::Shim {
+                        if let Some(contract) = self.registry.morphism_contract() {
+                            contract
+                                .validate_value(&backend.canonical, &resolved)
+                                .map_err(anyhow::Error::msg)?;
+                        }
+                    }
                     buf.push_str(&render_with(backend.renderer, &resolved));
                     if constructs_thunk {
                         deps.push(resolved);
@@ -2989,6 +3031,11 @@ impl Evaluator {
 
         debug_assert_eq!(backend.execution, ExecutionMode::Shim);
         let runtime_lang = backend.canonical.as_str();
+        if let Some(contract) = self.registry.morphism_contract() {
+            contract
+                .validate_bindings(runtime_lang, &local_scope)
+                .map_err(anyhow::Error::msg)?;
+        }
         let shim = BackendRegistry::global().resolve_shim_path(&self.shim_dir, runtime_lang);
         let environment = EnvironmentRefV2::from_encoded(env_id);
         let runtime_env_id = environment.runtime_env_id();
@@ -3128,10 +3175,37 @@ impl Evaluator {
                         if let Some(key) = &suspended_key {
                             self.suspended_actors.insert(key.clone());
                         }
-                        let eval_outcome = self.eval_source_with_scope(&src, &callback_scope);
+                        let fresh_suspension = environment
+                            .is_fresh()
+                            .then(|| {
+                                self.registry.suspend_fresh_actor(
+                                    runtime_lang,
+                                    runtime_env_id,
+                                    &sandbox,
+                                )
+                            })
+                            .transpose()?;
+                        let eval_outcome =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                self.eval_source_with_scope(&src, &callback_scope)
+                            }));
                         if let Some(key) = &suspended_key {
                             self.suspended_actors.remove(key);
                         }
+                        let eval_outcome = match eval_outcome {
+                            Ok(outcome) => {
+                                if let Some(token) = fresh_suspension {
+                                    self.registry.resume_fresh_actor(token)?;
+                                }
+                                outcome
+                            }
+                            Err(panic) => {
+                                if let Some(token) = fresh_suspension {
+                                    self.registry.cancel_fresh_callback_after_panic(token);
+                                }
+                                std::panic::resume_unwind(panic)
+                            }
+                        };
                         match eval_outcome {
                             Ok(result) => {
                                 self.registry
@@ -3144,6 +3218,15 @@ impl Evaluator {
                                     .with_context(|| format!("[{}] send_eval_result", env_label))?;
                             }
                             Err(e) => {
+                                if src.starts_with("native_") {
+                                    self.registry.send_eval_result(
+                                        runtime_lang,
+                                        runtime_env_id,
+                                        OValue::error(format!("{e:#}")),
+                                        &sandbox,
+                                    )?;
+                                    continue;
+                                }
                                 return Err(e).with_context(|| {
                                     format!(
                                         "[{}] O.eval() failed while evaluating quoted source",
@@ -3243,6 +3326,34 @@ impl Evaluator {
         scope: HashMap<String, OValue>,
     ) -> Result<OValue> {
         match fn_name {
+            "native_call" | "native_get" | "native_set" | "native_release" => {
+                if self.prepared_fragment_callbacks_forbidden {
+                    bail!("native.admission-refused: prepared placement cannot acquire owner operation authority");
+                }
+                let count = match fn_name {
+                    "native_set" => 3,
+                    "native_release" => 1,
+                    _ => 2,
+                };
+                if arg_vals.len() != count {
+                    bail!("{fn_name} requires {count} arguments");
+                }
+                let mut values = arg_vals.into_iter();
+                let handle = values.next().unwrap();
+                let arguments = if fn_name == "native_call" {
+                    match values.next().unwrap() {
+                        OValue::List { v } => v,
+                        _ => bail!("native_call arguments must be an O list"),
+                    }
+                } else {
+                    values.collect()
+                };
+                self.execute_native_operation(
+                    handle,
+                    fn_name.trim_start_matches("native_"),
+                    arguments,
+                )
+            }
             "instantiate" => {
                 if arg_vals.len() != 1 {
                     bail!(
@@ -3410,6 +3521,56 @@ impl Evaluator {
         }
     }
 
+    fn execute_native_operation(
+        &mut self,
+        handle: OValue,
+        operation: &str,
+        arguments: Vec<OValue>,
+    ) -> Result<OValue> {
+        let deadline = Instant::now()
+            .checked_add(crate::process::backend_operation_timeout())
+            .context("native operation deadline overflow")?;
+        let deadline = self
+            .callback_operation_deadline
+            .map_or(deadline, |outer| outer.min(deadline));
+        let mut ticket = self
+            .registry
+            .begin_native_operation(handle, operation, arguments)?;
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<OValue> {
+                loop {
+                    let remaining = deadline
+                        .checked_duration_since(Instant::now())
+                        .context("native.operation-timeout: owner operation deadline expired")?;
+                    match self
+                        .registry
+                        .recv_native_operation(&mut ticket, remaining)?
+                    {
+                        ExecStep::Done(OValue::Error { msg }) => bail!("{msg}"),
+                        ExecStep::Done(value) => return Ok(value),
+                        ExecStep::EvalRequest { src, scope } => {
+                            let scope = match scope {
+                                Some(OValue::Scope { bindings }) => bindings,
+                                None => HashMap::new(),
+                                _ => bail!("native.invalid-callback-scope: expected an O scope"),
+                            };
+                            let value =
+                                match self.eval_source_with_scope_until(&src, &scope, deadline) {
+                                    Ok(value) => value,
+                                    Err(error) => OValue::error(format!("{error:#}")),
+                                };
+                            self.registry.send_native_callback_result(&ticket, value)?;
+                        }
+                    }
+                }
+            }));
+        self.registry.abort_native_operation(&ticket);
+        match outcome {
+            Ok(result) => result,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // render_child — language-native splice representation
     //
@@ -3570,24 +3731,24 @@ fn prepared_backend_implementation(
             "admitted Ostadix proxy adapter",
             &backend.canonical,
         )?,
-        BackendAdapterKind::LegacyPythonShim => {
-            let common_name = "o_shim_common.py";
-            let common_hex = hex::encode(common_name.as_bytes());
-            unique_admitted_sha256(
-                admitted
-                    .admission()
-                    .backend_artifacts()
-                    .iter()
-                    .filter(|artifact| artifact.canonical_backend == backend.canonical)
-                    .filter(|artifact| {
-                        !artifact.resolved_identity.ends_with(common_name)
-                            && !artifact.resolved_identity.ends_with(&common_hex)
+        BackendAdapterKind::LegacyPythonShim => unique_admitted_sha256(
+            admitted
+                .admission()
+                .backend_artifacts()
+                .iter()
+                .filter(|artifact| artifact.canonical_backend == backend.canonical)
+                .filter(|artifact| {
+                    !crate::shims::BUNDLED_SHIM_SUPPORT_NAMES.iter().any(|name| {
+                        artifact.resolved_identity.ends_with(name)
+                            || artifact
+                                .resolved_identity
+                                .ends_with(&hex::encode(name.as_bytes()))
                     })
-                    .filter_map(|artifact| artifact.state.sha256()),
-                "admitted legacy shim adapter",
-                &backend.canonical,
-            )?
-        }
+                })
+                .filter_map(|artifact| artifact.state.sha256()),
+            "admitted legacy shim adapter",
+            &backend.canonical,
+        )?,
         BackendAdapterKind::Inline => {
             bail!(
                 "placement fragment backend `{}` has no hosted adapter",
@@ -3670,35 +3831,6 @@ impl GraphEvaluationHost for Evaluator {
         Evaluator::local_worker_parallelism_override(self)
     }
 
-    fn take_local_worker_pool(
-        &mut self,
-        capacity: usize,
-    ) -> Result<crate::executor::pool::WorkerPool> {
-        match self.local_worker_pool.take() {
-            Some(pool)
-                if pool.capacity() == capacity
-                    && pool.outstanding() == 0
-                    && pool.matches_current_affinity() =>
-            {
-                Ok(pool)
-            }
-            Some(pool) => {
-                drop(pool);
-                crate::executor::pool::WorkerPool::new(capacity)
-            }
-            None => crate::executor::pool::WorkerPool::new(capacity),
-        }
-    }
-
-    fn return_local_worker_pool(&mut self, pool: crate::executor::pool::WorkerPool) {
-        if self.reuse_local_worker_pool
-            && pool.outstanding() == 0
-            && self.local_worker_pool.is_none()
-        {
-            self.local_worker_pool = Some(pool);
-        }
-    }
-
     fn shim_path(&self, language: &str) -> PathBuf {
         Evaluator::shim_path(self, language)
     }
@@ -3738,12 +3870,51 @@ impl GraphEvaluationHost for Evaluator {
         Evaluator::install_execution_trace(self, trace);
     }
 
+    fn crossing_observations_enabled(&self) -> bool {
+        self.crossing_observations
+    }
+
+    fn morphism_contract(&self) -> Option<crate::backend_morphism::BackendCrossingContractV1> {
+        self.registry.morphism_contract()
+    }
+
     fn flush_autonomous_buffer(&mut self) -> Result<()> {
         Evaluator::flush_autonomous_buffer(self)
     }
 
     fn resolve_after_flush(&mut self, value: OValue) -> Result<OValue> {
         Evaluator::resolve_after_flush(self, value)
+    }
+}
+
+impl crate::executor::GraphExecutorHost for Evaluator {
+    fn take_local_worker_pool(
+        &mut self,
+        capacity: usize,
+    ) -> Result<crate::executor::pool::WorkerPool> {
+        match self.local_worker_pool.take() {
+            Some(pool)
+                if pool.capacity() == capacity
+                    && pool.outstanding() == 0
+                    && pool.matches_current_affinity() =>
+            {
+                Ok(pool)
+            }
+            Some(pool) => {
+                drop(pool);
+                crate::executor::pool::WorkerPool::new(capacity)
+            }
+            None => crate::executor::pool::WorkerPool::new(capacity),
+        }
+    }
+
+    fn return_local_worker_pool(&mut self, pool: crate::executor::pool::WorkerPool) {
+        if self.reuse_local_worker_pool
+            && pool.outstanding() == 0
+            && self.local_worker_pool.is_none()
+        {
+            self.local_worker_pool = Some(pool);
+        }
     }
 }
 
@@ -3768,16 +3939,69 @@ impl<'a> crate::executor::Coordinator<'a> {
 mod tests {
     use super::*;
 
+    macro_rules! exhaustive_cases {
+        ($ty:ty; $( $pattern:pat => $value:expr ),+ $(,)?) => {{
+            fn compile_time_exhaustiveness_guard(value: &$ty) {
+                match value {
+                    $( $pattern => (), )+
+                }
+            }
+
+            vec![
+                $(
+                    {
+                        let value: $ty = $value;
+                        assert!(
+                            matches!(&value, $pattern),
+                            "representative does not match {}",
+                            stringify!($pattern)
+                        );
+                        compile_time_exhaustiveness_guard(&value);
+                        value
+                    }
+                ),+
+            ]
+        }};
+    }
+
+    macro_rules! exhaustive_classification_cases {
+        ($ty:ty; $( $pattern:pat => ($value:expr, $expected:expr) ),+ $(,)?) => {{
+            fn compile_time_exhaustiveness_guard(value: &$ty) {
+                match value {
+                    $( $pattern => (), )+
+                }
+            }
+
+            vec![
+                $(
+                    {
+                        let value: $ty = $value;
+                        assert!(
+                            matches!(&value, $pattern),
+                            "representative does not match {}",
+                            stringify!($pattern)
+                        );
+                        compile_time_exhaustiveness_guard(&value);
+                        (value, $expected)
+                    }
+                ),+
+            ]
+        }};
+    }
+
     #[test]
     fn evaluator_retains_idle_graph_workers_and_resizes_on_demand() {
         let mut default_evaluator = Evaluator::new(PathBuf::from("/tmp"));
         let default_pool = crate::executor::pool::WorkerPool::new(1).unwrap();
-        GraphEvaluationHost::return_local_worker_pool(&mut default_evaluator, default_pool);
+        crate::executor::GraphExecutorHost::return_local_worker_pool(
+            &mut default_evaluator,
+            default_pool,
+        );
         assert!(default_evaluator.local_worker_pool.is_none());
 
         let mut evaluator = Evaluator::new(PathBuf::from("/tmp")).with_reusable_local_workers();
         let pool = crate::executor::pool::WorkerPool::new(2).unwrap();
-        GraphEvaluationHost::return_local_worker_pool(&mut evaluator, pool);
+        crate::executor::GraphExecutorHost::return_local_worker_pool(&mut evaluator, pool);
         assert_eq!(
             evaluator
                 .local_worker_pool
@@ -3787,14 +4011,16 @@ mod tests {
             2
         );
 
-        let pool = GraphEvaluationHost::take_local_worker_pool(&mut evaluator, 2).unwrap();
+        let pool =
+            crate::executor::GraphExecutorHost::take_local_worker_pool(&mut evaluator, 2).unwrap();
         assert_eq!(pool.capacity(), 2);
         assert!(evaluator.local_worker_pool.is_none());
-        GraphEvaluationHost::return_local_worker_pool(&mut evaluator, pool);
+        crate::executor::GraphExecutorHost::return_local_worker_pool(&mut evaluator, pool);
 
-        let resized = GraphEvaluationHost::take_local_worker_pool(&mut evaluator, 1).unwrap();
+        let resized =
+            crate::executor::GraphExecutorHost::take_local_worker_pool(&mut evaluator, 1).unwrap();
         assert_eq!(resized.capacity(), 1);
-        GraphEvaluationHost::return_local_worker_pool(&mut evaluator, resized);
+        crate::executor::GraphExecutorHost::return_local_worker_pool(&mut evaluator, resized);
     }
 
     fn placement_attempt() -> crate::placement::TaskAttemptIdV1 {
@@ -3926,52 +4152,187 @@ mod tests {
     }
 
     #[test]
-    fn rendering_fidelity_matrix_covers_every_ovalue_variant() {
-        use crate::value::SnapshotKind;
+    fn renderer_matrix_binds_every_ovalue_variant_to_an_expected_classification() {
+        use std::collections::BTreeMap;
 
-        let values = vec![
-            OValue::Null,
-            OValue::bool_(true),
-            OValue::int(1),
-            OValue::float(1.5),
-            OValue::str_("text"),
-            OValue::html("<b>text</b>"),
-            OValue::store_path("/nix/store/example"),
-            OValue::Expr { src: "42".into() },
-            OValue::list(vec![OValue::int(1)]),
-            OValue::map(HashMap::from([("key".into(), OValue::int(1))])),
-            OValue::scope(HashMap::from([("x".into(), OValue::int(1))])),
-            OValue::blob(b"data", "application/octet-stream"),
-            OValue::nix_expr("1 + 1", vec![]),
-            OValue::derivation("/nix/store/example.drv", vec!["out".into()], vec![]),
-            OValue::request(RequestKind::Instantiate, OValue::nix_expr("1", vec![])),
-            OValue::system("/nix/var/nix/profiles/system"),
-            OValue::capability(CapabilityKind::Service, "opaque", HashMap::new()),
-            OValue::snapshot(SnapshotKind::System, "generation", HashMap::new()),
-            OValue::thunk("42", vec![]),
-            OValue::group(GroupMode::Batch, vec![]),
-            OValue::error("failed"),
-        ];
-        let renderers = [
-            SpliceRenderer::Python,
-            SpliceRenderer::Nix,
-            SpliceRenderer::Html,
-            SpliceRenderer::Latex,
-            SpliceRenderer::Markdown,
-            SpliceRenderer::Default,
-        ];
+        use crate::value::{
+            GraphNode, NativeBoundary, NativeCodecSafety, NativeIdentity, OBytes, ONative,
+            RehydratePolicy, SeqKind, SetKind, SnapshotKind,
+        };
+        use RenderFidelity::{Opaque, Presentation, Structural, Typed};
 
-        assert_eq!(values.len(), 21, "update the matrix when OValue grows");
-        for renderer in renderers {
-            for value in &values {
+        // Expected columns follow `renderers` below: Python, HTML, LaTeX,
+        // Markdown, Nix, and the default textual renderer.
+        let cases = exhaustive_classification_cases!(OValue;
+            OValue::Null => (OValue::null(), [Typed, Presentation, Presentation, Presentation, Typed, Structural]),
+            OValue::Bool { .. } => (OValue::bool_(true), [Typed, Presentation, Presentation, Presentation, Typed, Structural]),
+            OValue::Number { .. } => (OValue::int(1), [Typed, Presentation, Presentation, Presentation, Typed, Structural]),
+            OValue::Text { .. } => (OValue::text("text"), [Structural, Presentation, Presentation, Presentation, Typed, Structural]),
+            OValue::Char { .. } => (OValue::char_('λ'), [Structural, Presentation, Presentation, Presentation, Structural, Structural]),
+            OValue::Html { .. } => (OValue::html("<b>text</b>"), [Typed, Presentation, Presentation, Presentation, Structural, Structural]),
+            OValue::StorePath { .. } => (OValue::store_path("/nix/store/example"), [Typed, Presentation, Presentation, Presentation, Structural, Structural]),
+            OValue::Expr { .. } => (OValue::Expr { src: "42".into() }, [Typed, Presentation, Presentation, Presentation, Structural, Structural]),
+            OValue::List { .. } => (OValue::list(vec![OValue::int(1)]), [Typed, Presentation, Presentation, Presentation, Typed, Structural]),
+            OValue::Map { .. } => (OValue::map(HashMap::from([("key".into(), OValue::int(1))])), [Typed, Presentation, Presentation, Presentation, Typed, Structural]),
+            OValue::Seq { .. } => (OValue::seq(SeqKind::Tuple, vec![OValue::int(1)]), [Typed, Presentation, Presentation, Presentation, Structural, Structural]),
+            OValue::Object { .. } => (OValue::object(BTreeMap::from([("key".into(), OValue::int(1))])), [Structural, Presentation, Presentation, Presentation, Structural, Structural]),
+            OValue::EntriesMap { .. } => (OValue::entries_map(vec![(OValue::text("key"), OValue::int(1))]), [Structural, Presentation, Presentation, Presentation, Structural, Structural]),
+            OValue::Set { .. } => (OValue::set(SetKind::Ordered, vec![OValue::int(1)]), [Structural, Presentation, Presentation, Presentation, Structural, Structural]),
+            OValue::Symbol { .. } => (OValue::symbol("answer"), [Structural, Presentation, Presentation, Presentation, Structural, Structural]),
+            OValue::Keyword { .. } => (OValue::keyword("required"), [Structural, Presentation, Presentation, Presentation, Structural, Structural]),
+            OValue::Scope { .. } => (OValue::scope(HashMap::from([("x".into(), OValue::int(1))])), [Typed, Opaque, Opaque, Opaque, Opaque, Opaque]),
+            OValue::Blob { .. } => (OValue::blob(b"data", "application/octet-stream"), [Structural, Presentation, Presentation, Presentation, Structural, Structural]),
+            OValue::Bytes { .. } => (OValue::bytes(b"data".to_vec(), Some("application/octet-stream".into())), [Structural, Presentation, Presentation, Presentation, Structural, Structural]),
+            OValue::Graph { .. } => (OValue::graph(
+                0,
+                vec![GraphNode::Value {
+                    value: Box::new(OValue::int(1)),
+                }],
+            ), [Typed, Opaque, Opaque, Opaque, Opaque, Opaque]),
+            OValue::Native { .. } => (OValue::native(ONative {
+                lang: "python".into(),
+                implementation: Some("cpython".into()),
+                version: Some("3.14".into()),
+                type_name: "decimal.Decimal".into(),
+                identity: NativeIdentity {
+                    stable: Some("decimal:1.25".into()),
+                    live: None,
+                },
+                codec: "repr".into(),
+                payload: Some(OBytes {
+                    bytes: b"Decimal('1.25')".to_vec(),
+                    media_type: Some("text/x-python-repr".into()),
+                }),
+                boundary: NativeBoundary::Pure,
+                safety: NativeCodecSafety::SourceBacked,
+                capabilities: vec![],
+                metadata: BTreeMap::new(),
+                rehydrate: RehydratePolicy::Portable,
+            }), [Typed, Opaque, Opaque, Opaque, Opaque, Opaque]),
+            OValue::NixExpr { .. } => (OValue::nix_expr("1 + 1", vec![]), [Typed, Presentation, Presentation, Presentation, Structural, Structural]),
+            OValue::Derivation { .. } => (OValue::derivation(
+                "/nix/store/example.drv",
+                vec!["out".into()],
+                vec![],
+            ), [Typed, Presentation, Presentation, Presentation, Structural, Structural]),
+            OValue::Request { .. } => (OValue::request(
+                RequestKind::Instantiate,
+                OValue::nix_expr("1", vec![]),
+            ), [Typed, Opaque, Opaque, Opaque, Opaque, Opaque]),
+            OValue::System { .. } => (OValue::system("/nix/var/nix/profiles/system"), [Typed, Presentation, Presentation, Presentation, Structural, Structural]),
+            OValue::Capability { .. } => (OValue::capability(
+                CapabilityKind::Service,
+                "opaque",
+                HashMap::new(),
+            ), [Typed, Opaque, Opaque, Opaque, Opaque, Opaque]),
+            OValue::Snapshot { .. } => (OValue::snapshot(
+                SnapshotKind::System,
+                "generation",
+                HashMap::new(),
+            ), [Typed, Opaque, Opaque, Opaque, Opaque, Opaque]),
+            OValue::Thunk { .. } => (OValue::thunk("42", vec![]), [Typed, Presentation, Presentation, Presentation, Structural, Structural]),
+            OValue::Group { .. } => (OValue::group(GroupMode::Batch, vec![]), [Typed, Opaque, Opaque, Opaque, Opaque, Opaque]),
+            OValue::Error { .. } => (OValue::error("failed"), [Typed, Presentation, Presentation, Presentation, Opaque, Opaque]),
+        );
+        let renderers = exhaustive_cases!(SpliceRenderer;
+            SpliceRenderer::Python => SpliceRenderer::Python,
+            SpliceRenderer::Html => SpliceRenderer::Html,
+            SpliceRenderer::Latex => SpliceRenderer::Latex,
+            SpliceRenderer::Markdown => SpliceRenderer::Markdown,
+            SpliceRenderer::Nix => SpliceRenderer::Nix,
+            SpliceRenderer::Default => SpliceRenderer::Default,
+        );
+
+        assert_eq!(cases.len(), 30);
+        assert_eq!(renderers.len(), 6);
+        assert_eq!(
+            cases
+                .iter()
+                .map(|(value, _)| value.type_name())
+                .collect::<HashSet<_>>()
+                .len(),
+            cases.len(),
+            "the matrix must contain one representative per OValue variant"
+        );
+
+        for (renderer_index, renderer) in renderers.iter().copied().enumerate() {
+            for (value, expected) in &cases {
                 let rendered = render_with(renderer, value);
-                let _classification = render_fidelity(renderer, value);
-                assert!(
-                    !rendered.is_empty() || matches!(value, OValue::Null),
-                    "{renderer:?} silently erased {}",
-                    value.type_name()
+                assert_eq!(
+                    render_fidelity(renderer, value),
+                    expected[renderer_index],
+                    "classification drift for {renderer:?} over {}",
+                    value.type_name(),
+                );
+                if expected[renderer_index] == RenderFidelity::Opaque {
+                    assert!(
+                        !rendered.is_empty(),
+                        "opaque {renderer:?} rendering needs an identifying marker for {}",
+                        value.type_name(),
+                    );
+                }
+            }
+        }
+
+        let graph = cases
+            .iter()
+            .map(|(value, _)| value)
+            .find(|value| matches!(value, OValue::Graph { .. }))
+            .unwrap();
+        let native = cases
+            .iter()
+            .map(|(value, _)| value)
+            .find(|value| matches!(value, OValue::Native { .. }))
+            .unwrap();
+        for value in [graph, native] {
+            assert_eq!(
+                render_fidelity(SpliceRenderer::Python, value),
+                RenderFidelity::Typed
+            );
+            for renderer in [
+                SpliceRenderer::Nix,
+                SpliceRenderer::Html,
+                SpliceRenderer::Latex,
+                SpliceRenderer::Markdown,
+                SpliceRenderer::Default,
+            ] {
+                assert_eq!(
+                    render_fidelity(renderer, value),
+                    RenderFidelity::Opaque,
+                    "{renderer:?} only retains a summary for {}",
+                    value.type_name(),
                 );
             }
+        }
+
+        let bytes_with_media_type = cases
+            .iter()
+            .map(|(value, _)| value)
+            .find(|value| matches!(value, OValue::Bytes { .. }))
+            .unwrap();
+        assert_eq!(
+            render_fidelity(SpliceRenderer::Nix, bytes_with_media_type),
+            RenderFidelity::Structural
+        );
+        assert_eq!(
+            render_fidelity(SpliceRenderer::Default, bytes_with_media_type),
+            RenderFidelity::Structural
+        );
+        let bytes_without_media_type = OValue::bytes(b"data".to_vec(), None);
+        let bytes_without_media_expected = [
+            Structural,
+            Presentation,
+            Presentation,
+            Presentation,
+            Opaque,
+            Opaque,
+        ];
+        for (renderer, expected) in renderers.iter().copied().zip(bytes_without_media_expected) {
+            assert_eq!(
+                render_fidelity(renderer, &bytes_without_media_type),
+                expected,
+                "classification drift for media-less Bytes under {renderer:?}",
+            );
         }
 
         assert_eq!(
@@ -3997,6 +4358,535 @@ mod tests {
             RenderFidelity::Structural,
             "container fidelity must be bounded by its least faithful child"
         );
+    }
+
+    #[test]
+    fn renderer_fidelity_records_numeric_and_container_subtype_collapse() {
+        use std::collections::BTreeMap;
+
+        use crate::value::{DecimalSpecial, FloatFormat, FloatSpecial, SeqKind, SetKind};
+
+        let decimal = OValue::number(ONumber::Decimal {
+            coeff: 125.into(),
+            exp10: -2,
+            special: None,
+        });
+        let f32_value = 1.25_f32;
+        let binary_f32 = OValue::number(ONumber::BinaryFloat {
+            format: FloatFormat::F32,
+            bits: f32_value.to_bits().to_be_bytes().to_vec(),
+        });
+        let binary_f64 = OValue::float(1.25);
+        let big_float = OValue::number(ONumber::BigFloat {
+            mantissa: 5.into(),
+            exp2: -2,
+            precision: Some(128),
+            special: None,
+        });
+        let special_big_float = OValue::number(ONumber::BigFloat {
+            mantissa: 0.into(),
+            exp2: 0,
+            precision: Some(128),
+            special: Some(FloatSpecial::NegZero),
+        });
+        let complex = OValue::number(ONumber::Complex {
+            re: Box::new(ONumber::Int { v: 1.into() }),
+            im: Box::new(ONumber::Int { v: 2.into() }),
+        });
+        let decimal_special = OValue::number(ONumber::Decimal {
+            coeff: 0.into(),
+            exp10: 0,
+            special: Some(DecimalSpecial::Nan),
+        });
+
+        for value in [
+            OValue::rational(2, 4).unwrap(),
+            binary_f32,
+            big_float,
+            special_big_float,
+            complex,
+        ] {
+            assert_eq!(
+                render_fidelity(SpliceRenderer::Python, &value),
+                RenderFidelity::Structural,
+                "Python erases a numeric subtype or precision fact for {value:?}",
+            );
+        }
+        for value in [&decimal, &decimal_special, &binary_f64] {
+            assert_eq!(
+                render_fidelity(SpliceRenderer::Python, value),
+                RenderFidelity::Typed,
+            );
+        }
+        for value in [
+            &decimal,
+            &decimal_special,
+            &binary_f64,
+            &OValue::rational(2, 4).unwrap(),
+        ] {
+            assert_eq!(
+                render_fidelity(SpliceRenderer::Nix, value),
+                RenderFidelity::Structural,
+                "Nix retains only plain O integers as typed numbers",
+            );
+        }
+
+        let tuple = OValue::seq(SeqKind::Tuple, vec![OValue::int(1)]);
+        assert_eq!(
+            render_fidelity(SpliceRenderer::Python, &tuple),
+            RenderFidelity::Typed,
+        );
+        assert_eq!(
+            render_fidelity(SpliceRenderer::Nix, &tuple),
+            RenderFidelity::Structural,
+        );
+
+        for value in [
+            OValue::seq(SeqKind::List, vec![OValue::int(1)]),
+            OValue::seq(SeqKind::Vector, vec![OValue::int(1)]),
+            OValue::set(SetKind::Ordered, vec![OValue::int(1)]),
+            OValue::set(SetKind::Unordered, vec![OValue::int(1)]),
+            OValue::object(BTreeMap::from([("x".into(), OValue::int(1))])),
+        ] {
+            assert_eq!(
+                render_fidelity(SpliceRenderer::Python, &value),
+                RenderFidelity::Structural,
+            );
+            assert_eq!(
+                render_fidelity(SpliceRenderer::Nix, &value),
+                RenderFidelity::Structural,
+            );
+        }
+    }
+
+    #[test]
+    fn renderer_fidelity_handles_adversarial_numeric_and_text_payloads() {
+        use num_bigint::BigInt;
+
+        use crate::value::{DecimalSpecial, FloatFormat};
+
+        let evaluator = Evaluator::new("/tmp".into());
+        let noncanonical_zero = OValue::number(ONumber::Decimal {
+            coeff: 0.into(),
+            exp10: -3,
+            special: None,
+        });
+        let inconsistent_special = OValue::number(ONumber::Decimal {
+            coeff: 1.into(),
+            exp10: 1,
+            special: Some(DecimalSpecial::Nan),
+        });
+        let extreme_decimal = OValue::number(ONumber::Decimal {
+            coeff: 1.into(),
+            exp10: 425_000_001,
+            special: None,
+        });
+        let adjusted_exponent_overflow = OValue::number(ONumber::Decimal {
+            coeff: 99.into(),
+            exp10: 425_000_000,
+            special: None,
+        });
+        for value in [
+            &noncanonical_zero,
+            &inconsistent_special,
+            &extreme_decimal,
+            &adjusted_exponent_overflow,
+        ] {
+            assert_eq!(
+                render_fidelity(SpliceRenderer::Python, value),
+                RenderFidelity::Structural,
+            );
+        }
+        assert!(
+            !evaluator
+                .render_child("python", &extreme_decimal)
+                .contains("Decimal("),
+            "an exponent outside the portable Decimal range must render as inert structure",
+        );
+
+        let huge_digits = "9".repeat(5_000);
+        let huge_coefficient = BigInt::parse_bytes(huge_digits.as_bytes(), 10).unwrap();
+        let huge_decimal = OValue::number(ONumber::Decimal {
+            coeff: huge_coefficient.clone(),
+            exp10: 0,
+            special: None,
+        });
+        assert_eq!(
+            render_fidelity(SpliceRenderer::Python, &huge_decimal),
+            RenderFidelity::Typed,
+            "the shim encodes Decimal tuples without CPython's int digit conversion",
+        );
+        assert!(evaluator
+            .render_child("python", &huge_decimal)
+            .contains("Decimal("));
+
+        let huge_int = OValue::big_int(huge_coefficient.clone());
+        let huge_python_int = evaluator.render_child("python", &huge_int);
+        assert_eq!(
+            render_fidelity(SpliceRenderer::Python, &huge_int),
+            RenderFidelity::Typed,
+        );
+        assert!(
+            huge_python_int.starts_with("0x"),
+            "large O integers must bypass Python's decimal-source digit ceiling",
+        );
+
+        let huge_rational = OValue::number(ONumber::Rational {
+            num: huge_coefficient,
+            den: 1.into(),
+        });
+        let huge_python_rational = evaluator.render_child("python", &huge_rational);
+        assert!(huge_python_rational.contains("Fraction(0x"));
+
+        let malformed_f64 = OValue::number(ONumber::BinaryFloat {
+            format: FloatFormat::F64,
+            bits: vec![0],
+        });
+        assert_eq!(
+            render_fidelity(SpliceRenderer::Python, &malformed_f64),
+            RenderFidelity::Structural,
+        );
+        assert!(
+            !evaluator
+                .render_child("python", &malformed_f64)
+                .contains("unpack"),
+            "malformed float bytes must not become a failing Python expression",
+        );
+
+        let zero_denominator = OValue::number(ONumber::Rational {
+            num: 1.into(),
+            den: 0.into(),
+        });
+        assert!(
+            !evaluator
+                .render_child("python", &zero_denominator)
+                .contains("Fraction("),
+            "a directly assembled invalid rational must still render without division",
+        );
+
+        let oversized_int = OValue::big_int(BigInt::from(i64::MAX) + 1_u8);
+        assert_eq!(
+            render_fidelity(SpliceRenderer::Nix, &oversized_int),
+            RenderFidelity::Structural,
+        );
+        assert!(evaluator
+            .render_child("nix", &oversized_int)
+            .starts_with('"'));
+
+        let min_i64 = OValue::big_int(i64::MIN);
+        assert_eq!(
+            render_fidelity(SpliceRenderer::Nix, &min_i64),
+            RenderFidelity::Typed,
+        );
+        assert_eq!(
+            evaluator.render_child("nix", &min_i64),
+            "(-9223372036854775807 - 1)",
+        );
+
+        let nonfinite = OValue::float(f64::INFINITY);
+        assert_eq!(
+            render_fidelity(SpliceRenderer::Nix, &nonfinite),
+            RenderFidelity::Structural,
+        );
+        assert!(evaluator.render_child("nix", &nonfinite).starts_with('"'));
+
+        let noncanonical_encoding = OValue::text_with_encoding("text", None);
+        let nul_text = OValue::text("before\0after");
+        let control_text = OValue::text("before\u{0008}after");
+        let interpolation_text = OValue::text(r#"${builtins.abort "not data"}"#);
+        assert_eq!(
+            render_fidelity(SpliceRenderer::Nix, &noncanonical_encoding),
+            RenderFidelity::Structural,
+        );
+        assert_eq!(
+            render_fidelity(SpliceRenderer::Nix, &nul_text),
+            RenderFidelity::Structural,
+        );
+        assert_eq!(
+            render_fidelity(SpliceRenderer::Nix, &control_text),
+            RenderFidelity::Typed,
+        );
+        assert!(!evaluator
+            .render_child("nix", &control_text)
+            .contains("builtins"));
+        assert_eq!(
+            render_fidelity(SpliceRenderer::Nix, &interpolation_text),
+            RenderFidelity::Typed,
+        );
+        assert!(evaluator
+            .render_child("nix", &interpolation_text)
+            .contains(r#"\${builtins.abort"#));
+
+        let control_key = OValue::map(HashMap::from([(
+            "before\u{0008}after".into(),
+            OValue::int(1),
+        )]));
+        let rendered_control_key = evaluator.render_child("nix", &control_key);
+        assert_eq!(
+            render_fidelity(SpliceRenderer::Nix, &control_key),
+            RenderFidelity::Typed,
+        );
+        assert!(rendered_control_key.contains("before\u{0008}after"));
+        assert!(!rendered_control_key.contains("builtins"));
+
+        let nul_collision_fields = [
+            ("\0".to_string(), OValue::int(1)),
+            ("\"\\u0000\"".to_string(), OValue::int(2)),
+        ];
+        let nul_collision_map = OValue::map(HashMap::from(nul_collision_fields.clone()));
+        let nul_collision_object =
+            OValue::object(std::collections::BTreeMap::from(nul_collision_fields));
+        assert_eq!(
+            render_fidelity(SpliceRenderer::Nix, &nul_collision_map),
+            RenderFidelity::Structural,
+        );
+        let structural_keys = evaluator.render_child("nix", &nul_collision_map);
+        assert!(structural_keys.starts_with("[ "));
+        assert!(structural_keys.contains("unicode-codepoints-v1"));
+        assert_eq!(
+            evaluator.render_child("nix", &nul_collision_object),
+            structural_keys,
+        );
+    }
+
+    #[test]
+    fn python_set_renderer_falls_back_to_a_list_for_unhashable_members() {
+        use crate::value::SetKind;
+
+        let evaluator = Evaluator::new("/tmp".into());
+        let hashable = OValue::set(SetKind::Unordered, vec![OValue::int(1)]);
+        let unhashable = OValue::set(SetKind::Unordered, vec![OValue::list(vec![OValue::int(1)])]);
+
+        assert_eq!(evaluator.render_child("python", &hashable), "set([1])");
+        assert_eq!(evaluator.render_child("python", &unhashable), "[[1]]");
+        assert_eq!(
+            render_fidelity(SpliceRenderer::Python, &unhashable),
+            RenderFidelity::Structural,
+        );
+    }
+
+    #[test]
+    fn nix_renderer_edge_sources_evaluate_when_nix_is_available() {
+        use std::process::Command;
+
+        fn evaluate(source: &str) -> Option<serde_json::Value> {
+            let output = match Command::new("nix")
+                .args(["eval", "--json", "--expr", source])
+                .output()
+            {
+                Ok(output) => output,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+                Err(error) => panic!("failed to start nix: {error}"),
+            };
+            assert!(
+                output.status.success(),
+                "nix rejected {source:?}: {}",
+                String::from_utf8_lossy(&output.stderr),
+            );
+            Some(serde_json::from_slice(&output.stdout).unwrap())
+        }
+
+        let evaluator = Evaluator::new("/tmp".into());
+        let min_i64 = evaluator.render_child("nix", &OValue::big_int(i64::MIN));
+        let Some(actual) = evaluate(&min_i64) else {
+            return;
+        };
+        assert_eq!(actual, serde_json::json!(i64::MIN));
+
+        let control = OValue::text("before\u{0008}after");
+        let control_source = evaluator.render_child("nix", &control);
+        assert_eq!(
+            evaluate(&format!("let builtins = null; in {control_source}")),
+            Some(serde_json::json!("before\u{0008}after")),
+        );
+
+        let map = OValue::map(HashMap::from([(
+            "before\u{0008}after".to_string(),
+            OValue::int(1),
+        )]));
+        assert_eq!(
+            evaluate(&evaluator.render_child("nix", &map)),
+            Some(serde_json::json!({"before\u{0008}after": 1})),
+        );
+
+        let nul_text = OValue::text("\0");
+        assert_eq!(
+            evaluate(&evaluator.render_child("nix", &nul_text)),
+            Some(serde_json::json!({
+                "__ostadix_string_encoding": "unicode-codepoints-v1",
+                "codepoints": [0],
+            })),
+        );
+        let nul_collision_map = OValue::map(HashMap::from([
+            ("\0".to_string(), OValue::int(1)),
+            ("\"\\u0000\"".to_string(), OValue::int(2)),
+        ]));
+        assert_eq!(
+            evaluate(&evaluator.render_child("nix", &nul_collision_map)),
+            Some(serde_json::json!([
+                {
+                    "key": {
+                        "__ostadix_string_encoding": "unicode-codepoints-v1",
+                        "codepoints": [0],
+                    },
+                    "value": 1,
+                },
+                {"key": "\"\\u0000\"", "value": 2},
+            ])),
+        );
+
+        let thunk = OValue::thunk("not valid nix {", vec![]);
+        assert_eq!(
+            evaluate(&evaluator.render_child("nix", &thunk)),
+            Some(serde_json::json!("not valid nix {")),
+        );
+        let empty_expr = OValue::nix_expr("", vec![]);
+        assert_eq!(
+            evaluate(&evaluator.render_child("nix", &empty_expr)),
+            Some(serde_json::json!("")),
+        );
+    }
+
+    #[test]
+    fn every_recursive_container_inherits_an_opaque_child() {
+        use std::collections::BTreeMap;
+
+        use crate::value::{SeqKind, SetKind};
+
+        let opaque = OValue::graph(0, vec![]);
+        let containers = [
+            OValue::list(vec![opaque.clone()]),
+            OValue::map(HashMap::from([("value".into(), opaque.clone())])),
+            OValue::seq(SeqKind::Tuple, vec![opaque.clone()]),
+            OValue::set(SetKind::Ordered, vec![opaque.clone()]),
+            OValue::object(BTreeMap::from([("value".into(), opaque.clone())])),
+            OValue::entries_map(vec![(opaque.clone(), OValue::int(1))]),
+            OValue::entries_map(vec![(OValue::int(1), opaque)]),
+        ];
+
+        for renderer in [
+            SpliceRenderer::Html,
+            SpliceRenderer::Latex,
+            SpliceRenderer::Markdown,
+            SpliceRenderer::Nix,
+            SpliceRenderer::Default,
+        ] {
+            for container in &containers {
+                assert_eq!(
+                    render_fidelity(renderer, container),
+                    RenderFidelity::Opaque,
+                    "{renderer:?} did not propagate an opaque child through {}",
+                    container.type_name(),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn opaque_renderings_keep_a_marker_for_empty_public_payloads() {
+        use std::collections::BTreeMap;
+
+        use crate::value::{
+            GraphNode, NativeBoundary, NativeCodecSafety, NativeIdentity, OBytes, ONative,
+            RehydratePolicy, SnapshotKind,
+        };
+
+        let values = [
+            OValue::bytes(vec![], None),
+            OValue::scope(HashMap::new()),
+            OValue::graph(0, Vec::<GraphNode>::new()),
+            OValue::native(ONative {
+                lang: String::new(),
+                implementation: None,
+                version: None,
+                type_name: String::new(),
+                identity: NativeIdentity {
+                    stable: None,
+                    live: None,
+                },
+                codec: String::new(),
+                payload: Some(OBytes {
+                    bytes: vec![],
+                    media_type: None,
+                }),
+                boundary: NativeBoundary::Pure,
+                safety: NativeCodecSafety::DataOnly,
+                capabilities: vec![],
+                metadata: BTreeMap::new(),
+                rehydrate: RehydratePolicy::Portable,
+            }),
+            OValue::Request {
+                kind: RequestKind::Instantiate,
+                source: Box::new(OValue::null()),
+                fingerprint: String::new(),
+            },
+            OValue::capability(CapabilityKind::Service, "", HashMap::new()),
+            OValue::snapshot(SnapshotKind::System, "", HashMap::new()),
+            OValue::Group {
+                mode: GroupMode::Batch,
+                members: vec![],
+                fingerprint: String::new(),
+            },
+            OValue::error(""),
+        ];
+
+        for renderer in [
+            SpliceRenderer::Python,
+            SpliceRenderer::Html,
+            SpliceRenderer::Latex,
+            SpliceRenderer::Markdown,
+            SpliceRenderer::Nix,
+            SpliceRenderer::Default,
+        ] {
+            for value in &values {
+                if render_fidelity(renderer, value) == RenderFidelity::Opaque {
+                    assert!(
+                        !render_with(renderer, value).is_empty(),
+                        "{renderer:?} erased opaque {}",
+                        value.type_name(),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn renderers_accept_short_unicode_fingerprints() {
+        let values = [
+            OValue::Request {
+                kind: RequestKind::Instantiate,
+                source: Box::new(OValue::null()),
+                fingerprint: "短".into(),
+            },
+            OValue::Thunk {
+                body: "42".into(),
+                deps: vec![],
+                fingerprint: "é".into(),
+            },
+            OValue::Group {
+                mode: GroupMode::Batch,
+                members: vec![],
+                fingerprint: "🔒".into(),
+            },
+        ];
+        let renderers = exhaustive_cases!(SpliceRenderer;
+            SpliceRenderer::Python => SpliceRenderer::Python,
+            SpliceRenderer::Html => SpliceRenderer::Html,
+            SpliceRenderer::Latex => SpliceRenderer::Latex,
+            SpliceRenderer::Markdown => SpliceRenderer::Markdown,
+            SpliceRenderer::Nix => SpliceRenderer::Nix,
+            SpliceRenderer::Default => SpliceRenderer::Default,
+        );
+
+        for renderer in renderers {
+            for value in &values {
+                assert!(
+                    !render_with(renderer, value).is_empty(),
+                    "{renderer:?} erased {} with a short fingerprint",
+                    value.type_name(),
+                );
+            }
+        }
     }
 
     #[test]
@@ -4423,7 +5313,7 @@ mod tests {
     fn prepared_placement_fragment_rejects_stale_runtime_before_dispatch() -> Result<()> {
         let source_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("backends");
         let temp = tempfile::tempdir()?;
-        for file in ["python_shim.py", "o_shim_common.py"] {
+        for file in ["python_shim.py", "o_shim_common.py", "o_native_objects.py"] {
             std::fs::copy(source_dir.join(file), temp.path().join(file))?;
         }
         let mut evaluator = placement_evaluator(temp.path().to_path_buf());
@@ -5683,6 +6573,44 @@ mod tests {
             "default backend authority should allow bash dispatch to reach the shim layer, got: {error}"
         );
         assert!(!error.contains("names no live capability"));
+    }
+
+    #[test]
+    fn crossing_evidence_does_not_claim_adapter_receipt_before_reentrancy_check() {
+        use crate::backend_morphism::RuntimeCrossingStateV1;
+        if which::which("python3").is_err() {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("must-not-run");
+        let path = serde_json::to_string(&marker.to_string_lossy()).unwrap();
+        let shim_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("backends");
+        let mut evaluator = Evaluator::new(shim_dir).with_crossing_observations();
+        evaluator.suspended_actors.insert(("python".to_owned(), 7));
+        let program = OIrProgram {
+            nodes: vec![OIr::Exec {
+                backend: BackendRegistry::global().interface_for("python"),
+                lang: "python".to_owned(),
+                env_id: 7,
+                attr: None,
+                body: vec![OIr::Text(format!(
+                    "__import__('pathlib').Path({path}).write_text('unexpected')"
+                ))],
+            }],
+        };
+        let error = evaluator
+            .eval_ir_program_graph_with_scope(&program, &mut HashMap::new())
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("reentrant deadlock"));
+        assert!(!marker.exists());
+        let records = &evaluator.last_execution_trace().unwrap().backend_crossings;
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].input_boundary,
+            "prepared-ovalue-adapter-bindings"
+        );
+        assert_eq!(records[0].state, RuntimeCrossingStateV1::Failed);
+        assert!(records[0].result.is_none() && !records[0].published);
     }
 
     #[test]

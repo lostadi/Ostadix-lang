@@ -28,20 +28,39 @@ jobs:
             ~/.cargo/git
             ~/.cargo/bin/cargo-fuzz
             fuzz/target
-          key: ${{ runner.os }}-parser-fuzz-${{ hashFiles('Cargo.lock', 'fuzz/Cargo.lock') }}
+          key: ${{ runner.os }}-parser-fuzz-nightly-2026-08-14-cargo-fuzz-0.13.2-${{ hashFiles('Cargo.lock', 'fuzz/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-parser-fuzz-
+            ${{ runner.os }}-parser-fuzz-nightly-2026-08-14-cargo-fuzz-0.13.2-
 
       - name: Install cargo-fuzz
-        run: command -v cargo-fuzz >/dev/null || cargo install cargo-fuzz --locked
+        run: |
+          if [[ "$(cargo fuzz --version 2>/dev/null || true)" != "cargo-fuzz 0.13.2" ]]; then
+            cargo install cargo-fuzz --version '=0.13.2' --locked --force
+          fi
+          test "$(cargo fuzz --version)" = "cargo-fuzz 0.13.2"
+
+      - name: Verify and record fuzz manifest lockfile
+        run: |
+          cargo +nightly-2026-08-14 metadata \
+            --locked \
+            --manifest-path fuzz/Cargo.toml \
+            --format-version 1 \
+            --no-deps
+          sha256sum fuzz/Cargo.lock > "$RUNNER_TEMP/fuzz-lock.sha256"
 
       - name: Run five-minute parser campaign
         run: >-
-          cargo +nightly fuzz run parser --
+          cargo +nightly-2026-08-14 fuzz run parser --
           -max_total_time=300
           -timeout=5
           -rss_limit_mb=2048
           -print_final_stats=1
+
+      - name: Verify fuzz campaign preserved its lockfile
+        if: always()
+        run: |
+          sha256sum --check "$RUNNER_TEMP/fuzz-lock.sha256"
+          git diff --exit-code -- fuzz/Cargo.lock
 
       - name: Upload parser crash artifacts
         if: failure()

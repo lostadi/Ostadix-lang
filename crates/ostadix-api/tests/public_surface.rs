@@ -2,8 +2,13 @@ use std::path::PathBuf;
 
 use ostadix_api::computation::OComputationBuilderV1;
 use ostadix_api::computation_core::{
-    ComputationLineageId, OComputationManifestV1, VerifiedOComputationV1,
-    OCOMPUTATION_MANIFEST_SCHEMA_V1,
+    verify_realization_set_v1, ComputationLineageId, FacetIdV1, FacetRefV1, OComputationErrorV1,
+    OComputationManifestV1, OperationContractIdV1, OperationContractV1, OperationIdV1,
+    OperationInterfaceIdV1, OperationInterfaceV1, OperationPortV1, OperationShapeParameterV1,
+    RealizationDescriptorIdV1, RealizationDescriptorV1, RealizationIdV1,
+    RealizationPortRepresentationsV1, RealizationSetIdV1, RealizationSetV1, SemanticArtifactRefV1,
+    VerifiedOComputationV1, OCOMPUTATION_MANIFEST_SCHEMA_V1, OPERATION_CONTRACT_SCHEMA_V1,
+    OPERATION_INTERFACE_SCHEMA_V1, REALIZATION_DESCRIPTOR_SCHEMA_V1, REALIZATION_SET_SCHEMA_V1,
 };
 use ostadix_api::execution_fabric::{
     ExecutionCandidateV1, ExecutionCapsuleV1, ExecutionIdV1, EXECUTION_CANDIDATE_SCHEMA_V1,
@@ -53,6 +58,66 @@ fn ocomputation_identity_spine_is_nameable_from_the_engine_root() {
         OCOMPUTATION_MANIFEST_SCHEMA_V1,
         "ostadix.ocomputation-manifest/v1"
     );
+}
+
+#[test]
+fn operation_realization_schema_is_nameable_from_the_engine_root() {
+    macro_rules! assert_semantic_record_api {
+        ($record:ty, $id:ty) => {{
+            let _verify: fn($record) -> Result<$record, OComputationErrorV1> = <$record>::verify;
+            let _decode_canonical: fn(&[u8]) -> Result<$record, OComputationErrorV1> =
+                <$record>::decode_canonical;
+            let _decode_json: fn(&[u8]) -> Result<$record, OComputationErrorV1> =
+                <$record>::decode_json;
+            let _canonical_bytes: fn(&$record) -> Result<Vec<u8>, OComputationErrorV1> =
+                <$record>::canonical_bytes;
+            let _canonical_json: fn(&$record) -> Result<Vec<u8>, OComputationErrorV1> =
+                <$record>::canonical_json;
+            let _canonical_json_pretty: fn(&$record) -> Result<Vec<u8>, OComputationErrorV1> =
+                <$record>::canonical_json_pretty;
+            let _id: fn(&$record) -> Result<$id, OComputationErrorV1> = <$record>::id;
+            let _facet_ref: fn(&$record, FacetIdV1) -> Result<FacetRefV1, OComputationErrorV1> =
+                <$record>::facet_ref;
+        }};
+    }
+
+    assert_public::<OperationIdV1>();
+    assert_public::<RealizationIdV1>();
+    assert_public::<OperationContractIdV1>();
+    assert_public::<OperationInterfaceIdV1>();
+    assert_public::<RealizationDescriptorIdV1>();
+    assert_public::<RealizationSetIdV1>();
+    assert_public::<SemanticArtifactRefV1>();
+    assert_public::<OperationPortV1>();
+    assert_public::<OperationShapeParameterV1>();
+    assert_public::<RealizationPortRepresentationsV1>();
+    assert_public::<OperationContractV1>();
+    assert_public::<OperationInterfaceV1>();
+    assert_public::<RealizationDescriptorV1>();
+    assert_public::<RealizationSetV1>();
+    assert_semantic_record_api!(OperationContractV1, OperationContractIdV1);
+    assert_semantic_record_api!(OperationInterfaceV1, OperationInterfaceIdV1);
+    assert_semantic_record_api!(RealizationDescriptorV1, RealizationDescriptorIdV1);
+    assert_semantic_record_api!(RealizationSetV1, RealizationSetIdV1);
+    let _verify: fn(
+        &OperationContractV1,
+        &OperationInterfaceV1,
+        &[RealizationDescriptorV1],
+        &RealizationSetV1,
+    ) -> Result<(), OComputationErrorV1> = verify_realization_set_v1;
+    assert_eq!(
+        OPERATION_CONTRACT_SCHEMA_V1,
+        "ostadix.operation-contract/v1"
+    );
+    assert_eq!(
+        OPERATION_INTERFACE_SCHEMA_V1,
+        "ostadix.operation-interface/v1"
+    );
+    assert_eq!(
+        REALIZATION_DESCRIPTOR_SCHEMA_V1,
+        "ostadix.realization-descriptor/v1"
+    );
+    assert_eq!(REALIZATION_SET_SCHEMA_V1, "ostadix.realization-set/v1");
 }
 
 #[test]

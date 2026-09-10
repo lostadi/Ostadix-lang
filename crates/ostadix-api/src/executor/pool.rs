@@ -1,7 +1,8 @@
 //! Fixed-size persistent local-worker pool.
 //!
-//! Workers are created once per graph-coordinator execution and reused across
-//! changing HGraph readiness frontiers. Each completion is delivered
+//! By default, workers live for one graph-coordinator execution and are reused
+//! across changing HGraph readiness frontiers. Embeddings may explicitly retain
+//! an idle pool across sequential executions. Each completion is delivered
 //! independently; this module does not batch, order, or settle results.
 
 use std::sync::{
@@ -77,11 +78,10 @@ impl WorkerPool {
     pub(crate) fn matches_current_affinity(&self) -> bool {
         #[cfg(any(target_os = "android", target_os = "linux"))]
         {
-            return self
-                .creator_affinity
+            self.creator_affinity
                 .as_ref()
                 .zip(current_thread_affinity().as_ref())
-                .is_some_and(|(created, current)| created == current);
+                .is_some_and(|(created, current)| created == current)
         }
         #[cfg(not(any(target_os = "android", target_os = "linux")))]
         {

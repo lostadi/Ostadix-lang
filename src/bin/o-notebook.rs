@@ -232,31 +232,6 @@ fn select_shim_dir(explicit: Option<PathBuf>, configured: Option<PathBuf>) -> Pa
         .unwrap_or_else(|| PathBuf::from("backends"))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::select_shim_dir;
-    use std::path::PathBuf;
-
-    #[test]
-    fn configured_backend_directory_is_the_zero_argument_default() {
-        assert_eq!(
-            select_shim_dir(None, Some(PathBuf::from("/opt/ostadix/backends"))),
-            PathBuf::from("/opt/ostadix/backends")
-        );
-    }
-
-    #[test]
-    fn explicit_backend_directory_overrides_environment_configuration() {
-        assert_eq!(
-            select_shim_dir(
-                Some(PathBuf::from("chosen-backends")),
-                Some(PathBuf::from("configured-backends")),
-            ),
-            PathBuf::from("chosen-backends")
-        );
-    }
-}
-
 // ─── Embedded notebook UI ────────────────────────────────────────────────────
 
 const NOTEBOOK_HTML: &str = r#"<!DOCTYPE html>
@@ -265,6 +240,7 @@ const NOTEBOOK_HTML: &str = r#"<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>O · Notebook</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%231e1e2e'/%3E%3Ctext x='32' y='45' text-anchor='middle' font-size='42' font-family='monospace' font-weight='700' fill='%2389b4fa'%3EO%3C/text%3E%3C/svg%3E">
 <style>
 :root {
   --base:     #1e1e2e;
@@ -327,6 +303,10 @@ header {
 .kdot.error { background:var(--red); }
 
 .spacer { flex:1; }
+
+.header-actions {
+  display:flex; align-items:center; gap:10px;
+}
 
 .hbtn {
   display:inline-flex; align-items:center; gap:5px;
@@ -460,6 +440,16 @@ footer {
   font-size:11px; color:var(--overlay0);
 }
 
+@media (max-width: 720px) {
+  header { flex-wrap:wrap; gap:8px; padding:9px 12px; }
+  .spacer { display:none; }
+  .header-actions {
+    flex:1 0 100%;
+    display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:6px;
+  }
+  .hbtn { justify-content:center; min-width:0; padding:6px 5px; }
+}
+
 /* utils */
 @keyframes blink { 0%,100%{opacity:1} 50%{opacity:.3} }
 ::-webkit-scrollbar { width:6px; height:6px; }
@@ -477,12 +467,14 @@ footer {
     <span id="klabel">Kernel ready</span>
   </div>
   <div class="spacer"></div>
-  <button class="hbtn" onclick="addCell()">+ Cell</button>
-  <button class="hbtn primary" onclick="runAll()">▶ Run All</button>
-  <button class="hbtn" onclick="clearAll()">Clear Outputs</button>
-  <button class="hbtn" onclick="saveNotebook()" title="Save notebook to JSON (Ctrl+S)">⬇ Save</button>
-  <button class="hbtn" onclick="loadNotebook()" title="Load notebook from JSON">⬆ Load</button>
-  <button class="hbtn danger" onclick="restartKernel()" title="Clear all variable bindings and subprocess state">↺ Restart Kernel</button>
+  <div class="header-actions">
+    <button class="hbtn" onclick="addCell()">+ Cell</button>
+    <button class="hbtn primary" onclick="runAll()">▶ Run All</button>
+    <button class="hbtn" onclick="clearAll()">Clear Outputs</button>
+    <button class="hbtn" onclick="saveNotebook()" title="Save notebook to JSON (Ctrl+S)">⬇ Save</button>
+    <button class="hbtn" onclick="loadNotebook()" title="Load notebook from JSON">⬆ Load</button>
+    <button class="hbtn danger" onclick="restartKernel()" title="Clear all variable bindings and subprocess state">↺ Restart Kernel</button>
+  </div>
 </header>
 
 <div id="notebook"></div>
@@ -750,3 +742,28 @@ addCell('');
 </script>
 </body>
 </html>"#;
+
+#[cfg(test)]
+mod tests {
+    use super::select_shim_dir;
+    use std::path::PathBuf;
+
+    #[test]
+    fn configured_backend_directory_is_the_zero_argument_default() {
+        assert_eq!(
+            select_shim_dir(None, Some(PathBuf::from("/opt/ostadix/backends"))),
+            PathBuf::from("/opt/ostadix/backends")
+        );
+    }
+
+    #[test]
+    fn explicit_backend_directory_overrides_environment_configuration() {
+        assert_eq!(
+            select_shim_dir(
+                Some(PathBuf::from("chosen-backends")),
+                Some(PathBuf::from("configured-backends")),
+            ),
+            PathBuf::from("chosen-backends")
+        );
+    }
+}

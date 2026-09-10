@@ -1,4 +1,9 @@
-//! Observable graph/serial conformance for state-complete HGraph execution.
+//! Observable graph/serial conformance for selected terminating executions.
+//!
+//! The contract retains process termination (including Unix signals), stdout,
+//! normalized stderr, and a selected relative-path-to-file-bytes projection.
+//! It excludes permissions, empty directories, timestamps, and unobserved
+//! external state. These examples do not establish contextual equivalence.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -103,8 +108,8 @@ fn normalized_stderr(run: &RunOutcome) -> String {
 
 fn assert_equivalent(serial: &RunOutcome, graph: &RunOutcome) {
     assert_eq!(
-        serial.output.status.code(),
-        graph.output.status.code(),
+        serial.output.status,
+        graph.output.status,
         "exit status differs\nserial stderr:\n{}\ngraph stderr:\n{}",
         normalized_stderr(serial),
         normalized_stderr(graph)
@@ -115,7 +120,34 @@ fn assert_equivalent(serial: &RunOutcome, graph: &RunOutcome) {
         normalized_stderr(graph),
         "stderr differs"
     );
-    assert_eq!(serial.files, graph.files, "filesystem trees differ");
+    assert_eq!(serial.files, graph.files, "observed file bytes differ");
+}
+
+#[cfg(unix)]
+#[test]
+fn conformance_distinguishes_signal_termination() {
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::ExitStatus;
+
+    // Both statuses have no exit code; comparing code() would erase the
+    // distinction that the execution observation contract retains.
+    let term = ExitStatus::from_raw(libc::SIGTERM);
+    let kill = ExitStatus::from_raw(libc::SIGKILL);
+    assert_eq!(term.code(), kill.code());
+    let run = |status| RunOutcome {
+        output: Output {
+            status,
+            stdout: vec![],
+            stderr: vec![],
+        },
+        files: BTreeMap::new(),
+        workdir: tempfile::tempdir().unwrap(),
+    };
+    let left = run(term);
+    let equal = run(term);
+    assert_equivalent(&left, &equal);
+    let different = run(kill);
+    assert!(std::panic::catch_unwind(|| assert_equivalent(&left, &different)).is_err());
 }
 
 #[test]

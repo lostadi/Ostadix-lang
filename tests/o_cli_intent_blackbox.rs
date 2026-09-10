@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use base64::{engine::general_purpose::STANDARD, Engine};
+use o_lang::project::ValidatedSelectionReceiptV1;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -244,16 +245,39 @@ fn ordinary_auto_no_record_is_local_only(root: &Path) {
     );
 }
 
-fn json_run_help_is_informational_not_a_failure_envelope(root: &Path) {
-    let output =
-        run(o_cli(&root.join("home"), &root.join("state"), None).args(["run", "--json", "--help"]));
-    assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Usage:"), "run help was absent: {stdout}");
-    assert!(
-        !stdout.contains("ostadix.run-summary/v1"),
-        "help was incorrectly prefixed with a preflight-failure envelope: {stdout}"
-    );
+fn json_help_is_informational_not_a_failure_envelope(root: &Path) {
+    for command in ["run", "optimize"] {
+        let output = run(o_cli(&root.join("home"), &root.join("state"), None)
+            .args([command, "--json", "--help"]));
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("Usage:"),
+            "{command} help was absent: {stdout}"
+        );
+        assert!(
+            stdout.contains(&format!("Usage: o {command}")),
+            "{command} help named the internal binary instead of the public front door: {stdout}"
+        );
+        if command == "optimize" {
+            for boundary in [
+                "executes the reference and every candidate",
+                "requires durable run recording",
+                "evidence-gathering invocation is not accelerated",
+                "o run TARGET --selection-run RUN_ID",
+            ] {
+                assert!(
+                    stdout.contains(boundary),
+                    "optimize help omitted {boundary:?}: {stdout}"
+                );
+            }
+        }
+        assert!(
+            !stdout.contains("ostadix.run-summary/v1")
+                && !stdout.contains("ostadix.optimize-summary/v1"),
+            "{command} help was incorrectly prefixed with a failure envelope: {stdout}"
+        );
+    }
     assert_eq!(snapshot_tree(&root.join("state")), TreeSnapshot::Missing);
 }
 
@@ -264,7 +288,11 @@ fn ordinary_auto_overlaps_independent_oir_operations(root: &Path) {
     fs::create_dir_all(&work).unwrap();
     let program = work.join("parallel.O");
     write(&program, INTERVAL_BATCH);
-    let output = run(o_cli(&home, &state, None)
+    let python = which::which("python3").expect("test host must provide python3");
+    let python_bin = python
+        .parent()
+        .expect("python3 executable must have a parent directory");
+    let output = run(o_cli(&home, &state, Some(python_bin))
         .current_dir(&work)
         .env("O_TEST_WORKDIR", &work)
         .args([
@@ -386,8 +414,12 @@ fn inherited_backend_stderr_is_fully_bound_in_the_record(root: &Path) {
     fs::create_dir_all(&shims).unwrap();
     let program = root.join("missing-python-shim.O");
     write(&program, b"python^(\nprint(2)\n)_python\n");
+    let python = which::which("python3").expect("test host must provide python3");
+    let python_bin = python
+        .parent()
+        .expect("python3 executable must have a parent directory");
 
-    let output = run(o_cli(&home, &state, None).args([
+    let output = run(o_cli(&home, &state, Some(python_bin)).args([
         "run",
         program.to_str().unwrap(),
         "--shim-dir",
@@ -402,7 +434,8 @@ fn inherited_backend_stderr_is_fully_bound_in_the_record(root: &Path) {
     );
     single_json(&output);
 
-    let inspection = run(o_cli(&home, &state, None).args(["inspect", "last-run", "--trace"]));
+    let inspection =
+        run(o_cli(&home, &state, Some(python_bin)).args(["inspect", "last-run", "--trace"]));
     assert!(inspection.status.success());
     let observation: Value = serde_json::from_slice(&inspection.stdout).unwrap();
     let stderr = &observation["record"]["stderr"];
@@ -634,6 +667,674 @@ default = true
     );
 }
 
+fn validated_selection_receipt_is_bound_and_durable(root: &Path) {
+    let home = root.join("home");
+    let state = root.join("state");
+    let project = root.join("project");
+    let receipt_path = root.join("validated-selection.json");
+    let secret = "TOKEN_receipt_secret_987";
+    let shell = which::which("sh").expect("test host must provide sh");
+    let shell_bin = shell.parent().expect("sh must have a parent directory");
+    write(
+        &project.join("olang.project.toml"),
+        format!(
+            r#"
+[project]
+name = "validated-selection-cli"
+
+[[routes]]
+id = "reference"
+command = ["sh", "-c", "sleep 0.3; printf same", "{secret}"]
+
+[[routes]]
+id = "safe"
+command = ["sh", "-c", "sleep 0.1; printf same", "{secret}"]
+
+[[routes]]
+id = "divergent-json"
+command = ["sh", "-c", "printf '{{\"wrong\":true}}'", "{secret}"]
+result_codec = "json"
+
+[[route_sets]]
+provides = "main"
+alternatives = ["reference", "safe", "divergent-json"]
+policy = "benchmark_validate_and_select"
+"#
+        ),
+    );
+
+    let invoke = |no_record: bool| {
+        let mut command = o_cli(&home, &state, Some(shell_bin));
+        command.args([
+            "run",
+            project.to_str().unwrap(),
+            "--project",
+            "--route",
+            "main",
+            "--routes-policy",
+            "benchmark_validate_and_select",
+            "--selection-receipt-out",
+            receipt_path.to_str().unwrap(),
+            "--json",
+        ]);
+        if no_record {
+            command.arg("--no-record");
+        }
+        run(&mut command)
+    };
+
+    let first = invoke(false);
+    assert!(
+        first.status.success(),
+        "validated selection CLI run failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let summary = single_json(&first);
+    assert_summary_schema(&summary);
+    assert_eq!(summary["disposition"], "succeeded");
+    assert_eq!(summary["recording"]["status"], "recorded");
+
+    let receipt_bytes = fs::read(&receipt_path).expect("selection receipt was not written");
+    assert!(
+        !receipt_bytes
+            .windows(secret.len())
+            .any(|window| window == secret.as_bytes()),
+        "route argv leaked into the validated-selection receipt"
+    );
+    let receipt: ValidatedSelectionReceiptV1 = serde_json::from_slice(&receipt_bytes).unwrap();
+    receipt.validate().unwrap();
+    assert_eq!(receipt.reference_route_id, "reference");
+    assert_eq!(receipt.selected_route_id, "safe");
+    assert_eq!(
+        receipt
+            .candidates
+            .iter()
+            .map(|candidate| candidate.route_id.as_str())
+            .collect::<Vec<_>>(),
+        ["reference", "safe", "divergent-json"]
+    );
+    assert_eq!(
+        receipt.sha256().unwrap(),
+        hex::encode(Sha256::digest(&receipt_bytes)),
+        "reported receipt identity must equal sha256sum of emitted bytes"
+    );
+    assert_eq!(
+        receipt.candidates[2].disposition,
+        o_lang::project::ValidatedSelectionDispositionV1::RejectedOutput {
+            mismatch: o_lang::project::ValidatedSelectionMismatchV1::ResultCodec,
+        }
+    );
+
+    let inspection = run(o_cli(&home, &state, Some(shell_bin)).args(["inspect", "last-run"]));
+    assert!(
+        inspection.status.success(),
+        "could not inspect validated-selection run: {}",
+        String::from_utf8_lossy(&inspection.stderr)
+    );
+    let inspection: Value = serde_json::from_slice(&inspection.stdout).unwrap();
+    assert_eq!(
+        inspection["record"]["validated_selection_receipt"],
+        serde_json::to_value(&receipt).unwrap()
+    );
+    let recorded_routes = inspection["record"]["route_results"]
+        .as_array()
+        .expect("validated selection must retain route results");
+    for candidate in &receipt.candidates {
+        let recorded = recorded_routes
+            .iter()
+            .find(|result| result["route_id"] == candidate.route_id)
+            .unwrap_or_else(|| panic!("missing recorded candidate {}", candidate.route_id));
+        assert_eq!(
+            recorded["result_codec"],
+            serde_json::to_value(candidate.observation.result_codec).unwrap()
+        );
+        assert_eq!(recorded["duration_ns"], candidate.terminal_elapsed_ns);
+        assert_eq!(recorded["branch_elapsed_ns"], candidate.branch_elapsed_ns);
+    }
+    assert_eq!(
+        inspection["record"]["route_results"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()["route_id"],
+        "safe"
+    );
+    assert_eq!(inspection["record"]["decoded_value"], Value::Null);
+
+    let first_bundle = receipt.bundle_sha256.clone();
+    let second = invoke(true);
+    assert!(
+        second.status.success(),
+        "second validated selection CLI run failed: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_eq!(single_json(&second)["recording"]["status"], "disabled");
+    let second_receipt: ValidatedSelectionReceiptV1 =
+        serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+    assert_eq!(
+        second_receipt.bundle_sha256, first_bundle,
+        "an excluded receipt output changed the next bundle identity"
+    );
+}
+
+fn optimize_command_is_readable_structured_and_durable(root: &Path) {
+    let home = root.join("home");
+    let state = root.join("state");
+    let project = root.join("project");
+    let receipt_path = root.join("optimized-selection.json");
+    let shell = which::which("sh").expect("test host must provide sh");
+    let shell_bin = shell.parent().expect("sh must have a parent directory");
+    write(
+        &project.join("olang.project.toml"),
+        r#"
+[project]
+name = "optimize-cli"
+
+[[routes]]
+id = "reference"
+command = ["sh", "-c", "sleep 0.80; printf RAW_OPTIMIZE_MATCH_9137"]
+
+[[routes]]
+id = "fast"
+command = ["sh", "-c", "sleep 0.01; printf RAW_OPTIMIZE_MATCH_9137"]
+
+[[routes]]
+id = "divergent"
+command = ["sh", "-c", "printf RAW_OPTIMIZE_DIVERGENT_9137"]
+
+[[route_sets]]
+provides = "main"
+alternatives = ["reference", "fast", "divergent"]
+policy = "all"
+"#,
+    );
+
+    let human = run(o_cli(&home, &state, Some(shell_bin)).args([
+        "optimize",
+        project.to_str().unwrap(),
+        "--route",
+        "main",
+        "--receipt",
+        receipt_path.to_str().unwrap(),
+    ]));
+    assert!(
+        human.status.success(),
+        "human optimize failed: {}",
+        String::from_utf8_lossy(&human.stderr)
+    );
+    let rendered = String::from_utf8(human.stdout).unwrap();
+    let reference = rendered.find("- reference [reference]").unwrap();
+    let fast = rendered.find("- fast [selected]").unwrap();
+    let divergent = rendered
+        .find("- divergent - rejected: complete stdout differs")
+        .unwrap();
+    assert!(reference < fast && fast < divergent);
+    assert!(rendered.contains("Ostadix optimization evidence"));
+    assert!(rendered.contains("Selected route: fast"));
+    assert!(rendered.contains("Measured complete-branch ratio versus reference:"));
+    assert!(rendered.contains("Declared-output contract:"));
+    assert!(rendered.contains("Durable evidence: o inspect "));
+    assert!(rendered.contains("Receipt export path:"));
+    assert!(rendered.contains("every candidate ran"));
+    assert!(rendered.contains("was not accelerated"));
+    assert!(
+        !rendered.contains("RAW_OPTIMIZE_MATCH_9137")
+            && !rendered.contains("RAW_OPTIMIZE_DIVERGENT_9137"),
+        "raw candidate output escaped into the optimize UI: {rendered}"
+    );
+
+    let receipt_bytes = fs::read(&receipt_path).expect("optimize receipt was not exported");
+    let receipt: ValidatedSelectionReceiptV1 = serde_json::from_slice(&receipt_bytes).unwrap();
+    receipt.validate().unwrap();
+    assert_eq!(receipt.reference_route_id, "reference");
+    assert_eq!(receipt.selected_route_id, "fast");
+    let receipt_sha256 = hex::encode(Sha256::digest(&receipt_bytes));
+    assert!(rendered.contains(&format!("Receipt SHA-256: {receipt_sha256}")));
+
+    let inspection = run(o_cli(&home, &state, Some(shell_bin)).args(["inspect", "last-run"]));
+    assert!(
+        inspection.status.success(),
+        "could not inspect optimize evidence: {}",
+        String::from_utf8_lossy(&inspection.stderr)
+    );
+    let inspection: Value = serde_json::from_slice(&inspection.stdout).unwrap();
+    assert_eq!(
+        inspection["record"]["validated_selection_receipt"],
+        serde_json::to_value(&receipt).unwrap()
+    );
+
+    let json = run(o_cli(&home, &state, Some(shell_bin)).args([
+        "optimize",
+        project.to_str().unwrap(),
+        "--route",
+        "main",
+        "--json",
+    ]));
+    assert!(
+        json.status.success(),
+        "JSON optimize failed: {}",
+        String::from_utf8_lossy(&json.stderr)
+    );
+    let envelope = single_json(&json);
+    assert_eq!(envelope["schema"], "ostadix.optimize-summary/v1");
+    assert_eq!(envelope["run"]["schema"], "ostadix.run-summary/v1");
+    assert_eq!(envelope["run"]["disposition"], "succeeded");
+    assert_eq!(envelope["run"]["recording"]["status"], "recorded");
+    assert_eq!(envelope["receipt"]["reference_route_id"], "reference");
+    assert_eq!(envelope["receipt"]["selected_route_id"], "fast");
+    assert_eq!(envelope["receipt_export_path"], Value::Null);
+    let embedded_receipt: ValidatedSelectionReceiptV1 =
+        serde_json::from_value(envelope["receipt"].clone()).unwrap();
+    embedded_receipt.validate().unwrap();
+    assert_eq!(
+        envelope["receipt_sha256"],
+        embedded_receipt.sha256().unwrap()
+    );
+
+    let impossible_export = root.join("receipt-path-is-a-directory");
+    fs::create_dir(&impossible_export).unwrap();
+    let export_failure = run(o_cli(&home, &state, Some(shell_bin)).args([
+        "optimize",
+        project.to_str().unwrap(),
+        "--route",
+        "main",
+        "--receipt",
+        impossible_export.to_str().unwrap(),
+        "--json",
+    ]));
+    assert!(!export_failure.status.success());
+    let export_failure = single_json(&export_failure);
+    assert_eq!(
+        export_failure["run"]["disposition"],
+        "infrastructure_failed"
+    );
+    assert_eq!(export_failure["run"]["recording"]["status"], "recorded");
+    assert!(export_failure["receipt"].is_object());
+    assert!(export_failure["receipt_sha256"].is_string());
+    assert_eq!(export_failure["receipt_export_path"], Value::Null);
+    assert!(impossible_export.is_dir());
+
+    let malformed = run(o_cli(&home, &state, Some(shell_bin)).args([
+        "optimize",
+        project.to_str().unwrap(),
+        "--json",
+    ]));
+    assert!(!malformed.status.success());
+    let failure = single_json(&malformed);
+    assert_eq!(failure["schema"], "ostadix.optimize-summary/v1");
+    assert_eq!(failure["run"]["disposition"], "preflight_failed");
+    assert_eq!(failure["run"]["run_id"], Value::Null);
+    assert_eq!(failure["run"]["input"], Value::Null);
+    assert_eq!(failure["run"]["plan"], Value::Null);
+    assert_eq!(failure["run"]["recording"]["status"], "not_started");
+    assert_eq!(failure["receipt"], Value::Null);
+    assert_eq!(failure["receipt_sha256"], Value::Null);
+    assert_eq!(failure["receipt_export_path"], Value::Null);
+}
+
+#[cfg(all(unix, not(target_vendor = "apple")))]
+fn optimize_rejects_non_utf8_target_without_execution_or_state(root: &Path) {
+    use std::os::unix::ffi::OsStringExt;
+
+    let home = root.join("home");
+    let state = root.join("state");
+    let marker = root.join("must-not-execute");
+    let project = root.join(OsString::from_vec(b"project-\xff".to_vec()));
+    write(
+        &project.join("olang.project.toml"),
+        format!(
+            r#"
+[project]
+name = "non-utf8-target"
+
+[[routes]]
+id = "reference"
+command = ["sh", "-c", "printf executed > \"$MARKER\"; printf same"]
+env = {{ MARKER = "{}" }}
+
+[[routes]]
+id = "candidate"
+command = ["sh", "-c", "printf executed > \"$MARKER\"; printf same"]
+env = {{ MARKER = "{}" }}
+
+[[route_sets]]
+provides = "main"
+alternatives = ["reference", "candidate"]
+policy = "all"
+"#,
+            marker.display(),
+            marker.display(),
+        ),
+    );
+
+    let output = run(o_cli(&home, &state, None)
+        .arg("optimize")
+        .arg(&project)
+        .args(["--route", "main", "--json"]));
+    assert!(!output.status.success());
+    let envelope = single_json(&output);
+    assert_eq!(envelope["schema"], "ostadix.optimize-summary/v1");
+    assert_eq!(envelope["run"]["disposition"], "preflight_failed");
+    assert_eq!(envelope["run"]["run_id"], Value::Null);
+    assert_eq!(envelope["run"]["input"], Value::Null);
+    assert_eq!(envelope["run"]["plan"], Value::Null);
+    assert_eq!(envelope["run"]["recording"]["status"], "not_started");
+    assert_eq!(envelope["receipt"], Value::Null);
+    assert_eq!(envelope["receipt_sha256"], Value::Null);
+    assert_eq!(envelope["receipt_export_path"], Value::Null);
+    assert!(!marker.exists(), "non-UTF-8 target unexpectedly executed");
+    assert_eq!(snapshot_tree(&state), TreeSnapshot::Missing);
+}
+
+// Darwin filesystems reject non-UTF-8 path components with EILSEQ before the
+// compiled CLI can observe them, so this contract is exercisable only on Unix
+// hosts whose filesystem admits arbitrary path bytes.
+#[cfg(any(not(unix), target_vendor = "apple"))]
+fn optimize_rejects_non_utf8_target_without_execution_or_state(_root: &Path) {}
+
+fn optimize_rejects_a_direct_route_before_execution(root: &Path) {
+    let home = root.join("home");
+    let state = root.join("state");
+    let project = root.join("project");
+    let marker = root.join("must-not-execute");
+    write(
+        &project.join("olang.project.toml"),
+        format!(
+            r#"
+[project]
+name = "optimize-direct-route"
+
+[[routes]]
+id = "direct"
+command = ["sh", "-c", "printf executed > \"$MARKER\"; printf same"]
+env = {{ MARKER = "{}" }}
+"#,
+            marker.display()
+        ),
+    );
+
+    let output = run(o_cli(&home, &state, None).args([
+        "optimize",
+        project.to_str().unwrap(),
+        "--route",
+        "direct",
+        "--json",
+    ]));
+    assert!(!output.status.success());
+    let envelope = single_json(&output);
+    assert_eq!(envelope["schema"], "ostadix.optimize-summary/v1");
+    assert_eq!(envelope["run"]["disposition"], "preflight_failed");
+    assert_eq!(envelope["run"]["recording"]["status"], "not_started");
+    assert_eq!(envelope["receipt"], Value::Null);
+    assert!(
+        !marker.exists(),
+        "direct route ran despite failed preflight"
+    );
+}
+
+fn optimize_reference_failure_is_recorded_without_a_selection(root: &Path) {
+    let home = root.join("home");
+    let state = root.join("state");
+    let project = root.join("project");
+    write(
+        &project.join("olang.project.toml"),
+        r#"
+[project]
+name = "optimize-reference-failure"
+
+[[routes]]
+id = "reference"
+command = ["sh", "-c", "exit 9"]
+
+[[routes]]
+id = "candidate"
+command = ["sh", "-c", "printf candidate"]
+
+[[route_sets]]
+provides = "main"
+alternatives = ["reference", "candidate"]
+policy = "all"
+"#,
+    );
+
+    let output = run(o_cli(&home, &state, None).args([
+        "optimize",
+        project.to_str().unwrap(),
+        "--route",
+        "main",
+        "--json",
+    ]));
+    assert!(!output.status.success());
+    let envelope = single_json(&output);
+    assert_eq!(envelope["schema"], "ostadix.optimize-summary/v1");
+    assert_ne!(envelope["run"]["disposition"], "succeeded");
+    assert_eq!(envelope["run"]["recording"]["status"], "recorded");
+    assert!(envelope["run"]["run_id"].is_string());
+    assert_eq!(envelope["receipt"], Value::Null);
+    assert_eq!(envelope["receipt_sha256"], Value::Null);
+
+    let inspection = run(o_cli(&home, &state, None).args(["inspect", "last-run"]));
+    assert!(inspection.status.success());
+    let inspection: Value = serde_json::from_slice(&inspection.stdout).unwrap();
+    assert_ne!(inspection["record"]["disposition"], "succeeded");
+    assert_eq!(
+        inspection["record"]["validated_selection_receipt"],
+        Value::Null
+    );
+}
+
+#[cfg(unix)]
+fn optimize_requires_recording_before_execution(root: &Path) {
+    use std::os::unix::fs::symlink;
+
+    let home = root.join("home");
+    let state = root.join("state");
+    let ostadix_state = state.join("ostadix");
+    let redirected_store = root.join("redirected-store");
+    fs::create_dir_all(&ostadix_state).unwrap();
+    fs::create_dir_all(&redirected_store).unwrap();
+    symlink(&redirected_store, ostadix_state.join("runs-v1")).unwrap();
+
+    let project = root.join("project");
+    let marker = root.join("must-not-execute");
+    let receipt_path = root.join("must-not-exist.json");
+    write(
+        &project.join("olang.project.toml"),
+        format!(
+            r#"
+[project]
+name = "optimize-required-record"
+
+[[routes]]
+id = "reference"
+command = ["sh", "-c", "printf executed > \"$MARKER\"; printf same"]
+env = {{ MARKER = "{}" }}
+
+[[routes]]
+id = "candidate"
+command = ["sh", "-c", "printf executed > \"$MARKER\"; printf same"]
+env = {{ MARKER = "{}" }}
+
+[[route_sets]]
+provides = "main"
+alternatives = ["reference", "candidate"]
+policy = "all"
+"#,
+            marker.display(),
+            marker.display(),
+        ),
+    );
+
+    let output = run(o_cli(&home, &state, None).args([
+        "optimize",
+        project.to_str().unwrap(),
+        "--route",
+        "main",
+        "--receipt",
+        receipt_path.to_str().unwrap(),
+        "--json",
+    ]));
+    assert!(!output.status.success());
+    let envelope = single_json(&output);
+    assert_eq!(envelope["schema"], "ostadix.optimize-summary/v1");
+    assert_eq!(envelope["run"]["disposition"], "infrastructure_failed");
+    assert_eq!(envelope["run"]["recording"]["status"], "incomplete");
+    assert_eq!(envelope["receipt"], Value::Null);
+    assert_eq!(envelope["receipt_sha256"], Value::Null);
+    assert_eq!(envelope["receipt_export_path"], Value::Null);
+    assert!(
+        !marker.exists(),
+        "candidate ran before recording was available"
+    );
+    assert!(!receipt_path.exists());
+}
+
+#[cfg(not(unix))]
+fn optimize_requires_recording_before_execution(_root: &Path) {}
+
+fn validated_selection_receipt_preflight_is_fail_closed(root: &Path) {
+    let home = root.join("home");
+    let state = root.join("state");
+    let shell = which::which("sh").expect("test host must provide sh");
+    let shell_bin = shell.parent().expect("sh must have a parent directory");
+
+    let ordinary = root.join("ordinary.O");
+    let ordinary_receipt = root.join("ordinary-receipt.json");
+    write(&ordinary, b"text^(ordinary)_text\n");
+    let ordinary_output = run(o_cli(&home, &state, Some(shell_bin)).args([
+        "run",
+        ordinary.to_str().unwrap(),
+        "--selection-receipt-out",
+        ordinary_receipt.to_str().unwrap(),
+        "--no-record",
+        "--json",
+    ]));
+    assert!(!ordinary_output.status.success());
+    assert_eq!(
+        single_json(&ordinary_output)["disposition"],
+        "preflight_failed"
+    );
+    assert!(!ordinary_receipt.exists());
+
+    let marker = root.join("must-not-execute");
+    let project = root.join("project");
+    let manifest_path = project.join("olang.project.toml");
+    let manifest = format!(
+        r#"
+[project]
+name = "validated-selection-preflight"
+
+[[routes]]
+id = "reference"
+command = ["sh", "-c", "printf executed > \"$MARKER\"; printf same"]
+env = {{ MARKER = "{}" }}
+
+[[routes]]
+id = "candidate"
+command = ["sh", "-c", "printf executed > \"$MARKER\"; printf same"]
+env = {{ MARKER = "{}" }}
+
+[[route_sets]]
+provides = "main"
+alternatives = ["reference", "candidate"]
+policy = "benchmark_validate_and_select"
+"#,
+        marker.display(),
+        marker.display()
+    );
+    write(&manifest_path, &manifest);
+
+    let input_overwrite = run(o_cli(&home, &state, Some(shell_bin)).args([
+        "run",
+        project.to_str().unwrap(),
+        "--project",
+        "--route",
+        "main",
+        "--selection-receipt-out",
+        manifest_path.to_str().unwrap(),
+        "--no-record",
+        "--json",
+    ]));
+    assert!(!input_overwrite.status.success());
+    assert_eq!(
+        single_json(&input_overwrite)["disposition"],
+        "preflight_failed"
+    );
+    assert_eq!(fs::read_to_string(&manifest_path).unwrap(), manifest);
+    assert!(!marker.exists());
+
+    let aliased_output = root.join("aliased-output.json");
+    let aliased_outputs = run(o_cli(&home, &state, Some(shell_bin))
+        .current_dir(root)
+        .args([
+            "run",
+            project.to_str().unwrap(),
+            "--project",
+            "--route",
+            "main",
+            "--mesh-trace-out",
+            aliased_output.to_str().unwrap(),
+            "--selection-receipt-out",
+            "aliased-output.json",
+            "--no-record",
+            "--json",
+        ]));
+    assert!(!aliased_outputs.status.success());
+    assert_eq!(
+        single_json(&aliased_outputs)["disposition"],
+        "preflight_failed"
+    );
+    assert!(!aliased_output.exists());
+    assert!(!marker.exists());
+
+    let wrong_receipt = root.join("wrong-policy.json");
+    let wrong_policy = run(o_cli(&home, &state, Some(shell_bin)).args([
+        "run",
+        project.to_str().unwrap(),
+        "--project",
+        "--route",
+        "main",
+        "--routes-policy",
+        "all",
+        "--selection-receipt-out",
+        wrong_receipt.to_str().unwrap(),
+        "--no-record",
+        "--json",
+    ]));
+    assert!(!wrong_policy.status.success());
+    assert_eq!(
+        single_json(&wrong_policy)["disposition"],
+        "preflight_failed"
+    );
+    assert!(!wrong_receipt.exists());
+    assert!(!marker.exists());
+
+    let hgraph_receipt = root.join("hgraph.json");
+    let hgraph = run(o_cli(&home, &state, Some(shell_bin))
+        .env("O_PROJECT_EXECUTOR", "hgraph")
+        .args([
+            "run",
+            project.to_str().unwrap(),
+            "--project",
+            "--route",
+            "main",
+            "--selection-receipt-out",
+            hgraph_receipt.to_str().unwrap(),
+            "--no-record",
+            "--json",
+        ]));
+    assert!(
+        hgraph.status.success(),
+        "{}",
+        String::from_utf8_lossy(&hgraph.stderr)
+    );
+    assert_eq!(single_json(&hgraph)["disposition"], "succeeded");
+    let receipt: ValidatedSelectionReceiptV1 =
+        serde_json::from_slice(&fs::read(&hgraph_receipt).unwrap()).unwrap();
+    receipt.validate().unwrap();
+    assert!(marker.exists());
+}
+
 fn no_record_preserves_absent_and_existing_state(root: &Path) {
     let home = root.join("home");
     let program = root.join("no-record.O");
@@ -778,7 +1479,7 @@ fn compiled_o_cli_black_box_contracts() {
     let root = tempfile::tempdir().unwrap();
 
     ordinary_auto_no_record_is_local_only(&root.path().join("local-auto"));
-    json_run_help_is_informational_not_a_failure_envelope(&root.path().join("json-help"));
+    json_help_is_informational_not_a_failure_envelope(&root.path().join("json-help"));
     ordinary_auto_overlaps_independent_oir_operations(&root.path().join("local-overlap"));
     recorded_json_survives_source_deletion(&root.path().join("recorded"));
     inherited_backend_stderr_is_fully_bound_in_the_record(&root.path().join("stderr-capture"));
@@ -786,6 +1487,19 @@ fn compiled_o_cli_black_box_contracts() {
     ordinary_rendered_output_over_one_mib_is_recorded_losslessly(&root.path().join("large-output"));
     semantic_failure_is_one_nonzero_json_envelope(&root.path().join("semantic-failure"));
     failed_route_command_arguments_are_not_persisted(&root.path().join("credential-redaction"));
+    validated_selection_receipt_is_bound_and_durable(&root.path().join("validated-selection"));
+    optimize_command_is_readable_structured_and_durable(&root.path().join("optimize"));
+    optimize_rejects_non_utf8_target_without_execution_or_state(
+        &root.path().join("optimize-non-utf8"),
+    );
+    optimize_rejects_a_direct_route_before_execution(&root.path().join("optimize-direct"));
+    optimize_reference_failure_is_recorded_without_a_selection(
+        &root.path().join("optimize-failure"),
+    );
+    optimize_requires_recording_before_execution(&root.path().join("optimize-recording"));
+    validated_selection_receipt_preflight_is_fail_closed(
+        &root.path().join("validated-selection-preflight"),
+    );
     no_record_preserves_absent_and_existing_state(&root.path().join("no-record"));
     missing_default_state_base_never_writes_history_into_cwd(
         &root.path().join("missing-state-base"),

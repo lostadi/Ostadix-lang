@@ -1,0 +1,319 @@
+module kernel::world_native_scalar_semantics;
+
+use runtime::interrupts::ticks;
+use runtime::serial::try_read_byte;
+use runtime::serial::write;
+use world::identity::IdentityRecord;
+use world::sha256::Sha256Scratch;
+use world::sha256::scratch_init as sha_scratch_init;
+use world::sha256::compute as sha256_compute;
+use world::value::ValueArena;
+use world::value::arena_init;
+use world::value_codec::ValueCodecScratch;
+use world::value_codec::scratch_init as value_scratch_init;
+use world::receipt::ReceiptValidationScratch;
+use world::receipt::validated_terminal_and_commit;
+use world::receipt::validation_scratch_init;
+
+use world::identity::record_begin;
+use world::identity::record_set_text;
+use world::identity::record_set_counter;
+use world::native_scalar::NativeScalarSession;
+use world::native_scalar::provision;
+use world::native_scalar::execute;
+use world::native_scalar::execution_count;
+use world::receipt::validate_unsigned_body;
+const BUFFER_CAPACITY: usize = 4096;
+static WORLD_NAME: [u8; 12] = b"native-world";
+static NODE_NAME: [u8; 11] = b"native-node";
+static DOMAIN_NAME: [u8; 13] = b"native-domain";
+static TASK_NAME: [u8; 11] = b"native-task";
+static RECEIPT_NAME: [u8; 14] = b"native-receipt";
+static mut SESSION_STORAGE: [u64; 8] = [0; 8];
+static mut ID_POINTERS: [u64; 6] = [0; 6];
+static mut CONTEXT_STORAGE: [u8; 1057] = [0; 1057];
+static mut CONTEXT_BINDING: [u8; 32] = [0; 32];
+static READY: [u8; 33] = b"World native scalar probe: ready\n";
+const READY_LEN: usize = 33;
+static REJECT: [u8; 51] = b"World native scalar probe: REJECT before execution\n";
+const REJECT_LEN: usize = 51;
+static BAD_CONTEXT: [u8; 57] = b"World native scalar stale context before execution: PASS\n";
+const BAD_CONTEXT_LEN: usize = 57;
+static BAD_OPCODE: [u8; 58] = b"World native scalar unknown opcode before execution: PASS\n";
+const BAD_OPCODE_LEN: usize = 58;
+static BAD_CAPACITY: [u8; 60] = b"World native scalar receipt capacity before execution: PASS\n";
+const BAD_CAPACITY_LEN: usize = 60;
+static EXECUTED: [u8; 45] = b"World native scalar actual execution count=1\n";
+const EXECUTED_LEN: usize = 45;
+static VALIDATED: [u8; 61] = b"World native scalar unsigned receipt native validation: PASS\n";
+const VALIDATED_LEN: usize = 61;
+static REPLAY: [u8; 62] = b"World native scalar duplicate attempt execution count=1: PASS\n";
+const REPLAY_LEN: usize = 62;
+static COMPLETE: [u8; 32] = b"World native scalar probe: PASS\n";
+const COMPLETE_LEN: usize = 32;
+static POST_TICK: [u8; 44] = b"World native scalar post-test timer: online\n";
+const POST_TICK_LEN: usize = 44;
+static BOUNDARY: [u8; 114] = b"World native scalar boundary: trusted fixture context; unsigned and uncommitted; no project or Governor authority\n";
+const BOUNDARY_LEN: usize = 114;
+static BINDING_PREFIX: [u8; 35] = b"WORLD_NATIVE_SCALAR_CONTEXT_SHA256=";
+const BINDING_PREFIX_LEN: usize = 35;
+static BODY_PREFIX: [u8; 41] = b"WORLD_NATIVE_SCALAR_UNSIGNED_RECEIPT_HEX=";
+const BODY_PREFIX_LEN: usize = 41;
+
+static mut RECEIPT_ID_STORAGE: [u64; 512] = [0; 512];
+static mut WORLD_ID_STORAGE: [u64; 512] = [0; 512];
+static mut GOVERNOR_ID_STORAGE: [u64; 512] = [0; 512];
+static mut ATTEMPT_ID_STORAGE: [u64; 512] = [0; 512];
+static mut NODE_ID_STORAGE: [u64; 512] = [0; 512];
+static mut DOMAIN_ID_STORAGE: [u64; 512] = [0; 512];
+static mut PROCESS_ID_STORAGE: [u64; 512] = [0; 512];
+static mut PRIOR_ID_STORAGE: [u64; 512] = [0; 512];
+static mut CURRENT_ID_STORAGE: [u64; 512] = [0; 512];
+
+static mut VALUE_ARENA_STORAGE: [u64; 16] = [0; 16];
+static mut VALUE_BYTES: [u8; 4096] = [0; 4096];
+static mut VALUE_NODES: [u64; 1536] = [0; 1536];
+static mut VALUE_EDGES: [u64; 128] = [0; 128];
+static mut TEMP_ARENA_STORAGE: [u64; 16] = [0; 16];
+static mut TEMP_BYTES: [u8; 4096] = [0; 4096];
+static mut TEMP_NODES: [u64; 1536] = [0; 1536];
+static mut TEMP_EDGES: [u64; 512] = [0; 512];
+static mut VALUE_SCRATCH_STORAGE: [u64; 16] = [0; 16];
+static mut VALUE_STAGED: [u8; 4096] = [0; 4096];
+static mut VALUE_LENGTHS: [u64; 128] = [0; 128];
+static mut VALUE_FRAMES: [u64; 256] = [0; 256];
+static mut VALUE_PENDING: [u64; 512] = [0; 512];
+static mut VALUE_DIGEST: [u8; 32] = [0; 32];
+static mut VALUE_REENCODED: [u8; 4096] = [0; 4096];
+
+static mut VALIDATION_STORAGE: [u64; 16] = [0; 16];
+static mut IDENTITY_STAGED: [u8; 1024] = [0; 1024];
+static mut RECORD: [u8; 4096] = [0; 4096];
+static mut REENCODED: [u8; 4096] = [0; 4096];
+
+static mut SHA_STORAGE: [u64; 4] = [0; 4];
+static mut SHA_SCHEDULE: [u64; 64] = [0; 64];
+static mut SEMANTIC_DIGEST: [u8; 32] = [0; 32];
+static mut HEX_PAIR: [u8; 2] = [0; 2];
+
+unsafe fn receipt_identity() -> *mut IdentityRecord {
+    return ((&mut RECEIPT_ID_STORAGE[0]) as *mut u64) as *mut IdentityRecord;
+}
+unsafe fn world_identity() -> *mut IdentityRecord {
+    return ((&mut WORLD_ID_STORAGE[0]) as *mut u64) as *mut IdentityRecord;
+}
+unsafe fn governor_identity() -> *mut IdentityRecord {
+    return ((&mut GOVERNOR_ID_STORAGE[0]) as *mut u64) as *mut IdentityRecord;
+}
+unsafe fn attempt_identity() -> *mut IdentityRecord {
+    return ((&mut ATTEMPT_ID_STORAGE[0]) as *mut u64) as *mut IdentityRecord;
+}
+unsafe fn node_identity() -> *mut IdentityRecord {
+    return ((&mut NODE_ID_STORAGE[0]) as *mut u64) as *mut IdentityRecord;
+}
+unsafe fn domain_identity() -> *mut IdentityRecord {
+    return ((&mut DOMAIN_ID_STORAGE[0]) as *mut u64) as *mut IdentityRecord;
+}
+unsafe fn process_identity() -> *mut IdentityRecord {
+    return ((&mut PROCESS_ID_STORAGE[0]) as *mut u64) as *mut IdentityRecord;
+}
+unsafe fn prior_identity() -> *mut IdentityRecord {
+    return ((&mut PRIOR_ID_STORAGE[0]) as *mut u64) as *mut IdentityRecord;
+}
+unsafe fn current_identity() -> *mut IdentityRecord {
+    return ((&mut CURRENT_ID_STORAGE[0]) as *mut u64) as *mut IdentityRecord;
+}
+unsafe fn value_arena() -> *mut ValueArena {
+    return ((&mut VALUE_ARENA_STORAGE[0]) as *mut u64) as *mut ValueArena;
+}
+unsafe fn temp_arena() -> *mut ValueArena {
+    return ((&mut TEMP_ARENA_STORAGE[0]) as *mut u64) as *mut ValueArena;
+}
+unsafe fn value_scratch() -> *mut ValueCodecScratch {
+    return ((&mut VALUE_SCRATCH_STORAGE[0]) as *mut u64) as *mut ValueCodecScratch;
+}
+unsafe fn validation_scratch() -> *mut ReceiptValidationScratch {
+    return ((&mut VALIDATION_STORAGE[0]) as *mut u64) as *mut ReceiptValidationScratch;
+}
+unsafe fn sha_scratch() -> *mut Sha256Scratch {
+    return ((&mut SHA_STORAGE[0]) as *mut u64) as *mut Sha256Scratch;
+}
+
+unsafe fn initialize_storage() -> bool {
+    if arena_init(value_arena(), (&mut VALUE_BYTES[0]), 4096,
+        (&mut VALUE_NODES[0]), 1536, (&mut VALUE_EDGES[0]), 128) != 1
+        || arena_init(temp_arena(), (&mut TEMP_BYTES[0]), 4096,
+            (&mut TEMP_NODES[0]), 1536, (&mut TEMP_EDGES[0]), 512) != 1
+        || sha_scratch_init(sha_scratch(), (&mut SHA_SCHEDULE[0]), 64) != 1 {
+        return false;
+    }
+    if value_scratch_init(value_scratch(), (&mut VALUE_STAGED[0]), 4096,
+        (&mut VALUE_LENGTHS[0]), 128, (&mut VALUE_FRAMES[0]), 256,
+        (&mut VALUE_PENDING[0]), 512, temp_arena(), sha_scratch(),
+        (&mut VALUE_DIGEST[0]), 32) != 1 {
+        return false;
+    }
+    return validation_scratch_init(validation_scratch(), receipt_identity(),
+        world_identity(), governor_identity(), attempt_identity(), node_identity(),
+        domain_identity(), process_identity(), prior_identity(), current_identity(),
+        (&mut IDENTITY_STAGED[0]), 1024, value_arena(), value_scratch(),
+        (&mut VALUE_REENCODED[0]), 4096) == 1;
+}
+
+unsafe fn hex_nibble(value: u8) -> u64 {
+    if value >= b'0' && value <= b'9' { return (value - b'0') as u64; }
+    if value >= b'a' && value <= b'f' {
+        return (value - b'a' + 10) as u64;
+    }
+    return 16;
+}
+
+unsafe fn read_canonical_hex_line() -> usize {
+    let mut length: usize = 0;
+    let mut high: u64 = 16;
+    loop {
+        let mut byte: u8 = 0;
+        while try_read_byte((&mut byte)) == 0 {
+            asm!("pause", options(nomem, nostack));
+        }
+        if byte == b'\n' {
+            if high != 16 { return 0; }
+            return length;
+        }
+        let nibble: u64 = hex_nibble(byte);
+        if nibble > 15 { return 0; }
+        if high == 16 {
+            high = nibble;
+        } else {
+            if length >= BUFFER_CAPACITY { return 0; }
+            volatile_store((&mut RECORD[length]), ((high << 4) | nibble) as u8);
+            length += 1;
+            high = 16;
+        }
+    }
+}
+
+
+unsafe fn session() -> *mut NativeScalarSession {
+    return ((&mut SESSION_STORAGE[0]) as *mut u64) as *mut NativeScalarSession;
+}
+unsafe fn fail_closed() -> never {
+    disable_interrupts();
+    loop { halt(); }
+}
+unsafe fn reject() -> never {
+    if execution_count(session() as *const NativeScalarSession) == 0 {
+        write((&REJECT[0]), REJECT_LEN);
+    }
+    fail_closed();
+}
+unsafe fn emit_hex(prefix: *const u8, prefix_length: usize,
+    bytes: *const u8, length: usize) -> void {
+    write(prefix, prefix_length);
+    let mut index: usize = 0;
+    while index < length {
+        let value: u8 = volatile_load(bytes + index);
+        HEX_PAIR[0] = hex_digit(value >> 4);
+        HEX_PAIR[1] = hex_digit(value & 15);
+        write((&HEX_PAIR[0]), 2);
+        index += 1;
+    }
+    HEX_PAIR[0] = b'\n';
+    write((&HEX_PAIR[0]), 1);
+}
+fn hex_digit(value: u8) -> u8 {
+    if value < 10 { return b'0' + value; }
+    return b'a' + (value - 10);
+}
+unsafe fn initialize_context() -> bool {
+    // Names/generations are installed by this trusted boot fixture, never by
+    // serial input. They are descriptive, and do not assert a live Governor.
+    ID_POINTERS[0] = receipt_identity() as u64;
+    ID_POINTERS[1] = world_identity() as u64;
+    ID_POINTERS[2] = governor_identity() as u64;
+    ID_POINTERS[3] = attempt_identity() as u64;
+    ID_POINTERS[4] = node_identity() as u64;
+    ID_POINTERS[5] = domain_identity() as u64;
+    let mut index: usize = 0;
+    while index < 6 {
+        let record: *mut IdentityRecord = ID_POINTERS[index] as *mut IdentityRecord;
+        let mut kind: u64 = 13;
+        if index == 1 { kind = 1; }
+        if index == 2 { kind = 2; }
+        if index == 3 { kind = 11; }
+        if index == 4 { kind = 3; }
+        if index == 5 { kind = 4; }
+        if record_begin(record, kind, 0) != 1
+            || record_set_text(record, 1, (&WORLD_NAME[0]), 12) != 1 { return false; }
+        if index == 0 && record_set_text(record, 11, (&RECEIPT_NAME[0]), 14) != 1 { return false; }
+        if (index == 1 || index == 2) && record_set_counter(record, 1, 7) != 1 { return false; }
+        if index == 2 && (record_set_counter(record, 2, 3) != 1
+            || record_set_counter(record, 3, 9) != 1) { return false; }
+        if index == 3 && (record_set_text(record, 9, (&TASK_NAME[0]), 11) != 1
+            || record_set_counter(record, 9, 5) != 1) { return false; }
+        if index >= 4 && (record_set_text(record, 2, (&NODE_NAME[0]), 11) != 1
+            || record_set_counter(record, 4, 4) != 1) { return false; }
+        if index == 5 && (record_set_text(record, 3, (&DOMAIN_NAME[0]), 13) != 1
+            || record_set_counter(record, 5, 2) != 1) { return false; }
+        index += 1;
+    }
+    return provision(session(), (&ID_POINTERS[0]), (&mut CONTEXT_STORAGE[0]), 1057,
+        (&mut CONTEXT_BINDING[0]), sha_scratch()) == 1;
+}
+unsafe fn run_request(length: usize, capacity: usize, written: *mut usize) -> u64 {
+    return execute(session(), (&RECORD[0]), length, (&mut REENCODED[0]), capacity,
+        written, value_arena(), value_scratch(), (&mut VALUE_REENCODED[0]),
+        sha_scratch(), (&mut SEMANTIC_DIGEST[0]));
+}
+
+pub unsafe fn start(mode: u64) -> never {
+    if mode != 35 || !initialize_storage() || !initialize_context() { fail_closed(); }
+    disable_interrupts();
+    emit_hex((&BINDING_PREFIX[0]), BINDING_PREFIX_LEN, (&CONTEXT_BINDING[0]), 32);
+    write((&READY[0]), READY_LEN);
+    let request_length: usize = read_canonical_hex_line();
+    if request_length != 64 { reject(); }
+    // Do not transform a bad external binding into a valid request while
+    // constructing the negative control below.
+    let mut index: usize = 0;
+    while index < 32 {
+        if RECORD[8 + index] != CONTEXT_BINDING[index] { reject(); }
+        index += 1;
+    }
+    let mut body_length: usize = 999;
+    let saved_binding: u8 = RECORD[8];
+    RECORD[8] = saved_binding ^ 1;
+    if run_request(request_length, 4096, (&mut body_length)) != 0
+        || body_length != 0 || execution_count(session() as *const NativeScalarSession) != 0 { fail_closed(); }
+    RECORD[8] = saved_binding;
+    write((&BAD_CONTEXT[0]), BAD_CONTEXT_LEN);
+    let saved_opcode: u8 = RECORD[47];
+    RECORD[47] = 2;
+    if run_request(request_length, 4096, (&mut body_length)) != 0
+        || body_length != 0 || execution_count(session() as *const NativeScalarSession) != 0 { fail_closed(); }
+    RECORD[47] = saved_opcode;
+    write((&BAD_OPCODE[0]), BAD_OPCODE_LEN);
+    if run_request(request_length, 0, (&mut body_length)) != 0
+        || body_length != 0 || execution_count(session() as *const NativeScalarSession) != 0 { fail_closed(); }
+    write((&BAD_CAPACITY[0]), BAD_CAPACITY_LEN);
+    if run_request(request_length, 4096, (&mut body_length)) != 1 { reject(); }
+    if execution_count(session() as *const NativeScalarSession) != 1 { fail_closed(); }
+    write((&EXECUTED[0]), EXECUTED_LEN);
+    if validate_unsigned_body((&REENCODED[0]), body_length, validation_scratch()) != 1 { fail_closed(); }
+    let mut terminal: u64 = 0;
+    let mut commit: u64 = 0;
+    if validated_terminal_and_commit(validation_scratch() as *const ReceiptValidationScratch,
+        (&mut terminal), (&mut commit)) != 1 || terminal != 1 || commit != 0 { fail_closed(); }
+    write((&VALIDATED[0]), VALIDATED_LEN);
+    emit_hex((&BODY_PREFIX[0]), BODY_PREFIX_LEN, (&REENCODED[0]), body_length);
+    if run_request(request_length, 4096, (&mut body_length)) != 0 || body_length != 0
+        || execution_count(session() as *const NativeScalarSession) != 1 { fail_closed(); }
+    write((&REPLAY[0]), REPLAY_LEN);
+    write((&BOUNDARY[0]), BOUNDARY_LEN);
+    write((&COMPLETE[0]), COMPLETE_LEN);
+    let tick_before: u64 = ticks();
+    enable_interrupts();
+    while ticks() == tick_before { halt(); }
+    write((&POST_TICK[0]), POST_TICK_LEN);
+    loop { halt(); }
+}

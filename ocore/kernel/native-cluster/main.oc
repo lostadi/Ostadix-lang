@@ -1,0 +1,305 @@
+module kernel::native_cluster;
+
+use runtime::serial::init as serial_init;
+use runtime::serial::write;
+use runtime::serial::write_byte;
+use runtime::serial::try_read_byte;
+use runtime::rtl8139::init as nic_init;
+use runtime::rtl8139::send;
+use runtime::rtl8139::receive;
+use runtime::rtl8139::online;
+use runtime::rtl8139::quiesce;
+use runtime::rtl8139::abort as nic_abort;
+use runtime::rtl8139::was_configured;
+use world::native_session::self_test;
+use world::native_session::provision;
+use world::native_session::local_node;
+use world::native_session::peer_node;
+use world::native_session::role;
+use world::native_session::tasks;
+use world::native_session::initial;
+use world::native_session::get;
+use world::native_session::put;
+use world::native_session::copy;
+use world::native_session::clear;
+use world::native_session::equal;
+use world::native_session::begin;
+use world::native_session::sign;
+use world::native_session::authenticate;
+use world::native_session::graph_digest;
+use world::native_session::retire;
+use world::native_distributed::request;
+use world::native_distributed::handle;
+use world::native_distributed::validate_result;
+use world::native_distributed::validate_drain_ack;
+use world::native_distributed::executions;
+use world::native_distributed::duplicates;
+use world::native_distributed::rejected;
+
+extern "sysv64" fn ocore_native_cycles() -> u64;
+const RETRY_CYCLES: u64 = 250_000_000;
+const DEADLINE_CYCLES: u64 = 60_000_000_000;
+static mut CONFIG: [u8; 160] = [0; 160];
+static mut MAC: [u8; 6] = [0; 6];
+static mut FRAME_IN: [u8; 1536] = [0; 1536];
+static mut FRAME_OUT: [u8; 1536] = [0; 1536];
+static mut REQUEST: [u8; 320] = [0; 320];
+static mut RESPONSE: [u8; 320] = [0; 320];
+static mut PRIOR_DIGEST: [u8; 32] = [0; 32];
+static mut ACK_PROBE: [u8; 320] = [0; 320];
+static mut DIGITS: [u8; 20] = [0; 20];
+static BOOT_READY: [u8; 26] = b"NATIVE_CLUSTER BOOT_READY\n";
+static AUTH_OK: [u8; 31] = b"NATIVE_CLUSTER HMAC_RFC4231_OK\n";
+static NIC_OK: [u8; 22] = b"NATIVE_CLUSTER NIC_OK\n";
+static ERROR: [u8; 21] = b"NATIVE_CLUSTER ERROR ";
+static GRAPH: [u8; 21] = b"NATIVE_CLUSTER GRAPH ";
+static TASK: [u8; 25] = b"NATIVE_CLUSTER TASK task=";
+static INPUT: [u8; 7] = b" input=";
+static OUTPUT: [u8; 8] = b" output=";
+static RESULT: [u8; 8] = b" result=";
+static COMPLETE: [u8; 30] = b"NATIVE_CLUSTER COMPLETE tasks=";
+static DRAIN: [u8; 34] = b"NATIVE_CLUSTER DRAINED executions=";
+static DUPLICATES: [u8; 12] = b" duplicates=";
+static REJECTED: [u8; 10] = b" rejected=";
+static QUIESCED: [u8; 28] = b"NATIVE_CLUSTER NIC_QUIESCED\n";
+static ACK_CANONICAL: [u8; 38] = b"NATIVE_CLUSTER DRAIN_ACK_CANONICAL_OK\n";
+static ABORTED: [u8; 27] = b"NATIVE_CLUSTER NIC_ABORTED\n";
+static ABORT_FAILED: [u8; 32] = b"NATIVE_CLUSTER NIC_ABORT_FAILED\n";
+
+unsafe fn number(value: u64) -> void {
+    let mut current: u64 = value;
+    let mut count: usize = 0;
+    loop {
+        DIGITS[count] = (current % 10) as u8 + 48;
+        count += 1;
+        current = current / 10;
+        if current == 0 { break; }
+    }
+    while count != 0 {
+        count -= 1;
+        write_byte(DIGITS[count]);
+    }
+}
+
+unsafe fn hex(data: *const u8, length: usize) -> void {
+    let mut index: usize = 0;
+    while index < length {
+        let byte: u8 = volatile_load(data + index);
+        let mut high: u8 = byte >> 4;
+        let mut low: u8 = byte & 15;
+        if high < 10 { high += 48; } else { high += 87; }
+        if low < 10 { low += 48; } else { low += 87; }
+        write_byte(high);
+        write_byte(low);
+        index += 1;
+    }
+}
+
+unsafe fn fail(code: u64) -> never {
+    write((&ERROR[0]), 21);
+    number(code);
+    write_byte(10);
+    let configured: bool = was_configured();
+    let disabled: u64 = nic_abort();
+    retire();
+    if configured {
+        if disabled == 1 { write((&ABORTED[0]), 27); }
+        else { write((&ABORT_FAILED[0]), 32); }
+    }
+    loop { halt(); }
+}
+
+fn unhex(byte: u8) -> u8 {
+    if byte >= 48 && byte <= 57 { return byte - 48; }
+    if byte >= 97 && byte <= 102 { return byte - 87; }
+    return 255;
+}
+
+unsafe fn read_config() -> bool {
+    let started: u64 = ocore_native_cycles();
+    let mut count: usize = 0;
+    let mut high: u8 = 0;
+    while ocore_native_cycles() - started < DEADLINE_CYCLES {
+        let mut byte: u8 = 0;
+        if try_read_byte((&mut byte)) == 0 { continue; }
+        if byte == 10 { return count == 320; }
+        if count >= 320 { return false; }
+        let value: u8 = unhex(byte);
+        if value == 255 { return false; }
+        if (count & 1) == 0 { high = value << 4; }
+        else { CONFIG[count / 2] = high | value; }
+        count += 1;
+    }
+    return false;
+}
+
+unsafe fn expected_mac(mac: *const u8, node: u64) -> bool {
+    return volatile_load(mac) == 0x52 && volatile_load(mac + 1) == 0x54
+        && volatile_load(mac + 2) == 0 && volatile_load(mac + 3) == 0x12
+        && volatile_load(mac + 4) == 0x34 && volatile_load(mac + 5) == node as u8;
+}
+
+unsafe fn send_packet(packet: *const u8) -> bool {
+    FRAME_OUT[0] = 0x52;
+    FRAME_OUT[1] = 0x54;
+    FRAME_OUT[2] = 0;
+    FRAME_OUT[3] = 0x12;
+    FRAME_OUT[4] = 0x34;
+    FRAME_OUT[5] = peer_node() as u8;
+    copy((&mut FRAME_OUT[6]), (&MAC[0]), 6);
+    FRAME_OUT[12] = 0x88;
+    FRAME_OUT[13] = 0xb5;
+    copy((&mut FRAME_OUT[14]), packet, 320);
+    return send((&FRAME_OUT[0]), 334) == 1;
+}
+
+unsafe fn receive_packet() -> usize {
+    let length: usize = receive((&mut FRAME_IN[0]), 1536);
+    if length == 0 { return 0; }
+    if length < 14 || !expected_mac((&FRAME_IN[0]), local_node())
+        || !expected_mac((&FRAME_IN[6]), peer_node())
+        || FRAME_IN[12] != 0x88 || FRAME_IN[13] != 0xb5 { return 0; }
+    return length - 14;
+}
+
+unsafe fn exchange(packet: *const u8, expected_kind: u8) -> bool {
+    let started: u64 = ocore_native_cycles();
+    let mut last_send: u64 = 0;
+    while ocore_native_cycles() - started < DEADLINE_CYCLES {
+        let now: u64 = ocore_native_cycles();
+        if last_send == 0 || now - last_send >= RETRY_CYCLES {
+            if send_packet(packet) { last_send = now; }
+        }
+        let length: usize = receive_packet();
+        if length == 0 { continue; }
+        let received: *const u8 = (&FRAME_IN[14]);
+        if expected_kind == 2 {
+            if validate_result(packet, received, length) {
+                copy((&mut RESPONSE[0]), received, 320);
+                return true;
+            }
+        } else {
+            if validate_drain_ack(received, length, get((&RESPONSE[192])), (&PRIOR_DIGEST[0])) {
+                // Native response-decoder regression: preserve the valid tag
+                // semantics by signing a noncanonical ACK locally. These
+                // probe bytes never reach the NIC or grant operation rights.
+                copy((&mut ACK_PROBE[0]), received, 320);
+                ACK_PROBE[88] = 1;
+                if !sign((&mut ACK_PROBE[0]))
+                    || validate_drain_ack((&ACK_PROBE[0]), 320,
+                        get((&RESPONSE[192])), (&PRIOR_DIGEST[0]))
+                    || validate_drain_ack(received, 319,
+                        get((&RESPONSE[192])), (&PRIOR_DIGEST[0]))
+                    || validate_drain_ack(received, 321,
+                        get((&RESPONSE[192])), (&PRIOR_DIGEST[0])) {
+                    fail(25);
+                }
+                clear((&mut ACK_PROBE[0]), 320);
+                write((&ACK_CANONICAL[0]), 38);
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+unsafe fn coordinator() -> never {
+    let mut task: u64 = 1;
+    let mut value: u64 = initial();
+    while task <= tasks() {
+        if !request((&mut REQUEST[0]), task, value, (&PRIOR_DIGEST[0])) { fail(20); }
+        if !exchange((&REQUEST[0]), 2) { fail(21); }
+        value = get((&RESPONSE[192]));
+        copy((&mut PRIOR_DIGEST[0]), (&RESPONSE[224]), 32);
+        task += 1;
+    }
+    if !begin((&mut REQUEST[0]), 3, tasks() + 1) || !sign((&mut REQUEST[0]))
+        || !exchange((&REQUEST[0]), 4) { fail(22); }
+    // COMPLETE is emitted only after the authenticated worker drain ack.
+    write((&COMPLETE[0]), 30);
+    number(tasks());
+    write((&RESULT[0]), 8);
+    number(value);
+    write_byte(10);
+    if !begin((&mut REQUEST[0]), 5, tasks() + 2) || !sign((&mut REQUEST[0])) {
+        fail(23);
+    }
+    // Redundant final confirmations allow link perturbation without creating
+    // another execution. The worker can always terminate on host teardown if
+    // every confirmation is lost; the earlier drain state already fences work.
+    let mut repeat: usize = 0;
+    while repeat < 3 {
+        send_packet((&REQUEST[0]));
+        let started: u64 = ocore_native_cycles();
+        while ocore_native_cycles() - started < 10_000_000 { }
+        repeat += 1;
+    }
+    if quiesce() != 1 { fail(24); }
+    retire();
+    write((&QUIESCED[0]), 28);
+    loop { halt(); }
+}
+
+unsafe fn worker() -> never {
+    let started: u64 = ocore_native_cycles();
+    let mut last_executed: u64 = 0;
+    let mut logged_drain: u8 = 0;
+    while ocore_native_cycles() - started < DEADLINE_CYCLES {
+        if !online() { fail(30); }
+        let length: usize = receive_packet();
+        if length == 0 { continue; }
+        let outcome: u64 = handle((&FRAME_IN[14]), length, (&mut RESPONSE[0]));
+        if outcome == 3 {
+            if quiesce() != 1 { fail(31); }
+            retire();
+            write((&QUIESCED[0]), 28);
+            loop { halt(); }
+        }
+        if outcome == 1 || outcome == 2 {
+            if executions() != last_executed {
+                last_executed = executions();
+                write((&TASK[0]), 25);
+                number(last_executed);
+                write((&INPUT[0]), 7);
+                hex((&RESPONSE[128]), 32);
+                write((&OUTPUT[0]), 8);
+                hex((&RESPONSE[224]), 32);
+                write((&RESULT[0]), 8);
+                number(get((&RESPONSE[192])));
+                write_byte(10);
+            }
+            if outcome == 2 && logged_drain == 0 {
+                logged_drain = 1;
+                write((&DRAIN[0]), 34);
+                number(executions());
+                write((&DUPLICATES[0]), 12);
+                number(duplicates());
+                write((&REJECTED[0]), 10);
+                number(rejected());
+                write_byte(10);
+            }
+            send_packet((&RESPONSE[0]));
+        }
+    }
+    fail(32);
+}
+
+@export
+@no_mangle
+pub unsafe fn native_cluster_main() -> never {
+    serial_init();
+    if !self_test() { fail(1); }
+    write((&AUTH_OK[0]), 31);
+    write((&BOOT_READY[0]), 26);
+    if !read_config() || !provision((&CONFIG[0]), 160) { fail(2); }
+    clear((&mut CONFIG[0]), 160);
+    if nic_init((&mut MAC[0])) != 1 || !expected_mac((&MAC[0]), local_node()) { fail(3); }
+    write((&NIC_OK[0]), 22);
+    graph_digest((&mut PRIOR_DIGEST[0]));
+    write((&GRAPH[0]), 21);
+    hex((&PRIOR_DIGEST[0]), 32);
+    write_byte(10);
+    clear((&mut PRIOR_DIGEST[0]), 32);
+    if role() == 1 { coordinator(); }
+    worker();
+}

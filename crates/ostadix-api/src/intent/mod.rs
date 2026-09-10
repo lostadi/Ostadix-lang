@@ -20,25 +20,31 @@ use crate::eval::{Evaluator, ExecutionTrace, TraceEvent};
 use crate::evidence::ExecutionIntentV1;
 use crate::execution_contract::Policy;
 use crate::hosted_remote::project_mesh::{
-    execute_mesh_selection_observed, observe_mesh_peers_read_only, MeshExecutionConfig,
-    MeshExecutionOutcome, MeshExecutionTraceV1, MeshLocalFallback, MeshReadOnlyDiscoveryConfig,
-    MeshRequirement, MeshTraceEventV1,
+    execute_mesh_selection_observed, execute_mesh_selection_observed_with_progress,
+    observe_mesh_peers_read_only, MeshExecutionConfig, MeshExecutionOutcome, MeshExecutionTraceV1,
+    MeshLocalFallback, MeshReadOnlyDiscoveryConfig, MeshRequirement, MeshTraceEventV1,
 };
 use crate::ir::{BackendRegistry, OIr, OIrProgram};
 use crate::parser::Parser;
 use crate::project::executor::{
-    execute_selection_with_configured_executor, ConfiguredProjectExecution, PROJECT_EXECUTOR_ENV,
+    execute_project_hgraph_selection_with_contract_and_progress, ConfiguredProjectExecution,
+    PROJECT_EXECUTOR_ENV,
 };
-use crate::project::runtime::{potential_route_execution_count, RunOptions};
+use crate::project::runtime::{
+    potential_route_execution_count, run_selection_observed, run_selection_observed_with_progress,
+    RunOptions, ValidatedSelectionProgressObserverV1,
+};
 use crate::project::{
-    build_project_hgraph, DeploymentPlanV1, OExecutionResult, ProjectAttemptState,
-    ProjectAttemptTrace, ProjectBundle, RoutePolicy,
+    build_project_hgraph_with_contract, DeploymentPlanV1, OExecutionResult, ProjectAttemptState,
+    ProjectAttemptTrace, ProjectBundle, ProjectExecutionContract, RoutePolicy,
 };
 use crate::value::OValue;
 
 pub mod record;
+pub mod reuse;
 pub mod store;
 pub use record::*;
+pub use reuse::*;
 pub use store::*;
 
 pub const O_EXECUTION_TRACE_SCHEMA_V1: &str = "ostadix.oir-execution-trace/v1";
@@ -170,8 +176,18 @@ pub struct PreparedProjectExecutionV1 {
     pub route_declaration_sha256: Vec<String>,
     pub parallel_auto: bool,
     pub executor: ProjectExecutorV1,
+    pub execution_contract: ProjectExecutionContract,
     pub mesh: Option<MeshExecutionConfig>,
     static_plan: String,
+    selection_reuse: Option<Box<PreparedSelectionReuseV1>>,
+}
+
+impl PreparedProjectExecutionV1 {
+    /// Evidence admission attached when this intent was derived from an exact
+    /// verified optimization run.
+    pub fn selection_reuse(&self) -> Option<&PreparedSelectionReuseV1> {
+        self.selection_reuse.as_deref()
+    }
 }
 
 #[derive(Debug)]
@@ -273,6 +289,7 @@ impl PreparedExecutionIntentV1 {
                 mesh_discovery_timeout_ms: None,
                 mesh_closed_registry: None,
                 mesh_peer_root: None,
+                selection_reuse: None,
             },
             Self::Project(project) => {
                 let mesh_mode = project.mesh.as_ref().map(|mesh| match mesh.requirement {
@@ -315,6 +332,9 @@ impl PreparedExecutionIntentV1 {
                         .mesh
                         .as_ref()
                         .and_then(|mesh| mesh.peer_root.clone()),
+                    selection_reuse: project
+                        .selection_reuse()
+                        .map(|reuse| reuse.binding().clone()),
                 }
             }
         }
@@ -327,6 +347,8 @@ impl PreparedExecutionIntentV1 {
             intent: self.run_intent_observation(),
             plan: self.run_plan_identities(),
             started_unix_nanos,
+            operation_decision: None,
+            operation_plan_ref: None,
         };
         seed.validate().map_err(anyhow::Error::msg)?;
         Ok(seed)
@@ -569,9 +591,13 @@ impl std::error::Error for OrdinaryOExecutionErrorV1 {}
 #[derive(Debug)]
 pub struct ProjectExecutionObservationV1 {
     pub results: Vec<OExecutionResult>,
+    pub validated_selection_receipt: Option<Box<crate::project::ValidatedSelectionReceiptV1>>,
+    pub validated_selection_measurements:
+        Option<Vec<crate::project::ValidatedSelectionMeasurement>>,
     pub project_trace: Option<ProjectAttemptTrace>,
     pub mesh_trace: Option<MeshExecutionTraceV1>,
     pub trace_unavailable_reason: Option<String>,
+    pub selection_reuse: Option<Box<ProjectSelectionReuseObservationV1>>,
 }
 
 #[derive(Debug)]
@@ -637,7 +663,8 @@ pub fn render_project_static_plan(
     route: Option<&str>,
     policy: Option<RoutePolicy>,
 ) -> Result<String> {
-    let project = build_project_hgraph(bundle, route, policy)
+    let contract = ProjectExecutionContract::configured().map_err(anyhow::Error::msg)?;
+    let project = build_project_hgraph_with_contract(bundle, route, policy, contract)
         .map_err(anyhow::Error::msg)
         .context("failed to build logical project HGraph")?;
     render_project_hgraph_static_plan(&project)
@@ -861,14 +888,15 @@ fn prepare_project_bundle(
         options.mesh = Some(MeshExecutionConfig::default());
     }
     validate_mesh_preflight(options.mesh.as_ref())?;
-    let executor = match options.mesh.as_ref().map(|mesh| mesh.requirement) {
-        Some(MeshRequirement::Prefer) => ProjectExecutorV1::MeshPrefer,
-        Some(MeshRequirement::Required) => ProjectExecutorV1::MeshRequired,
+    let (executor, execution_contract) = match options.mesh.as_ref().map(|mesh| mesh.requirement) {
+        Some(MeshRequirement::Prefer) => (ProjectExecutorV1::MeshPrefer, ProjectExecutionContract::Strict),
+        Some(MeshRequirement::Required) => (ProjectExecutorV1::MeshRequired, ProjectExecutionContract::Strict),
         None => match std::env::var_os(PROJECT_EXECUTOR_ENV) {
-            None => ProjectExecutorV1::Compatibility,
-            Some(value) if value == "hgraph" => ProjectExecutorV1::Hgraph,
+            None => (ProjectExecutorV1::Hgraph, ProjectExecutionContract::LegacyCompatibility),
+            Some(value) if value == "hgraph" => (ProjectExecutorV1::Hgraph, ProjectExecutionContract::Strict),
+            Some(value) if value == "legacy" => (ProjectExecutorV1::Compatibility, ProjectExecutionContract::LegacyCompatibility),
             Some(value) => bail!(
-                "unsupported {PROJECT_EXECUTOR_ENV} value `{}`; expected hgraph or an unset variable",
+                "unsupported {PROJECT_EXECUTOR_ENV} value `{}`; expected hgraph, legacy, or an unset variable",
                 value.to_string_lossy()
             ),
         },
@@ -884,10 +912,11 @@ fn prepare_project_bundle(
             )
         })
         .collect::<Vec<_>>();
-    let project = build_project_hgraph(
+    let project = build_project_hgraph_with_contract(
         &bundle,
         options.route.as_deref(),
         options.route_policy.clone(),
+        execution_contract,
     )
     .map_err(anyhow::Error::msg)
     .context("failed to build logical project HGraph")?;
@@ -925,8 +954,10 @@ fn prepare_project_bundle(
             route_declaration_sha256,
             parallel_auto: options.parallel_auto,
             executor,
+            execution_contract,
             mesh: options.mesh,
             static_plan,
+            selection_reuse: None,
         },
     ))
 }
@@ -944,20 +975,15 @@ fn validate_project_executor_preflight(
 
     if executor == ProjectExecutorV1::Hgraph {
         match &project.plan.policy {
-            RoutePolicy::Explicit(_) | RoutePolicy::Default => {
-                if project.plan.alternatives.len() != 1 {
-                    bail!(
-                        "project HGraph executor requires exactly one resolved alternative for policy `{}`, found {}",
-                        project.plan.policy.token(),
-                        project.plan.alternatives.len()
-                    );
-                }
+            RoutePolicy::Explicit(_) | RoutePolicy::Default
+                if project.plan.alternatives.len() != 1 =>
+            {
+                bail!(
+                    "project HGraph executor requires exactly one resolved alternative for policy `{}`, found {}",
+                    project.plan.policy.token(), project.plan.alternatives.len()
+                );
             }
-            RoutePolicy::Fallback | RoutePolicy::AnySuccess => {}
-            policy => bail!(
-                "project HGraph executor does not support policy `{}`; supported policies are explicit, default, fallback, and any_success",
-                policy.token()
-            ),
+            _ => {}
         }
     }
     Ok(())
@@ -1043,22 +1069,140 @@ pub fn execute_prepared_ordinary_o(
 /// observed mesh API attaches placement/retry history.
 fn execute_prepared_local_project(
     prepared: &PreparedProjectExecutionV1,
+    observer: Option<&dyn ValidatedSelectionProgressObserverV1>,
 ) -> Result<ProjectExecutionObservationV1> {
-    let ConfiguredProjectExecution { results, trace } = execute_selection_with_configured_executor(
-        &prepared.bundle,
-        prepared.route.as_deref(),
-        prepared.policy.clone(),
-        &RunOptions::default(),
-    )?;
+    let execution = execute_prepared_local_project_engine(prepared, observer);
+    let ConfiguredProjectExecution {
+        results,
+        trace,
+        validated_selection_receipt,
+        validated_selection_measurements,
+    } = match execution {
+        Ok(execution) => execution,
+        Err(error) if prepared.selection_reuse().is_some() => {
+            let selected_route = &prepared
+                .selection_reuse()
+                .unwrap()
+                .binding()
+                .contract
+                .selected_route_id;
+            // HGraph failures retain routes that settled before the graph
+            // stopped. Preserve the selected terminal result when present so
+            // a route failure keeps its causal status and output evidence.
+            if let Some(result) = error
+                .downcast_ref::<crate::project::ProjectExecutionError>()
+                .and_then(|failure| {
+                    failure
+                        .settled_results()
+                        .map(|(_, result)| result)
+                        .find(|result| &result.route_id == selected_route)
+                })
+            {
+                let observation = observe_reused_result(prepared, result)?;
+                return Err(anyhow::Error::new(
+                    SelectionReuseExecutionErrorV1::from_check(vec![result.clone()], observation),
+                ));
+            }
+            let reuse_error = SelectionReuseExecutionErrorV1::before_result(prepared, &error)?;
+            return Err(anyhow::Error::new(reuse_error));
+        }
+        Err(error) => return Err(error),
+    };
+    let selection_reuse = if prepared.selection_reuse().is_some() {
+        if results.len() != 1
+            || validated_selection_receipt.is_some()
+            || validated_selection_measurements.is_some()
+        {
+            let observation = observe_invalid_reuse_result(prepared)?;
+            return Err(anyhow::Error::new(
+                SelectionReuseExecutionErrorV1::from_check(results, observation),
+            ));
+        }
+        let observation = observe_reused_result(prepared, &results[0])?;
+        if !observation.output_check.matched() {
+            return Err(anyhow::Error::new(
+                SelectionReuseExecutionErrorV1::from_check(results, observation),
+            ));
+        }
+        Some(Box::new(observation))
+    } else {
+        None
+    };
     let trace_unavailable_reason = trace.is_none().then(|| {
         "compatibility project executor does not produce a Project HGraph attempt trace".to_string()
     });
     Ok(ProjectExecutionObservationV1 {
         results,
+        validated_selection_receipt: validated_selection_receipt.map(Box::new),
+        validated_selection_measurements,
         project_trace: trace,
         mesh_trace: None,
         trace_unavailable_reason,
+        selection_reuse,
     })
+}
+
+/// Dispatch from the executor fixed during preflight. Prepared intents must
+/// never re-read ambient executor configuration after admission: another
+/// thread or embedder could otherwise change the engine between preparation
+/// and execution.
+fn execute_prepared_local_project_engine(
+    prepared: &PreparedProjectExecutionV1,
+    observer: Option<&dyn ValidatedSelectionProgressObserverV1>,
+) -> Result<ConfiguredProjectExecution> {
+    let options = RunOptions::default();
+    match prepared.executor {
+        ProjectExecutorV1::Compatibility => {
+            let execution = match observer {
+                Some(observer) => run_selection_observed_with_progress(
+                    &prepared.bundle,
+                    prepared.route.as_deref(),
+                    prepared.policy.clone(),
+                    &options,
+                    observer,
+                )?,
+                None => run_selection_observed(
+                    &prepared.bundle,
+                    prepared.route.as_deref(),
+                    prepared.policy.clone(),
+                    &options,
+                )?,
+            };
+            Ok(ConfiguredProjectExecution {
+                results: execution.results,
+                trace: None,
+                validated_selection_receipt: execution.validated_selection_receipt,
+                validated_selection_measurements: execution.validated_selection_measurements,
+            })
+        }
+        ProjectExecutorV1::Hgraph => {
+            let project = build_project_hgraph_with_contract(
+                &prepared.bundle,
+                prepared.route.as_deref(),
+                prepared.policy.clone(),
+                prepared.execution_contract,
+            )
+            .map_err(anyhow::Error::msg)
+            .context("failed to rebuild the prepared project HGraph for execution")?;
+            let logical = project.logical_v1()?;
+            if logical.digest()?.as_sha256() != prepared.identities.logical_hgraph_sha256
+                || DeploymentPlanV1::hosted(&logical)?.digest()?.as_sha256()
+                    != prepared.identities.deployment_plan_sha256
+            {
+                bail!("prepared project source or execution contract changed before dispatch");
+            }
+            execute_project_hgraph_selection_with_contract_and_progress(
+                &prepared.bundle,
+                &project,
+                &options,
+                prepared.execution_contract,
+                observer,
+            )
+        }
+        ProjectExecutorV1::MeshPrefer | ProjectExecutorV1::MeshRequired => {
+            bail!("prepared mesh project has no mesh execution configuration")
+        }
+    }
 }
 
 /// Execute one preflighted project without changing the selected local/mesh
@@ -1068,21 +1212,56 @@ fn execute_prepared_local_project(
 pub fn execute_prepared_project(
     prepared: &PreparedProjectExecutionV1,
 ) -> Result<ProjectExecutionObservationV1> {
+    execute_prepared_project_inner(prepared, None)
+}
+
+/// Execute one preflighted project while reporting presentation-safe progress
+/// for `benchmark_validate_and_select` candidate execution.
+pub fn execute_prepared_project_with_progress(
+    prepared: &PreparedProjectExecutionV1,
+    observer: &dyn ValidatedSelectionProgressObserverV1,
+) -> Result<ProjectExecutionObservationV1> {
+    execute_prepared_project_inner(prepared, Some(observer))
+}
+
+fn execute_prepared_project_inner(
+    prepared: &PreparedProjectExecutionV1,
+    observer: Option<&dyn ValidatedSelectionProgressObserverV1>,
+) -> Result<ProjectExecutionObservationV1> {
+    if prepared.selection_reuse().is_some() {
+        if let Err(error) = validate_prepared_selection_reuse(prepared) {
+            let reuse_error = SelectionReuseExecutionErrorV1::before_result(prepared, &error)?;
+            return Err(anyhow::Error::new(reuse_error));
+        }
+    }
     let Some(mesh) = prepared.mesh.as_ref() else {
-        return execute_prepared_local_project(prepared);
+        return execute_prepared_local_project(prepared, observer);
     };
-    let MeshExecutionOutcome { execution, trace } = execute_mesh_selection_observed(
-        &prepared.bundle,
-        prepared.route.as_deref(),
-        prepared.policy.clone(),
-        &RunOptions::default(),
-        mesh,
-    )?;
+    let MeshExecutionOutcome { execution, trace } = match observer {
+        Some(observer) => execute_mesh_selection_observed_with_progress(
+            &prepared.bundle,
+            prepared.route.as_deref(),
+            prepared.policy.clone(),
+            &RunOptions::default(),
+            mesh,
+            observer,
+        )?,
+        None => execute_mesh_selection_observed(
+            &prepared.bundle,
+            prepared.route.as_deref(),
+            prepared.policy.clone(),
+            &RunOptions::default(),
+            mesh,
+        )?,
+    };
     Ok(ProjectExecutionObservationV1 {
         results: execution.results,
+        validated_selection_receipt: execution.validated_selection_receipt.map(Box::new),
+        validated_selection_measurements: execution.validated_selection_measurements,
         project_trace: execution.trace,
         mesh_trace: Some(trace),
         trace_unavailable_reason: None,
+        selection_reuse: None,
     })
 }
 
@@ -1090,12 +1269,29 @@ pub fn execute_prepared_project(
 pub fn execute_prepared_intent(
     prepared: &PreparedExecutionIntentV1,
 ) -> Result<ExecutionObservationV1> {
+    execute_prepared_intent_inner(prepared, None)
+}
+
+/// Execute any preflighted intent while reporting presentation-safe progress
+/// when its project branch uses `benchmark_validate_and_select`.
+/// Ordinary `.O` inputs execute normally and emit no project-selection events.
+pub fn execute_prepared_intent_with_progress(
+    prepared: &PreparedExecutionIntentV1,
+    observer: &dyn ValidatedSelectionProgressObserverV1,
+) -> Result<ExecutionObservationV1> {
+    execute_prepared_intent_inner(prepared, Some(observer))
+}
+
+fn execute_prepared_intent_inner(
+    prepared: &PreparedExecutionIntentV1,
+    observer: Option<&dyn ValidatedSelectionProgressObserverV1>,
+) -> Result<ExecutionObservationV1> {
     match prepared {
         PreparedExecutionIntentV1::OrdinaryO(ordinary) => {
             execute_prepared_ordinary_o(ordinary).map(ExecutionObservationV1::OrdinaryO)
         }
         PreparedExecutionIntentV1::Project(project) => {
-            execute_prepared_project(project).map(ExecutionObservationV1::Project)
+            execute_prepared_project_inner(project, observer).map(ExecutionObservationV1::Project)
         }
     }
 }
@@ -1360,6 +1556,15 @@ pub fn explain_verified_run(
             result.stdout.capture.total_observed_bytes,
             result.stderr.capture.retained_bytes,
             result.stderr.capture.total_observed_bytes
+        ));
+    }
+    if let Some(receipt) = &record.validated_selection_receipt {
+        output.push_str(&format!(
+            "Validated selection compared {} candidates against reference `{}` and selected `{}` by complete-branch elapsed time; receipt sha256:{} (unsigned observation).\n",
+            receipt.candidates.len(),
+            receipt.reference_route_id,
+            receipt.selected_route_id,
+            receipt.sha256().map_err(anyhow::Error::msg)?,
         ));
     }
     if let Some(failure) = &record.failure {
@@ -1675,6 +1880,7 @@ fn format_ordinary_map(map: &HashMap<String, OValue>, color: bool, depth: usize)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::project::build_project_hgraph;
     use tempfile::tempdir;
 
     fn options(shim_dir: &Path) -> PrepareExecutionOptionsV1 {
@@ -1752,7 +1958,7 @@ mod tests {
     }
 
     #[test]
-    fn hgraph_policy_incompatibility_is_rejected_during_preflight() {
+    fn all_policy_is_admitted_during_hgraph_preflight() {
         let temp = tempdir().unwrap();
         fs::write(
             temp.path().join("olang.project.toml"),
@@ -1777,11 +1983,7 @@ policy = "all"
         .unwrap();
         let bundle = crate::project::assemble(temp.path(), "policy", &[]).unwrap();
         let project = build_project_hgraph(&bundle, Some("both"), None).unwrap();
-        let error =
-            validate_project_executor_preflight(&bundle, &project, ProjectExecutorV1::Hgraph)
-                .unwrap_err()
-                .to_string();
-        assert!(error.contains("does not support policy `all`"), "{error}");
+        validate_project_executor_preflight(&bundle, &project, ProjectExecutorV1::Hgraph).unwrap();
     }
 
     #[test]

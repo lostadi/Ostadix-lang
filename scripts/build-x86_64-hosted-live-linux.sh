@@ -26,11 +26,11 @@ ALPINE_LTS_MODLOOP_SHA256=871ef51ed6378283db9462947bb7fb84c1ec31376611eb1a2281b0
 MUSL_DEV_VERSION=1.2.6-r2
 HOSTED_STANDARD_BINARIES=(
   O o-cli olangc ocorec o-link o-unlink ogit o-live-host o-node octl
-  o-registry o-info
+  o-registry o-info ostadix-device
 )
 HOSTED_ROOT_BINARIES=(
   O o-cli olangc ocorec o-link o-unlink o-notebook ogit o-live-host o-node
-  octl o-registry o-info ocore-kernel-world-record
+  octl o-registry o-info ostadix-device ocore-kernel-world-record
 )
 HOSTED_BINARIES=("${HOSTED_ROOT_BINARIES[@]}" ostadix-mcp)
 
@@ -895,6 +895,7 @@ payload = {
         for name in (
             "O", "o-cli", "olangc", "ocorec", "o-link", "o-unlink", "o-notebook",
             "ogit", "o-live-host", "o-node", "octl", "o-registry", "o-info",
+            "ostadix-device",
             "ocore-kernel-world-record", "ostadix-mcp",
         )
     },

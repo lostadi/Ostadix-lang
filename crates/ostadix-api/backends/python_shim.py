@@ -24,6 +24,10 @@ from o_shim_common import (
     read_wire_message,
     write_wire_message,
 )
+from o_native_objects import NativeObjectStore
+
+_native_objects = NativeObjectStore()
+_active_native_operation = False
 
 # Save a reference to the real process stdout (fd 1) before anything can
 # redirect it. O.eval() must write eval_request directly over the IPC pipe
@@ -35,6 +39,37 @@ _current_o_scope_wire = {}
 _INT64_MIN = -(2 ** 63)
 _INT64_MAX = 2 ** 63 - 1
 PYTHON_GRAPH_CODEC_V1 = "ostadix.python-graph/v1"
+_DECIMAL_CHUNK_DIGITS = 256
+_DECIMAL_CHUNK_BASE = 10 ** _DECIMAL_CHUNK_DIGITS
+
+
+def _decimal_text_to_int(text):
+    """Parse an arbitrary decimal integer without CPython's digit ceiling."""
+    text = str(text)
+    negative = text.startswith("-")
+    digits = text[1:] if negative else text
+    if not digits or not digits.isascii() or not digits.isdigit():
+        raise ValueError("invalid decimal integer")
+    value = 0
+    for offset in range(0, len(digits), _DECIMAL_CHUNK_DIGITS):
+        chunk = digits[offset : offset + _DECIMAL_CHUNK_DIGITS]
+        value = value * (10 ** len(chunk)) + int(chunk)
+    return -value if negative else value
+
+
+def _int_to_decimal_text(value):
+    """Format an arbitrary integer without CPython's digit ceiling."""
+    if value == 0:
+        return "0"
+    negative = value < 0
+    value = abs(value)
+    chunks = []
+    while value:
+        value, remainder = divmod(value, _DECIMAL_CHUNK_BASE)
+        chunks.append(remainder)
+    text = str(chunks.pop())
+    text += "".join(f"{chunk:0{_DECIMAL_CHUNK_DIGITS}d}" for chunk in reversed(chunks))
+    return f"-{text}" if negative else text
 
 def dump_generated_python(source):
     try:
@@ -122,6 +157,52 @@ class _OMod:
     """
 
     @staticmethod
+    def native(value):
+        """Retain any Python object and return its owner-process descriptor.
+
+        Use a persistent python[N] actor to resolve the handle in later blocks.
+        Fresh actors expire when their block finishes. Explicit native_call,
+        native_get and native_set route operations to the retained owner;
+        carrying the descriptor never reconstructs the Python object.
+        """
+        if _active_morphism_contract is not None:
+            raise TypeError("morphism.unsupported-native: owner handles are outside the plain-data contract")
+        return OOpaqueValue(_native_objects.export(value))
+
+    @staticmethod
+    def resolve_native(handle):
+        """Return the exact retained object in its original owning process."""
+        if not isinstance(handle, OOpaqueValue):
+            raise TypeError("native.invalid-handle: expected an O.native handle")
+        return _native_objects.resolve(handle.wire_value)
+
+    @staticmethod
+    def release_native(handle):
+        """Invalidate this export and all copies of its descriptor."""
+        if not isinstance(handle, OOpaqueValue):
+            raise TypeError("native.invalid-handle: expected an O.native handle")
+        _native_objects.release(handle.wire_value)
+
+    @staticmethod
+    def native_call(handle, *args):
+        return _OMod.eval("native_call($handle, $args)",
+                         _OMod.scope({"handle": handle, "args": list(args)}))
+
+    @staticmethod
+    def native_get(handle, name):
+        return _OMod.eval("native_get($handle, $name)",
+                         _OMod.scope({"handle": handle, "name": name}))
+
+    @staticmethod
+    def native_set(handle, name, value):
+        return _OMod.eval("native_set($handle, $name, $value)",
+                         _OMod.scope({"handle": handle, "name": name, "value": value}))
+
+    @staticmethod
+    def native_release(handle):
+        return _OMod.eval("native_release($handle)", _OMod.scope({"handle": handle}))
+
+    @staticmethod
     def eval(q, scope_snapshot=None):
         """Evaluate a quoted expression and return its result.
 
@@ -154,23 +235,40 @@ class _OMod:
         # for capturing print() output.  The IPC protocol must go over the
         # real pipe — not the StringIO capture buffer.
         msg = {"status": "eval_request", "src": src}
+        if _active_native_operation and scope_snapshot is None:
+            msg["scope"] = {"t": "scope", "bindings": dict(_current_o_scope_wire)}
         if scope_snapshot is not None:
             if not isinstance(scope_snapshot, OScopeValue):
                 raise TypeError(
                     "O.eval explicit scope must be an OScopeValue from "
                     f"scope() or O.scope(), got {type(scope_snapshot).__name__!r}"
                 )
-            msg["scope"] = py_to_oval(scope_snapshot)
+            if _active_morphism_contract is not None:
+                scope_seen = set()
+                msg["scope"] = {"t": "scope", "bindings": {
+                    name: _lossless_native_witness(value, f"$callback_scope.{name}", scope_seen)
+                    for name, value in scope_snapshot.bindings.items()
+                }}
+            else:
+                msg["scope"] = py_to_oval(scope_snapshot)
         write_wire_message(msg, _real_stdout.buffer)
         # Block until the runtime replies with eval_result.
         resp = read_wire_message(sys.stdin.buffer)
+        while resp is not None and resp.get("cmd") == "native_operation_v1":
+            handle_native_operation(resp)
+            resp = read_wire_message(sys.stdin.buffer)
         if resp is None:
             raise RuntimeError("O.eval: runtime closed stdin before sending eval_result")
         if resp.get("cmd") != "eval_result":
             raise RuntimeError(
                 f"O.eval: expected eval_result command, got {resp.get('cmd')!r}"
             )
-        return oval_to_py(resp.get("value", {"t": "null"}))
+        value = resp.get("value", {"t": "null"})
+        if value.get("t") == "error" and (_active_native_operation or src.startswith("native_")):
+            raise RuntimeError(value.get("msg", "native callback failed"))
+        if _active_morphism_contract is not None:
+            return _lossless_input(value, "$callback")
+        return oval_to_py(value)
 
     @staticmethod
     def quote(src: str) -> OExprValue:
@@ -254,25 +352,53 @@ def oval_to_py(v):
     if t == "scope":
         wire_bindings = v.get("bindings", {})
         return OScopeValue(
-            {k: oval_to_py(x) for k, x in wire_bindings.items()},
+            {k: _scope_binding_to_py(x) for k, x in wire_bindings.items()},
             wire_bindings,
         )
     if t == "blob":
-        return base64.b64decode(v.get("v", ""))
+        try:
+            return base64.b64decode(v.get("v", ""), validate=True)
+        except (TypeError, ValueError):
+            return OOpaqueValue(v)
     if t == "expr":
         return OExprValue(v.get("src", ""))
 
     return OOpaqueValue(v)
 
 
+def _scope_binding_to_py(value):
+    """Keep malformed nested public values inert while retaining scope wire."""
+    try:
+        return oval_to_py(value)
+    except Exception:
+        return OOpaqueValue(value)
+
+
 def oval_number_to_py(n):
     kind = n.get("kind")
     if kind == "int":
-        return int(n.get("v", "0"))
+        try:
+            return _decimal_text_to_int(n.get("v", "0"))
+        except ValueError:
+            return OOpaqueValue({"t": "number", "v": n})
     if kind == "rational":
-        return fractions.Fraction(int(n.get("num", "0")), int(n.get("den", "1")))
+        try:
+            numerator = _decimal_text_to_int(n.get("num", "0"))
+            denominator = _decimal_text_to_int(n.get("den", "1"))
+            if denominator == 0:
+                return OOpaqueValue({"t": "number", "v": n})
+            return fractions.Fraction(numerator, denominator)
+        except ValueError:
+            return OOpaqueValue({"t": "number", "v": n})
     if kind == "decimal":
         special = n.get("special")
+        try:
+            coeff = _decimal_text_to_int(n.get("coeff", "0"))
+            exponent = int(n.get("exp10", 0))
+        except (TypeError, ValueError):
+            return OOpaqueValue({"t": "number", "v": n})
+        if special is not None and (coeff != 0 or exponent != 0):
+            return OOpaqueValue({"t": "number", "v": n})
         if special == "nan":
             return decimal.Decimal("NaN")
         if special == "pos_inf":
@@ -283,26 +409,45 @@ def oval_number_to_py(n):
             return decimal.Decimal("0")
         if special == "neg_zero":
             return decimal.Decimal("-0")
-        return decimal.Decimal(int(n.get("coeff", "0"))).scaleb(int(n.get("exp10", 0)))
+        if special is not None:
+            return OOpaqueValue({"t": "number", "v": n})
+        literal = f"{n.get('coeff', '0')}e{exponent}"
+        try:
+            return decimal.Decimal(literal)
+        except (decimal.InvalidOperation, ValueError):
+            return OOpaqueValue({"t": "number", "v": n})
     if kind == "binary_float":
-        bits = bytes(n.get("bits", []))
-        if n.get("format") == "f32":
+        try:
+            bits = bytes(n.get("bits", []))
+        except (TypeError, ValueError):
+            return OOpaqueValue({"t": "number", "v": n})
+        if n.get("format") == "f32" and len(bits) == 4:
             return struct.unpack(">f", bits)[0]
-        return struct.unpack(">d", bits)[0]
+        if n.get("format") == "f64" and len(bits) == 8:
+            return struct.unpack(">d", bits)[0]
+        return OOpaqueValue({"t": "number", "v": n})
     if kind == "complex":
-        return complex(
-            oval_number_to_py(n.get("re", {"kind": "int", "v": "0"})),
-            oval_number_to_py(n.get("im", {"kind": "int", "v": "0"})),
-        )
+        real = oval_number_to_py(n.get("re", {"kind": "int", "v": "0"}))
+        imaginary = oval_number_to_py(n.get("im", {"kind": "int", "v": "0"}))
+        if isinstance(real, OOpaqueValue) or isinstance(imaginary, OOpaqueValue):
+            return OOpaqueValue({"t": "number", "v": n})
+        try:
+            return complex(real, imaginary)
+        except (OverflowError, TypeError, ValueError):
+            return OOpaqueValue({"t": "number", "v": n})
     return OOpaqueValue({"t": "number", "v": n})
 
 
 def py_number_to_oval_payload(x):
     if isinstance(x, int):
-        return {"kind": "int", "v": str(x)}
+        return {"kind": "int", "v": _int_to_decimal_text(x)}
 
     if isinstance(x, fractions.Fraction):
-        return {"kind": "rational", "num": str(x.numerator), "den": str(x.denominator)}
+        return {
+            "kind": "rational",
+            "num": _int_to_decimal_text(x.numerator),
+            "den": _int_to_decimal_text(x.denominator),
+        }
 
     if isinstance(x, decimal.Decimal):
         if x.is_nan():
@@ -319,10 +464,10 @@ def py_number_to_oval_payload(x):
                 "special": "neg_zero" if x.is_signed() else "pos_zero",
             }
         sign, digits, exponent = x.as_tuple()
-        coeff = int("".join(str(digit) for digit in digits) or "0")
-        if sign:
-            coeff = -coeff
-        return {"kind": "decimal", "coeff": str(coeff), "exp10": int(exponent), "special": None}
+        coeff = "".join(str(digit) for digit in digits).lstrip("0") or "0"
+        if sign and coeff != "0":
+            coeff = f"-{coeff}"
+        return {"kind": "decimal", "coeff": coeff, "exp10": int(exponent), "special": None}
 
     if isinstance(x, float):
         return {
@@ -445,9 +590,8 @@ def py_to_oval(x):
         }
 
     # Never turn an unknown Python object into apparently lossless O text.
-    # A native capsule would need an explicit codec, lifetime, identity, and
-    # rehydration contract. Until such a contract exists, this crossing is
-    # unsupported and must fail visibly rather than erase those semantics.
+    # Explicit owner-process retention is available through O.native(value).
+    # Never silently allocate a handle or erase unsupported object semantics.
     raise TypeError(
         "unsupported Python value for OValue projection: "
         f"{type(x).__module__}.{type(x).__qualname__}"
@@ -478,7 +622,7 @@ def _ambient_fingerprint():
         "environment": [
             [key, value]
             for key, value in sorted(os.environ.items())
-            if key not in {"O_BACKEND_SESSION_ID", "O_LIFECYCLE_TRACE"}
+            if key not in {"O_BACKEND_SESSION_ID", "O_BACKEND_NATIVE_INSTANCE_ID", "O_LIFECYCLE_TRACE"}
         ],
         "sys_path": list(sys.path),
         "decimal_context": {
@@ -520,7 +664,7 @@ class _PythonGraphEncoder:
         if type(value) is bool:
             return {"kind": "bool", "value": value}
         if type(value) is int:
-            return {"kind": "int", "value": str(value)}
+            return {"kind": "int", "value": _int_to_decimal_text(value)}
         if type(value) is float:
             return {
                 "kind": "float64",
@@ -542,8 +686,8 @@ class _PythonGraphEncoder:
         if type(value) is fractions.Fraction:
             return {
                 "kind": "fraction",
-                "numerator": str(value.numerator),
-                "denominator": str(value.denominator),
+                "numerator": _int_to_decimal_text(value.numerator),
+                "denominator": _int_to_decimal_text(value.denominator),
             }
         if type(value) is complex:
             return {
@@ -645,7 +789,7 @@ class _PythonGraphDecoder:
         if kind == "bool":
             return bool(encoded["value"])
         if kind == "int":
-            return int(encoded["value"])
+            return _decimal_text_to_int(encoded["value"])
         if kind == "float64":
             return struct.unpack(">d", bytes(encoded["bits"]))[0]
         if kind == "str":
@@ -656,7 +800,8 @@ class _PythonGraphDecoder:
             return decimal.Decimal(encoded["value"])
         if kind == "fraction":
             return fractions.Fraction(
-                int(encoded["numerator"]), int(encoded["denominator"])
+                _decimal_text_to_int(encoded["numerator"]),
+                _decimal_text_to_int(encoded["denominator"]),
             )
         if kind == "complex":
             return complex(
@@ -772,6 +917,11 @@ def handle_state_capabilities():
 
 
 def handle_checkpoint(max_bytes):
+    if _native_objects.live_count:
+        raise StatePinRequired(
+            "$native_handles",
+            "exported Python native handles retain owner-process objects; release every handle before checkpoint or migration",
+        )
     if _ambient_fingerprint() != _BASE_AMBIENT_SHA256:
         raise StatePinRequired(
             "$process.ambient",
@@ -808,19 +958,134 @@ def handle_restore(checkpoint):
     _current_o_scope = {}
     _current_o_scope_wire = {}
 
-def handle_exec(cmd):
-    global _current_o_scope, _current_o_scope_wire
+_active_morphism_contract = None
+_PLAIN_DATA_CONTRACT_V1 = "python-plain-data-lossless"
+
+
+def _lossless_native_witness(value, path="$", seen=None, depth=0):
+    """Exact plain-data observation before projection; never invokes user codecs.
+
+    Identity and arbitrary Python interactions are outside this contract. Shared
+    or cyclic containers are rejected, rather than silently copying their graph.
+    """
+    if depth > 64:
+        raise TypeError(f"morphism.depth-limit: {path}")
+    kind = type(value)
+    if value is None:
+        return {"t": "null"}
+    if kind is bool:
+        return {"t": "bool", "v": value}
+    if kind is int:
+        return {"t": "number", "v": {"kind": "int", "v": _int_to_decimal_text(value)}}
+    if kind is float:
+        if not math.isfinite(value):
+            raise TypeError(f"morphism.nonfinite-float: {path}")
+        return {"t": "number", "v": {
+            "kind": "binary_float", "format": "f64",
+            "bits": list(struct.pack(">d", value)),
+        }}
+    if kind is str:
+        value.encode("utf-8", errors="strict")
+        return {"t": "text", "v": {"utf8": value, "encoding": "utf-8"}}
+    if kind not in (list, dict):
+        raise TypeError(f"morphism.unsupported-native: {path}: {kind.__module__}.{kind.__qualname__}")
+    if seen is None:
+        seen = set()
+    identity = id(value)
+    if identity in seen:
+        raise TypeError(f"morphism.identity-required: shared or cyclic object at {path}")
+    seen.add(identity)
+    if kind is list:
+        return {"t": "list", "v": [
+            _lossless_native_witness(item, f"{path}[{index}]", seen, depth + 1)
+            for index, item in enumerate(value)
+        ]}
+    if any(type(key) is not str for key in value):
+        raise TypeError(f"morphism.non-string-map-key: {path}")
+    return {"t": "map", "v": {
+        key: _lossless_native_witness(item, f"{path}.{key}", seen, depth + 1)
+        for key, item in value.items()
+    }}
+
+
+def _lossless_input(value, path="$", depth=0):
+    """Admit the wire carrier before conversion, including callback ingress."""
+    if depth > 64 or type(value) is not dict:
+        raise TypeError(f"morphism.invalid-input: {path}")
+    tag = value.get("t")
+    if tag == "null":
+        result = None
+    elif tag == "bool" and type(value.get("v")) is bool:
+        result = value["v"]
+    elif tag == "number":
+        number = value.get("v", {})
+        if (number.get("kind") == "int"
+                or (number.get("kind") == "binary_float" and number.get("format") == "f64")):
+            result = oval_number_to_py(number)
+        else:
+            raise TypeError(f"morphism.unsupported-number: {path}")
+    elif tag == "text" and value.get("v", {}).get("encoding") == "utf-8":
+        result = value["v"]["utf8"]
+    elif tag == "list" and type(value.get("v")) is list:
+        result = [_lossless_input(item, f"{path}[{index}]", depth + 1)
+                  for index, item in enumerate(value["v"])]
+    elif tag == "map" and type(value.get("v")) is dict:
+        result = {key: _lossless_input(item, f"{path}.{key}", depth + 1)
+                  for key, item in value["v"].items()}
+    else:
+        raise TypeError(f"morphism.unsupported-input: {path}: {tag}")
+    _lossless_native_witness(result, path)
+    return result
+
+
+def handle_exec_morphism(cmd):
+    if cmd.get("contract") != _PLAIN_DATA_CONTRACT_V1:
+        raise TypeError("morphism.unsupported-contract")
+    request_id = cmd.get("request_id")
+    if (type(request_id) is not str or len(request_id) != 64
+            or any(char not in "0123456789abcdef" for char in request_id)):
+        raise TypeError("morphism.invalid-request-id")
+    handle_exec(cmd, morphism_contract=_PLAIN_DATA_CONTRACT_V1)
+
+
+def handle_exec(cmd, morphism_contract=None):
+    global _current_o_scope, _current_o_scope_wire, _active_morphism_contract
     code = cmd.get("code", "")
     bindings = cmd.get("bindings", {})
 
+    # Validate every input before changing the actor or executing source.
+    converted = {name: (_lossless_input(oval, f"$bindings.{name}")
+                        if morphism_contract is not None else oval_to_py(oval))
+                 for name, oval in bindings.items()}
+    input_witnesses = ({name: _lossless_native_witness(value)
+                        for name, value in converted.items()}
+                       if morphism_contract is not None else None)
+    if morphism_contract is not None and input_witnesses != bindings:
+        raise TypeError("morphism.input-law-violation: native conversion changed the admitted OValue")
     _current_o_scope_wire = dict(bindings)
-    _current_o_scope = {name: oval_to_py(oval) for name, oval in bindings.items()}
-    for name, oval in bindings.items():
-        env[name] = oval_to_py(oval)
+    _current_o_scope = {
+        name: (_lossless_input(oval, f"$bindings.{name}")
+               if morphism_contract is not None else oval_to_py(oval))
+        for name, oval in bindings.items()
+    }
+    env.update(converted)
+
+    def return_result(result):
+        if morphism_contract is None:
+            send_ok(result)
+        else:
+            value = _lossless_native_witness(result)
+            write_wire_message({"status": "morphism_result_v1", "receipt": {
+                "contract": morphism_contract,
+                "request_id": cmd["request_id"],
+                "input_witnesses": input_witnesses,
+                "value": value,
+            }}, _real_stdout.buffer)
 
     buf = io.StringIO()
 
     try:
+        _active_morphism_contract = morphism_contract
         # Parse the whole code first.  If the last statement is a bare
         # expression (e.g. `6 * 7`, `type(q).__name__`), split it off so we
         # can `eval` it and capture its value — exec-mode silently discards
@@ -867,7 +1132,7 @@ def handle_exec(cmd):
         else:
             result = None
 
-        send_ok(result)
+        return_result(result)
 
     except SystemExit as e:
         # SystemExit inherits BaseException, not Exception, so it would slip
@@ -876,7 +1141,7 @@ def handle_exec(cmd):
         # Treat exit(0) as a clean null result; any other code as an error.
         code = e.code if e.code is not None else 0
         if code == 0:
-            send_ok(None)
+            return_result(None)
         else:
             send_err(f"SystemExit({code})")
 
@@ -885,14 +1150,83 @@ def handle_exec(cmd):
         dump_path = dump_generated_python(code if isinstance(code, str) else "")
         message += f"\nGenerated Python source: {dump_path}\n"
         send_err(message)
+    finally:
+        _active_morphism_contract = None
 
 def handle_cleanup():
     global _current_o_scope, _current_o_scope_wire
     _current_o_scope = {}
     _current_o_scope_wire = {}
+    _native_objects.clear()
     env.clear()
     env.update(_BASE_ENV)
     send_ok(None)
+
+
+def _native_argument(value, depth=0):
+    if depth > 64:
+        raise ValueError("native.argument-depth: arguments exceed 64 levels")
+    if type(value) is not dict:
+        raise TypeError("native.invalid-argument: expected a typed OValue")
+    tag = value.get("t")
+    if tag == "native":
+        return _native_objects.resolve(value)
+    if tag == "list":
+        return [_native_argument(item, depth + 1) for item in value["v"]]
+    if tag == "map":
+        return {key: _native_argument(item, depth + 1) for key, item in value["v"].items()}
+    return _lossless_input(value, "$native_argument")
+
+
+def handle_native_operation(cmd):
+    global _active_native_operation
+    previous = _active_native_operation
+    request_id = cmd.get("request_id")
+    try:
+        if (type(request_id) is not str or len(request_id) != 64
+                or any(character not in "0123456789abcdef" for character in request_id)):
+            raise ValueError("native.invalid-request: expected a canonical request identity")
+        if _active_morphism_contract is not None:
+            raise TypeError("morphism.unsupported-native: native operations are outside plain data")
+        operation = cmd.get("operation")
+        arguments = cmd.get("arguments")
+        if operation not in {"call", "get", "set", "release"} or type(arguments) is not list:
+            raise ValueError("native.invalid-operation: expected call/get/set/release and arguments")
+        arity = {"get": 1, "set": 2, "release": 0}.get(operation)
+        if arity is not None and len(arguments) != arity:
+            raise ValueError("native.invalid-arguments: incorrect operation arity")
+        # Resolve/seal-check every handle and validate all data before running
+        # a callable, a descriptor, setattr, or a release finalizer.
+        retained = _native_objects.resolve(cmd.get("handle"))
+        args = [_native_argument(value) for value in arguments]
+        if operation in {"get", "set"} and type(args[0]) is not str:
+            raise TypeError("native.invalid-attribute: attribute name must be text")
+        _active_native_operation = True
+        with contextlib.redirect_stdout(io.StringIO()):
+            if operation == "call":
+                result = retained(*args)
+            elif operation == "get":
+                result = getattr(retained, args[0])
+            elif operation == "set":
+                setattr(retained, args[0], args[1])
+                result = None
+            else:
+                _native_objects.release(cmd["handle"])
+                retained = None  # Run any finalizer before publishing the receipt.
+                result = None
+        if type(result) in {type(None), bool, int, str, float}:
+            try:
+                value = _lossless_native_witness(result)
+            except (TypeError, ValueError):
+                value = _native_objects.export(result)
+        else:
+            value = _native_objects.export(result)
+    except BaseException as error:
+        value = {"t": "error", "msg": f"native.operation-failed: {type(error).__name__}: {error}"}
+    finally:
+        _active_native_operation = previous
+    write_wire_message({"status": "native_operation_result_v1", "request_id": request_id,
+                        "value": value}, _real_stdout.buffer)
 
 def handle_ping():
     send_ok(None)
@@ -905,4 +1239,6 @@ command_loop(
     handle_checkpoint=handle_checkpoint,
     handle_restore=handle_restore,
     state_backend="python",
+    handle_exec_morphism=handle_exec_morphism,
+    handle_native_operation=handle_native_operation,
 )

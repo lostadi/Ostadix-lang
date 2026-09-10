@@ -961,6 +961,20 @@ impl HGraph {
 
     fn validate_node_kinds(&self) -> Result<(), String> {
         for (id, node) in &self.nodes {
+            if let Some(assessment) = &node.fidelity_assessment {
+                assessment.validate().map_err(|error| {
+                    format!("value node {} has invalid fidelity bounds: {error}", id.0)
+                })?;
+                let projected = assessment.try_possible_fidelity().map_err(|error| {
+                    format!("value node {} has invalid fidelity bounds: {error}", id.0)
+                })?;
+                if node.fidelity.as_ref() != Some(&projected) {
+                    return Err(format!(
+                        "value node {} has a legacy fidelity projection inconsistent with its V2 assessment",
+                        id.0
+                    ));
+                }
+            }
             if !node.is_value() {
                 if node.value.is_some()
                     || !node.domain.is_empty()
@@ -1301,7 +1315,18 @@ impl HGraph {
         summary: &EffectSummary,
     ) -> Result<(), String> {
         if summary.unknown {
-            require_read_write(summary, &ResourceKey::HostWorld, info.plan_node)?;
+            let explicit_project_concurrency = matches!(
+                edge.op,
+                HEdgeKind::Execute(
+                    ExecutableOp::MaterializeProject | ExecutableOp::RunRoute { .. }
+                )
+            ) && summary.reads.iter().any(|resource| {
+                matches!(resource, ResourceKey::ConcurrentProjectBranch(_))
+                    && summary.writes.contains(resource)
+            });
+            if !explicit_project_concurrency {
+                require_read_write(summary, &ResourceKey::HostWorld, info.plan_node)?;
+            }
         }
 
         let HEdgeKind::Execute(op) = &edge.op else {
@@ -1954,7 +1979,18 @@ fn require_hosted_project_operation(
             plan_node.0
         ));
     }
-    require_read_write(summary, &ResourceKey::HostWorld, plan_node)
+    // A project source validator separately binds this marker to an explicit
+    // concurrent policy and the exact branch. It retains unknown effects; it
+    // does not turn temporary workspaces into host-isolation evidence.
+    if let Some(resource) = summary
+        .reads
+        .iter()
+        .find(|resource| matches!(resource, ResourceKey::ConcurrentProjectBranch(_)))
+    {
+        require_read_write(summary, resource, plan_node)
+    } else {
+        require_read_write(summary, &ResourceKey::HostWorld, plan_node)
+    }
 }
 
 fn require_read_write(

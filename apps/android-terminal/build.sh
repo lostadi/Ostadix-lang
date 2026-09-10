@@ -228,18 +228,18 @@ for native_object in "$INTERMEDIATES/package/lib/arm64-v8a/"*.so; do
         echo "Native object contains forbidden text relocations: $native_object" >&2
         exit 1
     fi
-    if ! readelf -l "$native_object" | awk '/LOAD/{ if ($NF != "0x4000") bad=1 } END{ exit bad }'; then
+    if ! readelf -lW "$native_object" | awk '/LOAD/{ if ($NF != "0x4000") bad=1 } END{ exit bad }'; then
         echo "Native object is not 16 KiB page aligned: $native_object" >&2
         exit 1
     fi
 done
-if ! readelf -l "$INTERMEDIATES/package/lib/arm64-v8a/libostadix_cli.so" \
+if ! readelf -lW "$INTERMEDIATES/package/lib/arm64-v8a/libostadix_cli.so" \
         | awk '/\/system\/bin\/linker64/{found=1} END{exit !found}'; then
     echo "Bundled O CLI is not an Android ARM64 PIE executable" >&2
     exit 1
 fi
 
-if ! readelf -l "$BASH_PACKAGE_DIR/libostadix_bash.so" \
+if ! readelf -lW "$BASH_PACKAGE_DIR/libostadix_bash.so" \
         | awk '/\/system\/bin\/linker64/{found=1} END{exit !found}'; then
     echo "Bundled Bash is not an Android ARM64 PIE executable" >&2
     exit 1

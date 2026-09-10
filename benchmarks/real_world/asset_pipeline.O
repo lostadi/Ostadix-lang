@@ -1,0 +1,38 @@
+# Responsive-image release pipeline over three real project assets. Each lane
+# owns its input and output subtree, so the declared unordered effects do not
+# conflict. The harness supplies O_ASSET_OUT and validates every derivative.
+autonomous(batch(
+bash^(
+set -euo pipefail
+export MAGICK_THREAD_LIMIT=1
+lane="\${O_ASSET_OUT}/reference"
+mkdir -p "\$lane"
+for size in 1536 1024 640; do
+  magick Olang_Mascot_little-o/little-o/references/reference-01.png -strip -resize "\${size}x\${size}>" -quality 48 "\$lane/reference-\${size}.avif"
+  magick Olang_Mascot_little-o/little-o/references/reference-01.png -strip -resize "\${size}x\${size}>" -quality 82 "\$lane/reference-\${size}.webp"
+done
+(cd "\$lane" && find . -type f -print0 | sort -z | xargs -0 sha256sum)
+)_bash,
+bash^(
+set -euo pipefail
+export MAGICK_THREAD_LIMIT=1
+lane="\${O_ASSET_OUT}/canonical"
+mkdir -p "\$lane"
+for size in 1536 1024 640; do
+  magick Olang_Mascot_little-o/little-o/references/canonical-base.png -strip -resize "\${size}x\${size}>" -quality 48 "\$lane/canonical-\${size}.avif"
+  magick Olang_Mascot_little-o/little-o/references/canonical-base.png -strip -resize "\${size}x\${size}>" -quality 82 "\$lane/canonical-\${size}.webp"
+done
+(cd "\$lane" && find . -type f -print0 | sort -z | xargs -0 sha256sum)
+)_bash,
+bash^(
+set -euo pipefail
+export MAGICK_THREAD_LIMIT=1
+lane="\${O_ASSET_OUT}/logo"
+mkdir -p "\$lane"
+for size in 1536 1024 640; do
+  magick assets/olang-logo.png -strip -resize "\${size}x\${size}>" -quality 48 "\$lane/logo-\${size}.avif"
+  magick assets/olang-logo.png -strip -resize "\${size}x\${size}>" -quality 82 "\$lane/logo-\${size}.webp"
+done
+(cd "\$lane" && find . -type f -print0 | sort -z | xargs -0 sha256sum)
+)_bash
+))

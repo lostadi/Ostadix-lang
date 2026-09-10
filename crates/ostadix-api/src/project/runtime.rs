@@ -10,10 +10,11 @@
 //! by default — only the selected policy activates them, and `Default` requires
 //! an unambiguous default route or an explicit selection. The parallel
 //! policies (`race_success`, `race_settle`, `verify_equivalent`,
-//! `benchmark_and_select`) run every alternative concurrently, each in its own
-//! isolated workspace, and cancel losers cooperatively where the policy
-//! permits it. Selection is deterministic: when several alternatives settle
-//! successfully, the one earliest in declaration order wins.
+//! `benchmark_and_select`, `benchmark_validate_and_select`) run every
+//! alternative concurrently, each in its own isolated workspace, and cancel
+//! losers cooperatively where the policy permits it. Selection is
+//! deterministic: when several alternatives settle successfully, the one
+//! earliest in declaration order wins.
 
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
@@ -32,9 +33,11 @@ use crate::process::linux_process_observation_disappeared;
 
 use super::materialize::{materialize_isolated, Workspace};
 use super::model::{
-    Artifact, ArtifactCaptureFailure, ArtifactCaptureStatus, ExecutionProvenance, OExecutionResult,
-    OutputCapture, ProjectBundle, ResultCodec, RouteExecutionDisposition, RouteGuard, RoutePolicy,
-    RouteSpec,
+    validated_selection_json_sha256, Artifact, ArtifactCaptureFailure, ArtifactCaptureStatus,
+    ExecutionProvenance, OExecutionResult, OutputCapture, ProjectBundle, ResultCodec,
+    RouteExecutionDisposition, RouteGuard, RoutePolicy, RouteSpec,
+    ValidatedArtifactCaptureStatusV1, ValidatedSelectionCandidateV1,
+    ValidatedSelectionDispositionV1, ValidatedSelectionObservationV1, ValidatedSelectionReceiptV1,
 };
 
 /// How unmet guards are handled.
@@ -201,6 +204,73 @@ impl Default for RunOptions {
             guard_behavior: GuardBehavior::Enforce,
             limits: ExecutionLimits::default(),
         }
+    }
+}
+
+/// Credential-minimized lifecycle state for one measured candidate branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidatedSelectionCandidateProgressV1 {
+    /// The route settled successfully with complete declared-artifact evidence.
+    Succeeded,
+    /// The route produced a result that is not successful. Output-equivalence
+    /// eligibility is deliberately not claimed until validation begins.
+    SettledUnsuccessful { exit_code: Option<i32> },
+    /// The branch failed before it could produce a settled route result.
+    InfrastructureFailed,
+}
+
+/// Presentation-safe progress emitted by `benchmark_validate_and_select`.
+///
+/// These events contain route identifiers, counts, exit status, and measured
+/// complete-branch duration only. They never contain argv, environment,
+/// workspace paths, captured output, artifacts, or runtime error details.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValidatedSelectionProgressEventV1 {
+    /// Every candidate is about to be dispatched concurrently.
+    SelectionStarted {
+        reference_route_id: String,
+        candidate_count: usize,
+    },
+    /// One candidate worker is about to enter the measured branch call.
+    CandidateStarted {
+        declaration_index: usize,
+        route_id: String,
+        candidate_count: usize,
+    },
+    /// One measured branch call returned. Events arrive in settlement order,
+    /// while the final receipt remains in declaration order.
+    CandidateFinished {
+        declaration_index: usize,
+        route_id: String,
+        candidate_count: usize,
+        branch_elapsed_ns: u128,
+        outcome: ValidatedSelectionCandidateProgressV1,
+    },
+    /// All branch calls returned and declared-output validation is beginning.
+    ValidationStarted { candidate_count: usize },
+}
+
+/// Non-authoritative observer for validated-selection presentation progress.
+/// Observer work is outside each candidate's measured complete-branch window.
+pub trait ValidatedSelectionProgressObserverV1: Send + Sync {
+    fn observe(&self, event: ValidatedSelectionProgressEventV1);
+}
+
+impl<F> ValidatedSelectionProgressObserverV1 for F
+where
+    F: Fn(ValidatedSelectionProgressEventV1) + Send + Sync,
+{
+    fn observe(&self, event: ValidatedSelectionProgressEventV1) {
+        self(event);
+    }
+}
+
+fn observe_validated_selection_progress(
+    observer: Option<&dyn ValidatedSelectionProgressObserverV1>,
+    event: ValidatedSelectionProgressEventV1,
+) {
+    if let Some(observer) = observer {
+        observer.observe(event);
     }
 }
 
@@ -658,7 +728,7 @@ pub fn is_timeout_error(err: &anyhow::Error) -> bool {
 
 /// Credential-safe projection for persistent observations and remote status.
 ///
-/// Direct executor callers retain the historical [`Display`] text (including
+/// Direct executor callers retain the historical [`std::fmt::Display`] text (including
 /// argv), while this projection deliberately excludes command arguments that
 /// may have arrived through a route declaration.
 pub fn public_route_execution_diagnostic(err: &anyhow::Error) -> String {
@@ -2742,8 +2812,54 @@ pub fn run_selection(
     policy_override: Option<RoutePolicy>,
     opts: &RunOptions,
 ) -> Result<Vec<OExecutionResult>> {
+    Ok(run_selection_observed(bundle, target, policy_override, opts)?.results)
+}
+
+/// Run a target while retaining policy-specific selection evidence.
+///
+/// Most policies produce no separate receipt. `benchmark_validate_and_select`
+/// returns an unsigned, content-addressable receipt binding the reference,
+/// every candidate observation, its eligibility, and the measured winner.
+pub fn run_selection_observed(
+    bundle: &ProjectBundle,
+    target: Option<&str>,
+    policy_override: Option<RoutePolicy>,
+    opts: &RunOptions,
+) -> Result<RouteSelectionExecution> {
+    run_selection_observed_inner(bundle, target, policy_override, opts, None)
+}
+
+/// Run a target while reporting presentation-safe progress for
+/// `benchmark_validate_and_select` candidate execution.
+///
+/// Other policies retain their ordinary execution behavior and emit no
+/// validated-selection progress events.
+pub fn run_selection_observed_with_progress(
+    bundle: &ProjectBundle,
+    target: Option<&str>,
+    policy_override: Option<RoutePolicy>,
+    opts: &RunOptions,
+    observer: &dyn ValidatedSelectionProgressObserverV1,
+) -> Result<RouteSelectionExecution> {
+    run_selection_observed_inner(bundle, target, policy_override, opts, Some(observer))
+}
+
+fn run_selection_observed_inner(
+    bundle: &ProjectBundle,
+    target: Option<&str>,
+    policy_override: Option<RoutePolicy>,
+    opts: &RunOptions,
+    observer: Option<&dyn ValidatedSelectionProgressObserverV1>,
+) -> Result<RouteSelectionExecution> {
     let selection = resolve_selection(bundle, target, policy_override)?;
-    execute_policy(bundle, &selection.alternatives, &selection.policy, opts)
+    execute_policy(
+        bundle,
+        &selection.target,
+        &selection.alternatives,
+        &selection.policy,
+        opts,
+        observer,
+    )
 }
 
 /// A route selection after every decision that can be made without executing
@@ -2759,6 +2875,43 @@ pub struct ResolvedSelection {
     pub alternatives: Vec<String>,
     /// The policy whose dynamic result/cancellation semantics remain to run.
     pub policy: RoutePolicy,
+}
+
+/// Route results plus any policy-specific decision evidence.
+#[derive(Debug)]
+pub struct RouteSelectionExecution {
+    pub results: Vec<OExecutionResult>,
+    pub validated_selection_receipt: Option<ValidatedSelectionReceiptV1>,
+    /// Independently carried in-memory measurements used by the run recorder
+    /// to bind receipt claims back to the execution that produced them.
+    pub validated_selection_measurements: Option<Vec<ValidatedSelectionMeasurement>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedSelectionMeasurement {
+    pub route_id: String,
+    pub result_codec: ResultCodec,
+    pub branch_elapsed_ns: u128,
+}
+
+/// One candidate result paired with the wall time of the complete branch call
+/// that produced it. This is deliberately distinct from
+/// `OExecutionResult::duration_ns`, which times only the terminal route
+/// process/output-capture attempt.
+#[derive(Debug)]
+pub(crate) struct MeasuredRouteExecution {
+    pub(crate) result: OExecutionResult,
+    pub(crate) branch_elapsed_ns: u128,
+}
+
+impl RouteSelectionExecution {
+    pub(crate) fn plain(results: Vec<OExecutionResult>) -> Self {
+        Self {
+            results,
+            validated_selection_receipt: None,
+            validated_selection_measurements: None,
+        }
+    }
 }
 
 /// Resolve a route/route-set request without materializing a workspace or
@@ -2861,6 +3014,29 @@ pub fn resolve_selection(
         other => (alternatives, other),
     };
 
+    if policy == RoutePolicy::BenchmarkValidateAndSelect && alternatives.len() < 2 {
+        bail!(
+            "benchmark_validate_and_select requires at least two declared alternatives (reference plus candidate)"
+        );
+    }
+    if policy == RoutePolicy::BenchmarkValidateAndSelect {
+        for route_id in &alternatives {
+            let route = bundle
+                .route(route_id)
+                .expect("route existence was checked while resolving alternatives");
+            ValidatedArtifactCaptureStatusV1::from_capture(
+                &ArtifactCaptureStatus::Complete,
+                &route.outputs,
+            )
+            .map_err(anyhow::Error::msg)
+            .with_context(|| {
+                format!(
+                    "benchmark_validate_and_select route `{route_id}` has nonportable artifact requirements"
+                )
+            })?;
+        }
+    }
+
     Ok(ResolvedSelection {
         target,
         alternatives,
@@ -2899,10 +3075,12 @@ pub(crate) fn potential_route_execution_count(
 
 fn execute_policy(
     bundle: &ProjectBundle,
+    target: &str,
     alternatives: &[String],
     policy: &RoutePolicy,
     opts: &RunOptions,
-) -> Result<Vec<OExecutionResult>> {
+    observer: Option<&dyn ValidatedSelectionProgressObserverV1>,
+) -> Result<RouteSelectionExecution> {
     if alternatives.is_empty() {
         bail!("route set has no alternatives to run");
     }
@@ -2915,13 +3093,17 @@ fn execute_policy(
                 .first()
                 .filter(|candidate| *candidate == id)
                 .context("resolved explicit selection lost its route")?;
-            Ok(vec![run_route(bundle, id, opts)?])
+            Ok(RouteSelectionExecution::plain(vec![run_route(
+                bundle, id, opts,
+            )?]))
         }
         RoutePolicy::Default => {
             let default = alternatives
                 .first()
                 .context("resolved default selection lost its route")?;
-            Ok(vec![run_route(bundle, default, opts)?])
+            Ok(RouteSelectionExecution::plain(vec![run_route(
+                bundle, default, opts,
+            )?]))
         }
         RoutePolicy::Fallback => {
             let mut results = Vec::new();
@@ -2930,10 +3112,10 @@ fn execute_policy(
                 let ok = result.succeeded();
                 results.push(result);
                 if ok {
-                    return Ok(results);
+                    return Ok(RouteSelectionExecution::plain(results));
                 }
             }
-            Ok(results)
+            Ok(RouteSelectionExecution::plain(results))
         }
         RoutePolicy::AnySuccess => {
             let mut results = Vec::new();
@@ -2942,24 +3124,30 @@ fn execute_policy(
                 let ok = result.succeeded();
                 results.push(result);
                 if ok {
-                    return Ok(results);
+                    return Ok(RouteSelectionExecution::plain(results));
                 }
             }
-            Ok(results)
+            Ok(RouteSelectionExecution::plain(results))
         }
         RoutePolicy::All => {
             let mut results = Vec::new();
             for id in alternatives {
                 results.push(run_route(bundle, id, opts)?);
             }
-            Ok(results)
+            Ok(RouteSelectionExecution::plain(results))
         }
-        RoutePolicy::RaceSuccess => {
-            race_alternatives(bundle, alternatives, opts, RaceMode::FirstSuccess)
-        }
-        RoutePolicy::RaceSettle => {
-            race_alternatives(bundle, alternatives, opts, RaceMode::FirstSettle)
-        }
+        RoutePolicy::RaceSuccess => Ok(RouteSelectionExecution::plain(race_alternatives(
+            bundle,
+            alternatives,
+            opts,
+            RaceMode::FirstSuccess,
+        )?)),
+        RoutePolicy::RaceSettle => Ok(RouteSelectionExecution::plain(race_alternatives(
+            bundle,
+            alternatives,
+            opts,
+            RaceMode::FirstSettle,
+        )?)),
         RoutePolicy::VerifyEquivalent => {
             let results = run_all_parallel(bundle, alternatives, opts)?;
             let failures: Vec<&OExecutionResult> =
@@ -2975,7 +3163,7 @@ fn execute_policy(
                 );
             }
             verify_results_equivalent(&results)?;
-            Ok(results)
+            Ok(RouteSelectionExecution::plain(results))
         }
         RoutePolicy::BenchmarkAndSelect => {
             let mut results = run_all_parallel(bundle, alternatives, opts)?;
@@ -2992,10 +3180,18 @@ fn execute_policy(
                     // result is the final element.
                     let selected = results.remove(index);
                     results.push(selected);
-                    Ok(results)
+                    Ok(RouteSelectionExecution::plain(results))
                 }
                 None => bail!("benchmark_and_select: no alternative succeeded"),
             }
+        }
+        RoutePolicy::BenchmarkValidateAndSelect => {
+            let dispatch = |_: usize, route_id: &str, cancel: CancellationToken| {
+                run_route_cancellable(bundle, route_id, opts, cancel)
+            };
+            let measured =
+                run_all_alternatives_parallel_measured(alternatives, &dispatch, observer)?;
+            benchmark_validate_and_select(bundle, target, alternatives, measured, observer)
         }
     }
 }
@@ -3078,6 +3274,89 @@ fn run_all_parallel(
             }
         }
         Ok(results)
+    })
+}
+
+/// Run all alternatives concurrently and measure the complete call for each
+/// branch. Results and launch errors are resolved in declaration order so host
+/// scheduling cannot change which error is reported.
+pub(crate) fn run_all_alternatives_parallel_measured<F>(
+    alternatives: &[String],
+    dispatch: &F,
+    observer: Option<&dyn ValidatedSelectionProgressObserverV1>,
+) -> Result<Vec<MeasuredRouteExecution>>
+where
+    F: Fn(usize, &str, CancellationToken) -> Result<OExecutionResult> + Sync,
+{
+    if let Some(reference_route_id) = alternatives.first() {
+        observe_validated_selection_progress(
+            observer,
+            ValidatedSelectionProgressEventV1::SelectionStarted {
+                reference_route_id: reference_route_id.clone(),
+                candidate_count: alternatives.len(),
+            },
+        );
+    }
+    let (sender, receiver) = mpsc::channel();
+    std::thread::scope(|scope| {
+        for (index, route_id) in alternatives.iter().enumerate() {
+            let sender = sender.clone();
+            scope.spawn(move || {
+                observe_validated_selection_progress(
+                    observer,
+                    ValidatedSelectionProgressEventV1::CandidateStarted {
+                        declaration_index: index,
+                        route_id: route_id.clone(),
+                        candidate_count: alternatives.len(),
+                    },
+                );
+                let started = Instant::now();
+                let outcome = dispatch(index, route_id, CancellationToken::new());
+                let branch_elapsed_ns = started.elapsed().as_nanos();
+                let progress_outcome = match &outcome {
+                    Ok(result) if result.succeeded() => {
+                        ValidatedSelectionCandidateProgressV1::Succeeded
+                    }
+                    Ok(result) => ValidatedSelectionCandidateProgressV1::SettledUnsuccessful {
+                        exit_code: result.exit_code,
+                    },
+                    Err(_) => ValidatedSelectionCandidateProgressV1::InfrastructureFailed,
+                };
+                observe_validated_selection_progress(
+                    observer,
+                    ValidatedSelectionProgressEventV1::CandidateFinished {
+                        declaration_index: index,
+                        route_id: route_id.clone(),
+                        candidate_count: alternatives.len(),
+                        branch_elapsed_ns,
+                        outcome: progress_outcome,
+                    },
+                );
+                let measured = outcome.map(|result| MeasuredRouteExecution {
+                    result,
+                    branch_elapsed_ns,
+                });
+                let _ = sender.send((index, measured));
+            });
+        }
+        drop(sender);
+        let mut slots = (0..alternatives.len())
+            .map(|_| None)
+            .collect::<Vec<Option<Result<MeasuredRouteExecution>>>>();
+        for (index, outcome) in receiver {
+            slots[index] = Some(outcome);
+        }
+        slots
+            .into_iter()
+            .enumerate()
+            .map(|(index, outcome)| {
+                outcome
+                    .context("measured alternative worker never reported a result")?
+                    .with_context(|| {
+                        format!("measured alternative `{}` failed", alternatives[index])
+                    })
+            })
+            .collect()
     })
 }
 
@@ -3187,10 +3466,251 @@ fn race_alternatives(
     })
 }
 
-/// The equivalence contract for `verify_equivalent`: when every result carries
-/// a decoded JSON value, values must be equal; otherwise trimmed stdout text
-/// must match across all alternatives.
-fn verify_results_equivalent(results: &[OExecutionResult]) -> Result<()> {
+/// Finalize the evidence-gated measured policy. The first declared route is
+/// the reference and must succeed. Other failed or divergent candidates are
+/// retained as measured evidence but are ineligible for selection.
+pub(crate) fn benchmark_validate_and_select(
+    bundle: &ProjectBundle,
+    target: &str,
+    alternatives: &[String],
+    mut measured: Vec<MeasuredRouteExecution>,
+    observer: Option<&dyn ValidatedSelectionProgressObserverV1>,
+) -> Result<RouteSelectionExecution> {
+    if alternatives.len() != measured.len() || alternatives.len() < 2 {
+        bail!("benchmark_validate_and_select: candidate/result cardinality is noncanonical");
+    }
+    observe_validated_selection_progress(
+        observer,
+        ValidatedSelectionProgressEventV1::ValidationStarted {
+            candidate_count: alternatives.len(),
+        },
+    );
+    for (expected, execution) in alternatives.iter().zip(&measured) {
+        if expected != &execution.result.route_id {
+            bail!(
+                "benchmark_validate_and_select: expected route `{expected}`, observed `{}`",
+                execution.result.route_id
+            );
+        }
+    }
+
+    let reference = measured
+        .first()
+        .map(|execution| &execution.result)
+        .context("benchmark_validate_and_select: reference result is absent")?;
+    if !reference.succeeded() {
+        bail!(
+            "benchmark_validate_and_select: reference route `{}` must succeed (exit {:?})",
+            reference.route_id,
+            reference.exit_code
+        );
+    }
+    let reference_route = bundle
+        .route(&reference.route_id)
+        .context("benchmark_validate_and_select: reference route declaration is absent")?;
+    let reference_observation = validated_selection_observation(reference, reference_route)?;
+    if reference_observation.result_codec == ResultCodec::Json
+        && reference_observation.json_value_sha256.is_none()
+    {
+        bail!(
+            "benchmark_validate_and_select: reference route `{}` did not produce valid, completely captured JSON",
+            reference.route_id
+        );
+    }
+
+    let mut candidates = Vec::with_capacity(measured.len());
+    let mut measurements = Vec::with_capacity(measured.len());
+    let mut winner = 0usize;
+    for (index, execution) in measured.iter().enumerate() {
+        let result = &execution.result;
+        let route = bundle.route(&result.route_id).with_context(|| {
+            format!(
+                "benchmark_validate_and_select: route declaration `{}` is absent",
+                result.route_id
+            )
+        })?;
+        let observation = validated_selection_observation(result, route)?;
+        let disposition = if index == 0 {
+            ValidatedSelectionDispositionV1::Eligible
+        } else if !result.succeeded() {
+            ValidatedSelectionDispositionV1::RejectedExecution {
+                exit_code: result.exit_code,
+            }
+        } else {
+            match reference_observation.declared_output_mismatch(&observation) {
+                None => ValidatedSelectionDispositionV1::Eligible,
+                Some(mismatch) => ValidatedSelectionDispositionV1::RejectedOutput { mismatch },
+            }
+        };
+        if disposition.is_eligible()
+            && (execution.branch_elapsed_ns, index) < (measured[winner].branch_elapsed_ns, winner)
+        {
+            winner = index;
+        }
+        let observation_sha256 = observation
+            .sha256()
+            .map_err(anyhow::Error::msg)
+            .context("failed to hash validated-selection observation")?;
+        let declared_output_sha256 = observation
+            .declared_output_sha256()
+            .map_err(anyhow::Error::msg)
+            .context("failed to hash validated-selection declared output")?;
+        candidates.push(ValidatedSelectionCandidateV1 {
+            route_id: result.route_id.clone(),
+            terminal_elapsed_ns: result.duration_ns.to_string(),
+            branch_elapsed_ns: execution.branch_elapsed_ns.to_string(),
+            observation,
+            observation_sha256,
+            declared_output_sha256,
+            disposition,
+        });
+        measurements.push(ValidatedSelectionMeasurement {
+            route_id: result.route_id.clone(),
+            result_codec: route.result_codec,
+            branch_elapsed_ns: execution.branch_elapsed_ns,
+        });
+    }
+
+    let selected_route_id = measured[winner].result.route_id.clone();
+    let bundle_bytes = super::bundle::serialize(bundle)
+        .context("failed to serialize project bundle for validated-selection receipt")?;
+    let receipt = ValidatedSelectionReceiptV1::new(
+        bundle.name.clone(),
+        hex::encode(Sha256::digest(bundle_bytes)),
+        target,
+        alternatives[0].clone(),
+        candidates,
+        selected_route_id,
+    )
+    .map_err(anyhow::Error::msg)
+    .context("failed to construct validated-selection receipt")?;
+
+    // The effective result remains last for compatibility with fallback and
+    // benchmark selection consumers. The receipt preserves declaration order,
+    // so its tie-break can be independently recomputed.
+    let selected = measured.remove(winner);
+    let mut results = measured
+        .into_iter()
+        .map(|execution| execution.result)
+        .collect::<Vec<_>>();
+    results.push(selected.result);
+    Ok(RouteSelectionExecution {
+        results,
+        validated_selection_receipt: Some(receipt),
+        validated_selection_measurements: Some(measurements),
+    })
+}
+
+/// Validate one result against its route declaration and project the exact
+/// credential-minimized evidence used by validated selection. Mesh execution
+/// invokes this after decoding remote results so untrusted result fields do
+/// not enter the selector unchecked.
+pub(crate) fn validated_selection_observation(
+    result: &OExecutionResult,
+    route: &RouteSpec,
+) -> Result<ValidatedSelectionObservationV1> {
+    if result.route_id != route.id {
+        bail!(
+            "route result id `{}` disagrees with declaration `{}`",
+            result.route_id,
+            route.id
+        );
+    }
+    result
+        .stdout_capture
+        .validate_for_retained(&result.stdout)
+        .map_err(anyhow::Error::msg)
+        .context("stdout capture evidence is invalid")?;
+    result
+        .stderr_capture
+        .validate_for_retained(&result.stderr)
+        .map_err(anyhow::Error::msg)
+        .context("stderr capture evidence is invalid")?;
+    result
+        .artifact_capture
+        .validate()
+        .map_err(anyhow::Error::msg)
+        .context("artifact capture evidence is invalid")?;
+    if result.artifact_requirements != route.outputs {
+        bail!(
+            "route `{}` result artifact requirements disagree with its declaration",
+            route.id
+        );
+    }
+    if result.exit_code == Some(0) && !result.artifact_capture.is_complete() {
+        bail!(
+            "route `{}` reports successful exit with incomplete artifact evidence",
+            route.id
+        );
+    }
+    let json_value_sha256 = match route.result_codec {
+        ResultCodec::Json => {
+            let decoded = if result.stdout_capture.truncated {
+                None
+            } else {
+                serde_json::from_slice::<serde_json::Value>(&result.stdout).ok()
+            };
+            if decoded != result.value {
+                bail!(
+                    "route `{}` decoded JSON value disagrees with captured stdout",
+                    route.id
+                );
+            }
+            result
+                .value
+                .as_ref()
+                .map(validated_selection_json_sha256)
+                .transpose()
+                .map_err(anyhow::Error::msg)?
+        }
+        ResultCodec::Text | ResultCodec::Bytes => {
+            if result.value.is_some() {
+                bail!(
+                    "route `{}` uses a non-JSON codec but carries a decoded JSON value",
+                    route.id
+                );
+            }
+            None
+        }
+    };
+    let mut artifacts = result.artifacts.clone();
+    artifacts.sort_unstable_by(|left, right| {
+        (&left.path, left.bytes_len, &left.content_hash).cmp(&(
+            &right.path,
+            right.bytes_len,
+            &right.content_hash,
+        ))
+    });
+    let mut artifact_requirements = result.artifact_requirements.clone();
+    artifact_requirements.sort_unstable();
+    artifact_requirements.dedup();
+    let artifact_capture = ValidatedArtifactCaptureStatusV1::from_capture(
+        &result.artifact_capture,
+        &artifact_requirements,
+    )
+    .map_err(anyhow::Error::msg)
+    .context("artifact capture evidence cannot form a portable validated-selection receipt")?;
+    let observation = ValidatedSelectionObservationV1 {
+        result_codec: route.result_codec,
+        exit_code: result.exit_code,
+        stdout_capture: result.stdout_capture.clone(),
+        stderr_capture: result.stderr_capture.clone(),
+        json_value_sha256,
+        artifacts,
+        artifact_requirements,
+        artifact_capture,
+        execution_disposition: result.disposition,
+    };
+    observation
+        .validate()
+        .map_err(anyhow::Error::msg)
+        .context("route result cannot form canonical validated-selection evidence")?;
+    Ok(observation)
+}
+
+/// Preserve the legacy `verify_equivalent` comparison contract. The richer,
+/// codec-aware artifact comparison belongs only to the new validated policy.
+pub(crate) fn verify_results_equivalent(results: &[OExecutionResult]) -> Result<()> {
     if results.len() < 2 {
         return Ok(());
     }
@@ -3210,8 +3730,7 @@ fn verify_results_equivalent(results: &[OExecutionResult]) -> Result<()> {
         }
         return Ok(());
     }
-    let all_json = results.iter().all(|r| r.value.is_some());
-    if all_json {
+    if results.iter().all(|result| result.value.is_some()) {
         let reference = &results[0];
         for other in &results[1..] {
             if other.value != reference.value {
@@ -3238,4 +3757,148 @@ fn verify_results_equivalent(results: &[OExecutionResult]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod validated_selection_progress_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    fn settled_result(route_id: &str, exit_code: i32) -> OExecutionResult {
+        OExecutionResult {
+            route_id: route_id.to_string(),
+            exit_code: Some(exit_code),
+            stdout: Vec::new(),
+            stdout_capture: OutputCapture::complete(&[]),
+            stderr: Vec::new(),
+            stderr_capture: OutputCapture::complete(&[]),
+            value: None,
+            artifacts: Vec::new(),
+            artifact_requirements: Vec::new(),
+            artifact_capture: ArtifactCaptureStatus::Complete,
+            disposition: RouteExecutionDisposition::Executed,
+            duration_ns: 1,
+            provenance: ExecutionProvenance {
+                workspace: PathBuf::from("test-workspace"),
+                command: vec!["test-command".to_string()],
+                cwd: PathBuf::from("test-workspace"),
+            },
+        }
+    }
+
+    #[test]
+    fn measured_candidate_progress_is_typed_and_credential_minimized() {
+        let alternatives = vec![
+            "reference".to_string(),
+            "unsuccessful".to_string(),
+            "infrastructure-error".to_string(),
+        ];
+        let events = Mutex::new(Vec::new());
+        let observer = |event| events.lock().unwrap().push(event);
+        let dispatch = |_: usize, route_id: &str, _: CancellationToken| match route_id {
+            "reference" => Ok(settled_result(route_id, 0)),
+            "unsuccessful" => Ok(settled_result(route_id, 7)),
+            _ => Err(anyhow::anyhow!(
+                "sensitive infrastructure detail must not enter progress"
+            )),
+        };
+
+        let error =
+            run_all_alternatives_parallel_measured(&alternatives, &dispatch, Some(&observer))
+                .unwrap_err();
+        assert!(error.to_string().contains("infrastructure-error"));
+
+        let events = events.into_inner().unwrap();
+        assert_eq!(
+            events.first(),
+            Some(&ValidatedSelectionProgressEventV1::SelectionStarted {
+                reference_route_id: "reference".to_string(),
+                candidate_count: 3,
+            })
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    ValidatedSelectionProgressEventV1::CandidateStarted { .. }
+                ))
+                .count(),
+            3
+        );
+
+        let mut finished = events
+            .iter()
+            .filter_map(|event| match event {
+                ValidatedSelectionProgressEventV1::CandidateFinished {
+                    declaration_index,
+                    route_id,
+                    candidate_count,
+                    outcome,
+                    ..
+                } => Some((
+                    *declaration_index,
+                    route_id.as_str(),
+                    *candidate_count,
+                    *outcome,
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        finished.sort_by_key(|candidate| candidate.0);
+        assert_eq!(
+            finished,
+            vec![
+                (
+                    0,
+                    "reference",
+                    3,
+                    ValidatedSelectionCandidateProgressV1::Succeeded,
+                ),
+                (
+                    1,
+                    "unsuccessful",
+                    3,
+                    ValidatedSelectionCandidateProgressV1::SettledUnsuccessful {
+                        exit_code: Some(7),
+                    },
+                ),
+                (
+                    2,
+                    "infrastructure-error",
+                    3,
+                    ValidatedSelectionCandidateProgressV1::InfrastructureFailed,
+                ),
+            ]
+        );
+        assert!(!format!("{events:?}").contains("sensitive infrastructure detail"));
+    }
+
+    #[test]
+    fn validation_progress_starts_after_measured_candidates_are_available() {
+        let alternatives = vec!["reference".to_string(), "candidate".to_string()];
+        let measured = alternatives
+            .iter()
+            .map(|route_id| MeasuredRouteExecution {
+                result: settled_result(route_id, 0),
+                branch_elapsed_ns: 1,
+            })
+            .collect();
+        let events = Mutex::new(Vec::new());
+        let observer = |event| events.lock().unwrap().push(event);
+
+        let error = benchmark_validate_and_select(
+            &ProjectBundle::empty("missing-routes"),
+            "routes",
+            &alternatives,
+            measured,
+            Some(&observer),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("reference route declaration"));
+        assert_eq!(
+            events.into_inner().unwrap(),
+            vec![ValidatedSelectionProgressEventV1::ValidationStarted { candidate_count: 2 }]
+        );
+    }
 }

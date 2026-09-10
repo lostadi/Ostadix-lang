@@ -82,8 +82,15 @@ pub struct OperationGrounding {
 
 impl OperationGrounding {
     pub fn has_residual_host_world(&self) -> bool {
-        self.ambient_reads.contains(&ResourceKey::HostWorld)
-            || self.ambient_writes.contains(&ResourceKey::HostWorld)
+        self.ambient_reads
+            .iter()
+            .chain(&self.ambient_writes)
+            .any(|resource| {
+                matches!(
+                    resource,
+                    ResourceKey::HostWorld | ResourceKey::ConcurrentProjectBranch(_)
+                )
+            })
     }
 }
 
@@ -489,6 +496,8 @@ fn require_governed_resource_world(
             require_resource_owner_world(current, accelerator)
         }
         ResourceKey::HostWorld
+        | ResourceKey::ConcurrentProjectBranch(_)
+        | ResourceKey::ProjectBranchPath { .. }
         | ResourceKey::EvaluatorState
         | ResourceKey::ScopeBinding(_)
         | ResourceKey::ProjectPath(_)

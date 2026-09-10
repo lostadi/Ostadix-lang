@@ -72,8 +72,8 @@ never automatically sources an app-writable Bash startup script.
 
 Typing `su` manually inside the non-root Bash session is a separate, explicitly
 unsafe path: KernelSU preserves that shell's environment, and the command does
-not use the ROOT action's paste confirmation. Use the app's ROOT action when a
-hardened privileged session is required.
+not use the ROOT action's large-or-multiline paste confirmation. Use the app's
+ROOT action when a hardened privileged session is required.
 
 The TERMUX action is the deliberate superset escape hatch. Android package
 isolation makes KernelSU necessary to traverse Termux's private data tree.
@@ -108,7 +108,6 @@ compiled PTY object; cache selection is printed at the start of the build.
 
 ```sh
 cd "$HOME/Ostadix-lang/apps/android-terminal"
-cargo generate-lockfile --manifest-path runtime/Cargo.toml
 ./build.sh
 ```
 
@@ -139,3 +138,8 @@ mistaken for the portable artifact.
 Install it from Android's package installer or with `adb install -r` from a
 connected development host. A release build should use a private release key
 instead of the Android debug key.
+
+The build-time Bash, CLI, PTY, and JNI smokes run under the Termux build UID.
+They are pre-install ABI checks, not proof of the standalone package's separate
+app sandbox. Before treating package-UID independence as device evidence,
+install the APK and exercise Bash, `O --eval 2`, and the O Console from the app.

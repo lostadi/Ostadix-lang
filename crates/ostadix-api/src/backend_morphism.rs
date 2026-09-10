@@ -1,15 +1,16 @@
-//! Bounded, shadow-mode backend morphism contracts.
+//! Bounded backend morphism contracts and opt-in adapter enforcement.
 //!
 //! This V1 kernel describes only crossings the current adapters can actually
-//! demonstrate. Catalog V5 binds the selected profile name, while evidence,
-//! admission, and dispatch remain unchanged. The HGraph solver can query the
-//! shadow assessment beside its compatibility fidelity result without changing
-//! execution behavior.
+//! demonstrate. The HGraph solver can query the static shadow assessment
+//! without changing compatibility execution. `BackendCrossingContractV1`
+//! separately opts into real adapter checks, binds that choice in admission,
+//! and requires an invocation-matched receipt before publishing a value.
 
 use std::collections::{BTreeSet, HashMap};
 
 use num_bigint::BigInt;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 pub use crate::backend_catalog::BackendMorphismProfileV1;
@@ -18,6 +19,321 @@ use crate::value::{AnnotationKind, FidelityAssessmentV2, FloatFormat, ONumber, O
 
 pub const BACKEND_MORPHISM_SCHEMA_V1: &str = "ostadix.backend-morphism/v1";
 pub const MAX_BACKEND_MORPHISM_DEPTH_V1: usize = 64;
+
+/// An opt-in executable crossing contract. It observes exact plain-data values
+/// (including numeric bits), not object identity, retained environments, or
+/// arbitrary future interactions with a Python object. The adapter rejects
+/// objects outside that carrier before lifting them into OValue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BackendCrossingContractV1 {
+    PythonPlainDataLossless,
+}
+
+impl BackendCrossingContractV1 {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::PythonPlainDataLossless => "python-plain-data-lossless",
+        }
+    }
+
+    pub fn validate_value(self, backend: &str, value: &OValue) -> Result<(), String> {
+        if !matches!(
+            BackendMorphismKernelV1::for_backend(backend),
+            Some(BackendMorphismKernelV1::Python)
+        ) {
+            return Err(format!(
+                "morphism.unsupported-backend: {backend} has no executable {} contract",
+                self.name()
+            ));
+        }
+        let round_trip = BackendMorphismKernelV1::Python
+            .round_trip(value)
+            .map_err(|error| format!("morphism.input-rejected: {error}"))?;
+        if round_trip.composed_fidelity != FidelityAssessmentV2::Lossless {
+            return Err(format!(
+                "morphism.fidelity-rejected: {} requires lossless input",
+                self.name()
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn validate_bindings(
+        self,
+        backend: &str,
+        bindings: &HashMap<String, OValue>,
+    ) -> Result<(), String> {
+        self.validate_value(backend, &OValue::Null)?;
+        let mut names = bindings.keys().collect::<Vec<_>>();
+        names.sort();
+        for name in names {
+            self.validate_value(backend, &bindings[name])
+                .map_err(|error| format!("binding {name:?}: {error}"))?;
+        }
+        Ok(())
+    }
+}
+
+/// Receipt emitted by the trusted adapter after checking the actual native
+/// input and output carriers. A matching request id and input witnesses are
+/// required before the process registry can publish the result. This is not a
+/// proof about arbitrary code, host effects, or future contextual equivalence.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackendMorphismReceiptV1 {
+    pub contract: BackendCrossingContractV1,
+    pub request_id: String,
+    pub input_witnesses: HashMap<String, OValue>,
+    pub value: OValue,
+}
+
+impl BackendMorphismReceiptV1 {
+    pub(crate) fn verify(
+        &self,
+        contract: BackendCrossingContractV1,
+        request_id: &str,
+        bindings: &HashMap<String, OValue>,
+    ) -> Result<(), String> {
+        if self.contract != contract
+            || self.request_id != request_id
+            || &self.input_witnesses != bindings
+        {
+            return Err(
+                "morphism.receipt-mismatch: contract, invocation, or actual input witness differs"
+                    .to_string(),
+            );
+        }
+        contract.validate_bindings("python", &self.input_witnesses)?;
+        contract
+            .validate_value("python", &self.value)
+            .map_err(|error| format!("morphism.output-rejected: {error}"))
+    }
+}
+
+/// An execution observation is separate from both the static compatibility
+/// judgment and admission authority. Inputs are the prepared OValue bindings;
+/// preparation does not prove adapter receipt. Results are observed *after*
+/// adapter wire lifting.
+/// It never asserts that arbitrary backend code preserves its input values.
+pub const BACKEND_CROSSING_OBSERVATION_SCHEMA_V1: &str = "ostadix.backend-crossing-observation/v1";
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum RuntimeInputProfileV1 {
+    Assessed { fidelity: FidelityAssessmentV2 },
+    OutsideProfile { reason: BackendMorphismErrorV1 },
+    Unprofiled,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeBindingObservationV1 {
+    pub name: String,
+    pub value_sha256: String,
+    pub input_profile: RuntimeInputProfileV1,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimeCrossingStateV1 {
+    Prepared,
+    ResultObserved,
+    Failed,
+    InfrastructureFailure,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeResultObservationV1 {
+    /// This is the adapter's returned OValue, not the backend's pre-lifting
+    /// native object. Native egress loss is deliberately not inferred from it.
+    pub boundary: String,
+    pub value_type: String,
+    pub value_sha256: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackendCrossingObservationV1 {
+    pub schema: String,
+    pub admission_sha256: String,
+    pub graph_sha256: String,
+    pub plan_node: usize,
+    pub backend: String,
+    pub environment: u32,
+    /// Binds the retained executable set, adapter artifact, and launch context.
+    pub launch_generation_sha256: String,
+    pub profile: Option<BackendMorphismProfileV1>,
+    pub input_boundary: String,
+    pub bindings: Vec<RuntimeBindingObservationV1>,
+    pub state: RuntimeCrossingStateV1,
+    pub result: Option<RuntimeResultObservationV1>,
+    /// Physical completion and semantic publication are different facts.
+    pub published: bool,
+    pub discarded: bool,
+}
+
+impl BackendCrossingObservationV1 {
+    pub(crate) fn prepared(
+        admission_sha256: &str,
+        graph_sha256: &str,
+        plan_node: usize,
+        backend: &str,
+        environment: u32,
+        launch_generation_sha256: String,
+        bindings: &HashMap<String, OValue>,
+    ) -> Self {
+        let kernel = BackendMorphismKernelV1::for_backend(backend);
+        let profile = kernel.as_ref().map(|kernel| kernel.spec().profile);
+        let mut observed = bindings
+            .iter()
+            .map(|(name, value)| {
+                // Rust's source-constant profile is not its runtime binding path.
+                // Keep that distinction explicit even when a scalar would fit.
+                let input_profile = match kernel.as_ref() {
+                    Some(kernel) if !matches!(kernel, BackendMorphismKernelV1::Rust) => {
+                        match kernel.project(value) {
+                            Ok(projected) => RuntimeInputProfileV1::Assessed {
+                                fidelity: projected.fidelity,
+                            },
+                            Err(reason) => RuntimeInputProfileV1::OutsideProfile { reason },
+                        }
+                    }
+                    _ => RuntimeInputProfileV1::Unprofiled,
+                };
+                RuntimeBindingObservationV1 {
+                    name: name.clone(),
+                    value_sha256: observed_value_sha256(value),
+                    input_profile,
+                }
+            })
+            .collect::<Vec<_>>();
+        observed.sort_by(|a, b| a.name.cmp(&b.name));
+        Self {
+            schema: BACKEND_CROSSING_OBSERVATION_SCHEMA_V1.to_owned(),
+            admission_sha256: admission_sha256.to_owned(),
+            graph_sha256: graph_sha256.to_owned(),
+            plan_node,
+            backend: backend.to_owned(),
+            environment,
+            launch_generation_sha256,
+            profile,
+            input_boundary: "prepared-ovalue-adapter-bindings".to_owned(),
+            bindings: observed,
+            state: RuntimeCrossingStateV1::Prepared,
+            result: None,
+            published: false,
+            discarded: false,
+        }
+    }
+
+    pub(crate) fn observe_result(&mut self, value: &OValue) {
+        self.state = RuntimeCrossingStateV1::ResultObserved;
+        self.result = Some(RuntimeResultObservationV1 {
+            boundary: "adapter-wire-response-ovalue".to_owned(),
+            value_type: value.type_name().to_owned(),
+            value_sha256: observed_value_sha256(value),
+        });
+    }
+
+    /// Validate structural facts and a trusted external observation digest.
+    /// A digest supplied by the same untrusted document is not authentication.
+    pub fn verify(
+        &self,
+        expected_sha256: &str,
+        admission_sha256: &str,
+        graph_sha256: &str,
+    ) -> Result<(), String> {
+        if self.schema != BACKEND_CROSSING_OBSERVATION_SCHEMA_V1
+            || self.admission_sha256 != admission_sha256
+            || self.graph_sha256 != graph_sha256
+            || self.input_boundary != "prepared-ovalue-adapter-bindings"
+            || self.digest()? != expected_sha256
+        {
+            return Err("backend crossing observation identity mismatch".to_owned());
+        }
+        for digest in [
+            &self.admission_sha256,
+            &self.graph_sha256,
+            &self.launch_generation_sha256,
+        ] {
+            validate_observation_digest(digest)?;
+        }
+        let kernel = BackendMorphismKernelV1::for_backend(&self.backend);
+        if kernel.as_ref().map(|kernel| kernel.spec().profile) != self.profile {
+            return Err("backend crossing profile does not match backend".to_owned());
+        }
+        if self
+            .bindings
+            .windows(2)
+            .any(|pair| pair[0].name >= pair[1].name)
+        {
+            return Err("backend crossing bindings are not uniquely ordered".to_owned());
+        }
+        for binding in &self.bindings {
+            validate_observation_digest(&binding.value_sha256)?;
+            match &binding.input_profile {
+                RuntimeInputProfileV1::Assessed { fidelity } => {
+                    fidelity.validate().map_err(|error| error.to_string())?;
+                    if kernel.is_none() || matches!(kernel, Some(BackendMorphismKernelV1::Rust)) {
+                        return Err("backend has no runtime binding profile".to_owned());
+                    }
+                }
+                RuntimeInputProfileV1::OutsideProfile { reason } => {
+                    if reason.backend != self.backend
+                        || reason.direction
+                            != BackendMorphismDirectionV1::OValueToBackendInputProfile
+                    {
+                        return Err(
+                            "backend crossing rejection is for a different boundary".to_owned()
+                        );
+                    }
+                }
+                RuntimeInputProfileV1::Unprofiled => {}
+            }
+        }
+        if (self.state == RuntimeCrossingStateV1::ResultObserved) != self.result.is_some()
+            || (self.published && (self.result.is_none() || self.discarded))
+        {
+            return Err("inconsistent backend crossing outcome/publication".to_owned());
+        }
+        if let Some(result) = &self.result {
+            if result.boundary != "adapter-wire-response-ovalue" {
+                return Err("unrecognized backend result boundary".to_owned());
+            }
+            validate_observation_digest(&result.value_sha256)?;
+        }
+        Ok(())
+    }
+
+    pub fn digest(&self) -> Result<String, String> {
+        let bytes = serde_json::to_vec(self).map_err(|error| error.to_string())?;
+        let mut digest = Sha256::new();
+        digest.update(b"ostadix.backend-crossing-observation/v1\0");
+        digest.update(bytes);
+        Ok(hex::encode(digest.finalize()))
+    }
+}
+
+pub fn observed_value_sha256(value: &OValue) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"ostadix.observed-ovalue/v1\0");
+    digest.update(value.canonical_bytes());
+    hex::encode(digest.finalize())
+}
+
+fn validate_observation_digest(digest: &str) -> Result<(), String> {
+    if digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        Ok(())
+    } else {
+        Err("backend crossing observation has an invalid SHA-256 digest".to_owned())
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -142,6 +458,7 @@ pub enum BackendMorphismRejectionKindV1 {
     IntegerOutOfRange,
     NonFiniteFloat,
     CurrentAdapterDoesNotBindContainers,
+    InvalidFidelityAssessment,
     LosslessLawViolation,
 }
 
@@ -171,6 +488,22 @@ impl BackendMorphismErrorV1 {
             message: message.into(),
         }
     }
+}
+
+fn validate_returned_fidelity(
+    spec: &BackendMorphismSpecV1,
+    direction: BackendMorphismDirectionV1,
+    fidelity: &FidelityAssessmentV2,
+) -> Result<(), BackendMorphismErrorV1> {
+    fidelity.validate().map_err(|error| {
+        BackendMorphismErrorV1::new(
+            spec,
+            direction,
+            BackendMorphismRejectionKindV1::InvalidFidelityAssessment,
+            "$",
+            format!("backend morphism returned invalid fidelity bounds: {error}"),
+        )
+    })
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -207,14 +540,38 @@ pub struct BackendMorphismAssessmentV1 {
     pub o_to_backend_input: BackendMorphismLegAssessmentV1,
     pub profiled_backend_output_to_o: BackendMorphismLegAssessmentV1,
     pub composed_fidelity: FidelityAssessmentV2,
-    /// Present only when the composed judgment claims `Lossless`.
+    /// Present only when the two valid legs compose to `Lossless`.
     pub lossless_law_holds: Option<bool>,
+    /// Present for a failed lossless law or malformed fidelity returned by a
+    /// public morphism implementation.
     pub law_error: Option<BackendMorphismErrorV1>,
 }
 
 impl BackendMorphismAssessmentV1 {
     pub fn is_supported(&self) -> bool {
-        !matches!(self.composed_fidelity, FidelityAssessmentV2::Unsupported)
+        let BackendMorphismLegAssessmentV1::Supported {
+            fidelity: projected,
+        } = &self.o_to_backend_input
+        else {
+            return false;
+        };
+        let BackendMorphismLegAssessmentV1::Supported { fidelity: injected } =
+            &self.profiled_backend_output_to_o
+        else {
+            return false;
+        };
+        let Ok(expected_composed) = projected.clone().try_then(injected.clone()) else {
+            return false;
+        };
+        let expected_lossless_law =
+            (expected_composed == FidelityAssessmentV2::Lossless).then_some(true);
+
+        self.composed_fidelity.validate().is_ok()
+            && projected.validate().is_ok()
+            && injected.validate().is_ok()
+            && self.composed_fidelity == expected_composed
+            && !matches!(self.composed_fidelity, FidelityAssessmentV2::Unsupported)
+            && self.lossless_law_holds == expected_lossless_law
             && self.law_error.is_none()
     }
 }
@@ -246,8 +603,30 @@ pub trait BackendMorphismV1 {
         value: &OValue,
     ) -> Result<BackendMorphismRoundTripV1, BackendMorphismErrorV1> {
         let projected = self.project(value)?;
+        validate_returned_fidelity(
+            self.spec(),
+            BackendMorphismDirectionV1::OValueToBackendInputProfile,
+            &projected.fidelity,
+        )?;
         let injected = self.inject(&projected.value)?;
-        let composed = projected.fidelity.clone().then(injected.fidelity.clone());
+        validate_returned_fidelity(
+            self.spec(),
+            BackendMorphismDirectionV1::ProfiledBackendOutputToOValue,
+            &injected.fidelity,
+        )?;
+        let composed = projected
+            .fidelity
+            .clone()
+            .try_then(injected.fidelity.clone())
+            .map_err(|error| {
+                BackendMorphismErrorV1::new(
+                    self.spec(),
+                    BackendMorphismDirectionV1::LosslessLaw,
+                    BackendMorphismRejectionKindV1::InvalidFidelityAssessment,
+                    "$",
+                    format!("could not compose backend fidelity bounds: {error}"),
+                )
+            })?;
         if composed == FidelityAssessmentV2::Lossless && injected.value != *value {
             return Err(BackendMorphismErrorV1::new(
                 self.spec(),
@@ -291,6 +670,29 @@ pub trait BackendMorphismV1 {
             }
         };
         let projection_fidelity = projected.fidelity.clone();
+        if let Err(error) = validate_returned_fidelity(
+            spec,
+            BackendMorphismDirectionV1::OValueToBackendInputProfile,
+            &projection_fidelity,
+        ) {
+            return BackendMorphismAssessmentV1 {
+                schema: spec.schema.to_owned(),
+                backend: spec.backend.to_owned(),
+                profile: spec.profile,
+                integration: spec.integration,
+                o_to_backend_input_boundary: spec.o_to_backend_input_boundary.to_owned(),
+                profiled_backend_output_to_o_boundary: spec
+                    .profiled_backend_output_to_o_boundary
+                    .to_owned(),
+                o_to_backend_input: BackendMorphismLegAssessmentV1::Rejected {
+                    error: error.clone(),
+                },
+                profiled_backend_output_to_o: BackendMorphismLegAssessmentV1::NotAttempted,
+                composed_fidelity: FidelityAssessmentV2::Unsupported,
+                lossless_law_holds: None,
+                law_error: Some(error),
+            };
+        }
         let injected = match self.inject(&projected.value) {
             Ok(injected) => injected,
             Err(error) => {
@@ -315,7 +717,65 @@ pub trait BackendMorphismV1 {
                 };
             }
         };
-        let composed_fidelity = projection_fidelity.clone().then(injected.fidelity.clone());
+        if let Err(error) = validate_returned_fidelity(
+            spec,
+            BackendMorphismDirectionV1::ProfiledBackendOutputToOValue,
+            &injected.fidelity,
+        ) {
+            return BackendMorphismAssessmentV1 {
+                schema: spec.schema.to_owned(),
+                backend: spec.backend.to_owned(),
+                profile: spec.profile,
+                integration: spec.integration,
+                o_to_backend_input_boundary: spec.o_to_backend_input_boundary.to_owned(),
+                profiled_backend_output_to_o_boundary: spec
+                    .profiled_backend_output_to_o_boundary
+                    .to_owned(),
+                o_to_backend_input: BackendMorphismLegAssessmentV1::Supported {
+                    fidelity: projection_fidelity,
+                },
+                profiled_backend_output_to_o: BackendMorphismLegAssessmentV1::Rejected {
+                    error: error.clone(),
+                },
+                composed_fidelity: FidelityAssessmentV2::Unsupported,
+                lossless_law_holds: None,
+                law_error: Some(error),
+            };
+        }
+        let composed_fidelity = match projection_fidelity
+            .clone()
+            .try_then(injected.fidelity.clone())
+        {
+            Ok(composed) => composed,
+            Err(bounds_error) => {
+                let error = BackendMorphismErrorV1::new(
+                    spec,
+                    BackendMorphismDirectionV1::LosslessLaw,
+                    BackendMorphismRejectionKindV1::InvalidFidelityAssessment,
+                    "$",
+                    format!("could not compose backend fidelity bounds: {bounds_error}"),
+                );
+                return BackendMorphismAssessmentV1 {
+                    schema: spec.schema.to_owned(),
+                    backend: spec.backend.to_owned(),
+                    profile: spec.profile,
+                    integration: spec.integration,
+                    o_to_backend_input_boundary: spec.o_to_backend_input_boundary.to_owned(),
+                    profiled_backend_output_to_o_boundary: spec
+                        .profiled_backend_output_to_o_boundary
+                        .to_owned(),
+                    o_to_backend_input: BackendMorphismLegAssessmentV1::Supported {
+                        fidelity: projection_fidelity,
+                    },
+                    profiled_backend_output_to_o: BackendMorphismLegAssessmentV1::Supported {
+                        fidelity: injected.fidelity,
+                    },
+                    composed_fidelity: FidelityAssessmentV2::Unsupported,
+                    lossless_law_holds: None,
+                    law_error: Some(error),
+                };
+            }
+        };
         let lossless_law_holds = (composed_fidelity == FidelityAssessmentV2::Lossless)
             .then_some(injected.value == *value);
         let law_error = matches!(lossless_law_holds, Some(false)).then(|| {
@@ -869,6 +1329,59 @@ fn concrete_structural(losses: impl IntoIterator<Item = AnnotationKind>) -> Fide
 mod tests {
     use super::*;
 
+    struct InvalidFidelityMorphism {
+        invalid_projection: bool,
+    }
+
+    fn invalid_fidelity_assessment() -> FidelityAssessmentV2 {
+        let definite = crate::value::Fidelity::structural([AnnotationKind::NumericPrecision])
+            .losses()
+            .unwrap()
+            .clone();
+        let possible = crate::value::Fidelity::structural([AnnotationKind::TypeTag])
+            .losses()
+            .unwrap()
+            .clone();
+        FidelityAssessmentV2::Structural {
+            definite: Some(definite),
+            possible,
+        }
+    }
+
+    impl BackendMorphismV1 for InvalidFidelityMorphism {
+        fn spec(&self) -> &'static BackendMorphismSpecV1 {
+            &PYTHON_SPEC_V1
+        }
+
+        fn inject(
+            &self,
+            _native: &BackendNativeValueV1,
+        ) -> Result<BackendMorphismValueV1<OValue>, BackendMorphismErrorV1> {
+            Ok(BackendMorphismValueV1 {
+                value: OValue::null(),
+                fidelity: if self.invalid_projection {
+                    FidelityAssessmentV2::Lossless
+                } else {
+                    invalid_fidelity_assessment()
+                },
+            })
+        }
+
+        fn project(
+            &self,
+            _value: &OValue,
+        ) -> Result<BackendMorphismValueV1<BackendNativeValueV1>, BackendMorphismErrorV1> {
+            Ok(BackendMorphismValueV1 {
+                value: BackendNativeValueV1::Null,
+                fidelity: if self.invalid_projection {
+                    invalid_fidelity_assessment()
+                } else {
+                    FidelityAssessmentV2::Lossless
+                },
+            })
+        }
+    }
+
     fn map(entries: Vec<(BackendNativeValueV1, BackendNativeValueV1)>) -> BackendNativeValueV1 {
         BackendNativeValueV1::Map { entries }
     }
@@ -889,6 +1402,71 @@ mod tests {
         assert!(BackendMorphismKernelV1::for_backend("java").is_none());
         assert!(BackendMorphismKernelV1::for_backend("html").is_none());
         assert!(BackendMorphismKernelV1::for_backend("unknown").is_none());
+    }
+
+    #[test]
+    fn public_morphism_implementers_cannot_panic_composition_with_invalid_bounds() {
+        for invalid_projection in [true, false] {
+            let morphism = InvalidFidelityMorphism { invalid_projection };
+            let error = morphism.round_trip(&OValue::null()).unwrap_err();
+            assert_eq!(
+                error.kind,
+                BackendMorphismRejectionKindV1::InvalidFidelityAssessment
+            );
+
+            let assessment = morphism.shadow_assess(&OValue::null());
+            assert_eq!(
+                assessment.composed_fidelity,
+                FidelityAssessmentV2::Unsupported
+            );
+            assert_eq!(
+                assessment.law_error.as_ref().map(|error| error.kind),
+                Some(BackendMorphismRejectionKindV1::InvalidFidelityAssessment)
+            );
+            if invalid_projection {
+                assert!(matches!(
+                    assessment.o_to_backend_input,
+                    BackendMorphismLegAssessmentV1::Rejected { .. }
+                ));
+                assert_eq!(
+                    assessment.profiled_backend_output_to_o,
+                    BackendMorphismLegAssessmentV1::NotAttempted
+                );
+            } else {
+                assert!(matches!(
+                    assessment.profiled_backend_output_to_o,
+                    BackendMorphismLegAssessmentV1::Rejected { .. }
+                ));
+            }
+        }
+
+        let mut directly_assembled = BackendMorphismKernelV1::Python.shadow_assess(&OValue::null());
+        assert!(directly_assembled.is_supported());
+        directly_assembled.composed_fidelity = invalid_fidelity_assessment();
+        assert!(!directly_assembled.is_supported());
+
+        let mut invalid_leg = BackendMorphismKernelV1::Python.shadow_assess(&OValue::null());
+        invalid_leg.o_to_backend_input = BackendMorphismLegAssessmentV1::Supported {
+            fidelity: invalid_fidelity_assessment(),
+        };
+        assert!(!invalid_leg.is_supported());
+
+        let mut missing_leg = BackendMorphismKernelV1::Python.shadow_assess(&OValue::null());
+        missing_leg.profiled_backend_output_to_o = BackendMorphismLegAssessmentV1::NotAttempted;
+        assert!(!missing_leg.is_supported());
+
+        let mut forged_composition =
+            serde_json::to_value(BackendMorphismKernelV1::Python.shadow_assess(&OValue::null()))
+                .unwrap();
+        forged_composition["composed_fidelity"] = serde_json::json!({"kind": "native_capsule"});
+        let forged_composition: BackendMorphismAssessmentV1 =
+            serde_json::from_value(forged_composition).unwrap();
+        assert!(!forged_composition.is_supported());
+
+        let mut false_law = BackendMorphismKernelV1::Python.shadow_assess(&OValue::null());
+        false_law.lossless_law_holds = Some(false);
+        false_law.law_error = None;
+        assert!(!false_law.is_supported());
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use std::any::TypeId;
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 
@@ -24,6 +25,50 @@ fn compatibility_modules_preserve_the_engine_type_identities() {
     assert_same!(
         o_lang::computation_core::VerifiedOComputationV1,
         ostadix_api::computation_core::VerifiedOComputationV1
+    );
+    assert_same!(
+        o_lang::computation_core::OperationContractV1,
+        ostadix_api::computation_core::OperationContractV1
+    );
+    assert_same!(
+        o_lang::computation_core::OperationContractIdV1,
+        ostadix_api::computation_core::OperationContractIdV1
+    );
+    assert_same!(
+        o_lang::computation_core::OperationInterfaceV1,
+        ostadix_api::computation_core::OperationInterfaceV1
+    );
+    assert_same!(
+        o_lang::computation_core::OperationInterfaceIdV1,
+        ostadix_api::computation_core::OperationInterfaceIdV1
+    );
+    assert_same!(
+        o_lang::computation_core::RealizationDescriptorV1,
+        ostadix_api::computation_core::RealizationDescriptorV1
+    );
+    assert_same!(
+        o_lang::computation_core::RealizationDescriptorIdV1,
+        ostadix_api::computation_core::RealizationDescriptorIdV1
+    );
+    assert_same!(
+        o_lang::computation_core::RealizationSetV1,
+        ostadix_api::computation_core::RealizationSetV1
+    );
+    assert_same!(
+        o_lang::computation_core::RealizationSetIdV1,
+        ostadix_api::computation_core::RealizationSetIdV1
+    );
+    assert_same!(
+        o_lang::computation_core::OperationIdV1,
+        ostadix_api::computation_core::OperationIdV1
+    );
+    assert_same!(
+        o_lang::computation_core::RealizationIdV1,
+        ostadix_api::computation_core::RealizationIdV1
+    );
+    assert_same!(
+        o_lang::computation_core::SemanticArtifactRefV1,
+        ostadix_api::computation_core::SemanticArtifactRefV1
     );
     assert_same!(
         o_lang::evidence::EvidenceBundleV5,
@@ -125,7 +170,22 @@ fn dependency_direction_is_shell_to_engine_only() {
 #[test]
 fn root_backend_directory_is_an_exact_compatibility_mirror() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    assert_eq!(ostadix_api::shims::BUNDLED_SHIMS.len(), 23);
+    assert_eq!(ostadix_api::shims::BUNDLED_SHIMS.len(), 24);
+    let names = ostadix_api::shims::BUNDLED_SHIMS
+        .iter()
+        .map(|(name, _)| *name)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(names.len(), 24, "bundled adapter filenames must be unique");
+    let support_names = names
+        .iter()
+        .copied()
+        .filter(|name| !name.ends_with("_shim.py"))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        support_names,
+        BTreeSet::from(["o_shim_common.py", "o_native_objects.py"]),
+        "the independently packaged engine must include both Python support modules"
+    );
     for &(name, engine_bytes) in ostadix_api::shims::BUNDLED_SHIMS {
         let compatibility_bytes = fs::read(root.join("backends").join(name)).unwrap();
         assert_eq!(

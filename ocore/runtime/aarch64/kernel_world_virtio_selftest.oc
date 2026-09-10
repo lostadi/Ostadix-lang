@@ -1,0 +1,123 @@
+module runtime::aarch64::kernel_world_virtio_selftest;
+
+use runtime::aarch64::kernel_world_virtio::init;
+use runtime::aarch64::kernel_world_virtio::mmio_read;
+use runtime::aarch64::kernel_world_virtio::mmio_write;
+use runtime::aarch64::kernel_world_virtio::poll;
+use runtime::aarch64::kernel_world_virtio::arm_hold_next_read;
+use runtime::aarch64::kernel_world_virtio::begin_withdraw;
+use runtime::aarch64::kernel_world_virtio::query_completion;
+use runtime::aarch64::kernel_world_virtio::note_guest_consumed;
+use runtime::aarch64::kernel_world_virtio::denials;
+use runtime::aarch64::kernel_world_virtio::pending;
+
+extern "ocore" fn kw_guest_address(gpa: u64, length: u64) -> usize;
+
+unsafe fn put16(gpa: u64, value: u64) -> void {
+    volatile_store(kw_guest_address(gpa, 2) as *mut u16, value as u16);
+}
+unsafe fn put32(gpa: u64, value: u64) -> void {
+    volatile_store(kw_guest_address(gpa, 4) as *mut u32, value as u32);
+}
+unsafe fn put64(gpa: u64, value: u64) -> void {
+    volatile_store(kw_guest_address(gpa, 8) as *mut u64, value);
+}
+unsafe fn byte(gpa: u64) -> u64 {
+    return volatile_load(kw_guest_address(gpa, 1) as *const u8) as u64;
+}
+unsafe fn desc(base: u64, id: u64, start: u64, size: u64, flags: u64, next: u64) -> void {
+    let entry: u64 = base + id * 16;
+    put64(entry, start);
+    put32(entry + 8, size);
+    put16(entry + 12, flags);
+    put16(entry + 14, next);
+}
+
+unsafe fn configure(base: u64, generation: u64) -> bool {
+    if kw_guest_address(base, 65536) == 0 || init(base, 65536, generation) == 0 {
+        return false;
+    }
+    let mut offset: u64 = 0;
+    while offset < 65536 {
+        volatile_store(kw_guest_address(base + offset, 1) as *mut u8, 0);
+        offset += 1;
+    }
+    if mmio_write(112, 1) == 0 || mmio_write(112, 3) == 0
+        || mmio_write(36, 0) == 0 || mmio_write(32, 102) == 0
+        || mmio_write(36, 1) == 0 || mmio_write(32, 1) == 0
+        || mmio_write(112, 11) == 0 || mmio_write(48, 0) == 0
+        || mmio_write(56, 32) == 0
+        || mmio_write(128, base & 0xffff_ffff) == 0
+        || mmio_write(132, base >> 32) == 0
+        || mmio_write(144, (base + 0x1000) & 0xffff_ffff) == 0
+        || mmio_write(148, (base + 0x1000) >> 32) == 0
+        || mmio_write(160, (base + 0x2000) & 0xffff_ffff) == 0
+        || mmio_write(164, (base + 0x2000) >> 32) == 0
+        || mmio_write(68, 1) == 0 || mmio_write(112, 15) == 0 {
+        return false;
+    }
+    desc(base, 0, base + 0x3000, 16, 1, 1);
+    desc(base, 1, base + 0x4000, 512, 3, 2);
+    desc(base, 2, base + 0x5000, 1, 2, 0);
+    volatile_store(kw_guest_address(base + 0x5000, 1) as *mut u8, 255);
+    put16(base + 0x1004, 0);
+    put16(base + 0x1002, 1);
+    return true;
+}
+
+// Run before guest entry with a dedicated 64-KiB scratch range. These native
+// adversarial tests call the production MMIO and queue code; they do not
+// replace the subsequent Linux driver's success/error/liveness observations.
+// Zero means failure. Five is the next unused generation for the real guest.
+pub unsafe fn run(base: u64) -> u64 {
+    if (base & 4095) != 0 || !configure(base, 1) { return 0; }
+    // Out-of-range DMA-shaped address must never be translated or written.
+    desc(base, 1, base + 65536, 512, 3, 2);
+    if poll() != 0 || denials() != 1 || byte(base + 0x5000) != 255 {
+        return 0;
+    }
+    if !configure(base, 2) { return 0; }
+    // Reused descriptor identity forms a cycle, even when all bytes are in RAM.
+    desc(base, 1, base + 0x4000, 512, 3, 0);
+    if poll() != 0 || denials() != 1 || byte(base + 0x5000) != 255 {
+        return 0;
+    }
+    if !configure(base, 3) { return 0; }
+    // A wrapped index is legitimate; more than queue-size outstanding entries
+    // is not. The monitor must not walk attacker-controlled unbounded work.
+    put16(base + 0x1002, 33);
+    if poll() != 0 || denials() != 1 || byte(base + 0x5000) != 255 {
+        return 0;
+    }
+    if !configure(base, 4) { return 0; }
+    if poll() != 1 || byte(base + 0x5000) != 0
+        || byte(base + 0x4000) != 0x5a || byte(base + 0x41ff) != 0xa5
+        || mmio_write(100, 1) != 1 || mmio_read(96) != 0 {
+        return 0;
+    }
+    if arm_hold_next_read(3) != 0 || arm_hold_next_read(4) != 1 { return 0; }
+    put16(base + 0x1006, 0);
+    put16(base + 0x1002, 2);
+    volatile_store(kw_guest_address(base + 0x5000, 1) as *mut u8, 255);
+    if poll() != 2 || pending() != 1 || byte(base + 0x5000) != 255
+        || begin_withdraw(0) != 0 {
+        return 0;
+    }
+    let completion: u64 = begin_withdraw(1);
+    if completion == 0 || begin_withdraw(1) != completion
+        || begin_withdraw(2) != 0 || query_completion(completion) != 0
+        || note_guest_consumed(4) != 0 || poll() != 1
+        || byte(base + 0x5000) != 1 || pending() != 0
+        || query_completion(completion) != 0
+        || init(base, 65536, 5) != 0
+        || note_guest_consumed(3) != 0 || note_guest_consumed(4) != 1
+        || query_completion(completion) != 0
+        || mmio_write(100, 1) != 1 || query_completion(completion) != 1
+        || mmio_write(112, 0) != 0 || query_completion(completion) != 1
+        || mmio_write(113, 0) != 0 || query_completion(completion) != 1
+        || note_guest_consumed(4) != 0 || query_completion(completion + 1) != 2
+        || init(base, 65536, 4) != 0 {
+        return 0;
+    }
+    return 5;
+}

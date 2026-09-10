@@ -456,11 +456,11 @@ the common identity for three different roles:
 | Runnable products | Admitted x86_64 executables at `/usr/local/bin` | Built separately from the same tree and individually receipt-bound by size and SHA-256. |
 | Derived O artifact | `/usr/share/ostadix/wasm/hello.wasm` plus `hello.release.json` | The descriptor binds the staged tree, O input, installed `olangc`, generated Cargo-project closure, fixed offline build profile, and module identity. |
 
-The 14 declared root products are `O`, `o-cli`, `olangc`, `ocorec`, `o-link`,
+The 15 declared root products are `O`, `o-cli`, `olangc`, `ocorec`, `o-link`,
 `o-unlink`, `o-notebook`, `ogit`, `o-live-host`, `o-node`, `octl`,
-`o-registry`, `o-info`, and `ocore-kernel-world-record`. `ostadix-mcp` is a
-fifteenth executable built from its separately locked MCP crate. The hosted
-workstation also contains `apk`, Rust, Cargo, rustfmt, Clippy, `rust-wasm`, the
+`o-registry`, `o-info`, `ostadix-device`, and `ocore-kernel-world-record`.
+`ostadix-mcp` is a sixteenth executable built from its separately locked MCP
+crate. The hosted workstation also contains `apk`, Rust, Cargo, rustfmt, Clippy, `rust-wasm`, the
 `wasm32-wasip1` standard library and WASI libc, Git, OpenSSL, Firefox ESR,
 xdg-open, and the C/C++ build tools. The zero-argument
 `o-notebook` honors the installed `O_BACKENDS_DIR`; the boot gate evaluates a

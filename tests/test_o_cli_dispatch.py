@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -41,19 +42,28 @@ class LowercaseCliDispatchTests(unittest.TestCase):
         ):
             self.environment[variable] = str(self.fake)
 
-    def run_cli(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+    def run_cli(
+        self,
+        *arguments: str,
+        environment: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [str(O_CLI), *arguments],
             cwd=PROJECT_ROOT,
-            env=self.environment,
+            env=environment or self.environment,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
         )
 
-    def assert_dispatch(self, arguments: tuple[str, ...], expected: list[str]) -> None:
-        result = self.run_cli(*arguments)
+    def assert_dispatch(
+        self,
+        arguments: tuple[str, ...],
+        expected: list[str],
+        environment: dict[str, str] | None = None,
+    ) -> None:
+        result = self.run_cli(*arguments, environment=environment)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines(), [f"arg=<{arg}>" for arg in expected])
 
@@ -61,16 +71,34 @@ class LowercaseCliDispatchTests(unittest.TestCase):
         for arguments in (
             ("run", "program.O", "backends"),
             ("run", "project", "--parallel", "auto"),
+            ("routes", "project", "--json"),
+            ("optimize", "project", "--route", "main", "--json"),
             ("plan", "--parallel", "auto", "project", "--live"),
             ("explain", "last-run"),
             ("inspect", "last-run", "--trace"),
+            ("operation", "inspect", "set", "set.cbor", "--json"),
+            ("operation", "normalize", "--json"),
+            ("realizations", "normalize", "--json"),
+            ("observe", "normalize", "--run", "last-run", "--json"),
+            ("replan", "normalize", "--without-target", "gpu-1", "--json"),
         ):
             with self.subTest(arguments=arguments):
                 self.assert_dispatch(arguments, list(arguments))
 
-    def test_android_doctor_and_device_commands_use_the_native_controller(self) -> None:
-        self.assert_dispatch(("doctor", "--json"), ["doctor", "--json"])
-        self.assert_dispatch(("device", "status", "--json"), ["status", "--json"])
+    def test_android_commands_use_the_explicit_device_namespace(self) -> None:
+        non_device_environment = self.environment.copy()
+        non_device_environment["O_LANG_DEVICE_BIN"] = str(
+            Path(self.temporary.name) / "missing-device-controller"
+        )
+        self.assert_dispatch(
+            ("doctor", "--json"),
+            ["doctor", "--json"],
+            non_device_environment,
+        )
+        self.assert_dispatch(
+            ("device", "doctor", "--json"),
+            ["doctor", "--json"],
+        )
 
     def test_why_preserves_arguments_under_posix_sh(self) -> None:
         self.assert_dispatch(
@@ -184,6 +212,24 @@ class LowercaseCliDispatchTests(unittest.TestCase):
 
     def test_unknown_command_forms_still_fall_through_to_the_evaluator(self) -> None:
         self.assert_dispatch(("program.O", "backends"), ["program.O", "backends"])
+
+    def test_packaged_dispatchers_route_optimize_to_the_compiled_front_door(self) -> None:
+        dockerfile = (PROJECT_ROOT / "Dockerfile").read_text(encoding="utf-8")
+        capacity_host = (
+            PROJECT_ROOT / "scripts" / "prepare-x86_64-capacity-host.sh"
+        ).read_text(encoding="utf-8")
+        expected = (
+            "run|routes|optimize|plan|explain|inspect|object|operation|"
+            "realizations|observe|replan"
+        )
+        self.assertIn(expected, dockerfile)
+        self.assertIn(expected, capacity_host)
+
+    def test_docker_builder_copies_olangc_browser_asset_closure(self) -> None:
+        dockerfile = (PROJECT_ROOT / "Dockerfile").read_text(encoding="utf-8")
+        self.assertIn(
+            "COPY apps/olang-browser-wasi ./apps/olang-browser-wasi", dockerfile
+        )
 
 
 class KernelCapacityCliDispatchTests(unittest.TestCase):
@@ -387,8 +433,10 @@ class InstalledWrapperDispatchTests(unittest.TestCase):
             self.assertIn('/scripts/o-cli.sh" "$@"', source)
             self.assertNotIn('${0##*/}', source)
 
+            true_command = shutil.which("true")
+            self.assertIsNotNone(true_command)
             environment = os.environ.copy()
-            environment["O_LANG_OCLI_BIN"] = "/bin/true"
+            environment["O_LANG_OCLI_BIN"] = true_command
             result = subprocess.run(
                 [str(destination), "help"],
                 cwd=PROJECT_ROOT,

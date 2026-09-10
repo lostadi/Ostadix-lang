@@ -8,6 +8,7 @@ use runtime::endpoint::receiver_waiter;
 use runtime::endpoint::ENDPOINT_WAITER_RECEIVER;
 use runtime::ipc_wait::abort as abort_ipc_wait;
 use runtime::ipc_wait::begin as begin_ipc_wait;
+use runtime::ipc_wait::can_complete as can_complete_ipc_wait;
 use runtime::ipc_wait::complete as complete_ipc_wait;
 use runtime::ipc_wait::invariants_hold as wait_invariants_hold;
 use runtime::ipc_wait::cancel_process_waits;
@@ -428,7 +429,14 @@ unsafe fn transition_terminal(
             && SERVICE_DEATH_TERMINALS == MAX_COUNTER) {
         return ERR_PERSONALITY_FAILED;
     }
-    if receiver_waiter(CLIENT_WAIT_ENDPOINT) != CALLER_THREADS[slot] {
+    if !can_complete_ipc_wait(
+        WAIT_REQUESTS[slot],
+        CLIENT_WAIT_ENDPOINT,
+        ENDPOINT_WAITER_RECEIVER,
+        CALLER_THREADS[slot],
+        ERR_IPC_RETRY,
+        wake_reason
+    ) {
         return ERR_PERSONALITY_BUSY;
     }
     if complete_ipc_wait(
@@ -1154,6 +1162,16 @@ pub unsafe fn can_reply(
         || !process_is_live(replying_service_process)
         || receiver_waiter(CLIENT_WAIT_ENDPOINT) != CALLER_THREADS[slot] {
         return ERR_PERSONALITY_STALE;
+    }
+    if !can_complete_ipc_wait(
+        WAIT_REQUESTS[slot],
+        CLIENT_WAIT_ENDPOINT,
+        ENDPOINT_WAITER_RECEIVER,
+        CALLER_THREADS[slot],
+        ERR_IPC_RETRY,
+        WAKE_REASON_IPC
+    ) {
+        return ERR_PERSONALITY_FAILED;
     }
     if TERMINAL_TRANSITIONS == MAX_COUNTER
         || TERMINAL_WAKES == MAX_COUNTER

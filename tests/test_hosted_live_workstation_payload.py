@@ -38,6 +38,7 @@ STANDARD_BINARIES = (
     "octl",
     "o-registry",
     "o-info",
+    "ostadix-device",
 )
 DECLARED_ROOT_BINARIES = (
     "O",
@@ -53,6 +54,7 @@ DECLARED_ROOT_BINARIES = (
     "octl",
     "o-registry",
     "o-info",
+    "ostadix-device",
     "ocore-kernel-world-record",
 )
 LEGACY_BINARIES = ("O", "o-cli", "olangc", "o-link")

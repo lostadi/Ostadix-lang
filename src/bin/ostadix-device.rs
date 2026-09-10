@@ -7,7 +7,7 @@
 use std::collections::BTreeSet;
 use std::env;
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, ExitCode, ExitStatus, Stdio};
@@ -19,7 +19,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
 #[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 
@@ -1439,10 +1439,37 @@ fn shell_quote_os(value: &OsStr) -> Result<String> {
 
 fn evaluator_path(root: &Path) -> Option<PathBuf> {
     let built = root.join("target/release/O");
-    if built.is_file() {
+    if is_android_aarch64_executable(&built) {
         return Some(built);
     }
-    which::which("O").ok()
+    which::which("O")
+        .ok()
+        .filter(|path| is_android_aarch64_executable(path))
+}
+
+fn is_android_aarch64_executable(path: &Path) -> bool {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => metadata,
+        _ => return false,
+    };
+    #[cfg(unix)]
+    if metadata.permissions().mode() & 0o111 == 0 {
+        return false;
+    }
+
+    let mut header = [0_u8; 20];
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+    if file.read_exact(&mut header).is_err() {
+        return false;
+    }
+
+    header[..4] == *b"\x7fELF"
+        && header[4] == 2
+        && header[5] == 1
+        && u16::from_le_bytes([header[18], header[19]]) == 183
 }
 
 fn termux_loader_path() -> Option<OsString> {
@@ -1613,7 +1640,7 @@ fn affinity_for_pid(pid: i32) -> Option<Vec<u32>> {
     if result != 0 {
         return None;
     }
-    let cpus = (0..libc::CPU_SETSIZE)
+    let cpus = (0..cpu_set_size())
         .filter(|cpu| unsafe { libc::CPU_ISSET(*cpu, &set) })
         .map(|cpu| cpu as u32)
         .collect::<Vec<_>>();
@@ -1628,7 +1655,7 @@ fn set_affinity_for_pid(pid: i32, cpus: &[u32]) -> Result<()> {
     let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
     for cpu in cpus {
         let cpu = usize::try_from(*cpu).context("CPU index does not fit usize")?;
-        if cpu >= libc::CPU_SETSIZE {
+        if cpu >= cpu_set_size() {
             bail!("CPU {cpu} exceeds the platform affinity limit");
         }
         unsafe { libc::CPU_SET(cpu, &mut set) };
@@ -1644,6 +1671,19 @@ fn set_affinity_for_pid(pid: i32, cpus: &[u32]) -> Result<()> {
         return Err(std::io::Error::last_os_error()).context("sched_setaffinity failed");
     }
     Ok(())
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn cpu_set_size() -> usize {
+    // libc exposes CPU_SETSIZE as c_int on Linux and size_t on Android.
+    #[cfg(target_os = "linux")]
+    {
+        libc::CPU_SETSIZE as usize
+    }
+    #[cfg(target_os = "android")]
+    {
+        libc::CPU_SETSIZE
+    }
 }
 
 #[cfg(not(any(target_os = "android", target_os = "linux")))]
@@ -1895,6 +1935,34 @@ mod tests {
     fn shell_quote_does_not_expose_metacharacters() {
         assert_eq!(shell_quote("plain"), "'plain'");
         assert_eq!(shell_quote("a'b"), "'a'\"'\"'b'");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn evaluator_probe_requires_executable_android_aarch64_elf() {
+        let directory = tempfile::tempdir().unwrap();
+        let evaluator = directory.path().join("O");
+        let mut header = [0_u8; 20];
+        header[..4].copy_from_slice(b"\x7fELF");
+        header[4] = 2;
+        header[5] = 1;
+        header[18..20].copy_from_slice(&183_u16.to_le_bytes());
+        fs::write(&evaluator, header).unwrap();
+
+        let mut permissions = fs::metadata(&evaluator).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&evaluator, permissions.clone()).unwrap();
+        assert!(is_android_aarch64_executable(&evaluator));
+
+        header[18..20].copy_from_slice(&62_u16.to_le_bytes());
+        fs::write(&evaluator, header).unwrap();
+        assert!(!is_android_aarch64_executable(&evaluator));
+
+        header[18..20].copy_from_slice(&183_u16.to_le_bytes());
+        fs::write(&evaluator, header).unwrap();
+        permissions.set_mode(0o644);
+        fs::set_permissions(&evaluator, permissions).unwrap();
+        assert!(!is_android_aarch64_executable(&evaluator));
     }
 
     #[test]

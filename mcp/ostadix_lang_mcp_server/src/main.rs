@@ -606,9 +606,13 @@ fn append_termux_runtime_paths(
             .iter()
             .find(|(key, _)| key == OsStr::new(variable))
         {
+            let prefix = PathBuf::from(prefix);
+            if variable == "PREFIX" && !is_termux_prefix(&prefix) {
+                continue;
+            }
             append_existing_runtime_path(
                 entries,
-                PathBuf::from(prefix).join("bin"),
+                prefix.join("bin"),
                 format!("termux-env:{variable}"),
             );
         }
@@ -622,6 +626,13 @@ fn append_termux_runtime_paths(
             append_existing_runtime_path(entries, files_root.join("usr/bin"), "termux-home-prefix");
         }
     }
+}
+
+fn is_termux_prefix(prefix: &Path) -> bool {
+    prefix.file_name() == Some(OsStr::new("usr"))
+        && prefix
+            .parent()
+            .is_some_and(|parent| parent.file_name() == Some(OsStr::new("files")))
 }
 
 fn append_environment_runtime_paths(
@@ -3039,6 +3050,33 @@ mod tests {
             .entries
             .iter()
             .all(|entry| entry.directory != selected_bin));
+    }
+
+    #[test]
+    fn generic_prefix_environment_is_not_treated_as_termux() {
+        let fixture = Fixture::new();
+        let generic_prefix = fixture.0.join("ordinary-prefix");
+        let generic_bin = generic_prefix.join("bin");
+        fs::create_dir_all(&generic_bin).expect("create generic prefix bin");
+        let manager_environment = vec![(
+            std::ffi::OsString::from("PREFIX"),
+            generic_prefix.as_os_str().to_os_string(),
+        )];
+
+        let search = runtime_search_path_with_mode_and_manager_environment(
+            &fixture.0,
+            &fixture.0.join("ordinary-home"),
+            None,
+            None,
+            RuntimePathMode::DiscoverLocal,
+            &manager_environment,
+        )
+        .expect("construct discover-local path with generic prefix");
+
+        assert!(search
+            .entries
+            .iter()
+            .all(|entry| entry.directory != generic_bin));
     }
 
     #[test]

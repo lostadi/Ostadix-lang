@@ -18,15 +18,222 @@ use crate::hosted_remote::{
 };
 use crate::project::model::OutputCapture;
 use crate::project::{
-    Artifact, ArtifactCaptureStatus, OExecutionResult, ProjectAttemptEvent, ProjectAttemptTrace,
-    ProjectAttemptTraceHeader, RouteExecutionDisposition,
+    validated_selection_json_sha256, Artifact, ArtifactCaptureStatus, OExecutionResult,
+    ProjectAttemptEvent, ProjectAttemptTrace, ProjectAttemptTraceHeader, ResultCodec,
+    RouteExecutionDisposition, SelectionReuseContractV1, SelectionReuseOutputCheckV1,
+    ValidatedArtifactCaptureStatusV1, ValidatedSelectionObservationV1, ValidatedSelectionReceiptV1,
 };
+#[cfg(test)]
+use crate::project::{ValidatedSelectionCandidateV1, ValidatedSelectionDispositionV1};
 
 pub const RUN_RECORD_SCHEMA_V1: &str = "ostadix.run-record/v1";
 pub const RUN_SUMMARY_SCHEMA_V1: &str = "ostadix.run-summary/v1";
 pub const PLACEMENT_PREVIEW_SCHEMA_V1: &str = "ostadix.placement-preview/v1";
 pub const RUN_TRACE_ATTACHMENT_SCHEMA_V1: &str = "ostadix.run-trace/v1";
 pub const RUN_RECORD_INTEGRITY_V1: &str = "unsigned_observation";
+pub const PROJECT_SELECTION_REUSE_BINDING_SCHEMA_V1: &str =
+    "ostadix.project-selection-reuse-binding/v1";
+pub const PROJECT_SELECTION_REUSE_OBSERVATION_SCHEMA_V1: &str =
+    "ostadix.project-selection-reuse-observation/v1";
+pub const OPERATION_RUN_DECISION_SCHEMA_V1: &str = "ostadix.operation-run-decision/v1";
+pub const OPERATION_RUN_PLAN_SCHEMA_V1: &str = "ostadix.operation-run-plan/v1";
+
+/// Compact original decision, durably frozen before execution. Descriptor and
+/// target identities are declarations; they are never physical observations.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperationRunDecisionV1 {
+    pub schema: String,
+    pub planning_request_id: String,
+    pub deployment_plan_id: String,
+    pub selected_candidate_sha256: String,
+    pub planning_request_content_sha256: String,
+    pub deployment_plan_content_sha256: String,
+    pub bundle_sha256: String,
+    pub route: String,
+    pub route_plan_sha256: String,
+    pub route_deployment_sha256: String,
+    #[serde(default = "default_operation_project_execution_contract")]
+    pub project_execution_contract: String,
+    #[serde(default = "default_operation_project_scheduling_contract")]
+    pub project_scheduling_contract: String,
+    pub route_pipeline_sha256: String,
+    pub implementation: String,
+    pub implementation_sha256: String,
+}
+
+fn default_operation_project_execution_contract() -> String {
+    "strict".to_string()
+}
+
+fn default_operation_project_scheduling_contract() -> String {
+    "serial_host_world_v1".to_string()
+}
+
+impl OperationRunDecisionV1 {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema != OPERATION_RUN_DECISION_SCHEMA_V1 {
+            return Err("unsupported operation-run decision schema".to_string());
+        }
+        for (label, digest) in [
+            (
+                "operation selected candidate",
+                &self.selected_candidate_sha256,
+            ),
+            ("operation planning request", &self.planning_request_id),
+            ("operation deployment plan", &self.deployment_plan_id),
+            (
+                "operation request content",
+                &self.planning_request_content_sha256,
+            ),
+            (
+                "operation deployment content",
+                &self.deployment_plan_content_sha256,
+            ),
+            ("operation bundle", &self.bundle_sha256),
+            ("operation route plan", &self.route_plan_sha256),
+            ("operation route deployment", &self.route_deployment_sha256),
+            ("operation route pipeline", &self.route_pipeline_sha256),
+            ("operation implementation", &self.implementation_sha256),
+        ] {
+            validate_lower_hex_64(digest, label)?;
+        }
+        validate_nonempty(&self.route, "operation route")?;
+        if !matches!(
+            self.project_execution_contract.as_str(),
+            "strict" | "legacy_compatibility"
+        ) {
+            return Err("operation project execution contract is unsupported".to_string());
+        }
+        if !matches!(
+            self.project_scheduling_contract.as_str(),
+            "serial_host_world_v1" | "concurrent_branches_v1"
+        ) {
+            return Err("operation project scheduling contract is unsupported".to_string());
+        }
+        validate_nonempty(&self.implementation, "operation implementation path")?;
+        let path = std::path::Path::new(&self.implementation);
+        if self.implementation.contains('\\')
+            || path.is_absolute()
+            || path
+                .components()
+                .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        {
+            return Err(
+                "operation implementation must be a canonical bundle-relative path".to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_context(
+        &self,
+        input: &RunInputIdentityV1,
+        intent: &ExecutionIntentObservationV1,
+        plan: &PlanIdentitiesV1,
+    ) -> Result<(), String> {
+        self.validate()?;
+        if input.kind != RunInputKindV1::ProjectDirectory
+            || input.digest_sha256 != self.bundle_sha256
+            || intent.selected_route.as_deref() != Some(self.route.as_str())
+            || intent.route_policy.as_deref() != Some(format!("explicit:{}", self.route).as_str())
+            || intent.mesh_mode.is_some()
+            || intent.selection_reuse.is_some()
+            || plan.hgraph_sha256.as_deref() != Some(self.route_plan_sha256.as_str())
+            || plan.deployment_sha256.as_deref() != Some(self.route_deployment_sha256.as_str())
+        {
+            return Err(
+                "original operation decision disagrees with the run input, route, or project plan"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Original authority-free planner records. The request/deployment are retained
+/// in the content-addressed terminal object, never the bounded attempt index.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordedOperationPlanV1 {
+    pub schema: String,
+    /// Canonical JSON projections; semantic validation belongs to the higher
+    /// computation/CLI layer. Content hashes freeze these exact projections.
+    pub request: Value,
+    pub deployment: Value,
+    pub selected_candidate: Value,
+    pub execution: Option<OperationExecutionObservationV1>,
+}
+
+/// Credential-safe facts from a local route result. A direct entrypoint proves
+/// which captured artifact was submitted as argv, not what an interpreter
+/// actually loaded. Host facts do not authenticate the declared target node.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperationExecutionObservationV1 {
+    pub route: String,
+    pub execution_scope: String,
+    pub artifact_use: String,
+    pub operating_system: String,
+    pub architecture: String,
+    pub pointer_width: u16,
+    pub endianness: String,
+    pub target_platform: String,
+    pub runtime: String,
+}
+
+/// SHA-256 of the recursively key-sorted JSON projection retained by the run
+/// store. This is a content binding, distinct from a planner's semantic ID.
+pub fn operation_record_content_sha256(value: &Value) -> String {
+    hex::encode(Sha256::digest(canonical_json_bytes(value)))
+}
+
+impl RecordedOperationPlanV1 {
+    pub fn validate_for_decision(&self, decision: &OperationRunDecisionV1) -> Result<(), String> {
+        decision.validate()?;
+        if self.schema != OPERATION_RUN_PLAN_SCHEMA_V1 {
+            return Err("unsupported operation-run plan schema".to_string());
+        }
+        if operation_record_content_sha256(&self.request)
+            != decision.planning_request_content_sha256
+            || operation_record_content_sha256(&self.deployment)
+                != decision.deployment_plan_content_sha256
+            || self.deployment["operations"].as_array().map(Vec::len) != Some(1)
+            || operation_record_content_sha256(&self.selected_candidate)
+                != decision.selected_candidate_sha256
+            || self.deployment["operations"][0]["selection"] != self.selected_candidate
+        {
+            return Err("original operation planner content or selected candidate differs from the frozen decision".to_string());
+        }
+        if let Some(execution) = &self.execution {
+            if execution.route != decision.route
+                || execution.execution_scope != "isolated_local_project_workspace"
+                || !matches!(
+                    execution.artifact_use.as_str(),
+                    "direct_entrypoint_submitted" | "not_established"
+                )
+                || !matches!(
+                    execution.target_platform.as_str(),
+                    "matched_local_platform" | "mismatched_local_platform" | "partially_observed"
+                )
+                || !matches!(
+                    execution.runtime.as_str(),
+                    "declared_interpreter_command_submitted" | "not_established"
+                )
+                || !matches!(execution.endianness.as_str(), "little" | "big")
+                || execution.pointer_width == 0
+            {
+                return Err(
+                    "operation execution observation has invalid route or evidence classification"
+                        .to_string(),
+                );
+            }
+            validate_nonempty(&execution.operating_system, "observed operating system")?;
+            validate_nonempty(&execution.architecture, "observed architecture")?;
+        }
+        Ok(())
+    }
+}
 
 fn validate_nonempty(value: &str, label: &str) -> Result<(), String> {
     if value.is_empty() || value.contains('\0') {
@@ -34,6 +241,19 @@ fn validate_nonempty(value: &str, label: &str) -> Result<(), String> {
     } else {
         Ok(())
     }
+}
+
+fn parse_canonical_duration(value: &str, label: &str) -> Result<u128, String> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!("{label} must be canonical unsigned decimal text"));
+    }
+    let duration = value
+        .parse::<u128>()
+        .map_err(|_| format!("{label} must be canonical unsigned decimal text"))?;
+    if duration.to_string() != value {
+        return Err(format!("{label} must be canonical unsigned decimal text"));
+    }
+    Ok(duration)
 }
 
 pub(crate) fn validate_lower_hex_64(value: &str, label: &str) -> Result<(), String> {
@@ -97,6 +317,10 @@ pub struct ExecutionIntentObservationV1 {
     pub mesh_discovery_timeout_ms: Option<u64>,
     pub mesh_closed_registry: Option<bool>,
     pub mesh_peer_root: Option<PathBuf>,
+    /// Exact durable evidence used to select one route without re-running the
+    /// full benchmark set. The optional encoding preserves older records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_reuse: Option<ProjectSelectionReuseBindingV1>,
 }
 
 impl ExecutionIntentObservationV1 {
@@ -131,6 +355,24 @@ impl ExecutionIntentObservationV1 {
         }
         if self.local_worker_limit == Some(0) {
             return Err("local worker limit must be positive".to_string());
+        }
+        if let Some(binding) = &self.selection_reuse {
+            binding.validate()?;
+            let expected_policy = format!("explicit:{}", binding.contract.selected_route_id);
+            if !matches!(
+                self.engine.as_str(),
+                "project_compatibility" | "project_hgraph"
+            ) || self.target.as_deref() != Some(binding.contract.target.as_str())
+                || self.selected_route.as_deref() != Some(binding.contract.target.as_str())
+                || self.route_policy.as_deref() != Some(expected_policy.as_str())
+                || self.route_declarations != binding.contract.route_declaration_sha256
+                || self.mesh_mode.is_some()
+            {
+                return Err(
+                    "selection-reuse binding disagrees with the effective project intent"
+                        .to_string(),
+                );
+            }
         }
         Ok(())
     }
@@ -178,6 +420,11 @@ pub struct RunAttemptSeedV1 {
     pub intent: ExecutionIntentObservationV1,
     pub plan: PlanIdentitiesV1,
     pub started_unix_nanos: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_decision: Option<OperationRunDecisionV1>,
+    /// Neutral original planner snapshot durably published before dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_plan_ref: Option<RunContentRefV1>,
 }
 
 impl RunAttemptSeedV1 {
@@ -185,6 +432,15 @@ impl RunAttemptSeedV1 {
         self.input.validate()?;
         self.intent.validate()?;
         self.plan.validate()?;
+        if let Some(decision) = &self.operation_decision {
+            decision.validate_context(&self.input, &self.intent, &self.plan)?;
+        }
+        if let Some(reference) = &self.operation_plan_ref {
+            reference.validate()?;
+            if reference.kind != RunContentKindV1::Record || self.operation_decision.is_none() {
+                return Err("original operation snapshot reference has no frozen decision or wrong object kind".to_string());
+            }
+        }
         if self.started_unix_nanos == 0 {
             return Err("run start observation must be nonzero".to_string());
         }
@@ -249,6 +505,10 @@ impl Default for CapturedStreamV1 {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct RecordedRouteResultV1 {
     pub route_id: String,
+    /// The declared result codec is retained only when another durable datum
+    /// (currently a validated-selection receipt) must be checked against it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_codec: Option<ResultCodec>,
     pub exit_code: Option<i32>,
     pub stdout: CapturedStreamV1,
     pub stderr: CapturedStreamV1,
@@ -258,6 +518,10 @@ pub struct RecordedRouteResultV1 {
     pub artifact_capture: ArtifactCaptureStatus,
     pub disposition: RouteExecutionDisposition,
     pub duration_ns: String,
+    /// Complete-branch timing retained for validated selection. Legacy route
+    /// results omit it, preserving their canonical encoding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_elapsed_ns: Option<String>,
     pub provenance: RecordedExecutionProvenanceV1,
 }
 
@@ -276,6 +540,7 @@ impl From<&OExecutionResult> for RecordedRouteResultV1 {
     fn from(result: &OExecutionResult) -> Self {
         Self {
             route_id: result.route_id.clone(),
+            result_codec: None,
             exit_code: result.exit_code,
             stdout: CapturedStreamV1 {
                 retained: result.stdout.clone(),
@@ -291,6 +556,7 @@ impl From<&OExecutionResult> for RecordedRouteResultV1 {
             artifact_capture: result.artifact_capture.clone(),
             disposition: result.disposition,
             duration_ns: result.duration_ns.to_string(),
+            branch_elapsed_ns: None,
             provenance: RecordedExecutionProvenanceV1 {
                 execution_scope: "isolated_project_workspace".to_string(),
                 command_argv_retained: false,
@@ -315,11 +581,26 @@ impl RecordedRouteResultV1 {
                     .to_string(),
             );
         }
-        self.duration_ns
+        if self.duration_ns.is_empty()
+            || !self.duration_ns.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return Err("route duration must be canonical unsigned decimal text".to_string());
+        }
+        let duration = self
+            .duration_ns
             .parse::<u128>()
             .map_err(|_| "route duration must be canonical unsigned decimal text".to_string())?;
-        if self.duration_ns.len() > 1 && self.duration_ns.starts_with('0') {
-            return Err("route duration must not have leading zeroes".to_string());
+        if duration.to_string() != self.duration_ns {
+            return Err("route duration must be canonical unsigned decimal text".to_string());
+        }
+        if let Some(branch_elapsed_ns) = &self.branch_elapsed_ns {
+            let branch_duration =
+                parse_canonical_duration(branch_elapsed_ns, "route complete-branch duration")?;
+            if branch_duration < duration {
+                return Err(
+                    "route complete-branch duration is shorter than terminal duration".to_string(),
+                );
+            }
         }
         for artifact in &self.artifacts {
             validate_nonempty(&artifact.path, "artifact path")?;
@@ -383,6 +664,172 @@ impl RunContentRefV1 {
         validate_lower_hex_64(&self.sha256, "run object digest")?;
         if self.bytes_len == 0 {
             return Err("run object length must be positive".to_string());
+        }
+        Ok(())
+    }
+}
+
+/// Pre-execution evidence binding for one bundle-bound selected-route reuse.
+///
+/// The source record is named by its verified content-addressed object. The
+/// embedded receipt keeps a later record intelligible if retention prunes the
+/// source attempt, but remains an unsigned observation rather than authority
+/// on its own.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectSelectionReuseBindingV1 {
+    pub schema: String,
+    pub source_run_id: String,
+    pub source_sequence: u64,
+    pub source_record: RunContentRefV1,
+    pub receipt_sha256: String,
+    pub contract_sha256: String,
+    pub receipt: ValidatedSelectionReceiptV1,
+    pub contract: SelectionReuseContractV1,
+}
+
+impl ProjectSelectionReuseBindingV1 {
+    pub fn new(
+        source_run_id: impl Into<String>,
+        source_sequence: u64,
+        source_record: RunContentRefV1,
+        receipt: ValidatedSelectionReceiptV1,
+        contract: SelectionReuseContractV1,
+    ) -> Result<Self, String> {
+        let receipt_sha256 = receipt.sha256()?;
+        let contract_sha256 = contract.sha256()?;
+        let binding = Self {
+            schema: PROJECT_SELECTION_REUSE_BINDING_SCHEMA_V1.to_string(),
+            source_run_id: source_run_id.into(),
+            source_sequence,
+            source_record,
+            receipt_sha256,
+            contract_sha256,
+            receipt,
+            contract,
+        };
+        binding.validate()?;
+        Ok(binding)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema != PROJECT_SELECTION_REUSE_BINDING_SCHEMA_V1 {
+            return Err("project selection-reuse binding has an unsupported schema".to_string());
+        }
+        validate_lower_hex_64(&self.source_run_id, "selection source run id")?;
+        if self.source_sequence == 0 {
+            return Err("selection source sequence must be positive".to_string());
+        }
+        self.source_record.validate()?;
+        if self.source_record.kind != RunContentKindV1::Record {
+            return Err("selection source object is not a run record".to_string());
+        }
+        validate_lower_hex_64(&self.receipt_sha256, "selection receipt digest")?;
+        validate_lower_hex_64(&self.contract_sha256, "selection contract digest")?;
+        self.receipt.validate()?;
+        self.contract.validate()?;
+        if self.receipt.sha256()? != self.receipt_sha256
+            || self.contract.sha256()? != self.contract_sha256
+        {
+            return Err(
+                "selection-reuse receipt or contract digest disagrees with its evidence"
+                    .to_string(),
+            );
+        }
+        let receipt_routes = self
+            .receipt
+            .candidates
+            .iter()
+            .map(|candidate| candidate.route_id.as_str())
+            .collect::<Vec<_>>();
+        let contract_routes = self
+            .contract
+            .ordered_alternatives
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let selected = self
+            .receipt
+            .candidates
+            .iter()
+            .find(|candidate| candidate.route_id == self.receipt.selected_route_id)
+            .ok_or_else(|| "selection receipt lost its selected candidate".to_string())?;
+        if self.receipt.project_name != self.contract.project_name
+            || self.receipt.bundle_sha256 != self.contract.bundle_sha256
+            || self.receipt.target != self.contract.target
+            || self.receipt.policy != self.contract.evidence_policy
+            || self.receipt.equivalence_contract != self.contract.equivalence_contract
+            || self.receipt.selection_rule != self.contract.selection_rule
+            || self.receipt.reference_route_id != self.contract.reference_route_id
+            || self.receipt.selected_route_id != self.contract.selected_route_id
+            || selected.declared_output_sha256 != self.contract.expected_declared_output_sha256
+            || receipt_routes != contract_routes
+        {
+            return Err("selection receipt and reuse contract disagree".to_string());
+        }
+        Ok(())
+    }
+}
+
+/// Terminal postcondition attached to a run that reused a selected route.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectSelectionReuseObservationV1 {
+    pub schema: String,
+    pub source_run_id: String,
+    pub source_record_sha256: String,
+    pub receipt_sha256: String,
+    pub contract_sha256: String,
+    pub selected_route_id: String,
+    pub output_check: SelectionReuseOutputCheckV1,
+}
+
+impl ProjectSelectionReuseObservationV1 {
+    pub fn from_binding(
+        binding: &ProjectSelectionReuseBindingV1,
+        output_check: SelectionReuseOutputCheckV1,
+    ) -> Result<Self, String> {
+        let observation = Self {
+            schema: PROJECT_SELECTION_REUSE_OBSERVATION_SCHEMA_V1.to_string(),
+            source_run_id: binding.source_run_id.clone(),
+            source_record_sha256: binding.source_record.sha256.clone(),
+            receipt_sha256: binding.receipt_sha256.clone(),
+            contract_sha256: binding.contract_sha256.clone(),
+            selected_route_id: binding.contract.selected_route_id.clone(),
+            output_check,
+        };
+        observation.validate_for(binding)?;
+        Ok(observation)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema != PROJECT_SELECTION_REUSE_OBSERVATION_SCHEMA_V1 {
+            return Err(
+                "project selection-reuse observation has an unsupported schema".to_string(),
+            );
+        }
+        validate_lower_hex_64(&self.source_run_id, "selection source run id")?;
+        validate_lower_hex_64(&self.source_record_sha256, "selection source record digest")?;
+        validate_lower_hex_64(&self.receipt_sha256, "selection receipt digest")?;
+        validate_lower_hex_64(&self.contract_sha256, "selection contract digest")?;
+        validate_nonempty(&self.selected_route_id, "selected route id")?;
+        self.output_check.validate()
+    }
+
+    pub fn validate_for(&self, binding: &ProjectSelectionReuseBindingV1) -> Result<(), String> {
+        self.validate()?;
+        binding.validate()?;
+        if self.source_run_id != binding.source_run_id
+            || self.source_record_sha256 != binding.source_record.sha256
+            || self.receipt_sha256 != binding.receipt_sha256
+            || self.contract_sha256 != binding.contract_sha256
+            || self.selected_route_id != binding.contract.selected_route_id
+            || self.output_check.expected_declared_output_sha256
+                != binding.contract.expected_declared_output_sha256
+        {
+            return Err(
+                "selection-reuse observation disagrees with its admitted binding".to_string(),
+            );
         }
         Ok(())
     }
@@ -901,6 +1348,10 @@ pub struct RunRecordV1 {
     pub input: RunInputIdentityV1,
     pub intent: ExecutionIntentObservationV1,
     pub plan: PlanIdentitiesV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_decision: Option<OperationRunDecisionV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_plan: Option<RecordedOperationPlanV1>,
     pub started_unix_nanos: u64,
     pub finished_unix_nanos: u64,
     pub elapsed_nanos: u64,
@@ -909,6 +1360,16 @@ pub struct RunRecordV1 {
     pub stderr: CapturedStreamV1,
     pub decoded_value: Option<Value>,
     pub route_results: Vec<RecordedRouteResultV1>,
+    /// Structured evidence for the new validated benchmark selector. The
+    /// optional encoding preserves canonical bytes for records written before
+    /// this policy existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validated_selection_receipt: Option<ValidatedSelectionReceiptV1>,
+    /// Terminal declared-output check for a route chosen from a prior
+    /// validated-selection run. Fresh benchmark evidence and reused evidence
+    /// are intentionally separate fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_reuse: Option<ProjectSelectionReuseObservationV1>,
     pub result_references: Vec<RunResultReferenceV1>,
     pub trace: RunTraceBindingV1,
     pub failure: Option<RunFailureV1>,
@@ -939,6 +1400,8 @@ impl RunRecordV1 {
             input: seed.input.clone(),
             intent: seed.intent.clone(),
             plan: seed.plan.clone(),
+            operation_decision: seed.operation_decision.clone(),
+            operation_plan: None,
             started_unix_nanos: seed.started_unix_nanos,
             finished_unix_nanos,
             elapsed_nanos,
@@ -947,6 +1410,8 @@ impl RunRecordV1 {
             stderr,
             decoded_value,
             route_results,
+            validated_selection_receipt: None,
+            selection_reuse: None,
             result_references,
             trace,
             failure,
@@ -1046,6 +1511,9 @@ impl RunRecordV1 {
                     || self.plan.execution_intent_sha256.is_none()
                     || self.plan.deployment_sha256.is_some()
                     || !self.route_results.is_empty()
+                    || self.validated_selection_receipt.is_some()
+                    || self.intent.selection_reuse.is_some()
+                    || self.selection_reuse.is_some()
                 {
                     return Err(
                         "ordinary run input, engine, plan, or result fields are inconsistent"
@@ -1094,6 +1562,51 @@ impl RunRecordV1 {
                     result.route_id
                 ));
             }
+        }
+        self.validate_validated_selection_receipt()?;
+        self.validate_selection_reuse()?;
+        match (&self.operation_decision, &self.operation_plan) {
+            (Some(decision), snapshot) => {
+                decision.validate_context(&self.input, &self.intent, &self.plan)?;
+                if self.route_results.len() > 1
+                    || self
+                        .route_results
+                        .iter()
+                        .any(|result| result.route_id != decision.route)
+                {
+                    return Err(
+                        "operation run contains results outside its one frozen route".to_string(),
+                    );
+                }
+                if let Some(snapshot) = snapshot {
+                    snapshot.validate_for_decision(decision)?;
+                    if let Some(execution) = &snapshot.execution {
+                        if !self.route_results.iter().any(|result| {
+                            result.route_id == execution.route
+                                && result.disposition == RouteExecutionDisposition::Executed
+                        }) {
+                            return Err(
+                                "operation execution observation has no executed route result"
+                                    .to_string(),
+                            );
+                        }
+                    }
+                } else if !matches!(
+                    self.disposition,
+                    RunDispositionV1::Interrupted | RunDispositionV1::RecordingIncomplete
+                ) {
+                    return Err(
+                        "operation terminal record is missing its original planner records"
+                            .to_string(),
+                    );
+                }
+            }
+            (None, Some(_)) => {
+                return Err(
+                    "operation planner records have no frozen pre-execution decision".to_string(),
+                )
+            }
+            (None, None) => {}
         }
         let mut result_reference_ids = BTreeSet::new();
         for reference in &self.result_references {
@@ -1145,6 +1658,392 @@ impl RunRecordV1 {
         }
         Ok(())
     }
+
+    fn validate_selection_reuse(&self) -> Result<(), String> {
+        let Some(binding) = &self.intent.selection_reuse else {
+            if self.selection_reuse.is_some() {
+                return Err(
+                    "selection-reuse observation exists without an admitted binding".to_string(),
+                );
+            }
+            return Ok(());
+        };
+        binding.validate()?;
+        if matches!(self.input.kind, RunInputKindV1::OrdinaryO)
+            || self.input.digest_sha256 != binding.contract.bundle_sha256
+            || self.validated_selection_receipt.is_some()
+        {
+            return Err(
+                "selection-reuse binding is attached to an incompatible run input or fresh receipt"
+                    .to_string(),
+            );
+        }
+
+        let Some(observation) = &self.selection_reuse else {
+            if matches!(
+                self.disposition,
+                RunDispositionV1::Interrupted | RunDispositionV1::RecordingIncomplete
+            ) {
+                return Ok(());
+            }
+            return Err(
+                "completed selection-reuse execution has no terminal output check".to_string(),
+            );
+        };
+        observation.validate_for(binding)?;
+        if self.route_results.len() > 1
+            || self
+                .route_results
+                .first()
+                .is_some_and(|result| result.route_id != binding.contract.selected_route_id)
+        {
+            return Err(
+                "selection-reuse run contains a route other than its admitted winner".to_string(),
+            );
+        }
+
+        use crate::project::SelectionReuseOutputStatusV1;
+        let selected_candidate = binding
+            .receipt
+            .candidates
+            .iter()
+            .find(|candidate| candidate.route_id == binding.contract.selected_route_id)
+            .ok_or_else(|| "selection-reuse binding lost its selected candidate".to_string())?;
+        let selected_codec = selected_candidate.observation.result_codec;
+        let recomputed_output = self
+            .route_results
+            .first()
+            .map(|result| {
+                recorded_validated_selection_observation(result, selected_codec)
+                    .and_then(|evidence| evidence.declared_output_sha256())
+            })
+            .transpose();
+        let retained_contract_mismatch = self.route_results.first().is_some_and(|result| {
+            let mut normalized_requirements = result.artifact_requirements.clone();
+            normalized_requirements.sort();
+            normalized_requirements.dedup();
+            result.result_codec != Some(selected_codec)
+                || normalized_requirements != selected_candidate.observation.artifact_requirements
+        });
+        if retained_contract_mismatch {
+            return Err(
+                "selection-reuse route result does not retain its admitted codec and artifact requirements"
+                    .to_string(),
+            );
+        }
+        match observation.output_check.status {
+            SelectionReuseOutputStatusV1::Matched => {
+                let result = self.route_results.first().ok_or_else(|| {
+                    "matched selection-reuse run has no selected route result".to_string()
+                })?;
+                if result.exit_code != Some(0)
+                    || !result.artifact_capture.is_complete()
+                    || self.decoded_value != result.value
+                {
+                    return Err(
+                        "matched selection-reuse result is not a successful selected output"
+                            .to_string(),
+                    );
+                }
+                let recomputed = recomputed_output.map_err(|_| {
+                    "matched selection-reuse result has invalid declared-output evidence"
+                        .to_string()
+                })?;
+                if recomputed.as_deref()
+                    != observation
+                        .output_check
+                        .observed_declared_output_sha256
+                        .as_deref()
+                {
+                    return Err(
+                        "matched selection-reuse output digest was not derived from its recorded result"
+                            .to_string(),
+                    );
+                }
+            }
+            SelectionReuseOutputStatusV1::DeclaredOutputMismatch => {
+                if self.disposition == RunDispositionV1::Succeeded
+                    || self.failure.as_ref().map(|failure| failure.stage.as_str())
+                        != Some("selection_reuse_postcondition")
+                {
+                    return Err(
+                        "selection-reuse output mismatch was not recorded as a failed postcondition"
+                            .to_string(),
+                    );
+                }
+                let result = self.route_results.first().ok_or_else(|| {
+                    "selection-reuse output mismatch has no selected route result".to_string()
+                })?;
+                if result.exit_code != Some(0) || !result.artifact_capture.is_complete() {
+                    return Err(
+                        "selection-reuse output mismatch did not follow a successful route result"
+                            .to_string(),
+                    );
+                }
+                let recomputed = recomputed_output.map_err(|_| {
+                    "selection-reuse mismatch result has invalid declared-output evidence"
+                        .to_string()
+                })?;
+                if recomputed.as_deref()
+                    != observation
+                        .output_check
+                        .observed_declared_output_sha256
+                        .as_deref()
+                {
+                    return Err(
+                        "selection-reuse mismatch digest was not derived from its recorded result"
+                            .to_string(),
+                    );
+                }
+            }
+            SelectionReuseOutputStatusV1::RouteFailed => {
+                if self.disposition == RunDispositionV1::Succeeded {
+                    return Err(
+                        "failed selection-reuse output check cannot accompany a successful run"
+                            .to_string(),
+                    );
+                }
+                let result = self.route_results.first().ok_or_else(|| {
+                    "selection-reuse route-failed status has no selected route result".to_string()
+                })?;
+                if result.exit_code == Some(0) && result.artifact_capture.is_complete() {
+                    return Err(
+                        "selection-reuse route-failed status accompanies a successful route"
+                            .to_string(),
+                    );
+                }
+            }
+            SelectionReuseOutputStatusV1::ObservationInvalid => {
+                if self.disposition == RunDispositionV1::Succeeded {
+                    return Err(
+                        "invalid selection-reuse evidence cannot accompany a successful run"
+                            .to_string(),
+                    );
+                }
+                if recomputed_output.is_ok()
+                    && recomputed_output.as_ref().is_ok_and(Option::is_some)
+                {
+                    return Err(
+                        "selection-reuse observation-invalid status has valid recorded output evidence"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_validated_selection_receipt(&self) -> Result<(), String> {
+        let policy_is_validated =
+            self.intent.route_policy.as_deref() == Some("benchmark_validate_and_select");
+        let Some(receipt) = &self.validated_selection_receipt else {
+            let known_post_execution_failure = self.disposition
+                == RunDispositionV1::InfrastructureFailed
+                && self.failure.as_ref().is_some_and(|failure| {
+                    matches!(
+                        failure.stage.as_str(),
+                        "trace_output" | "stream_observation" | "validated_selection_evidence"
+                    )
+                });
+            // A failed benchmark may retain settled branches before its
+            // reference/compare/select operation fails. Those observations
+            // are useful failure evidence; they are not a completed selection.
+            let failed_during_execution = matches!(
+                self.disposition,
+                RunDispositionV1::ExecutionFailed | RunDispositionV1::InfrastructureFailed
+            ) && self.failure.as_ref().is_some_and(|failure| {
+                matches!(failure.stage.as_str(), "execution" | "infrastructure")
+            });
+            if policy_is_validated
+                && (self.disposition == RunDispositionV1::Succeeded
+                    || (!self.route_results.is_empty() && !failed_during_execution)
+                    || known_post_execution_failure)
+            {
+                return Err(
+                    "completed validated-selection execution has no selection receipt".to_string(),
+                );
+            }
+            return Ok(());
+        };
+        if matches!(self.input.kind, RunInputKindV1::OrdinaryO) || !policy_is_validated {
+            return Err(
+                "validated-selection receipt is attached to an incompatible run input or policy"
+                    .to_string(),
+            );
+        }
+        if !matches!(
+            self.disposition,
+            RunDispositionV1::Succeeded | RunDispositionV1::InfrastructureFailed
+        ) {
+            return Err(
+                "validated-selection receipt is attached to an incompatible run disposition"
+                    .to_string(),
+            );
+        }
+        receipt.validate()?;
+        if self.input.digest_sha256 != receipt.bundle_sha256
+            || self.intent.target.as_deref() != Some(receipt.target.as_str())
+            || self.intent.route_policy.as_deref() != Some(receipt.policy.as_str())
+        {
+            return Err(
+                "validated-selection receipt is not bound to the run input, target, and policy"
+                    .to_string(),
+            );
+        }
+        if receipt.candidates.len() != self.route_results.len() {
+            return Err(
+                "validated-selection receipt candidate count disagrees with route results"
+                    .to_string(),
+            );
+        }
+        let mut expected_result_order = receipt
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.route_id != receipt.selected_route_id)
+            .map(|candidate| candidate.route_id.as_str())
+            .collect::<Vec<_>>();
+        expected_result_order.push(receipt.selected_route_id.as_str());
+        let observed_result_order = self
+            .route_results
+            .iter()
+            .map(|result| result.route_id.as_str())
+            .collect::<Vec<_>>();
+        if observed_result_order != expected_result_order {
+            return Err(
+                "validated-selection route results do not preserve candidate order plus winner-last"
+                    .to_string(),
+            );
+        }
+        for candidate in &receipt.candidates {
+            let result = self
+                .route_results
+                .iter()
+                .find(|result| result.route_id == candidate.route_id)
+                .ok_or_else(|| {
+                    format!(
+                        "validated-selection candidate `{}` has no recorded route result",
+                        candidate.route_id
+                    )
+                })?;
+            let recorded_codec = result.result_codec.ok_or_else(|| {
+                format!(
+                    "validated-selection candidate `{}` has no recorded result codec",
+                    candidate.route_id
+                )
+            })?;
+            if recorded_codec != candidate.observation.result_codec {
+                return Err(format!(
+                    "validated-selection candidate `{}` codec disagrees with its recorded route result",
+                    candidate.route_id
+                ));
+            }
+            if result.branch_elapsed_ns.as_deref() != Some(candidate.branch_elapsed_ns.as_str())
+                || result.duration_ns != candidate.terminal_elapsed_ns
+            {
+                return Err(format!(
+                    "validated-selection candidate `{}` timing disagrees with its recorded route result",
+                    candidate.route_id
+                ));
+            }
+            let branch_duration = parse_canonical_duration(
+                &candidate.branch_elapsed_ns,
+                "validated-selection complete-branch duration",
+            )?;
+            let terminal_duration =
+                parse_canonical_duration(&result.duration_ns, "route terminal duration")?;
+            if branch_duration < terminal_duration
+                || branch_duration > u128::from(self.elapsed_nanos)
+            {
+                return Err(format!(
+                    "validated-selection candidate `{}` timing falls outside terminal and whole-run bounds",
+                    candidate.route_id
+                ));
+            }
+            let observation = recorded_validated_selection_observation(result, recorded_codec)?;
+            if observation != candidate.observation {
+                return Err(format!(
+                    "validated-selection candidate `{}` evidence disagrees with its recorded route result",
+                    candidate.route_id
+                ));
+            }
+        }
+        let selected = self.route_results.last().ok_or_else(|| {
+            "validated-selection receipt has no selected route result".to_string()
+        })?;
+        if selected.route_id != receipt.selected_route_id
+            || selected.exit_code != Some(0)
+            || !selected.artifact_capture.is_complete()
+            || self.decoded_value != selected.value
+        {
+            return Err(
+                "validated-selection selected result or decoded value is inconsistent".to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+fn recorded_validated_selection_observation(
+    result: &RecordedRouteResultV1,
+    result_codec: ResultCodec,
+) -> Result<ValidatedSelectionObservationV1, String> {
+    let json_value_sha256 = match result_codec {
+        ResultCodec::Json => {
+            let decoded = if result.stdout.capture.truncated {
+                None
+            } else {
+                serde_json::from_slice::<Value>(&result.stdout.retained).ok()
+            };
+            if decoded != result.value {
+                return Err(format!(
+                    "recorded route `{}` JSON value disagrees with stdout",
+                    result.route_id
+                ));
+            }
+            result
+                .value
+                .as_ref()
+                .map(validated_selection_json_sha256)
+                .transpose()?
+        }
+        ResultCodec::Text | ResultCodec::Bytes => {
+            if result.value.is_some() {
+                return Err(format!(
+                    "recorded non-JSON route `{}` carries a decoded JSON value",
+                    result.route_id
+                ));
+            }
+            None
+        }
+    };
+    let mut artifacts = result.artifacts.clone();
+    artifacts.sort_unstable_by(|left, right| {
+        (&left.path, left.bytes_len, &left.content_hash).cmp(&(
+            &right.path,
+            right.bytes_len,
+            &right.content_hash,
+        ))
+    });
+    let mut artifact_requirements = result.artifact_requirements.clone();
+    artifact_requirements.sort_unstable();
+    artifact_requirements.dedup();
+    let artifact_capture = ValidatedArtifactCaptureStatusV1::from_capture(
+        &result.artifact_capture,
+        &artifact_requirements,
+    )?;
+    let observation = ValidatedSelectionObservationV1 {
+        result_codec,
+        exit_code: result.exit_code,
+        stdout_capture: result.stdout.capture.clone(),
+        stderr_capture: result.stderr.capture.clone(),
+        json_value_sha256,
+        artifacts,
+        artifact_requirements,
+        artifact_capture,
+        execution_disposition: result.disposition,
+    };
+    observation.validate()?;
+    Ok(observation)
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1272,6 +2171,8 @@ pub struct RunSummaryV1 {
     pub plan: Option<PlanIdentitiesV1>,
     pub disposition: RunDispositionV1,
     pub result_references: Vec<RunResultReferenceV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_reuse: Option<ProjectSelectionReuseObservationV1>,
     pub recording: RunRecordingStatusV1,
     pub failure: Option<RunFailureV1>,
 }
@@ -1285,6 +2186,7 @@ impl RunSummaryV1 {
             plan: Some(record.plan.clone()),
             disposition: record.disposition,
             result_references: record.result_references.clone(),
+            selection_reuse: record.selection_reuse.clone(),
             recording,
             failure: record.failure.clone(),
         }
@@ -1299,6 +2201,7 @@ impl RunSummaryV1 {
             plan: None,
             disposition: RunDispositionV1::PreflightFailed,
             result_references: Vec::new(),
+            selection_reuse: None,
             recording: RunRecordingStatusV1::NotStarted {
                 reason: "preflight did not produce an executable intent".to_string(),
             },
@@ -1331,6 +2234,12 @@ impl RunSummaryV1 {
         }
         for reference in &self.result_references {
             reference.validate()?;
+        }
+        if let Some(observation) = &self.selection_reuse {
+            observation.validate()?;
+            if self.run_id.is_none() || self.input.is_none() || self.plan.is_none() {
+                return Err("selection-reuse summary lacks an executed run identity".to_string());
+            }
         }
         match &self.recording {
             RunRecordingStatusV1::Recorded {
@@ -1502,6 +2411,11 @@ mod b64_bytes {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::project::{
+        RoutePolicy, SelectionReuseOutputStatusV1, SELECTION_REUSE_CONTRACT_SCHEMA_V1,
+        SELECTION_REUSE_EFFECT_BOUNDARY_V1, SELECTION_REUSE_OUTPUT_CHECK_SCHEMA_V1,
+        VALIDATED_SELECTION_EQUIVALENCE_V1, VALIDATED_SELECTION_RULE_V1,
+    };
     use sha2::{Digest, Sha256};
 
     fn digest(bytes: &[u8]) -> String {
@@ -1529,6 +2443,7 @@ mod tests {
                 mesh_discovery_timeout_ms: None,
                 mesh_closed_registry: None,
                 mesh_peer_root: None,
+                selection_reuse: None,
             },
             plan: PlanIdentitiesV1 {
                 oir_sha256: Some(digest(b"oir")),
@@ -1538,7 +2453,314 @@ mod tests {
                 ..PlanIdentitiesV1::default()
             },
             started_unix_nanos: 1,
+            operation_decision: None,
+            operation_plan_ref: None,
         }
+    }
+
+    fn validated_project_seed() -> RunAttemptSeedV1 {
+        RunAttemptSeedV1 {
+            input: RunInputIdentityV1 {
+                kind: RunInputKindV1::ProjectDirectory,
+                path: PathBuf::from("project"),
+                digest_sha256: "ab".repeat(32),
+            },
+            intent: ExecutionIntentObservationV1 {
+                engine: "project_compatibility".to_string(),
+                target: Some("main".to_string()),
+                selected_route: None,
+                route_policy: Some("benchmark_validate_and_select".to_string()),
+                route_declarations: Vec::new(),
+                parallel_policy: "project_policy".to_string(),
+                local_worker_limit: None,
+                mesh_mode: None,
+                mesh_max_retries: None,
+                mesh_fallback: None,
+                mesh_discovery_timeout_ms: None,
+                mesh_closed_registry: None,
+                mesh_peer_root: None,
+                selection_reuse: None,
+            },
+            plan: PlanIdentitiesV1 {
+                hgraph_sha256: Some(digest(b"project-hgraph")),
+                deployment_sha256: Some(digest(b"project-deployment")),
+                ..PlanIdentitiesV1::default()
+            },
+            started_unix_nanos: 1,
+            operation_decision: None,
+            operation_plan_ref: None,
+        }
+    }
+
+    fn recorded_text_result(route_id: &str, stdout: &[u8]) -> RecordedRouteResultV1 {
+        RecordedRouteResultV1 {
+            route_id: route_id.to_string(),
+            result_codec: Some(ResultCodec::Text),
+            exit_code: Some(0),
+            stdout: CapturedStreamV1::complete(stdout.to_vec()),
+            stderr: CapturedStreamV1::default(),
+            value: None,
+            artifacts: Vec::new(),
+            artifact_requirements: Vec::new(),
+            artifact_capture: ArtifactCaptureStatus::Complete,
+            disposition: RouteExecutionDisposition::Executed,
+            duration_ns: "1".to_string(),
+            branch_elapsed_ns: None,
+            provenance: RecordedExecutionProvenanceV1 {
+                execution_scope: "isolated_project_workspace".to_string(),
+                command_argv_retained: false,
+                command_argument_count: 3,
+            },
+        }
+    }
+
+    fn receipt_candidate(
+        result: &RecordedRouteResultV1,
+        branch_elapsed_ns: &str,
+    ) -> ValidatedSelectionCandidateV1 {
+        let observation =
+            recorded_validated_selection_observation(result, ResultCodec::Text).unwrap();
+        ValidatedSelectionCandidateV1 {
+            route_id: result.route_id.clone(),
+            terminal_elapsed_ns: result.duration_ns.clone(),
+            branch_elapsed_ns: branch_elapsed_ns.to_string(),
+            observation_sha256: observation.sha256().unwrap(),
+            declared_output_sha256: observation.declared_output_sha256().unwrap(),
+            observation,
+            disposition: ValidatedSelectionDispositionV1::Eligible,
+        }
+    }
+
+    fn matched_selection_reuse_record() -> RunRecordV1 {
+        let mut reference = recorded_text_result("reference", b"same");
+        reference.artifacts = vec![Artifact {
+            path: "out.txt".to_string(),
+            content_hash: digest(b"artifact"),
+            bytes_len: 8,
+        }];
+        reference.artifact_requirements = vec!["out.txt".to_string()];
+        let mut fast = reference.clone();
+        fast.route_id = "fast".to_string();
+
+        let receipt = ValidatedSelectionReceiptV1::new(
+            "fixture",
+            "ab".repeat(32),
+            "main",
+            "reference",
+            vec![
+                receipt_candidate(&reference, "20"),
+                receipt_candidate(&fast, "10"),
+            ],
+            "fast",
+        )
+        .unwrap();
+        let expected_declared_output_sha256 = receipt
+            .candidates
+            .iter()
+            .find(|candidate| candidate.route_id == "fast")
+            .unwrap()
+            .declared_output_sha256
+            .clone();
+        let contract = SelectionReuseContractV1 {
+            schema: SELECTION_REUSE_CONTRACT_SCHEMA_V1.to_string(),
+            project_name: "fixture".to_string(),
+            bundle_sha256: receipt.bundle_sha256.clone(),
+            target: "main".to_string(),
+            ordered_alternatives: vec!["reference".to_string(), "fast".to_string()],
+            evidence_policy: RoutePolicy::BenchmarkValidateAndSelect.token(),
+            equivalence_contract: VALIDATED_SELECTION_EQUIVALENCE_V1.to_string(),
+            selection_rule: VALIDATED_SELECTION_RULE_V1.to_string(),
+            effect_boundary: SELECTION_REUSE_EFFECT_BOUNDARY_V1.to_string(),
+            reference_route_id: "reference".to_string(),
+            selected_route_id: "fast".to_string(),
+            expected_declared_output_sha256: expected_declared_output_sha256.clone(),
+            benchmark_hgraph_sha256: digest(b"benchmark-hgraph"),
+            benchmark_deployment_sha256: digest(b"benchmark-deployment"),
+            route_declaration_sha256: Vec::new(),
+        };
+        let binding = ProjectSelectionReuseBindingV1::new(
+            "cc".repeat(32),
+            7,
+            RunContentRefV1 {
+                kind: RunContentKindV1::Record,
+                sha256: "dd".repeat(32),
+                bytes_len: 1,
+            },
+            receipt,
+            contract,
+        )
+        .unwrap();
+        let seed = RunAttemptSeedV1 {
+            input: RunInputIdentityV1 {
+                kind: RunInputKindV1::ProjectDirectory,
+                path: PathBuf::from("project"),
+                digest_sha256: binding.contract.bundle_sha256.clone(),
+            },
+            intent: ExecutionIntentObservationV1 {
+                engine: "project_compatibility".to_string(),
+                target: Some(binding.contract.target.clone()),
+                selected_route: Some(binding.contract.target.clone()),
+                route_policy: Some(
+                    RoutePolicy::Explicit(binding.contract.selected_route_id.clone()).token(),
+                ),
+                route_declarations: binding.contract.route_declaration_sha256.clone(),
+                parallel_policy: "project_policy".to_string(),
+                local_worker_limit: None,
+                mesh_mode: None,
+                mesh_max_retries: None,
+                mesh_fallback: None,
+                mesh_discovery_timeout_ms: None,
+                mesh_closed_registry: None,
+                mesh_peer_root: None,
+                selection_reuse: Some(binding.clone()),
+            },
+            plan: PlanIdentitiesV1 {
+                hgraph_sha256: Some(digest(b"selected-hgraph")),
+                deployment_sha256: Some(digest(b"selected-deployment")),
+                ..PlanIdentitiesV1::default()
+            },
+            started_unix_nanos: 1,
+            operation_decision: None,
+            operation_plan_ref: None,
+        };
+        let route_results = vec![fast];
+        let mut record = RunRecordV1::terminal(
+            "ee".repeat(32),
+            8,
+            &seed,
+            21,
+            20,
+            RunDispositionV1::Succeeded,
+            CapturedStreamV1::default(),
+            CapturedStreamV1::default(),
+            None,
+            route_results.clone(),
+            route_result_references(&route_results),
+            RunTraceBindingV1::unavailable("compatibility engine has no checked trace"),
+            None,
+        );
+        record.selection_reuse = Some(
+            ProjectSelectionReuseObservationV1::from_binding(
+                &binding,
+                SelectionReuseOutputCheckV1 {
+                    schema: SELECTION_REUSE_OUTPUT_CHECK_SCHEMA_V1.to_string(),
+                    status: SelectionReuseOutputStatusV1::Matched,
+                    expected_declared_output_sha256: expected_declared_output_sha256.clone(),
+                    observed_declared_output_sha256: Some(expected_declared_output_sha256),
+                },
+            )
+            .unwrap(),
+        );
+        record.validate().unwrap();
+        record
+    }
+
+    fn route_failed_selection_reuse_record() -> RunRecordV1 {
+        let mut record = matched_selection_reuse_record();
+        let binding = record.intent.selection_reuse.as_ref().unwrap().clone();
+        record.disposition = RunDispositionV1::ExecutionFailed;
+        record.failure = Some(RunFailureV1 {
+            stage: "execution".to_string(),
+            message: "selected route failed".to_string(),
+        });
+        record.route_results[0].exit_code = Some(1);
+        record.result_references = route_result_references(&record.route_results);
+        record.selection_reuse = Some(
+            ProjectSelectionReuseObservationV1::from_binding(
+                &binding,
+                SelectionReuseOutputCheckV1 {
+                    schema: SELECTION_REUSE_OUTPUT_CHECK_SCHEMA_V1.to_string(),
+                    status: SelectionReuseOutputStatusV1::RouteFailed,
+                    expected_declared_output_sha256: binding
+                        .contract
+                        .expected_declared_output_sha256
+                        .clone(),
+                    observed_declared_output_sha256: None,
+                },
+            )
+            .unwrap(),
+        );
+        record.validate().unwrap();
+        record
+    }
+
+    #[test]
+    fn selection_reuse_record_recomputes_retained_output_evidence() {
+        let record = matched_selection_reuse_record();
+
+        let mut forged_observed_digest = record.clone();
+        forged_observed_digest
+            .selection_reuse
+            .as_mut()
+            .unwrap()
+            .output_check
+            .observed_declared_output_sha256 = Some(digest(b"forged"));
+        assert!(forged_observed_digest.validate().is_err());
+
+        let mut changed_stdout = record.clone();
+        changed_stdout.route_results[0].stdout = CapturedStreamV1::complete(b"changed".to_vec());
+        assert!(changed_stdout
+            .validate()
+            .unwrap_err()
+            .contains("digest was not derived from its recorded result"));
+
+        let mut changed_artifact = record.clone();
+        changed_artifact.route_results[0].artifacts[0].content_hash = digest(b"changed");
+        assert!(changed_artifact
+            .validate()
+            .unwrap_err()
+            .contains("digest was not derived from its recorded result"));
+
+        let mut changed_codec = record.clone();
+        changed_codec.route_results[0].result_codec = Some(ResultCodec::Bytes);
+        assert!(changed_codec
+            .validate()
+            .unwrap_err()
+            .contains("admitted codec and artifact requirements"));
+
+        let mut extra_route = record.clone();
+        let mut reference = extra_route.route_results[0].clone();
+        reference.route_id = "reference".to_string();
+        extra_route.route_results.push(reference);
+        extra_route.result_references = route_result_references(&extra_route.route_results);
+        assert!(extra_route
+            .validate()
+            .unwrap_err()
+            .contains("route other than its admitted winner"));
+
+        let mut contradictory_status = record;
+        let check = &mut contradictory_status
+            .selection_reuse
+            .as_mut()
+            .unwrap()
+            .output_check;
+        check.status = SelectionReuseOutputStatusV1::RouteFailed;
+        check.observed_declared_output_sha256 = None;
+        assert!(contradictory_status
+            .validate()
+            .unwrap_err()
+            .contains("cannot accompany a successful run"));
+    }
+
+    #[test]
+    fn selection_reuse_route_failed_status_requires_the_selected_result() {
+        let mut record = route_failed_selection_reuse_record();
+        record.route_results.clear();
+        record.result_references.clear();
+        assert!(record
+            .validate()
+            .unwrap_err()
+            .contains("route-failed status has no selected route result"));
+    }
+
+    #[test]
+    fn selection_reuse_result_must_retain_admitted_artifact_requirements() {
+        let mut record = matched_selection_reuse_record();
+        record.route_results[0].artifact_requirements = vec!["other.txt".to_string()];
+        assert!(record
+            .validate()
+            .unwrap_err()
+            .contains("admitted codec and artifact requirements"));
     }
 
     #[test]
@@ -1571,6 +2793,174 @@ mod tests {
         );
         record.validate().unwrap();
         assert_eq!(record.integrity, RUN_RECORD_INTEGRITY_V1);
+        assert!(serde_json::to_value(&record)
+            .unwrap()
+            .get("validated_selection_receipt")
+            .is_none());
+    }
+
+    #[test]
+    fn terminal_record_binds_validated_selection_receipt_to_results() {
+        let seed = validated_project_seed();
+        let reference = recorded_text_result("reference", b"same");
+        let fast = recorded_text_result("fast", b"same");
+        let receipt = ValidatedSelectionReceiptV1::new(
+            "fixture",
+            seed.input.digest_sha256.clone(),
+            "main",
+            "reference",
+            vec![
+                receipt_candidate(&reference, "20"),
+                receipt_candidate(&fast, "10"),
+            ],
+            "fast",
+        )
+        .unwrap();
+        let mut route_results = vec![reference, fast];
+        for (result, candidate) in route_results.iter_mut().zip(&receipt.candidates) {
+            result.branch_elapsed_ns = Some(candidate.branch_elapsed_ns.clone());
+        }
+        let mut record = RunRecordV1::terminal(
+            "44".repeat(32),
+            1,
+            &seed,
+            31,
+            30,
+            RunDispositionV1::Succeeded,
+            CapturedStreamV1::default(),
+            CapturedStreamV1::default(),
+            None,
+            route_results.clone(),
+            route_result_references(&route_results),
+            RunTraceBindingV1::unavailable("compatibility engine has no checked trace"),
+            None,
+        );
+        record.validated_selection_receipt = Some(receipt);
+        record.validate().unwrap();
+
+        let mut wrong_result = record.clone();
+        wrong_result.route_results[0].stdout = CapturedStreamV1::complete(b"changed".to_vec());
+        assert!(wrong_result.validate().is_err());
+
+        let mut wrong_binding = record.clone();
+        wrong_binding.input.digest_sha256 = digest(b"different-bundle");
+        assert!(wrong_binding.validate().is_err());
+
+        let mut wrong_codec = record.clone();
+        wrong_codec.route_results[0].result_codec = Some(ResultCodec::Bytes);
+        assert!(wrong_codec.validate().is_err());
+
+        let mut shorter_than_terminal = record.clone();
+        shorter_than_terminal.route_results[1].duration_ns = "11".to_string();
+        assert!(shorter_than_terminal.validate().is_err());
+
+        let mut longer_than_run = record.clone();
+        longer_than_run.elapsed_nanos = 9;
+        assert!(longer_than_run.validate().is_err());
+
+        let mut missing_receipt = record;
+        missing_receipt.validated_selection_receipt = None;
+        assert!(missing_receipt.validate().is_err());
+
+        let mut infrastructure_failed = validated_project_seed();
+        infrastructure_failed.started_unix_nanos = 10;
+        let reference = recorded_text_result("reference", b"same");
+        let fast = recorded_text_result("fast", b"same");
+        let receipt = ValidatedSelectionReceiptV1::new(
+            "fixture",
+            infrastructure_failed.input.digest_sha256.clone(),
+            "main",
+            "reference",
+            vec![
+                receipt_candidate(&reference, "20"),
+                receipt_candidate(&fast, "10"),
+            ],
+            "fast",
+        )
+        .unwrap();
+        let mut route_results = vec![reference, fast];
+        for (result, candidate) in route_results.iter_mut().zip(&receipt.candidates) {
+            result.branch_elapsed_ns = Some(candidate.branch_elapsed_ns.clone());
+        }
+        let mut failed_record = RunRecordV1::terminal(
+            "55".repeat(32),
+            2,
+            &infrastructure_failed,
+            40,
+            30,
+            RunDispositionV1::InfrastructureFailed,
+            CapturedStreamV1::default(),
+            CapturedStreamV1::complete(b"sidecar failed".to_vec()),
+            None,
+            route_results.clone(),
+            route_result_references(&route_results),
+            RunTraceBindingV1::unavailable("compatibility engine has no checked trace"),
+            Some(RunFailureV1 {
+                stage: "trace_output".to_string(),
+                message: "sidecar failed".to_string(),
+            }),
+        );
+        failed_record.validated_selection_receipt = Some(receipt);
+        failed_record.validate().unwrap();
+        failed_record.validated_selection_receipt = None;
+        assert!(failed_record.validate().is_err());
+
+        let mut interrupted_selection = failed_record.clone();
+        interrupted_selection.disposition = RunDispositionV1::ExecutionFailed;
+        interrupted_selection.failure = Some(RunFailureV1 {
+            stage: "execution".to_string(),
+            message: "reference validation failed after branches settled".to_string(),
+        });
+        interrupted_selection.validate().unwrap();
+        interrupted_selection.disposition = RunDispositionV1::InfrastructureFailed;
+        interrupted_selection.failure.as_mut().unwrap().stage = "infrastructure".to_string();
+        interrupted_selection.validate().unwrap();
+        interrupted_selection.disposition = RunDispositionV1::Succeeded;
+        interrupted_selection.failure = None;
+        assert!(interrupted_selection.validate().is_err());
+
+        let post_execution_without_results = RunRecordV1::terminal(
+            "66".repeat(32),
+            3,
+            &infrastructure_failed,
+            40,
+            30,
+            RunDispositionV1::InfrastructureFailed,
+            CapturedStreamV1::default(),
+            CapturedStreamV1::complete(b"sidecar failed".to_vec()),
+            None,
+            Vec::new(),
+            Vec::new(),
+            RunTraceBindingV1::unavailable("compatibility engine has no checked trace"),
+            Some(RunFailureV1 {
+                stage: "trace_output".to_string(),
+                message: "sidecar failed".to_string(),
+            }),
+        );
+        assert_eq!(
+            post_execution_without_results.validate().unwrap_err(),
+            "completed validated-selection execution has no selection receipt"
+        );
+
+        let setup_failure = RunRecordV1::terminal(
+            "77".repeat(32),
+            4,
+            &infrastructure_failed,
+            40,
+            30,
+            RunDispositionV1::InfrastructureFailed,
+            CapturedStreamV1::default(),
+            CapturedStreamV1::complete(b"capture setup failed".to_vec()),
+            None,
+            Vec::new(),
+            Vec::new(),
+            RunTraceBindingV1::unavailable("execution never began"),
+            Some(RunFailureV1 {
+                stage: "stream_observation_setup".to_string(),
+                message: "capture setup failed".to_string(),
+            }),
+        );
+        setup_failure.validate().unwrap();
     }
 
     #[test]

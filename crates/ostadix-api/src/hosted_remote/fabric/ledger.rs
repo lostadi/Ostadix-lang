@@ -795,8 +795,7 @@ impl FabricAttemptLedgerV1 {
         validate_private_directory(&state_base, "Fabric state base")?;
         let state_base = FabricLedgerDirectoryAnchorV1::open(state_base, "Fabric state base")?;
         let root_path = state_base.path().join(FABRIC_LEDGER_DIRECTORY_V1);
-        let root = &root_path;
-        ensure_private_fabric_root(&root)?;
+        ensure_private_fabric_root(&root_path)?;
         state_base.sync()?;
         let root = FabricLedgerDirectoryAnchorV1::open(root_path, "Fabric attempt-ledger root")?;
         let lock = acquire_root_lock(&root)?;
@@ -1264,6 +1263,9 @@ enum MutationV1<T> {
     Unchanged(T),
 }
 
+// Conflict details stay inline so ledger lookup does not introduce a separate
+// allocation policy solely to satisfy a size heuristic.
+#[allow(clippy::large_enum_variant)]
 enum BindingLookupV1 {
     Exact(usize),
     Conflict(FabricLedgerConflictV1),
@@ -2014,7 +2016,10 @@ mod tests {
     fn private_namespaced_root_and_exclusive_lock_survive_clones() -> Result<()> {
         let directory = private_tempdir()?;
         let ledger = FabricAttemptLedgerV1::open(directory.path())?;
-        assert_eq!(ledger.root(), directory.path().join("fabric-v1"));
+        assert_eq!(
+            ledger.root(),
+            fs::canonicalize(directory.path())?.join("fabric-v1")
+        );
         assert_eq!(ledger.execution_cell_incarnation()?.get(), 1);
         #[cfg(unix)]
         {

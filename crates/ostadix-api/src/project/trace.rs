@@ -40,7 +40,7 @@ use super::deployment::DEPLOYMENT_PLAN_SCHEMA_V1;
 use super::logical::LOGICAL_HGRAPH_SCHEMA_V1;
 use super::model::{
     Artifact, ArtifactCaptureFailure, ArtifactCaptureStatus, OExecutionResult,
-    RouteFailureContinuation, RoutePolicy,
+    RouteFailureContinuation, RoutePolicy, ValidatedSelectionReceiptV1,
 };
 use super::plan::{ProjectDependency, ProjectHGraph, ProjectPlanOperation};
 
@@ -54,9 +54,11 @@ use super::plan::{ProjectDependency, ProjectHGraph, ProjectPlanOperation};
 /// rejects substitution of that artifact. Version 6 distinguishes retained
 /// child-output prefixes from the complete drained streams by binding observed
 /// and retained lengths, truncation, full-stream digests, and declared-artifact
-/// completeness. It does not bind or execute a snapshot-derived provider
-/// proposal or attach World identity.
-pub const PROJECT_ATTEMPT_TRACE_VERSION: u32 = 6;
+/// completeness. Version 7 adds policy-selection observations and causal race
+/// cancellation; the source-bound logical digest also distinguishes execution
+/// and scheduling contracts. An ordinary hosted trace does not execute a
+/// snapshot-derived provider proposal or attach World identity.
+pub const PROJECT_ATTEMPT_TRACE_VERSION: u32 = 7;
 
 pub(crate) fn project_logical_graph_digest(
     project: &ProjectHGraph,
@@ -504,6 +506,9 @@ pub enum ProjectContinuationEvidence {
     DeclaredIdempotent,
     /// At least one child process started without a safe continuation contract.
     UnprovenEffects,
+    /// Frozen legacy behavior: continue after unproven effects. This is valid
+    /// only under the trusted plan's LegacyCompatibility execution contract.
+    LegacyUnchecked,
 }
 
 /// One checked admission/denial for the next ordered route alternative.
@@ -594,6 +599,27 @@ impl ProjectAttemptState {
     }
 }
 
+/// Observed candidate metadata bound to its ordinary route settlement. Timing
+/// is measured evidence, not a deterministic or independently attested fact.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectPolicyCandidate {
+    pub route_id: String,
+    pub outcome: ProjectRouteOutcome,
+    pub terminal_elapsed_ns: String,
+    pub branch_elapsed_ns: String,
+}
+
+/// Recomputable policy choice, in canonical declaration order. This records
+/// selection without retaining argv, environment, output bytes, or host paths.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectPolicySelection {
+    pub selected_route_id: String,
+    pub candidates: Vec<ProjectPolicyCandidate>,
+    pub validated_receipt: Option<ValidatedSelectionReceiptV1>,
+}
+
 /// One self-describing deterministic coordinator lifecycle event.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectAttemptEvent {
@@ -618,6 +644,11 @@ pub struct ProjectAttemptEvent {
     /// whether the next ordered alternative may start.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continuation: Option<ProjectContinuationDecision>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<ProjectPolicySelection>,
+    /// Earlier qualifying terminal event that caused cooperative cancellation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancelled_by_ordinal: Option<u64>,
 }
 
 impl ProjectAttemptEvent {
@@ -639,6 +670,8 @@ impl ProjectAttemptEvent {
             outcome,
             failure_sha256,
             continuation,
+            selection: None,
+            cancelled_by_ordinal: None,
         }
     }
 
@@ -659,6 +692,53 @@ impl ProjectAttemptEvent {
         }
         if let Some(continuation) = &self.continuation {
             continuation.validate()?;
+        }
+        if self.selection.is_some()
+            && (self.state != ProjectAttemptState::Finished
+                || !self.operation_label.starts_with("select-route:"))
+        {
+            return Err(ProjectTraceError::InvalidEvent(
+                "policy selection belongs only to a finished SelectRoute".to_string(),
+            ));
+        }
+        if self.cancelled_by_ordinal.is_some()
+            && (self.state != ProjectAttemptState::Aborted
+                || !self.is_run_route()
+                || self.outcome.is_some())
+        {
+            return Err(ProjectTraceError::InvalidEvent(
+                "cancellation belongs only to an aborted RunRoute without a semantic result"
+                    .to_string(),
+            ));
+        }
+        if let Some(selection) = &self.selection {
+            if selection.candidates.is_empty()
+                || !selection
+                    .candidates
+                    .iter()
+                    .any(|candidate| candidate.route_id == selection.selected_route_id)
+            {
+                return Err(ProjectTraceError::InvalidEvent(
+                    "policy selection has no selected candidate".to_string(),
+                ));
+            }
+            for candidate in &selection.candidates {
+                candidate.outcome.validate()?;
+                for duration in [&candidate.terminal_elapsed_ns, &candidate.branch_elapsed_ns] {
+                    if duration.parse::<u128>().is_err()
+                        || duration.parse::<u128>().unwrap().to_string() != *duration
+                    {
+                        return Err(ProjectTraceError::InvalidEvent(
+                            "policy candidate timing is noncanonical".to_string(),
+                        ));
+                    }
+                }
+            }
+            if let Some(receipt) = &selection.validated_receipt {
+                receipt
+                    .validate()
+                    .map_err(ProjectTraceError::InvalidEvent)?;
+            }
         }
         match self.state {
             ProjectAttemptState::Ready | ProjectAttemptState::Started => {
@@ -982,6 +1062,40 @@ impl ProjectAttemptTrace {
         self.record_state(identity, ProjectAttemptState::Finished, None, None, None)
     }
 
+    pub fn record_selected(
+        &mut self,
+        identity: &ProjectAttemptIdentity,
+        selection: ProjectPolicySelection,
+    ) -> Result<(), ProjectTraceError> {
+        let mut event = ProjectAttemptEvent::new(
+            self.next_ordinal()?,
+            identity,
+            ProjectAttemptState::Finished,
+            None,
+            None,
+            None,
+        );
+        event.selection = Some(selection);
+        self.record(event)
+    }
+
+    pub fn record_cancelled(
+        &mut self,
+        identity: &ProjectAttemptIdentity,
+        trigger: u64,
+    ) -> Result<(), ProjectTraceError> {
+        let mut event = ProjectAttemptEvent::new(
+            self.next_ordinal()?,
+            identity,
+            ProjectAttemptState::Aborted,
+            None,
+            Some(sha256_hex(b"cooperative race cancellation")),
+            None,
+        );
+        event.cancelled_by_ordinal = Some(trigger);
+        self.record(event)
+    }
+
     /// Record a route result whose process status is successful.
     pub fn record_settled_success(
         &mut self,
@@ -1181,6 +1295,7 @@ impl ProjectAttemptTrace {
             }
             ProjectContinuationEvidence::DeclaredIdempotent
             | ProjectContinuationEvidence::UnprovenEffects
+            | ProjectContinuationEvidence::LegacyUnchecked
                 if !any_executed =>
             {
                 return Err(ProjectTraceError::InvalidEvent(
@@ -1400,26 +1515,55 @@ fn validate_observed_readiness(
                     event.plan_node.0
                 ))
             })?;
+        let prefix = &events[..event.coordinator_ordinal as usize];
+        if let Some(trigger_ordinal) = event.cancelled_by_ordinal {
+            let trigger = race_trigger(project, prefix).ok_or_else(|| {
+                ProjectTraceError::InvalidEvent(
+                    "race cancellation has no earlier qualifying settlement".to_string(),
+                )
+            })?;
+            if trigger.coordinator_ordinal != trigger_ordinal || trigger.branch == event.branch {
+                return Err(ProjectTraceError::InvalidEvent(
+                    "race cancellation has a mismatched cause or cancels the triggering branch"
+                        .to_string(),
+                ));
+            }
+        }
         if event.state == ProjectAttemptState::Ready {
+            if let Some(trigger) = race_trigger(project, prefix) {
+                if event.branch.is_some() && event.branch != trigger.branch {
+                    return Err(ProjectTraceError::InvalidEvent(
+                        "losing race branch started after cancellation was requested".to_string(),
+                    ));
+                }
+            }
             let input_policy = ready.input_policy(&project.graph).map_err(|error| {
                 ProjectTraceError::InvalidMetadata(format!(
                     "failed to derive input policy for plan node {}: {error}",
                     event.plan_node.0
                 ))
             })?;
-            let justified = match input_policy {
-                ReadyInputPolicy::All => ready
-                    .inputs
-                    .iter()
-                    .all(|input| materialized.contains(input)),
-                ReadyInputPolicy::OrderedFirstSuccess => {
-                    continuation_denied
-                        || ordered_selection_inputs_ready(
-                            ready.inputs.as_slice(),
-                            &materialized,
-                            &output_producers,
-                            &terminal_states,
-                        )?
+            let is_race_select = matches!(
+                project.plan.operations[event.plan_node.0].op,
+                ExecutableOp::SelectRoute { .. }
+            ) && race_trigger(project, prefix).is_some();
+            let justified = if is_race_select {
+                race_selection_ready(project, prefix)
+            } else {
+                match input_policy {
+                    ReadyInputPolicy::All => ready
+                        .inputs
+                        .iter()
+                        .all(|input| materialized.contains(input)),
+                    ReadyInputPolicy::OrderedFirstSuccess => {
+                        continuation_denied
+                            || ordered_selection_inputs_ready(
+                                ready.inputs.as_slice(),
+                                &materialized,
+                                &output_producers,
+                                &terminal_states,
+                            )?
+                    }
                 }
             };
             if !justified {
@@ -1655,6 +1799,15 @@ fn validate_completed_selection(
         // no successfully committed SelectRoute root.
         return Ok(());
     };
+    if !matches!(
+        project.plan.policy,
+        RoutePolicy::Explicit(_)
+            | RoutePolicy::Default
+            | RoutePolicy::Fallback
+            | RoutePolicy::AnySuccess
+    ) {
+        return validate_policy_selection(project, events, selection_finished);
+    }
     let selection_ready = events
         .iter()
         .position(|event| {
@@ -1723,6 +1876,287 @@ fn validate_completed_selection(
     Ok(())
 }
 
+/// First coordinator-observed qualifying terminal alternative. Cancellation
+/// does not manufacture success, and prerequisites never win a route race.
+pub(crate) fn race_trigger<'a>(
+    project: &ProjectHGraph,
+    events: &'a [ProjectAttemptEvent],
+) -> Option<&'a ProjectAttemptEvent> {
+    if !matches!(
+        project.plan.policy,
+        RoutePolicy::RaceSuccess | RoutePolicy::RaceSettle
+    ) {
+        return None;
+    }
+    events
+        .iter()
+        .find(|event| race_event_qualifies(project, event))
+}
+
+fn race_event_qualifies(project: &ProjectHGraph, event: &ProjectAttemptEvent) -> bool {
+    let terminal = event
+        .branch
+        .and_then(|branch| project.plan.alternatives.get(branch))
+        .is_some_and(|route| event.route_id.as_ref() == Some(route));
+    match project.plan.policy {
+        RoutePolicy::RaceSuccess => terminal && event.state == ProjectAttemptState::SettledSuccess,
+        RoutePolicy::RaceSettle => {
+            event.branch.is_some()
+                && event.cancelled_by_ordinal.is_none()
+                && ((terminal
+                    && matches!(
+                        event.state,
+                        ProjectAttemptState::SettledSuccess
+                            | ProjectAttemptState::SettledFailure
+                            | ProjectAttemptState::Skipped
+                    ))
+                    || event.state == ProjectAttemptState::Aborted
+                    || (!terminal && event.state == ProjectAttemptState::SettledFailure))
+        }
+        _ => false,
+    }
+}
+
+/// Final race choice after worker drain. Cancellation uses the first observed
+/// qualifying event, but legacy tie-breaking includes both results and real
+/// branch errors in declaration order.
+pub(crate) fn race_selected_settlement<'a>(
+    project: &ProjectHGraph,
+    events: &'a [ProjectAttemptEvent],
+) -> Option<&'a ProjectAttemptEvent> {
+    events
+        .iter()
+        .filter(|event| race_event_qualifies(project, event))
+        .min_by_key(|event| (event.branch, event.coordinator_ordinal))
+}
+
+pub(crate) fn race_selection_ready(
+    project: &ProjectHGraph,
+    events: &[ProjectAttemptEvent],
+) -> bool {
+    race_trigger(project, events).is_some()
+        && !events.iter().any(|event| {
+            matches!(
+                event.state,
+                ProjectAttemptState::Ready | ProjectAttemptState::Started
+            ) && !events.iter().any(|terminal| {
+                terminal.plan_node == event.plan_node && terminal.state.is_terminal()
+            })
+        })
+}
+
+fn validate_policy_selection(
+    project: &ProjectHGraph,
+    events: &[ProjectAttemptEvent],
+    selected: &ProjectAttemptEvent,
+) -> Result<(), ProjectTraceError> {
+    let invalid = |message: &str| ProjectTraceError::InvalidEvent(message.to_owned());
+    let selection = selected
+        .selection
+        .as_ref()
+        .ok_or_else(|| invalid("completed multi-alternative policy lacks selection evidence"))?;
+    let prefix = &events[..selected.coordinator_ordinal as usize];
+    let terminal = project
+        .plan
+        .alternatives
+        .iter()
+        .filter_map(|route| {
+            prefix.iter().find(|event| {
+                event.route_id.as_ref() == Some(route)
+                    && event
+                        .branch
+                        .and_then(|branch| project.plan.alternatives.get(branch))
+                        == Some(route)
+                    && matches!(
+                        event.state,
+                        ProjectAttemptState::SettledSuccess
+                            | ProjectAttemptState::SettledFailure
+                            | ProjectAttemptState::Skipped
+                    )
+            })
+        })
+        .collect::<Vec<_>>();
+    if selection.candidates.len() != terminal.len() {
+        return Err(invalid(
+            "policy candidate inventory differs from observed terminal alternatives",
+        ));
+    }
+    for (candidate, event) in selection.candidates.iter().zip(&terminal) {
+        if event.route_id.as_ref() != Some(&candidate.route_id)
+            || event.outcome.as_ref() != Some(&candidate.outcome)
+        {
+            return Err(invalid(
+                "policy candidate differs from its observed route settlement",
+            ));
+        }
+        validate_transitive_prerequisite_coverage(
+            project,
+            events,
+            event.plan_node,
+            &mut BTreeSet::new(),
+        )?;
+    }
+    let winner = match project.plan.policy {
+        RoutePolicy::All | RoutePolicy::VerifyEquivalent => {
+            if terminal.len() != project.plan.alternatives.len() {
+                return Err(invalid("all-alternative policy omitted a candidate"));
+            }
+            if project.plan.policy == RoutePolicy::VerifyEquivalent
+                && terminal
+                    .iter()
+                    .any(|event| event.state != ProjectAttemptState::SettledSuccess)
+            {
+                return Err(invalid(
+                    "verified policy selected unsuccessful alternatives",
+                ));
+            }
+            selection
+                .candidates
+                .last()
+                .map(|candidate| &candidate.route_id)
+        }
+        RoutePolicy::BenchmarkAndSelect => {
+            if terminal.len() != project.plan.alternatives.len() {
+                return Err(invalid("benchmark policy omitted a candidate"));
+            }
+            selection
+                .candidates
+                .iter()
+                .enumerate()
+                .filter(|(_, candidate)| {
+                    candidate.outcome.exit_code == Some(0)
+                        && candidate.outcome.artifact_capture.is_complete()
+                })
+                .min_by_key(|(index, candidate)| {
+                    (
+                        candidate.terminal_elapsed_ns.parse::<u128>().unwrap(),
+                        *index,
+                    )
+                })
+                .map(|(_, candidate)| &candidate.route_id)
+        }
+        RoutePolicy::BenchmarkValidateAndSelect => {
+            let receipt = selection
+                .validated_receipt
+                .as_ref()
+                .ok_or_else(|| invalid("validated selection omitted its receipt"))?;
+            if receipt.project_name != project.plan.project_name
+                || receipt.bundle_sha256 != project.plan.bundle_digest
+                || receipt.target != project.plan.target
+                || receipt.reference_route_id != project.plan.alternatives[0]
+                || receipt.candidates.len() != selection.candidates.len()
+                || receipt.candidates.len() != project.plan.alternatives.len()
+            {
+                return Err(invalid(
+                    "validated selection receipt differs from trusted project",
+                ));
+            }
+            for (candidate, observed) in receipt.candidates.iter().zip(&selection.candidates) {
+                let observation = &candidate.observation;
+                let outcome = &observed.outcome;
+                if candidate.route_id != observed.route_id
+                    || candidate.terminal_elapsed_ns != observed.terminal_elapsed_ns
+                    || candidate.branch_elapsed_ns != observed.branch_elapsed_ns
+                    || observation.exit_code != outcome.exit_code
+                    || observation.stdout_capture.sha256 != outcome.stdout_sha256
+                    || observation.stdout_capture.total_observed_bytes
+                        != outcome.stdout_total_observed_bytes
+                    || observation.stdout_capture.retained_bytes != outcome.stdout_retained_bytes
+                    || observation.stdout_capture.truncated != outcome.stdout_truncated
+                    || observation.stderr_capture.sha256 != outcome.stderr_sha256
+                    || observation.stderr_capture.total_observed_bytes
+                        != outcome.stderr_total_observed_bytes
+                    || observation.stderr_capture.retained_bytes != outcome.stderr_retained_bytes
+                    || observation.stderr_capture.truncated != outcome.stderr_truncated
+                    || observation.artifact_capture
+                        != super::model::ValidatedArtifactCaptureStatusV1::from_capture(
+                            &outcome.artifact_capture,
+                            &outcome.artifact_requirements,
+                        )
+                        .map_err(|_| invalid("invalid candidate artifact capture"))?
+                    || observation.execution_disposition
+                        != if terminal.iter().any(|event| {
+                            event.route_id.as_ref() == Some(&candidate.route_id)
+                                && event.state == ProjectAttemptState::Skipped
+                        }) {
+                            super::model::RouteExecutionDisposition::GuardSkipped
+                        } else {
+                            super::model::RouteExecutionDisposition::Executed
+                        }
+                    || observation.artifact_requirements != outcome.artifact_requirements
+                    || observation
+                        .artifacts
+                        .iter()
+                        .map(|artifact| {
+                            (&artifact.path, &artifact.content_hash, artifact.bytes_len)
+                        })
+                        .collect::<Vec<_>>()
+                        != outcome
+                            .artifacts
+                            .iter()
+                            .map(|artifact| (&artifact.path, &artifact.sha256, artifact.bytes_len))
+                            .collect::<Vec<_>>()
+                {
+                    return Err(invalid(
+                        "validated selection receipt is not bound to observed candidate results",
+                    ));
+                }
+            }
+            Some(&receipt.selected_route_id)
+        }
+        RoutePolicy::RaceSuccess | RoutePolicy::RaceSettle => {
+            if race_trigger(project, prefix).is_some() {
+                if !race_selection_ready(project, &prefix[..prefix.len().saturating_sub(2)]) {
+                    return Err(invalid("race selection preceded worker drain"));
+                }
+                let winner = race_selected_settlement(project, prefix)
+                    .ok_or_else(|| invalid("race has no qualifying settlement"))?;
+                if winner.state == ProjectAttemptState::Aborted
+                    || winner
+                        .branch
+                        .and_then(|branch| project.plan.alternatives.get(branch))
+                        != winner.route_id.as_ref()
+                {
+                    return Err(invalid(
+                        "race selected a real branch error as a route result",
+                    ));
+                }
+                winner.route_id.as_ref()
+            } else {
+                if terminal.len() != project.plan.alternatives.len() {
+                    return Err(invalid("exhausted race omitted a terminal alternative"));
+                }
+                selection
+                    .candidates
+                    .last()
+                    .map(|candidate| &candidate.route_id)
+            }
+        }
+        _ => return Err(invalid("unexpected policy selection evidence")),
+    };
+    if winner != Some(&selection.selected_route_id) {
+        return Err(invalid(
+            "recorded policy winner differs from recomputed selection",
+        ));
+    }
+    if project.plan.policy != RoutePolicy::BenchmarkValidateAndSelect
+        && selection.validated_receipt.is_some()
+    {
+        return Err(invalid(
+            "unvalidated policy carries a validated-selection receipt",
+        ));
+    }
+    if events
+        .iter()
+        .any(|event| event.coordinator_ordinal > selected.coordinator_ordinal)
+    {
+        return Err(invalid(
+            "coordinator published events after final selection",
+        ));
+    }
+    Ok(())
+}
+
 fn recompute_continuation_evidence(
     project: &ProjectHGraph,
     events: &[ProjectAttemptEvent],
@@ -1773,6 +2207,10 @@ fn recompute_continuation_evidence(
         ProjectContinuationEvidence::NoExecution
     } else if every_executed_route_is_idempotent {
         ProjectContinuationEvidence::DeclaredIdempotent
+    } else if project.plan.execution_contract
+        == super::plan::ProjectExecutionContract::LegacyCompatibility
+    {
+        ProjectContinuationEvidence::LegacyUnchecked
     } else {
         ProjectContinuationEvidence::UnprovenEffects
     })
@@ -2054,7 +2492,7 @@ mod tests {
         assert_eq!(trace.format_version(), PROJECT_ATTEMPT_TRACE_VERSION);
         assert_eq!(trace.header(), &expected);
         let serialized = serde_json::to_value(&trace).unwrap();
-        assert_eq!(serialized["format_version"], 6);
+        assert_eq!(serialized["format_version"], 7);
         assert_eq!(serialized["header"]["project_name"], "project");
         assert_eq!(serialized["header"]["logical_graph_schema"], 1);
         assert_eq!(serialized["header"]["deployment_plan_schema"], 1);

@@ -36,6 +36,7 @@ WORLD_ATTESTATION_PATHS = (
     "evidence/world/g0-repository-conformance-2026-08-03-v2.toml",
     "evidence/world/g0-ostadix-alpha-branding-2026-08-09.toml",
     "evidence/world/g0-independent-engine-2026-08-17.toml",
+    "evidence/world/g0-attribution-history-continuity-2026-09-03.toml",
     "evidence/world/g2-aarch64-qemu.toml",
     "evidence/world/g2-aarch64-qemu-2026-08-03.toml",
 )
@@ -44,11 +45,13 @@ WORLD_EVIDENCE_EVENT_PATHS = {
     "evidence/world/g0-machine-contract-supersession-2026-08-03.toml",
     "evidence/world/g0-ostadix-alpha-branding-supersession-2026-08-09.toml",
     "evidence/world/g0-independent-engine-supersession-2026-08-17.toml",
+    "evidence/world/g0-attribution-history-continuity-supersession-2026-09-03.toml",
     "evidence/world/g0-schema-v3-supersession-2026-08-03.toml",
     "evidence/world/g2-derivation-rederive-2026-08-03.toml",
     "evidence/world/g2-counter-wording-supersession-2026-08-03.toml",
 }
 WORLD_EVIDENCE_RELEASE_PATHS = set(WORLD_ATTESTATION_PATHS) | WORLD_EVIDENCE_EVENT_PATHS
+WORLD_EVIDENCE_RELEASE_PATHS.add(release.WORLD_ATTRIBUTION_REWRITE_MAP_PATH)
 for _attestation_path in WORLD_ATTESTATION_PATHS:
     _attestation = tomllib.loads(
         (PROJECT_ROOT / _attestation_path).read_text(encoding="utf-8")
@@ -672,6 +675,9 @@ class WorkspaceFacadeReleaseValidationTests(unittest.TestCase):
         self.assertTrue(release.is_allowed_release_path("src/lib.rs"))
         self.assertTrue(release.is_allowed_release_path("src/bin/o-cli.rs"))
         self.assertTrue(release.is_allowed_release_path("src/bin/olangc.rs"))
+        self.assertTrue(
+            release.is_allowed_release_path("apps/olang-browser-wasi/index.html")
+        )
         self.assertFalse(release.is_allowed_release_path("src/eval.rs"))
         self.assertFalse(release.is_allowed_release_path("src/world/identity.rs"))
 
@@ -753,6 +759,10 @@ class SourceReleaseTests(unittest.TestCase):
             "CONTRIBUTING.md": "# Contributing\n",
             "Cargo.lock": "# fixture root lock\n",
             "Cargo.toml": FIXTURE_CARGO,
+            "apps/android-terminal/runtime/Cargo.lock": "# fixture Android runtime lock\n",
+            "apps/android-terminal/runtime/Cargo.toml": (
+                "[package]\nname = 'fixture-android-runtime'\nversion = '0.0.0'\n"
+            ),
             "crates/ostadix-api/Cargo.toml": FIXTURE_API_CARGO,
             "crates/ostadix-api/LICENSE": FIXTURE_LICENSE,
             "crates/ostadix-api/NOTICE": FIXTURE_NOTICE,
@@ -761,6 +771,42 @@ class SourceReleaseTests(unittest.TestCase):
             "crates/ostadix-api/src/api/aot_source.rs": FIXTURE_AOT_SOURCE,
             "crates/ostadix-api/src/lib.rs": FIXTURE_API_SOURCE,
             "crates/ostadix-api/tests/public_surface.rs": FIXTURE_API_TEST,
+            "crates/ostadix-api/src/computation/graph_realization_plan.rs": (
+                "// fixture multi-operation realization planning\n"
+            ),
+            "crates/ostadix-api/src/hgraph/semantics.rs": "// fixture execution observations\n",
+            "crates/ostadix-api/src/migration.rs": "// fixture acknowledged actor migration\n",
+            "crates/ostadix-api/tests/graph_realization_execution.rs": (
+                "#[test] fn graph_realization_execution_fixture() {}\n"
+            ),
+            "src/bin/olangc/embedded_runtime.rs": "// fixture embedded runtime launch\n",
+            "src/bin/olangc/runtime_bundle.rs": "// fixture runtime bundle collection\n",
+            "crates/ostadix-api/src/computation/oir_physical_execution.rs": "// fixture executable runtime capability\n",
+            "crates/ostadix-api/src/hosted_remote/v2/migration_protocol.rs": "// fixture executable runtime capability\n",
+            "crates/ostadix-api/src/hosted_remote/v2/migration_runtime.rs": "// fixture executable runtime capability\n",
+            "src/bin/olangc/linux_rootfs.rs": "// fixture executable runtime capability\n",
+            "scripts/collect_runtime_rootfs.py": "# fixture executable runtime capability\n",
+            "docs/OIR_PHYSICAL_EXECUTION_V1.md": "# fixture executable runtime capability\n",
+            "docs/HOSTED_ACTOR_MIGRATION.md": "# fixture executable runtime capability\n",
+            "docs/LINUX_RUNTIME_ROOTFS.md": "# fixture executable runtime capability\n",
+            "tests/oir_physical_execution.rs": "// fixture executable runtime capability\n",
+            "tests/hosted_actor_migration.rs": "// fixture executable runtime capability\n",
+            "tests/linux_runtime_rootfs.rs": "// fixture executable runtime capability\n",
+            "tests/test_runtime_rootfs_collection.py": "# fixture executable runtime capability\n",
+            "docs/BACKEND_MORPHISM_ENFORCEMENT_V1.md": "# Fixture morphism enforcement\n",
+            "docs/EMBEDDED_RUNTIME_BUNDLES.md": "# Fixture embedded runtime bundles\n",
+            "docs/EXECUTION_OBSERVATION_CONTRACT.md": "# Fixture execution observations\n",
+            "docs/LOCAL_ACTOR_MIGRATION.md": "# Fixture supported actor migration\n",
+            "docs/PHYSICAL_GRAPH_EXECUTION_V1.md": "# Fixture physical graph execution\n",
+            "docs/PYTHON_NATIVE_HANDLES.md": "# Fixture owner-process native handles\n",
+            "tests/actor_migration.rs": "#[test] fn actor_migration_fixture() {}\n",
+            "tests/backend_morphism_enforcement.rs": "#[test] fn morphism_enforcement_fixture() {}\n",
+            "tests/embedded_runtime_bundle.rs": "#[test] fn embedded_runtime_bundle_fixture() {}\n",
+            "tests/hgraph_observational_confluence.rs": "#[test] fn hgraph_confluence_fixture() {}\n",
+            "tests/python_native_handles.rs": "#[test] fn python_native_handles_fixture() {}\n",
+            "tests/test_morphism_enforcement_protocol.py": "# fixture morphism protocol tests\n",
+            "tests/test_python_native_handles.py": "# fixture native handle protocol tests\n",
+            "backends/o_native_objects.py": "# fixture owner-process native object support\n",
             "Dockerfile": "FROM scratch\n",
             "LICENSE": FIXTURE_LICENSE,
             "NOTICE": FIXTURE_NOTICE,
@@ -768,6 +814,20 @@ class SourceReleaseTests(unittest.TestCase):
             "README.md": fixture_readme(),
             "SECURITY.md": "# Security\n",
             "boot-and-test.sh": "#!/bin/sh\nexit 0\n",
+            "apps/olang-browser-wasi/browser-main.mjs": "// fixture browser entry\n",
+            "apps/olang-browser-wasi/browser-process.mjs": "// fixture browser process\n",
+            "apps/olang-browser-wasi/index.html": "<!doctype html><title>fixture</title>\n",
+            "apps/olang-browser-wasi/runner.mjs": "// fixture browser runner\n",
+            "apps/olang-browser-wasi/test-bundle.mjs": "// fixture bundle test\n",
+            "apps/olang-browser-wasi/test-browser.mjs": "// fixture browser test\n",
+            "apps/olang-browser-wasi/test-browser-harness.mjs": "// fixture browser harness test\n",
+            "apps/olang-browser-wasi/test-direct-wasm.mjs": (
+                "// fixture direct wasm test\n"
+            ),
+            "apps/olang-browser-wasi/test-host.mjs": "// fixture host test\n",
+            "apps/olang-browser-wasi/wasi-preview1-host.mjs": (
+                "// fixture WASI host\n"
+            ),
             "ci/architecture-roots.toml": (
                 PROJECT_ROOT / "ci/architecture-roots.toml"
             ).read_text(encoding="utf-8"),
@@ -791,6 +851,7 @@ class SourceReleaseTests(unittest.TestCase):
             "docs/releases/v0.3.0.md": "# Ostadix-lang v0.3.0 fixture\n",
             "docs/HOSTED_LIVE_REFERENCE.md": "fixture hosted reference\n",
             "docs/HOSTED_PLACEMENT_V6.md": "fixture hosted placement contract\n",
+            "docs/OFFLINE_AI_BUILD_KIT.md": "# Fixture offline AI build kit\n",
             "docs/PROJECT_MESH_V1.md": "fixture project mesh contract\n",
             "docs/UNIFIED_INTENT_FRONT_DOOR_V1.md": "fixture unified intent front door contract\n",
             "docs/OIR_EXECUTION_FABRIC_V1.md": "fixture OIR execution-fabric contract\n",
@@ -802,6 +863,12 @@ class SourceReleaseTests(unittest.TestCase):
             "docs/O_MACHINE_CONTRACT.md": WORLD_NORMATIVE_BYTES[
                 "docs/O_MACHINE_CONTRACT.md"
             ],
+            "docs/OPERATION_PLANNING_V1.md": (
+                "# Fixture operation-planning V1 contract\n"
+            ),
+            "docs/OPERATION_REALIZATION_V1.md": (
+                "# Fixture operation-realization V1 contract\n"
+            ),
             "docs/OSTADIX_BOOT.md": "# Fixture OSTADIX boot contract\n",
             "docs/OSTADIX_BOOT_OBJECTS.md": "# Fixture OSTADIX boot objects\n",
             "docs/OSTADIX_WORLD.md": WORLD_NORMATIVE_BYTES[
@@ -829,6 +896,9 @@ class SourceReleaseTests(unittest.TestCase):
                 "alpine-workstation-package-fixture\n"
             ),
             "evidence/gates.toml": fixture_evidence_manifest(),
+            "evidence/attribution-rewrite-2026-09-03.commit-map": (
+                PROJECT_ROOT / "evidence/attribution-rewrite-2026-09-03.commit-map"
+            ).read_bytes(),
             "evidence/world_alpha_gates.toml": WORLD_NORMATIVE_BYTES[
                 "evidence/world_alpha_gates.toml"
             ],
@@ -892,10 +962,27 @@ class SourceReleaseTests(unittest.TestCase):
             )
             + "\n",
             "examples/docker_literal/main.py": "__oval_result__ = 42\n",
+            "examples/normalize/input.json": "{\"values\": [1, 2, 3]}\n",
+            "examples/normalize/normalize_chunked.py": (
+                "__oval_result__ = {'values': [0.0, 0.5, 1.0]}\n"
+            ),
+            "examples/normalize/normalize_scalar.py": (
+                "__oval_result__ = {'values': [0.0, 0.5, 1.0]}\n"
+            ),
+            "examples/normalize/olang.project.toml": (
+                "name = \"normalize-fixture\"\n"
+                "[operation]\n"
+                "request = \"operation-planning-request.json\"\n"
+            ),
+            "examples/normalize/operation-planning-request.json": "{}\n",
             "examples/semantic_custody.O": "text^(fixture)_text\n",
             "examples/wasm_hello.O": "text^(fixture-wasm)_text\n",
             "examples/webassembly_hello.O": "text^(fixture-webassembly)_text\n",
             "llms.txt": "release index\n",
+            "fuzz/Cargo.lock": "# fixture fuzz lock\n",
+            "fuzz/Cargo.toml": (
+                "[package]\nname = 'fixture-fuzz'\nversion = '0.0.0'\n"
+            ),
             "mcp/ostadix_lang_mcp_server/Cargo.lock": (
                 "# This file is automatically @generated by Cargo.\n"
                 "version = 4\n\n"
@@ -939,6 +1026,12 @@ class SourceReleaseTests(unittest.TestCase):
             "ocore/kernel/build-x86_64-uefi-iso.sh": "#!/bin/sh\nexit 0\n",
             "ocore/kernel/build-x86_64-uefi-media.sh": "#!/bin/sh\nexit 0\n",
             "ocore/kernel/build.sh": "#!/bin/sh\nexit 0\n",
+            "ocore/kernel/capability_boot_test.oc": (
+                "module kernel::capability_boot_test;\n"
+            ),
+            "ocore/kernel/capability_boot_test_stub.oc": (
+                "module kernel::capability_boot_test;\n"
+            ),
             "ocore/kernel/main.oc": "module kernel::main;\n",
             "ocore/kernel/m6_mode25_diagnostics.oc": (
                 "module kernel::m6_mode25_diagnostics;\n"
@@ -1009,10 +1102,18 @@ class SourceReleaseTests(unittest.TestCase):
             "ocore/world/protocol.oc": "module world::protocol;\n",
             "ocore/world/receipt.oc": "module world::receipt;\n",
             "ocore/world/receipt_codec.oc": "module world::receipt_codec;\n",
+            "ocore/world/native_scalar.oc": "module world::native_scalar;\n",
+            "ocore/kernel/world_native_scalar_semantics.oc": "module kernel::world_native_scalar_semantics;\n",
+            "ocore/kernel/world_native_scalar_semantics_stub.oc": "module kernel::world_native_scalar_semantics;\n",
+            "ocore/kernel/smoke-world-native-scalar-qemu.sh": "#!/bin/sh\nexit 0\n",
+            "ocore/kernel/verify-native-scalar.py": "# fixture native verifier\n",
+            "tests/world_native_scalar.rs": "// fixture native scalar corpus\n",
             "ocore/world/sha256.oc": "module world::sha256;\n",
             "ocore/world/value.oc": "module world::value;\n",
             "ocore/world/value_codec.oc": "module world::value_codec;\n",
             "scripts/smoke_ostadix_mcp.py": "#!/usr/bin/env python3\n",
+            "scripts/bootstrap_offline_kit.sh": "#!/bin/sh\nexit 0\n",
+            "scripts/build_offline_kit.py": "#!/usr/bin/env python3\n",
             "scripts/foreign_kernel_lab.py": "#!/usr/bin/env python3\n",
             "scripts/smoke-docker.sh": "#!/usr/bin/env bash\n",
             "scripts/smoke-execution-fabric-v1.sh": "#!/usr/bin/env bash\n",
@@ -1055,6 +1156,7 @@ class SourceReleaseTests(unittest.TestCase):
             "crates/ostadix-api/src/computation/build_oir.rs": "// fixture ordinary-O computation projection\n",
             "crates/ostadix-api/src/computation/build_project.rs": "// fixture project computation projection\n",
             "crates/ostadix-api/src/computation/mod.rs": "pub mod verify;\n",
+            "crates/ostadix-api/src/computation/realization_plan.rs": "// fixture operation planning records\n",
             "crates/ostadix-api/src/computation/verify.rs": "// fixture computation artifact verification\n",
             "crates/ostadix-api/src/computation_core.rs": "// fixture authority-free computation identity\n",
             "crates/ostadix-api/src/dispatch_model.rs": "// fixture pure dispatch contract\n",
@@ -1236,6 +1338,11 @@ class SourceReleaseTests(unittest.TestCase):
             "tests/test_ostadix_wasm_release.py": (
                 "# fixture Olangc WASM release tests\n"
             ),
+            "tests/test_offline_kit.py": "# fixture offline-kit tests\n",
+            "tests/test_olang_browser_bundle.py": "# fixture browser-bundle tests\n",
+            "tests/qualify_offline_kit_recipient.py": (
+                "# fixture offline recipient qualification\n"
+            ),
             "tests/test_ostadix_boot_media.py": "# fixture boot-media tests\n",
             "tests/test_ostadix_boot_iso.py": "# fixture boot-iso tests\n",
             "tests/test_ostadix_boot_info_qemu.py": "# fixture boot-info QEMU tests\n",
@@ -1244,6 +1351,12 @@ class SourceReleaseTests(unittest.TestCase):
             "tests/test_o_cli_dispatch.py": "# fixture lowercase CLI dispatch tests\n",
             "tests/unified_intent_acceptance.rs": "#[test] fn unified_intent_acceptance_fixture() {}\n",
             "tests/o_cli_intent_blackbox.rs": "#[test] fn o_cli_intent_blackbox_fixture() {}\n",
+            "tests/o_cli_operation_blackbox.rs": (
+                "#[test] fn o_cli_operation_blackbox_fixture() {}\n"
+            ),
+            "tests/o_cli_operation_planner_blackbox.rs": (
+                "#[test] fn o_cli_operation_planner_blackbox_fixture() {}\n"
+            ),
             "tests/unified_plan_boundaries.rs": "#[test] fn unified_plan_boundaries_fixture() {}\n",
             "tests/test_release_evidence.py": "# fixture release evidence tests\n",
             "tests/test_setup.py": "# fixture setup tests\n",
@@ -1282,12 +1395,16 @@ class SourceReleaseTests(unittest.TestCase):
             contents[path] = (PROJECT_ROOT / path).read_bytes()
         for path in release.CPU_RUNTIME_BENCHMARK_PATHS:
             contents[path] = (PROJECT_ROOT / path).read_bytes()
+        for path in release.REAL_WORLD_BENCHMARK_RELEASE_PATHS:
+            contents[path] = (PROJECT_ROOT / path).read_bytes()
         for path in release.OSTADIX_API_ROOT_MODULE_PATHS.values():
             contents.setdefault(path, "// fixture engine root module\n")
         for path in release.OSTADIX_API_RUNTIME_ASSET_PATHS:
             contents.setdefault(path, b"fixture runtime asset\n")
         for path in release.HOSTED_TLS_TEST_IDENTITY_PATHS:
             contents.setdefault(path, b"fixture hosted TLS test identity\n")
+        for path in release.NATIVE_DISTRIBUTED_LINUX_RELEASE_PATHS:
+            contents.setdefault(path, b"fixture native source closure\n")
         if files:
             contents.update(files)
         for index in range(FIXTURE_EVIDENCE_GATE_COUNT):
@@ -1348,7 +1465,12 @@ class SourceReleaseTests(unittest.TestCase):
                     "scripts/ostadix_physical_evidence.py",
                     "scripts/ostadix_xorriso_reproducible.py",
                     "scripts/benchmark_hgraph_hosted.sh",
+                    "scripts/benchmark_real_world.sh",
+                    "benchmarks/real_world/timed_exec.py",
+                    "benchmarks/real_world/transcode_preview.sh",
                     "scripts/install-o-cli-wrapper.sh",
+                    "scripts/bootstrap_offline_kit.sh",
+                    "scripts/build_offline_kit.py",
                     "scripts/smoke-execution-fabric-v1.sh",
                     "scripts/smoke-zero-config-lan-netns.sh",
                     "scripts/smoke-project-hgraph-exec.sh",
@@ -1507,7 +1629,19 @@ class SourceReleaseTests(unittest.TestCase):
                 ".github/workflows/fuzz.yml",
                 ".gitignore",
                 ".mcp.json",
+                "apps/olang-browser-wasi/browser-main.mjs",
+                "apps/olang-browser-wasi/browser-process.mjs",
+                "apps/olang-browser-wasi/index.html",
+                "apps/olang-browser-wasi/runner.mjs",
+                "apps/olang-browser-wasi/test-bundle.mjs",
+                "apps/olang-browser-wasi/test-browser.mjs",
+                "apps/olang-browser-wasi/test-browser-harness.mjs",
+                "apps/olang-browser-wasi/test-direct-wasm.mjs",
+                "apps/olang-browser-wasi/test-host.mjs",
+                "apps/olang-browser-wasi/wasi-preview1-host.mjs",
                 "apps/android-terminal/README.md",
+                "apps/android-terminal/runtime/Cargo.lock",
+                "apps/android-terminal/runtime/Cargo.toml",
                 "apps/android-terminal/runtime/src/lib.rs",
                 "CITATION.cff",
                 "CHANGELOG.md",
@@ -1518,6 +1652,38 @@ class SourceReleaseTests(unittest.TestCase):
                 "crates/ostadix-api/Cargo.toml",
                 "crates/ostadix-api/src/lib.rs",
                 "crates/ostadix-api/tests/public_surface.rs",
+                "crates/ostadix-api/src/computation/graph_realization_plan.rs",
+                "crates/ostadix-api/src/hgraph/semantics.rs",
+                "crates/ostadix-api/src/migration.rs",
+                "crates/ostadix-api/tests/graph_realization_execution.rs",
+                "src/bin/olangc/embedded_runtime.rs",
+                "src/bin/olangc/runtime_bundle.rs",
+                "crates/ostadix-api/src/computation/oir_physical_execution.rs",
+                "crates/ostadix-api/src/hosted_remote/v2/migration_protocol.rs",
+                "crates/ostadix-api/src/hosted_remote/v2/migration_runtime.rs",
+                "src/bin/olangc/linux_rootfs.rs",
+                "scripts/collect_runtime_rootfs.py",
+                "docs/OIR_PHYSICAL_EXECUTION_V1.md",
+                "docs/HOSTED_ACTOR_MIGRATION.md",
+                "docs/LINUX_RUNTIME_ROOTFS.md",
+                "tests/oir_physical_execution.rs",
+                "tests/hosted_actor_migration.rs",
+                "tests/linux_runtime_rootfs.rs",
+                "tests/test_runtime_rootfs_collection.py",
+                "docs/BACKEND_MORPHISM_ENFORCEMENT_V1.md",
+                "docs/EMBEDDED_RUNTIME_BUNDLES.md",
+                "docs/EXECUTION_OBSERVATION_CONTRACT.md",
+                "docs/LOCAL_ACTOR_MIGRATION.md",
+                "docs/PHYSICAL_GRAPH_EXECUTION_V1.md",
+                "docs/PYTHON_NATIVE_HANDLES.md",
+                "tests/actor_migration.rs",
+                "tests/backend_morphism_enforcement.rs",
+                "tests/embedded_runtime_bundle.rs",
+                "tests/hgraph_observational_confluence.rs",
+                "tests/python_native_handles.rs",
+                "tests/test_morphism_enforcement_protocol.py",
+                "tests/test_python_native_handles.py",
+                "backends/o_native_objects.py",
                 "Dockerfile",
                 "LICENSE",
                 "NOTICE",
@@ -1540,6 +1706,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "docs/releases/v0.3.0.md",
                 "docs/HOSTED_LIVE_REFERENCE.md",
                 "docs/HOSTED_PLACEMENT_V6.md",
+                "docs/OFFLINE_AI_BUILD_KIT.md",
                 "docs/PROJECT_MESH_V1.md",
                 "docs/UNIFIED_INTENT_FRONT_DOOR_V1.md",
                 "docs/OIR_EXECUTION_FABRIC_V1.md",
@@ -1547,6 +1714,8 @@ class SourceReleaseTests(unittest.TestCase):
                 "docs/HOSTED_WORLD_REFERENCE_PROFILE.md",
                 "docs/KERNEL_WORLD_CONTRACT.md",
                 "docs/O_MACHINE_CONTRACT.md",
+                "docs/OPERATION_PLANNING_V1.md",
+                "docs/OPERATION_REALIZATION_V1.md",
                 "docs/OSTADIX_BOOT.md",
                 "docs/OSTADIX_BOOT_OBJECTS.md",
                 "docs/OSTADIX_WORLD.md",
@@ -1560,6 +1729,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "evidence/hosted_live_workstation_apk_packages.txt",
                 "evidence/foreign_kernel_lab.toml",
                 "evidence/gates.toml",
+                "evidence/attribution-rewrite-2026-09-03.commit-map",
                 "evidence/o_machine_contract_v1.toml",
                 "evidence/world_alpha_gates.toml",
                 "evidence/world_contract_v1.toml",
@@ -1570,6 +1740,8 @@ class SourceReleaseTests(unittest.TestCase):
                 "evidence/world/g0-ostadix-alpha-branding-supersession-2026-08-09.toml",
                 "evidence/world/g0-independent-engine-2026-08-17.toml",
                 "evidence/world/g0-independent-engine-supersession-2026-08-17.toml",
+                "evidence/world/g0-attribution-history-continuity-2026-09-03.toml",
+                "evidence/world/g0-attribution-history-continuity-supersession-2026-09-03.toml",
                 "evidence/world/g0-repository-conformance.toml",
                 "evidence/world/g0-repository-conformance-2026-08-03.toml",
                 "evidence/world/g0-repository-conformance-2026-08-03-v2.toml",
@@ -1583,14 +1755,22 @@ class SourceReleaseTests(unittest.TestCase):
                 "evidence/world/transcripts/g0-repository-conformance-2026-08-03-v2.log",
                 "evidence/world/transcripts/g0-ostadix-alpha-branding-2026-08-09.log",
                 "evidence/world/transcripts/g0-independent-engine-2026-08-17.log",
+                "evidence/world/transcripts/g0-attribution-history-continuity-2026-09-03.log",
                 "evidence/world/transcripts/g2-aarch64-qemu.log",
                 "evidence/world/transcripts/g2-aarch64-qemu-2026-08-03.log",
                 "examples/manifest.json",
                 "examples/docker_literal/main.py",
+                "examples/normalize/input.json",
+                "examples/normalize/normalize_chunked.py",
+                "examples/normalize/normalize_scalar.py",
+                "examples/normalize/olang.project.toml",
+                "examples/normalize/operation-planning-request.json",
                 "examples/semantic_custody.O",
                 "examples/wasm_hello.O",
                 "examples/webassembly_hello.O",
                 "llms.txt",
+                "fuzz/Cargo.lock",
+                "fuzz/Cargo.toml",
                 "mcp/ostadix_lang_mcp_server/Cargo.lock",
                 "mcp/ostadix_lang_mcp_server/Cargo.toml",
                 "mcp/ostadix_lang_mcp_server/README.md",
@@ -1611,6 +1791,8 @@ class SourceReleaseTests(unittest.TestCase):
                 "ocore/kernel/build-x86_64-uefi-iso.sh",
                 "ocore/kernel/build-x86_64-uefi-media.sh",
                 "ocore/kernel/build.sh",
+                "ocore/kernel/capability_boot_test.oc",
+                "ocore/kernel/capability_boot_test_stub.oc",
                 "ocore/kernel/main.oc",
                 "ocore/kernel/m6_mode25_diagnostics.oc",
                 "ocore/kernel/m6_mode25_diagnostics_stub.oc",
@@ -1655,10 +1837,18 @@ class SourceReleaseTests(unittest.TestCase):
                 "ocore/world/protocol.oc",
                 "ocore/world/receipt.oc",
                 "ocore/world/receipt_codec.oc",
+                "ocore/world/native_scalar.oc",
+                "ocore/kernel/world_native_scalar_semantics.oc",
+                "ocore/kernel/world_native_scalar_semantics_stub.oc",
+                "ocore/kernel/smoke-world-native-scalar-qemu.sh",
+                "ocore/kernel/verify-native-scalar.py",
+                "tests/world_native_scalar.rs",
                 "ocore/world/sha256.oc",
                 "ocore/world/value.oc",
                 "ocore/world/value_codec.oc",
                 "scripts/smoke_ostadix_mcp.py",
+                "scripts/bootstrap_offline_kit.sh",
+                "scripts/build_offline_kit.py",
                 "scripts/foreign_kernel_lab.py",
                 "scripts/smoke-docker.sh",
                 "scripts/smoke-execution-fabric-v1.sh",
@@ -1702,6 +1892,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "crates/ostadix-api/src/computation/build_oir.rs",
                 "crates/ostadix-api/src/computation/build_project.rs",
                 "crates/ostadix-api/src/computation/mod.rs",
+                "crates/ostadix-api/src/computation/realization_plan.rs",
                 "crates/ostadix-api/src/computation/verify.rs",
                 "crates/ostadix-api/src/computation_core.rs",
                 "crates/ostadix-api/src/dispatch_model.rs",
@@ -1862,6 +2053,9 @@ class SourceReleaseTests(unittest.TestCase):
                 "tests/test_ostadix_hosted_live_vga_smoke.py",
                 "tests/test_ostadix_ventoy_installer.py",
                 "tests/test_ostadix_wasm_release.py",
+                "tests/test_offline_kit.py",
+                "tests/test_olang_browser_bundle.py",
+                "tests/qualify_offline_kit_recipient.py",
                 "tests/test_ostadix_boot_iso.py",
                 "tests/test_ostadix_boot_media.py",
                 "tests/test_ostadix_boot_info_qemu.py",
@@ -1870,6 +2064,8 @@ class SourceReleaseTests(unittest.TestCase):
                 "tests/test_o_cli_dispatch.py",
                 "tests/unified_intent_acceptance.rs",
                 "tests/o_cli_intent_blackbox.rs",
+                "tests/o_cli_operation_blackbox.rs",
+                "tests/o_cli_operation_planner_blackbox.rs",
                 "tests/unified_plan_boundaries.rs",
                 "tests/test_release_evidence.py",
                 "tests/test_setup.py",
@@ -1917,8 +2113,10 @@ class SourceReleaseTests(unittest.TestCase):
             )
             included.update(release.HOSTED_HGRAPH_BENCHMARK_RELEASE_PATHS)
             included.update(release.CPU_RUNTIME_BENCHMARK_PATHS)
+            included.update(release.REAL_WORLD_BENCHMARK_RELEASE_PATHS)
             included.update(release.OSTADIX_API_RELEASE_PATHS)
             included.update(release.OSTADIX_API_ROOT_MODULE_PATHS.values())
+            included.update(release.NATIVE_DISTRIBUTED_LINUX_RELEASE_PATHS)
             excluded = {
                 ".DS_Store",
                 ".ocore-repair-backups/run/typeck.rs",
@@ -1989,6 +2187,8 @@ class SourceReleaseTests(unittest.TestCase):
                 "scripts/ostadix_xorriso_reproducible.py",
                 "scripts/smoke-execution-fabric-v1.sh",
                 "scripts/foreign_kernel_lab.py",
+                "scripts/bootstrap_offline_kit.sh",
+                "scripts/build_offline_kit.py",
             ):
                 self.assertEqual(modes[executable_path], "100755")
             self.assertEqual(modes["ocore/kernel/x86_64/grub-iso.cfg"], "100644")
@@ -1999,6 +2199,15 @@ class SourceReleaseTests(unittest.TestCase):
             self.assertEqual(modes["tests/fixtures/project_hgraph_tools/sh"], "100755")
             self.assertEqual(
                 modes["scripts/benchmark_hgraph_hosted.sh"], "100755"
+            )
+            self.assertEqual(
+                modes["scripts/benchmark_real_world.sh"], "100755"
+            )
+            self.assertEqual(
+                modes["benchmarks/real_world/transcode_preview.sh"], "100755"
+            )
+            self.assertEqual(
+                modes["benchmarks/real_world/timed_exec.py"], "100755"
             )
             checksums = archive.read(f"{prefix}/{release.CHECKSUMS_NAME}").decode()
             cargo_digest = hashlib.sha256(
@@ -2117,6 +2326,22 @@ class SourceReleaseTests(unittest.TestCase):
             r"unsupported Git mode 120000 for docs/escape-link",
         ):
             self._build("symlink.zip")
+
+    def test_offline_release_scripts_must_remain_executable(self) -> None:
+        self._commit()
+        paths = sorted(release.REQUIRED_EXECUTABLE_RELEASE_PATHS)
+        for path in paths:
+            (self.repo / path).chmod(0o644)
+        self._git("add", *paths)
+        self._git("commit", "-q", "-m", "remove offline script executable modes")
+
+        with self.assertRaisesRegex(
+            release.ReleaseError,
+            r"source release requires executable mode 100755",
+        ) as raised:
+            self._build("non-executable-offline-scripts.zip")
+        for path in paths:
+            self.assertIn(path, str(raised.exception))
 
     def test_unconfigured_gitlink_is_rejected_even_outside_allowlist(self) -> None:
         parent = self._commit()
@@ -2285,6 +2510,26 @@ class SourceReleaseTests(unittest.TestCase):
             r"TRANSCRIPT-2026-08-08-f216771\.log",
         ):
             self._build("missing-analyzer-bound-benchmark-evidence.zip")
+
+    def test_real_world_benchmark_is_a_required_release_closure(self) -> None:
+        self._commit()
+        self._git(
+            "rm",
+            "Olang_Mascot_little-o/little-o/qa/previews/failed.gif",
+            "benchmarks/real_world/README.md",
+            "benchmarks/real_world/video_previews.O",
+            "scripts/benchmark_real_world.sh",
+            "tests/test_benchmark_real_world.py",
+        )
+        self._git("commit", "-q", "-m", "remove real-world benchmark closure")
+
+        with self.assertRaisesRegex(
+            release.ReleaseError,
+            r"missing required path\(s\): .*failed\.gif.*README\.md.*"
+            r"video_previews\.O.*benchmark_real_world\.sh.*"
+            r"test_benchmark_real_world\.py",
+        ):
+            self._build("missing-real-world-benchmark.zip")
 
     def test_root_license_is_a_required_release_member(self) -> None:
         self._commit()
@@ -2459,6 +2704,42 @@ class SourceReleaseTests(unittest.TestCase):
         for required_path in required:
             self.assertIn(required_path, message)
 
+    def test_native_distributed_linux_is_a_required_release_closure(self) -> None:
+        required = (
+            "docs/NATIVE_DISTRIBUTED_LINUX_STATUS.md",
+            "ocore/guest/linux/README.md",
+            "ocore/guest/linux/build-initramfs.sh",
+            "ocore/guest/linux/init.c",
+            "ocore/kernel/aarch64/kernel_world/guest.dts",
+            "ocore/kernel/aarch64/kernel_world/linker.ld",
+            "ocore/kernel/aarch64/kernel_world/monitor.S",
+            "ocore/kernel/build-aarch64-kernel-world-linux.sh",
+            "ocore/kernel/smoke-aarch64-kernel-world-linux-qemu.py",
+            "ocore/kernel/native-cluster/boot.S",
+            "ocore/kernel/native-cluster/build.sh",
+            "ocore/kernel/native-cluster/linker.ld",
+            "ocore/kernel/native-cluster/main.oc",
+            "ocore/kernel/native-cluster/README.md",
+            "ocore/kernel/native-cluster/verify.py",
+            "ocore/runtime/aarch64/kernel_world_monitor.oc",
+            "ocore/runtime/aarch64/kernel_world_virtio.oc",
+            "ocore/runtime/aarch64/kernel_world_virtio_selftest.oc",
+            "ocore/runtime/x86_64/rtl8139.oc",
+            "ocore/world/native_distributed.oc",
+            "ocore/world/native_session.oc",
+            "scripts/build-real-linux-payload.sh",
+            "tests/test_native_cluster_harness.py",
+            "tests/test_kernel_world_real_linux.py",
+        )
+        self._commit()
+        archive = self._build("native-systems-closure.zip")
+        with zipfile.ZipFile(archive.output) as members:
+            for path in required:
+                self.assertIn(f"{archive.prefix}/{path}", members.namelist())
+        self._git("rm", *required)
+        self._git("commit", "-q", "-m", "remove native distributed Linux closure")
+        self._assert_missing_required_paths("missing-native-systems.zip", required)
+
     def test_hosted_placement_v6_commands_and_contract_are_required(self) -> None:
         required = (
             "backends/o_shim_common.py",
@@ -2599,6 +2880,8 @@ class SourceReleaseTests(unittest.TestCase):
             "docs/OSTADIX_BOOT.md",
             "ocore/kernel/build-x86_64-uefi-iso.sh",
             "ocore/kernel/build-x86_64-uefi-media.sh",
+            "ocore/kernel/capability_boot_test.oc",
+            "ocore/kernel/capability_boot_test_stub.oc",
             "ocore/kernel/resolve-x86_64-ovmf-code.sh",
             "ocore/kernel/run-x86_64-uefi-iso-qemu.sh",
             "ocore/kernel/run-x86_64-uefi-media-qemu.sh",
@@ -2703,6 +2986,48 @@ class SourceReleaseTests(unittest.TestCase):
             "tests/test_world_alpha_evidence.py",
         ):
             self.assertIn(path, message)
+
+    def test_attribution_rewrite_map_is_required_and_digest_pinned(self) -> None:
+        path = release.WORLD_ATTRIBUTION_REWRITE_MAP_PATH
+        self._commit()
+        self._git("rm", path)
+        self._git("commit", "-q", "-m", "remove attribution rewrite map")
+        self._assert_missing_required_paths(
+            "missing-attribution-rewrite-map.zip", (path,)
+        )
+
+        tampered = (PROJECT_ROOT / path).read_bytes() + b"tamper\n"
+        with self.assertRaisesRegex(
+            release.ReleaseError, "trusted history-rewrite map"
+        ):
+            release._validate_world_alpha_release_surface(
+                {path: tampered}, {path: "100644"}
+            )
+
+    def test_world_validator_has_distinct_historical_and_current_seals(self) -> None:
+        historical_path = "evidence/world/g0-independent-engine-2026-08-17.toml"
+        current_path = (
+            "evidence/world/g0-attribution-history-continuity-2026-09-03.toml"
+        )
+        historical_attestation = tomllib.loads(
+            (PROJECT_ROOT / historical_path).read_text(encoding="utf-8")
+        )
+        current_attestation = tomllib.loads(
+            (PROJECT_ROOT / current_path).read_text(encoding="utf-8")
+        )
+        historical = release.WORLD_HISTORICAL_VALIDATOR_SHA256_BY_ATTESTATION[
+            historical_path
+        ]
+        current = hashlib.sha256(
+            (PROJECT_ROOT / "scripts/world_alpha_evidence.py").read_bytes()
+        ).hexdigest()
+        self.assertEqual(historical_attestation["validator_sha256"], historical)
+        self.assertEqual(current_attestation["validator_sha256"], current)
+        self.assertEqual(release.WORLD_CURRENT_VALIDATOR_SHA256, current)
+        self.assertNotEqual(historical, current)
+        self.assertIn(historical_path, release.WORLD_HISTORICAL_ATTESTATION_SHA256)
+        self.assertNotIn(historical_path, release.WORLD_CURRENT_ATTESTATION_SHA256)
+        self.assertIn(current_path, release.WORLD_CURRENT_ATTESTATION_SHA256)
 
     def test_world_identity_cross_language_surface_is_required(self) -> None:
         self._commit()
@@ -2929,6 +3254,47 @@ class SourceReleaseTests(unittest.TestCase):
         ):
             release.verify_archive(tampered)
 
+    def test_runtime_capability_sources_docs_and_tests_are_required(self) -> None:
+        required = (
+            "backends/o_native_objects.py",
+            "crates/ostadix-api/backends/o_native_objects.py",
+            "crates/ostadix-api/src/computation/graph_realization_plan.rs",
+            "crates/ostadix-api/src/hgraph/semantics.rs",
+            "crates/ostadix-api/src/migration.rs",
+            "crates/ostadix-api/tests/graph_realization_execution.rs",
+            "src/bin/olangc/embedded_runtime.rs",
+            "src/bin/olangc/runtime_bundle.rs",
+            "crates/ostadix-api/src/computation/oir_physical_execution.rs",
+            "crates/ostadix-api/src/hosted_remote/v2/migration_protocol.rs",
+            "crates/ostadix-api/src/hosted_remote/v2/migration_runtime.rs",
+            "src/bin/olangc/linux_rootfs.rs",
+            "scripts/collect_runtime_rootfs.py",
+            "docs/OIR_PHYSICAL_EXECUTION_V1.md",
+            "docs/HOSTED_ACTOR_MIGRATION.md",
+            "docs/LINUX_RUNTIME_ROOTFS.md",
+            "tests/oir_physical_execution.rs",
+            "tests/hosted_actor_migration.rs",
+            "tests/linux_runtime_rootfs.rs",
+            "tests/test_runtime_rootfs_collection.py",
+            "docs/BACKEND_MORPHISM_ENFORCEMENT_V1.md",
+            "docs/EMBEDDED_RUNTIME_BUNDLES.md",
+            "docs/EXECUTION_OBSERVATION_CONTRACT.md",
+            "docs/LOCAL_ACTOR_MIGRATION.md",
+            "docs/PHYSICAL_GRAPH_EXECUTION_V1.md",
+            "docs/PYTHON_NATIVE_HANDLES.md",
+            "tests/actor_migration.rs",
+            "tests/backend_morphism_enforcement.rs",
+            "tests/embedded_runtime_bundle.rs",
+            "tests/hgraph_observational_confluence.rs",
+            "tests/python_native_handles.rs",
+            "tests/test_morphism_enforcement_protocol.py",
+            "tests/test_python_native_handles.py",
+        )
+        self._commit()
+        self._git("rm", *required)
+        self._git("commit", "-q", "-m", "remove runtime capability release surface")
+        self._assert_missing_required_paths("missing-runtime-capabilities.zip", required)
+
     def test_prepared_task_driver_pool_surface_is_required(self) -> None:
         self._commit()
         self._git(
@@ -2994,6 +3360,40 @@ class SourceReleaseTests(unittest.TestCase):
 
         self._assert_missing_required_paths(
             "missing-ocomputation-identity-spine.zip",
+            required,
+        )
+
+    def test_operation_realization_contract_is_required(self) -> None:
+        required = (
+            "docs/OPERATION_REALIZATION_V1.md",
+            "tests/o_cli_operation_blackbox.rs",
+        )
+        self._commit()
+        self._git("rm", *required)
+        self._git("commit", "-q", "-m", "remove operation-realization contract")
+
+        self._assert_missing_required_paths(
+            "missing-operation-realization-contract.zip",
+            required,
+        )
+
+    def test_operation_planning_release_closure_is_required(self) -> None:
+        required = (
+            "docs/OPERATION_PLANNING_V1.md",
+            "crates/ostadix-api/src/computation/realization_plan.rs",
+            "tests/o_cli_operation_planner_blackbox.rs",
+            "examples/normalize/input.json",
+            "examples/normalize/normalize_chunked.py",
+            "examples/normalize/normalize_scalar.py",
+            "examples/normalize/olang.project.toml",
+            "examples/normalize/operation-planning-request.json",
+        )
+        self._commit()
+        self._git("rm", *required)
+        self._git("commit", "-q", "-m", "remove operation-planning closure")
+
+        self._assert_missing_required_paths(
+            "missing-operation-planning-closure.zip",
             required,
         )
 
@@ -3112,6 +3512,20 @@ class SourceReleaseTests(unittest.TestCase):
                 "tests/project_world_runtime.rs",
             ),
         )
+
+    def test_native_scalar_execution_receipt_surface_is_required(self) -> None:
+        paths = (
+            "ocore/world/native_scalar.oc",
+            "ocore/kernel/world_native_scalar_semantics.oc",
+            "ocore/kernel/world_native_scalar_semantics_stub.oc",
+            "ocore/kernel/smoke-world-native-scalar-qemu.sh",
+            "ocore/kernel/verify-native-scalar.py",
+            "tests/world_native_scalar.rs",
+        )
+        self._commit()
+        self._git("rm", *paths)
+        self._git("commit", "-q", "-m", "remove native scalar receipt surface")
+        self._assert_missing_required_paths("missing-native-scalar.zip", paths)
 
     def test_world_normative_bytes_are_sealed_before_packaging(self) -> None:
         for path, data in WORLD_NORMATIVE_BYTES.items():
@@ -3241,6 +3655,18 @@ class SourceReleaseTests(unittest.TestCase):
                 release._validate_world_evidence_ledger_release_surface(
                     files, modes, {"G0"}, {"repository_conformance"}
                 )
+
+    def test_schema_v3_historical_attestation_retains_exact_byte_seal(self) -> None:
+        path = "evidence/world/g0-independent-engine-2026-08-17.toml"
+        files = {path: (PROJECT_ROOT / path).read_bytes() + b"\n"}
+        modes = {path: "100644"}
+        with self.assertRaisesRegex(
+            release.ReleaseError,
+            "historical attestation bytes differ from seal",
+        ):
+            release._validate_world_attestation_release_surface(
+                files, modes, path, "G0", "repository_conformance"
+            )
 
     def test_release_external_unverified_witness_is_status_inert(self) -> None:
         witness_path = "evidence/world/witness.toml"
@@ -3390,7 +3816,7 @@ class SourceReleaseTests(unittest.TestCase):
             release._validate_release_rederive_ledger([attestation], [])
 
     def test_fresh_attestation_cannot_couple_replace_the_trusted_validator(self) -> None:
-        path = "evidence/world/g0-independent-engine-2026-08-17.toml"
+        path = "evidence/world/g0-attribution-history-continuity-2026-09-03.toml"
         source_path = PROJECT_ROOT / path
         if not source_path.is_file():
             self.skipTest("fresh schema-v3 G0 attestation has not been minted yet")
@@ -3418,7 +3844,14 @@ class SourceReleaseTests(unittest.TestCase):
         replacement_digest = hashlib.sha256(files[validator_path]).hexdigest()
         record = files[path].decode("utf-8")
         self.assertGreaterEqual(record.count(old_digest), 2)
-        files[path] = record.replace(old_digest, replacement_digest).encode("utf-8")
+        record = record.replace(old_digest, replacement_digest)
+        for source in attestation["source"]:
+            released_path = release._released_path_for_historical_source(
+                source["path"]
+            )
+            released_digest = hashlib.sha256(files[released_path]).hexdigest()
+            record = record.replace(source["sha256"], released_digest)
+        files[path] = record.encode("utf-8")
         with self.assertRaisesRegex(
             release.ReleaseError,
             "validator_sha256 differs from the trusted validator bytes",
@@ -3428,7 +3861,7 @@ class SourceReleaseTests(unittest.TestCase):
             )
 
     def test_fresh_attestation_seal_rejects_coupled_transcript_rewrite(self) -> None:
-        path = "evidence/world/g0-independent-engine-2026-08-17.toml"
+        path = "evidence/world/g0-attribution-history-continuity-2026-09-03.toml"
         source_path = PROJECT_ROOT / path
         if not source_path.is_file():
             self.skipTest("fresh schema-v3 G0 attestation has not been minted yet")

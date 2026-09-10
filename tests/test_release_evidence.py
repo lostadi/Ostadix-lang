@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import re
+import subprocess
+import tempfile
 from pathlib import Path
 import sys
 import unittest
@@ -161,6 +164,45 @@ class AggregateOwnershipTests(unittest.TestCase):
             1,
         )
         self.assertIn("test result: ok. 1 passed; 0 failed;", root_source)
+
+
+class ProjectExecutionClaimGuardTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        script = (ROOT / "scripts/check_release_claims.sh").read_text(encoding="utf-8")
+        function = "require_fixed() {" + script.split("require_fixed() {", 1)[1].split("\n}\n", 1)[0] + "\n}\n"
+        block = script.split("# PROJECT_EXECUTION_CLAIMS_BEGIN\n", 1)[1].split("# PROJECT_EXECUTION_CLAIMS_END", 1)[0]
+        cls.guard = "set -eu\nfail=0\n" + function + block + '\nexit "$fail"\n'
+        cls.requirements = re.findall(r"require_fixed (\S+) \\\n    '([^']+)' \\\n    '([^']+)'", block)
+        if len(cls.requirements) < 27:
+            raise AssertionError("current execution/history guard lost protected contracts")
+        if len(cls.requirements) != block.count("require_fixed "):
+            raise AssertionError("a current project guard requirement escaped regression coverage")
+        cls.surfaces = {file: (ROOT / file).read_text(encoding="utf-8") for file, _, _ in cls.requirements}
+
+    def run_guard(self, surfaces):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for file, contents in surfaces.items():
+                path = root / file
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(contents, encoding="utf-8")
+            return subprocess.run(["bash", "-c", self.guard], cwd=root,
+                text=True, capture_output=True, timeout=15)
+
+    def test_current_execution_and_history_contracts_satisfy_guard(self):
+        result = self.run_guard(self.surfaces)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_each_contract_removal_fails_the_production_guard(self):
+        for file, required, reason in self.requirements:
+            with self.subTest(file=file, contract=required):
+                self.assertIn(required, self.surfaces[file])
+                changed = dict(self.surfaces)
+                changed[file] = changed[file].replace(required, "contract omitted for regression test")
+                result = self.run_guard(changed)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn(reason, result.stdout)
 
 
 if __name__ == "__main__":

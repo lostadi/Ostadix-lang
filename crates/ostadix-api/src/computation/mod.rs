@@ -1,9 +1,10 @@
-//! High-level builders for authority-free [`OComputation`](crate::computation_core)
-//! manifests.
+//! Builders and physical planning for [`OComputation`](crate::computation_core).
 //!
 //! Domain modules remain owners of their native representations. These
-//! builders only attach immutable facet identities and witnessed derivations
-//! to the low-level computation spine.
+//! manifest builders only attach immutable facet identities and witnessed
+//! derivations to the low-level computation spine. The graph executor requires
+//! separately registered adapters and their live admission checks; planning
+//! records carry no authority.
 
 use crate::computation_core::{
     artifact_id_for_bytes, ComputationLineageId, ComputationRevisionId, DerivationRefV1, FacetIdV1,
@@ -12,7 +13,14 @@ use crate::computation_core::{
 
 pub mod build_oir;
 pub mod build_project;
+pub mod graph_realization_plan;
+pub mod oir_physical_execution;
+pub mod realization_plan;
 pub mod verify;
+
+pub use graph_realization_plan::*;
+pub use oir_physical_execution::*;
+pub use realization_plan::*;
 
 /// Incremental manifest assembly with verification deferred to `finish`.
 /// This builder carries no execution authority and performs no dispatch.

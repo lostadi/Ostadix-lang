@@ -7,6 +7,7 @@ import subprocess
 from scripts.check_attribution import (
     CommitMetadata,
     LEGACY_POLICY_BASELINE,
+    ROOT,
     cargo_author_values,
     commit_violations,
     contains_forbidden_identity,
@@ -93,6 +94,25 @@ class AttributionPolicyTests(unittest.TestCase):
             subprocess.CompletedProcess([], 0, f"{parent}\n", ""),
         )
         self.assertEqual(policy_boundary("rewritten-head"), (introduction, parent))
+
+    def test_checked_in_legacy_baseline_is_policy_introduction_parent(self) -> None:
+        policy_commit, parent = policy_boundary("HEAD")
+        self.assertIsNotNone(policy_commit)
+        self.assertEqual(parent, LEGACY_POLICY_BASELINE)
+        resolved = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(ROOT),
+                "cat-file",
+                "-e",
+                f"{LEGACY_POLICY_BASELINE}^{{commit}}",
+            ],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self.assertEqual(resolved.returncode, 0)
 
     def test_missing_or_unrelated_push_base_uses_policy_boundary(self) -> None:
         fallback = "f" * 40

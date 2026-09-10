@@ -7,6 +7,9 @@ BUILD_DIR="${OCORE_BUILD_DIR:-$ROOT/target/ocore-m6a-personality}"
 # long aggregate run.  Keep the evidence assertions unchanged while giving the
 # fixed lifecycle enough wall-clock budget to finish under host contention.
 TIMEOUT_SECONDS="${OCORE_M6A_TIMEOUT_SECONDS:-180}"
+# Optional QEMU instruction-counted virtual-time exercise. CI pins shift 1 to
+# retain a bounded cadence that distinguished the periodic-timer starvation.
+QEMU_ICOUNT="${OCORE_M6A_QEMU_ICOUNT:-}"
 DIGEST="f5924eeb64b5a3d332e20b5d0fae7b233ae2714eb58b72ea07f08a4d26334417"
 IMAGE_BYTES=62104
 IMAGE="$ROOT/target/ocore-m6-artifacts/images/root-${DIGEST}.ovfs"
@@ -63,8 +66,9 @@ if grep -Eq '_O_runtime__m6_(client|personalityd|supervisord|observer)__' \
   exit 1
 fi
 
-python3 - "$BUILD_DIR/kernel.elf" "$TIMEOUT_SECONDS" "$DIGEST" \
-  "$IMAGE_BYTES" "$NM_TOOL" <<'PY'
+OCORE_M6A_QEMU_ICOUNT="$QEMU_ICOUNT" \
+  python3 - "$BUILD_DIR/kernel.elf" "$TIMEOUT_SECONDS" "$DIGEST" \
+    "$IMAGE_BYTES" "$NM_TOOL" <<'PY'
 import atexit
 import json
 import os
@@ -102,6 +106,9 @@ command = [
     "-no-reboot",
     "-no-shutdown",
 ]
+icount = os.environ.get("OCORE_M6A_QEMU_ICOUNT", "").strip()
+if icount:
+    command.extend(["-accel", "tcg", "-icount", icount])
 
 process = subprocess.Popen(
     command,
@@ -804,5 +811,7 @@ print(output, end="")
 print(
     f"M6A artifact identity: {image_bytes} bytes sha256={digest}"
 )
+if icount:
+    print(f"M6A instruction-counted virtual time: {icount}")
 print("M6A scalar personality smoke: PASS")
 PY

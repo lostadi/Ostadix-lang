@@ -1,0 +1,176 @@
+module world::native_distributed;
+
+use world::native_session::PACKET_BYTES;
+use world::native_session::authenticate;
+use world::native_session::begin;
+use world::native_session::sign;
+use world::native_session::get;
+use world::native_session::put;
+use world::native_session::copy;
+use world::native_session::equal;
+use world::native_session::digest;
+use world::native_session::input_digest;
+use world::native_session::tasks;
+use world::native_session::initial;
+use world::native_session::operand;
+
+// Four independent retained attempt slots, not one global RPC/wait slot.
+// This V1 graph is an explicitly delegated add chain: later work consumes the
+// exact prior output and its digest. Native code executes and settles it.
+// The cache lasts for this provisioned boot session only: no crash persistence,
+// retry across a new generation, replicated commit, or exactly-once effects.
+static mut REQUESTS: [u8; 1280] = [0; 1280];
+static mut RESULTS: [u8; 1280] = [0; 1280];
+static mut DRAIN_REQUEST: [u8; 320] = [0; 320];
+static mut DRAIN_RESPONSE: [u8; 320] = [0; 320];
+static mut EXPECTED_DIGEST: [u8; 32] = [0; 32];
+static mut LAST_DIGEST: [u8; 32] = [0; 32];
+static mut COMPLETED: u64 = 0;
+static mut LAST_RESULT: u64 = 0;
+static mut DUPLICATES: u64 = 0;
+static mut REJECTIONS: u64 = 0;
+static mut DRAINED: u8 = 0;
+static mut CONFIRMED: u8 = 0;
+
+pub unsafe fn executions() -> u64 { return COMPLETED; }
+pub unsafe fn duplicates() -> u64 { return DUPLICATES; }
+pub unsafe fn rejected() -> u64 { return REJECTIONS; }
+pub unsafe fn result() -> u64 { return LAST_RESULT; }
+
+unsafe fn reject() -> u64 {
+    if REJECTIONS < 0xffff_ffff_ffff_ffff { REJECTIONS += 1; }
+    return 0;
+}
+
+unsafe fn duplicate() -> void {
+    if DUPLICATES < 0xffff_ffff_ffff_ffff { DUPLICATES += 1; }
+}
+
+unsafe fn empty_control(packet: *const u8) -> bool {
+    let mut index: usize = 88;
+    while index < 256 {
+        if volatile_load(packet + index) != 0 { return false; }
+        index += 1;
+    }
+    return true;
+}
+
+// Return 0=rejected, 1=result, 2=drain acknowledgment, 3=drain confirmed.
+// Exact duplicates return the cached bytes without incrementing executions.
+pub unsafe fn handle(packet: *const u8, length: usize, response: *mut u8) -> u64 {
+    if response as usize == 0 || !authenticate(packet, length) { return reject(); }
+    let kind: u8 = volatile_load(packet + 11);
+    let sequence: u64 = get(packet + 80);
+    if kind == 5 {
+        if DRAINED == 0 || sequence != tasks() + 2 || !empty_control(packet) {
+            return reject();
+        }
+        CONFIRMED = 1;
+        return 3;
+    }
+    if kind == 3 {
+        if COMPLETED != tasks() || sequence != tasks() + 1 || !empty_control(packet)
+            || CONFIRMED != 0 { return reject(); }
+        if DRAINED != 0 {
+            if !equal(packet, (&DRAIN_REQUEST[0]), PACKET_BYTES) { return reject(); }
+            duplicate();
+            copy(response, (&DRAIN_RESPONSE[0]), PACKET_BYTES);
+            return 2;
+        }
+        if !begin(response, 4, sequence) { return reject(); }
+        put(response + 192, LAST_RESULT);
+        put(response + 200, COMPLETED);
+        put(response + 208, DUPLICATES);
+        put(response + 216, REJECTIONS);
+        copy(response + 224, (&LAST_DIGEST[0]), 32);
+        if !sign(response) { return reject(); }
+        copy((&mut DRAIN_REQUEST[0]), packet, PACKET_BYTES);
+        copy((&mut DRAIN_RESPONSE[0]), response as *const u8, PACKET_BYTES);
+        DRAINED = 1;
+        return 2;
+    }
+    if kind != 1 || sequence < 1 || sequence > tasks()
+        || get(packet + 88) != sequence || get(packet + 96) != 1
+        || get(packet + 120) != sequence - 1 || CONFIRMED != 0 { return reject(); }
+    let slot: usize = (sequence - 1) as usize;
+    if sequence <= COMPLETED {
+        if !equal(packet, (&REQUESTS[0]) + slot * PACKET_BYTES, PACKET_BYTES) {
+            return reject();
+        }
+        duplicate();
+        copy(response, (&RESULTS[0]) + slot * PACKET_BYTES, PACKET_BYTES);
+        return 1;
+    }
+    if DRAINED != 0 || sequence != COMPLETED + 1 { return reject(); }
+    let mut expected_left: u64 = LAST_RESULT;
+    if sequence == 1 { expected_left = initial(); }
+    if get(packet + 104) != expected_left || get(packet + 112) != operand(sequence)
+        || !equal(packet + 160, (&LAST_DIGEST[0]), 32)
+        || !input_digest(packet, (&mut EXPECTED_DIGEST[0]))
+        || !equal(packet + 128, (&EXPECTED_DIGEST[0]), 32) { return reject(); }
+    let mut index: usize = 192;
+    while index < 256 {
+        if volatile_load(packet + index) != 0 { return reject(); }
+        index += 1;
+    }
+    // The finite delegation bounds the accumulator by five u32 maxima, so
+    // this sum is total in u64, including dependent outputs larger than u32.
+    let value: u64 = expected_left + operand(sequence);
+    if !begin(response, 2, sequence) { return reject(); }
+    copy(response + 88, packet + 88, 104);
+    put(response + 192, value);
+    if !digest((response + 192) as *const u8, 8, response + 224) { return reject(); }
+    put(response + 200, COMPLETED + 1);
+    put(response + 208, DUPLICATES);
+    put(response + 216, REJECTIONS);
+    if !sign(response) { return reject(); }
+    // Publish the exact request/result cache and semantic state together on
+    // this single native dispatcher after every fallible preflight step.
+    copy((&mut REQUESTS[0]) + slot * PACKET_BYTES, packet, PACKET_BYTES);
+    copy((&mut RESULTS[0]) + slot * PACKET_BYTES, response as *const u8, PACKET_BYTES);
+    copy((&mut LAST_DIGEST[0]), (response + 224) as *const u8, 32);
+    LAST_RESULT = value;
+    COMPLETED += 1;
+    return 1;
+}
+
+pub unsafe fn request(packet: *mut u8, task: u64, prior_value: u64,
+    prior_digest: *const u8) -> bool {
+    if task < 1 || task > tasks() || prior_digest as usize == 0
+        || !begin(packet, 1, task) { return false; }
+    put(packet + 88, task);
+    put(packet + 96, 1);
+    put(packet + 104, prior_value);
+    put(packet + 112, operand(task));
+    put(packet + 120, task - 1);
+    copy(packet + 160, prior_digest, 32);
+    return input_digest(packet as *const u8, packet + 128) && sign(packet);
+}
+
+pub unsafe fn validate_result(request_packet: *const u8, packet: *const u8,
+    length: usize) -> bool {
+    if !authenticate(packet, length) || volatile_load(packet + 11) != 2
+        || get(packet + 80) != get(request_packet + 80)
+        || !equal(packet + 88, request_packet + 88, 104)
+        || get(packet + 200) != get(request_packet + 80)
+        || !digest(packet + 192, 8, (&mut EXPECTED_DIGEST[0]))
+        || !equal(packet + 224, (&EXPECTED_DIGEST[0]), 32) { return false; }
+    // Native semantic validation is independent of the worker's hash claim.
+    return get(packet + 192) == get(request_packet + 104) + get(request_packet + 112);
+}
+
+pub unsafe fn validate_drain_ack(packet: *const u8, length: usize,
+    expected_result: u64, expected_digest: *const u8) -> bool {
+    if expected_digest as usize == 0 || !authenticate(packet, length)
+        || volatile_load(packet + 11) != 4 || get(packet + 80) != tasks() + 1
+        || get(packet + 192) != expected_result || get(packet + 200) != tasks()
+        || !equal(packet + 224, expected_digest, 32) { return false; }
+    // Control acknowledgments have no task/op/input/dependency fields. An
+    // authentic noncanonical record must not become a drain observation.
+    let mut index: usize = 88;
+    while index < 192 {
+        if volatile_load(packet + index) != 0 { return false; }
+        index += 1;
+    }
+    return true;
+}

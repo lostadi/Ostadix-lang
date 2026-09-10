@@ -315,9 +315,9 @@ pub struct BackendInterface {
     pub required_authorities: Vec<BackendAuthority>,
 }
 /// How an OValue is rendered into a backend's splice buffer. The actual
-/// renderer functions live in eval.rs (they need OValue); the registry only
-/// records which strategy a backend uses, so the dispatch decision is
-/// centralized here while the value-level code stays with the evaluator.
+/// renderer functions live in `eval_core.rs` (they need OValue); the registry
+/// only records which strategy a backend uses, so dispatch stays centralized
+/// while the value-level code stays with the evaluator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpliceRenderer {
     /// Python literals (`None`, `True`, `[1, 2]`, …).
@@ -328,7 +328,8 @@ pub enum SpliceRenderer {
     Latex,
     /// Markdown-safe text.
     Markdown,
-    /// Syntactically valid Nix expressions.
+    /// Nix-oriented source expressions. Captured raw `NixExpr` bodies retain
+    /// their own backend parse obligation; other values render inertly.
     Nix,
     /// `OValue::splice_repr()` — the conservative cross-language form.
     Default,

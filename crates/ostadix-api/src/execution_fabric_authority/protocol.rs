@@ -929,6 +929,9 @@ impl FabricAttemptQueryV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+// This public request API predates the lint threshold. Boxing its primary
+// variant would break construction sites and add an allocation per submission.
+#[allow(clippy::large_enum_variant)]
 pub enum FabricRequestV1 {
     SubmitPureAttempt(FabricSubmissionV1),
     QueryAttempt(FabricAttemptQueryV1),
@@ -1455,6 +1458,8 @@ impl FabricTerminalCandidateV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+// Keep the public response representation allocation-free on the provider path.
+#[allow(clippy::large_enum_variant)]
 pub enum FabricResponseV1 {
     Accepted(FabricAttemptStatusV1),
     Running(FabricAttemptStatusV1),

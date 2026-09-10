@@ -18,14 +18,6 @@ INFO_BIN=${O_LANG_INFO_BIN:-"$ROOT/target/release/o-info"}
 DEVICE_BIN=${O_LANG_DEVICE_BIN:-"$ROOT/target/release/ostadix-device"}
 
 case "${1:-}" in
-    doctor)
-        shift
-        if [ ! -x "$DEVICE_BIN" ]; then
-            printf 'error: Android device controller is missing or not executable: %s\n' "$DEVICE_BIN" >&2
-            exit 1
-        fi
-        exec "$DEVICE_BIN" doctor "$@"
-        ;;
     device)
         shift
         if [ ! -x "$DEVICE_BIN" ]; then
@@ -34,7 +26,7 @@ case "${1:-}" in
         fi
         exec "$DEVICE_BIN" "$@"
         ;;
-    help|--help|-h|run|plan|explain|inspect|object)
+    help|--help|-h|run|routes|optimize|plan|explain|inspect|object|operation|realizations|observe|replan)
         if [ ! -x "$OCLI_BIN" ]; then
             printf 'error: compiled Ostadix front door is missing or not executable: %s\n' "$OCLI_BIN" >&2
             exit 1

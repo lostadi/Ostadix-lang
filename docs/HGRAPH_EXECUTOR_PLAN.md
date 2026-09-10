@@ -107,7 +107,7 @@ authority; a prior receipt cannot authorize a new run. Project HGraphs and the
 buffered Request scheduler also remain separate execution islands under the
 current V6 admission contract.
 
-Project inputs have a distinct logical-planning and opt-in hosted execution
+Project inputs have a distinct logical-planning and hosted execution
 surface:
 
 ```text
@@ -116,7 +116,7 @@ ProjectBundle -> shared ResolvedSelection -> ProjectExecutionPlan
               -> OExecutionResult + ProjectAttemptTrace
 
 ProjectHGraph -> LogicalHGraphV1 -> DeploymentPlanV1(hosted-unbound)
-                                  -> ProjectAttemptTrace v5 header binding
+                                  -> ProjectAttemptTrace v7 header binding
 
 LogicalHGraphV1 + PlacementSnapshotV1 + DeploymentPlanV1(snapshot-derived)
   -> HostedWorldLaunchV1 + HostedWorldCurrentV1
@@ -136,23 +136,47 @@ source plan and checks the exact operations, dependencies, effects, values, and
 graph projection. This closes a provenance gap that generic HGraph
 well-formedness and the intentionally OIR-only `source_plan` field cannot close.
 
-`olangc <project> --target ir|dot` remains inspection only. With
-`O_PROJECT_EXECUTOR=hgraph`, project script execution and compiled project
-binaries use `ProjectCoordinator` for one resolved `Explicit`/`Default`
-alternative or serial ordered `Fallback`/`AnySuccess` alternatives. The graph
-controls isolated materialization, prerequisite readiness, route execution,
-and policy selection. `Fallback` uses resolved priority order; `AnySuccess`
-uses declaration order. Both preserve the attempted result prefix and stop
-before materializing a later alternative after the first successful result.
-Parallel/racing and aggregate policies fail closed and never fall back to
-`run_selection`.
+`olangc <project> --target ir|dot` remains inspection only and uses the selected
+execution contract when computing graph identity. Default project execution
+uses `ProjectCoordinator` with a canonical `LegacyCompatibility` contract;
+`O_PROJECT_EXECUTOR=hgraph` selects the existing strict contract, and `legacy`
+explicitly selects the previous runtime. No graph failure triggers fallback.
 
-The compatibility project runtime remains the default when the environment
-variable is unset. In either mode, materialization and commands remain
-fallible `HostWorld` work even if a manifest declares `pure=true`. Logical
-alternative branches still share conservative ambient/resource chains; the
-ordered executor is not evidence of parallel or independently mediated branch
-execution.
+All ten policies execute through the graph. Explicit/default and ordered
+fallback/any-success preserve their ordering; `all` retains sequential legacy
+behavior. Race, equivalence, and benchmark policies launch graph-ready route
+workers concurrently, each branch owning its isolated workspace. Prerequisites
+and explicit shared resources remain graph dependencies. For these expressly
+parallel policies, `ConcurrentProjectBranch` retains unknown ambient effects
+but permits them to overlap across branches, with a shared HostWorld lease so
+explicit ambient exclusivity still fences access. `ProjectBranchPath` names
+paths in physically separate workspaces. These keys confer no governed World
+authority, host isolation, or strict effect-equivalence guarantee. Placement
+and grounding still classify the branch marker as residual ambient host access;
+a provider that denies that access remains incompatible.
+
+The logical source freezes `ProjectSchedulingContract`. New parallel plans
+explicitly encode `concurrent_branches_v1`; absence means the archived
+`serial_host_world_v1` graph, including its original global HostWorld/path
+chains and digest. Both reconstruct against the trusted bundle. The concurrent
+version is invalid for nonparallel policies. The continuation contract is
+independent: omitting its Strict default preserves earlier bytes only when the
+scheduling version is also unchanged.
+
+One coordinator owns publication. Race cancellation is triggered by the first
+qualifying branch settlement, including prerequisite/infrastructure failure
+for race-settle. Started workers are drained before final selection; typed
+cancellation is recorded as an aborted route with its causal terminal ordinal.
+Results and real branch errors that settle before cancellation takes effect
+retain declaration-order tie behavior. The cancellation cause remains the
+first observed qualifying event even when a different branch wins that tie. Equivalence and validated selection reuse the existing comparison
+algorithms and reference order. Validated selection preserves both terminal
+process time and complete branch time, its receipt, and progress events.
+Candidate-start callbacks complete before measurement begins. Candidate-finish
+callbacks use a separate delivery worker and are flushed before validation;
+route workers supply the actual completion instant, so callback and delivery
+queue delays do not enter the branch measurement. No observer worker is
+created when no observer is supplied.
 
 The normative World-v3 constitution and Hosted World profile are byte-sealed
 by the append-only G0 evidence ledger. Their older repository-status paragraphs
@@ -163,14 +187,12 @@ explicit supersession event. Nothing here claims G1.
 ## Deployment intention boundary
 
 World PR8-2 adds `DeploymentPlanV1` as a canonical intention record bound to
-the exact `LogicalHGraphV1` digest. The opt-in hosted executor derives only the
-hosted-unbound form. For coordinator-supported `Explicit`, `Default`,
-`Fallback`, and `AnySuccess` policies, `BuildRoute`, `SelectRoute`, and
-`CompareRouteResults` are `HostedCoordinator`; `MaterializeProject` and
-`RunRoute` are `AmbientHost`. The record carries no World, task, node, domain,
-process, provider, or placement identity. Unsupported hosted policies remain
-`Unresolved`; they do not acquire a placement by using the compatibility
-runtime.
+the exact `LogicalHGraphV1` digest, including the continuation contract. All
+current route policies have hosted bindings: `BuildRoute`, `SelectRoute`, and
+`CompareRouteResults` are `HostedCoordinator`; materialization and route
+commands are `AmbientHost`. The hosted-unbound form carries no World, task,
+node, domain, process, provider, or placement identity. Parallel policy markers
+retain residual ambient host truth and do not acquire a provider assignment.
 
 The active requirements derived from the logical graph are the exact project
 bundle, bundle-scoped role/path declarations, runtime classes,
@@ -187,7 +209,7 @@ exact `TaskIdentity` for each logical operation. It deterministically emits a
 `ProposedProvider` or `Unresolved` result from those descriptive facts. This is
 not current or authenticated inventory, Governor admission, authority,
 dispatch, reservation, provider health, or execution. `require_current_world`
-checks only World identity/epoch. The ordinary opt-in executor continues to use
+checks only World identity/epoch. The ordinary configured executor continues to use
 the hosted-unbound plan, but the separate hosted-reference World entry point
 does consume the exact snapshot-derived plan. `HostedWorldLaunchV1` binds the
 logical, deployment, snapshot, World, descriptive Governor position, selected
@@ -455,15 +477,20 @@ autonomous hosted task is submitted, the coordinator revalidates runtime
 artifacts, resolves live backend authority, and freezes the sandbox policy into
 the task.
 
-The separate hosted `ProjectCoordinator` is serial and uses the conservative
-launch rank plus stable ordinal as its baseline/tie-break order. For ordered
+The separate hosted `ProjectCoordinator` uses stable launch rank for dispatch
+and one coordinator for publication; expressly parallel policies launch ready
+route workers concurrently. For ordered
 first-success policies it prioritizes the now-ready `SelectRoute` choice over
 later potential branches; those later operations never receive `Ready` or
 `Started` attempt events. When the terminal alternative settles unsuccessfully,
-continuation is admitted only when every route child was guard-skipped or every
-executed route in that branch, including successful prerequisites, carries the bundle-bound
+under the strict contract continuation is admitted only when every route child
+was guard-skipped or every executed route in that branch, including successful prerequisites, carries the bundle-bound
 `failure_continuation = "declared_idempotent"` contract. The field defaults to
-`unproven`, which stops before the next branch. An infrastructure abort also
+`unproven`, which stops before the next branch under the strict contract. The
+default compatibility contract instead records `LegacyUnchecked` and admits
+legacy continuation; trusted-plan replay rejects that evidence under strict
+execution. Strict canonical JSON omits the default continuation field; the
+separate scheduling contract preserves archival graph reconstruction. An infrastructure abort also
 stops because it publishes no alternative result or resource successor. A
 nonzero prerequisite also hard-stops: this slice does not synthesize a
 branch-terminal result or continuation decision from a failed prerequisite,
@@ -473,8 +500,9 @@ operations use `Finished`. Recording the terminal event, storing the operation
 value, and publishing the settlement-appropriate outputs is the coordinator's
 local linearization point. The idempotency contract is an author declaration,
 not a verified sandbox, effect log, fence, compensation protocol, or proof of
-exactly-once external effects. This admission rule exists only in the opt-in
-hosted HGraph coordinator; it does not change the compatibility runtime.
+exactly-once external effects. Strict admission remains available through the
+explicit HGraph setting; default compatibility execution records unchecked
+continuation rather than asserting idempotence.
 Project-bundle format v2 carries the continuation contract. Legacy v1 bundles
 migrate only when all routes omit that field and then default to `unproven`;
 v1 documents carrying the v2 field and mislabeled serializer inputs are
@@ -506,7 +534,7 @@ lease, and no dispatch or overlap observed. Even a `yes` coverage value proves
 no simultaneous dispatch, CPU/memory fit, runtime readiness, placement, or
 dynamic-frontier bound.
 
-`ProjectAttemptTrace` version 5 binds events to the project name, bundle digest,
+`ProjectAttemptTrace` version 7 binds events to the project name, bundle digest,
 target, policy, canonical `LogicalHGraphV1` schema/digest, exact canonical
 deployment schema/digest, and an execution-attempt identifier. The ordinary
 path binds the hosted-unbound plan and uses a fresh diagnostic identifier. The
