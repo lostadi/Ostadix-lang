@@ -2941,7 +2941,7 @@ semver     = {{ version = "1", features = ["serde"] }}
 sha2       = "0.10"
 hex        = "0.4"
 ed25519-dalek = "2"
-num-bigint = {{ version = "0.4", features = ["serde"] }}
+num-bigint = {{ version = "0.5", features = ["serde"] }}
 num-traits = "0.2"
 bitflags   = "2"
 getrandom  = "0.4.3"
@@ -4388,6 +4388,19 @@ fn backend_state_root_and_legacy_paths_share_one_type_identity() {
     let compatibility: CompatibilityBackendStateTierV1 = canonical;
     let canonical_again: CanonicalBackendStateTierV1 = compatibility;
     assert_eq!(canonical_again, CanonicalBackendStateTierV1::SemanticSnapshot);
+}
+
+#[test]
+fn generated_bigint_dependency_preserves_public_value_identity_and_precision() {
+    let integer = (num_bigint::BigInt::from(1_u8) << 256_usize)
+        + num_bigint::BigInt::from(42_u8);
+    let value = ostadix_generated_serde::value::OValue::big_int(integer.clone());
+    assert_eq!(value.to_string(), integer.to_string());
+    let encoded = serde_json::to_vec(&value).unwrap();
+    let decoded: ostadix_generated_serde::value::OValue =
+        serde_json::from_slice(&encoded).unwrap();
+    assert_eq!(decoded, value);
+    assert_eq!(decoded.canonical_bytes(), value.canonical_bytes());
 }
 
 #[test]
