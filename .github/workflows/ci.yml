@@ -124,7 +124,7 @@ jobs:
       - name: Install semantic-test prerequisites
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends clang sqlite3
+          sudo apt-get install --yes --no-install-recommends clang openssl sqlite3
       - name: Verify declared runtime prerequisites
         run: python3 scripts/contract_surfaces.py probe-runtimes --suite rust-tests
       - name: Cache Cargo
@@ -176,7 +176,7 @@ jobs:
       - name: Install hosted prerequisites
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends clang iproute2 openssl sqlite3
+          sudo apt-get install --yes --no-install-recommends binutils clang iproute2 openssl sqlite3
       - name: Verify declared hosted runtimes
         run: python3 scripts/contract_surfaces.py probe-runtimes --suite rust-hosted
       - name: Cache Cargo
@@ -189,6 +189,11 @@ jobs:
           key: ${{ runner.os }}-cargo-hosted-${{ hashFiles('Cargo.lock') }}
       - name: Build hosted targets
         run: cargo +1.97.1 build --locked --workspace --all-targets --all-features
+      - name: Prove immutable rootfs execution and namespace lifecycle
+        timeout-minutes: 10
+        env:
+          OSTADIX_ROOTFS_TEST_SUDO: "1"
+        run: cargo +1.97.1 test --locked --package o-lang --all-features --test linux_runtime_rootfs one_binary_runs_python_bash_and_multicall_inside_immutable_private_root -- --ignored --exact --nocapture --test-threads=1
       - name: Prove zero-config non-loopback LAN path
         timeout-minutes: 2
         run: bash scripts/smoke-zero-config-lan-netns.sh
@@ -265,6 +270,7 @@ jobs:
           python3 -m tests.test_evaluator
           python3 -B tests/test_backend_state_protocol.py -v
           python3 -B tests/test_bundled_shim_protocol.py -v
+          python3 -m unittest -v tests.test_python_native_handles tests.test_morphism_enforcement_protocol tests.test_runtime_rootfs_collection
           python3 -m compileall -q o_lang backends tests
 
   c17:

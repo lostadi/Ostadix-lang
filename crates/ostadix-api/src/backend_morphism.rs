@@ -15,28 +15,13 @@ use thiserror::Error;
 
 pub use crate::backend_catalog::BackendMorphismProfileV1;
 use crate::backend_catalog::BackendRegistry;
+pub use crate::backend_state::{BackendCrossingContractV1, BackendMorphismReceiptV1};
 use crate::value::{AnnotationKind, FidelityAssessmentV2, FloatFormat, ONumber, OText, OValue};
 
 pub const BACKEND_MORPHISM_SCHEMA_V1: &str = "ostadix.backend-morphism/v1";
 pub const MAX_BACKEND_MORPHISM_DEPTH_V1: usize = 64;
 
-/// An opt-in executable crossing contract. It observes exact plain-data values
-/// (including numeric bits), not object identity, retained environments, or
-/// arbitrary future interactions with a Python object. The adapter rejects
-/// objects outside that carrier before lifting them into OValue.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum BackendCrossingContractV1 {
-    PythonPlainDataLossless,
-}
-
 impl BackendCrossingContractV1 {
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::PythonPlainDataLossless => "python-plain-data-lossless",
-        }
-    }
-
     pub fn validate_value(self, backend: &str, value: &OValue) -> Result<(), String> {
         if !matches!(
             BackendMorphismKernelV1::for_backend(backend),
@@ -73,19 +58,6 @@ impl BackendCrossingContractV1 {
         }
         Ok(())
     }
-}
-
-/// Receipt emitted by the trusted adapter after checking the actual native
-/// input and output carriers. A matching request id and input witnesses are
-/// required before the process registry can publish the result. This is not a
-/// proof about arbitrary code, host effects, or future contextual equivalence.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BackendMorphismReceiptV1 {
-    pub contract: BackendCrossingContractV1,
-    pub request_id: String,
-    pub input_witnesses: HashMap<String, OValue>,
-    pub value: OValue,
 }
 
 impl BackendMorphismReceiptV1 {

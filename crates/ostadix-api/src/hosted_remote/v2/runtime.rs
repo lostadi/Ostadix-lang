@@ -29,9 +29,8 @@ use super::auth::{
     AuthorizedPlacementV2, PlacementAuthorizationContextV2, SharedPlacementAuthorizerV2,
 };
 use super::crypto::{constant_time_eq, decode_fixed_hex, salted_bearer_hash};
-use super::migration_protocol::*;
+use super::migration_protocol::{MigrateSessionRequestV2, MigrationTransitionV2};
 use super::protocol::*;
-#[path = "migration_runtime.rs"]
 mod migration_runtime;
 use super::store::{DurableSessionStoreV2, DurableStoreReopenRequiredV2, JournalReadV2};
 

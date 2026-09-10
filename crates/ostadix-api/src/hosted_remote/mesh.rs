@@ -1085,7 +1085,6 @@ struct ActiveActorV1 {
 #[derive(Debug)]
 struct MeshNodeRuntimeInner {
     config: MeshNodeRuntimeConfig,
-    #[allow(dead_code)]
     state_lock: File,
     storage_used: Mutex<u64>,
     active_count: AtomicU32,
@@ -1095,6 +1094,16 @@ struct MeshNodeRuntimeInner {
     drain_gate: Mutex<()>,
     drain_condvar: Condvar,
     worker_failures: Mutex<Vec<String>>,
+}
+
+impl Drop for MeshNodeRuntimeInner {
+    fn drop(&mut self) {
+        // Closing our descriptor alone may leave the open file description
+        // locked in a concurrently forked child until that child execs. The
+        // final runtime owner explicitly releases its lock; shutdown and
+        // dropping individual runtime clones must not release it early.
+        let _ = fs2::FileExt::unlock(&self.state_lock);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -3770,7 +3779,34 @@ mod tests {
         runtime.shutdown().unwrap();
         drop(runtime);
         let reopened = MeshNodeRuntime::open(MeshNodeRuntimeConfig::new("mesh-node", &state));
-        assert!(reopened.is_ok());
+        assert!(reopened.is_ok(), "runtime reopen failed: {reopened:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_runtime_owner_releases_lock_with_an_inherited_descriptor() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        let runtime =
+            MeshNodeRuntime::open(MeshNodeRuntimeConfig::new("mesh-node", &state)).unwrap();
+        // A duplicate shares the locked open file description, just as a
+        // concurrently forked child does until it closes the file or execs.
+        // Keep it alive without depending on thread/process scheduling.
+        let inherited = runtime.inner.state_lock.try_clone().unwrap();
+        let last_owner = runtime.clone();
+        runtime.shutdown().unwrap();
+        drop(runtime);
+        assert!(
+            MeshNodeRuntime::open(MeshNodeRuntimeConfig::new("mesh-node", &state)).is_err(),
+            "shutdown must not release state ownership while a runtime clone survives"
+        );
+        drop(last_owner);
+        let reopened = MeshNodeRuntime::open(MeshNodeRuntimeConfig::new("mesh-node", &state));
+        assert!(
+            reopened.is_ok(),
+            "final runtime owner left the lock held by an inherited descriptor: {reopened:?}"
+        );
+        drop(inherited);
     }
 
     #[test]

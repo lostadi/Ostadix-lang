@@ -23,6 +23,7 @@ use crate::backend_morphism::{BackendCrossingObservationV1, RuntimeCrossingState
 use crate::effects::EffectSummary;
 use crate::eval_core::{
     derive_policy_contexts, trace_fingerprint, ExecutionTrace, GraphEvalFrame, GraphEvaluationHost,
+    GraphExecutionBoundary,
 };
 use crate::evidence::{AdmittedExecution, DispatchAdapterV1, DispatchLaneV1, FailureClassV1};
 use crate::execution_contract::{validate_execution_metadata, BlockOptions, Policy};
@@ -100,7 +101,7 @@ struct OpState {
 }
 
 pub struct Coordinator<'a> {
-    physical: Option<crate::computation::oir_physical_execution::OirPhysicalSession>,
+    physical: Option<Box<dyn GraphExecutionBoundary>>,
     admitted: AdmittedExecution<'a>,
     program: &'a OIrProgram,
     plan: &'a ExecutionPlan,
@@ -217,11 +218,11 @@ impl<'a> Coordinator<'a> {
         })
     }
 
-    pub(crate) fn with_physical_session(
+    pub(crate) fn with_execution_boundary(
         mut self,
-        physical: crate::computation::oir_physical_execution::OirPhysicalSession,
+        boundary: impl GraphExecutionBoundary + 'static,
     ) -> Self {
-        self.physical = Some(physical);
+        self.physical = Some(Box::new(boundary));
         self
     }
 

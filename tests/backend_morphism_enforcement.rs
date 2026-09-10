@@ -9,6 +9,27 @@ use o_lang::value::OValue;
 
 mod support;
 
+#[test]
+fn public_morphism_types_reexport_the_wire_identity_and_keep_validation_methods() {
+    use o_lang::backend_morphism::{BackendCrossingContractV1, BackendMorphismReceiptV1};
+
+    let contract = BackendCrossingContractV1::PythonPlainDataLossless;
+    let wire_contract: o_lang::backend_state::BackendCrossingContractV1 = contract;
+    assert_eq!(wire_contract.name(), "python-plain-data-lossless");
+    contract.validate_value("python", &OValue::int(42)).unwrap();
+    assert!(wire_contract
+        .validate_value("javascript", &OValue::int(42))
+        .is_err());
+    let receipt: o_lang::backend_state::BackendMorphismReceiptV1 = BackendMorphismReceiptV1 {
+        contract,
+        request_id: "reexported-contract".to_owned(),
+        input_witnesses: Default::default(),
+        value: OValue::Null,
+    };
+    let original_api_type: BackendMorphismReceiptV1 = receipt;
+    assert_eq!(original_api_type.contract, wire_contract);
+}
+
 struct Fixture {
     directory: tempfile::TempDir,
     binary: PathBuf,

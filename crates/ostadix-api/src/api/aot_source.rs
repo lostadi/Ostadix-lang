@@ -88,7 +88,7 @@ pub const RUNTIME_HOSTED_REMOTE_FABRIC_SOURCES: &[(&str, &str)] = &[
 ];
 pub const RUNTIME_EVAL_CORE_RS: &str = include_str!("../eval_core.rs");
 pub const RUNTIME_EVAL_RS: &str = include_str!("../eval.rs");
-pub const RUNTIME_MIGRATION_RS: &str = include_str!("../migration.rs");
+pub const RUNTIME_MIGRATION_RS: &str = include_str!("../eval/migration.rs");
 pub const RUNTIME_PROCESS_RS: &str = include_str!("../process.rs");
 pub const RUNTIME_BACKEND_RS: &str = include_str!("../backend.rs");
 pub const RUNTIME_BACKEND_MORPHISM_RS: &str = include_str!("../backend_morphism.rs");

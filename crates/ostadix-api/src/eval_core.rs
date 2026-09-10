@@ -117,6 +117,61 @@ impl GraphEvalFrame {
     }
 }
 
+/// Original inputs temporarily replaced at one operation's execution boundary.
+/// The coordinator restores them after preparation or execution, including
+/// ordinary error returns, so another consumer keeps its original inputs.
+pub(crate) struct GraphInputRestore {
+    values: Vec<(PlanNodeId, OValue)>,
+    scope: HashMap<String, OValue>,
+}
+
+impl GraphInputRestore {
+    pub(crate) fn replace(
+        frame: &mut GraphEvalFrame,
+        replacements: Vec<(PlanNodeId, OValue)>,
+        bindings: HashMap<String, OValue>,
+    ) -> Self {
+        let scope = std::mem::replace(&mut frame.base_scope, bindings);
+        let mut values = Vec::with_capacity(replacements.len());
+        for (id, value) in replacements {
+            values.push((
+                id,
+                frame.values[id.0]
+                    .replace(value)
+                    .expect("materialized source"),
+            ));
+        }
+        Self { values, scope }
+    }
+
+    pub(crate) fn restore(self, frame: &mut GraphEvalFrame) {
+        for (id, value) in self.values {
+            frame.values[id.0] = Some(value);
+        }
+        frame.base_scope = self.scope;
+    }
+}
+
+/// Optional input delivery and lifecycle hooks for an admitted graph run.
+///
+/// The coordinator remains the scheduling and admission authority; this
+/// interface cannot select workers or execute an operation. Indices follow
+/// the admitted ready-operation schedule. Implementations must validate every
+/// delivered input before replacing the frame, leaving it unchanged on error.
+/// Planning records and transport implementations stay above this shared
+/// evaluator-independent boundary.
+pub(crate) trait GraphExecutionBoundary: Send + Sync {
+    fn prepare_inputs(
+        &mut self,
+        index: usize,
+        frame: &mut GraphEvalFrame,
+    ) -> Result<GraphInputRestore>;
+
+    fn started(&self, index: usize);
+
+    fn completed(&mut self, index: usize, success: bool);
+}
+
 /// The evaluator authority and state operations required by graph execution.
 ///
 /// This trait is deliberately crate-private and has no `Send` bound: the
