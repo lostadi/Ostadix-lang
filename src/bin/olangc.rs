@@ -18,6 +18,7 @@
 //   olangc <input.O> --target ir --why P3         # explain one admitted operation
 //   olangc <input.O> --target dot                 # Graphviz DOT hypergraph
 //   olangc <input.O> --shim-dir ./backends        # custom shim directory
+//   olangc <input.O> --runtime-bundle ./runtimes  # embed supplied runtime tree
 //
 // Target A ("binary"):
 //   1. Reads the .O source file.
@@ -41,8 +42,10 @@
 //
 //   The output binary is fully self-contained at the Rust level: it has no
 //   dependency on the .O source file, the backends/ directory, or the olangc
-//   tool itself. At runtime it still needs the language runtimes that the .O
-//   program uses: Python for python^ blocks, Nix for nix^ blocks, etc.
+//   tool itself. By default it needs the language runtimes that the .O program
+//   uses. --runtime-bundle embeds an explicit relocatable tree and confines
+//   command lookup to its bin/. OS/library/service closure needs separate
+//   qualification; payload embedding alone is not hermetic execution.
 //
 // Target B ("wasm"):
 //   Generates the same hosted runtime project for wasm32-wasip1. With
@@ -93,6 +96,9 @@ use o_lang::parser::Parser;
 use o_lang::shims::read_shims;
 use o_lang::value::OValue;
 use o_lang::world::{GroundingReport, WorldEpoch, WorldId, WorldIdentity};
+
+#[path = "olangc/runtime_bundle.rs"]
+mod runtime_bundle;
 
 // Cargo.lock from the workspace — embedded so the temp project gets identical
 // resolved dependency versions (Cargo may still download an absent crate).
@@ -248,6 +254,12 @@ struct Cli {
     #[arg(long)]
     shim_dir: Option<PathBuf>,
 
+    /// Embed a supplied relocatable runtime tree (runtime.json and bin/).
+    /// Native ordinary .O binaries only. Runtime command lookup uses bundled
+    /// bin/ exclusively; OS/dynamic-library/service closure is not inferred.
+    #[arg(long, value_name = "DIR")]
+    runtime_bundle: Option<PathBuf>,
+
     /// Keep the intermediate build directory after compilation (useful for
     /// debugging; relevant for binary and wasm targets)
     #[arg(long)]
@@ -326,6 +338,9 @@ fn main() -> Result<()> {
     }
 
     let cli = Cli::parse();
+    if cli.runtime_bundle.is_some() && cli.target != CompileTarget::Binary {
+        bail!("--runtime-bundle requires --target binary");
+    }
     validate_admission_inspection(&cli)?;
     let grounding_world = parse_grounding_world(&cli)?;
 
@@ -342,6 +357,9 @@ fn main() -> Result<()> {
     // lists and runs the same routes.
     let is_project = input_is_dir || o_lang::project::lower::has_embedded_bundle(&source);
     if is_project {
+        if cli.runtime_bundle.is_some() {
+            bail!("--runtime-bundle currently requires an ordinary .O input");
+        }
         if cli.explain_schedule || cli.why.is_some() {
             bail!(
                 "--explain-schedule and --why currently admit ordinary .O HGraphs only; project HGraph admission is deferred"
@@ -409,6 +427,9 @@ fn main() -> Result<()> {
                     &output,
                     &cli.backend_grants,
                 )?;
+                if let Some(bundle) = &cli.runtime_bundle {
+                    runtime_bundle::embed(bundle, materialize_dir)?;
+                }
                 let (materialized_target, rust_target) = match cli.target {
                     CompileTarget::Binary => ("binary", "native"),
                     CompileTarget::Wasm => ("wasm", "wasm32-wasip1"),
@@ -432,7 +453,13 @@ fn main() -> Result<()> {
                     &shims,
                     &build_dir,
                     &output,
-                    cli.target == CompileTarget::Wasm,
+                    if cli.target == CompileTarget::Wasm {
+                        BinaryTarget::Wasm
+                    } else {
+                        BinaryTarget::Native {
+                            runtime_bundle: cli.runtime_bundle.as_deref(),
+                        }
+                    },
                     &cli.backend_grants,
                 );
 
@@ -1102,17 +1129,29 @@ fn write_binary_cargo_project(
     Ok(bin_name)
 }
 
+enum BinaryTarget<'a> {
+    Native { runtime_bundle: Option<&'a Path> },
+    Wasm,
+}
+
 fn compile_to_binary(
     input_path: &Path,
     source: &str,
     shims: &[(String, Vec<u8>)],
     build_dir: &Path,
     output: &Path,
-    is_wasm: bool,
+    target: BinaryTarget<'_>,
     backend_grants: &[String],
 ) -> Result<()> {
     let bin_name =
         write_binary_cargo_project(input_path, source, shims, build_dir, output, backend_grants)?;
+    if let BinaryTarget::Native {
+        runtime_bundle: Some(bundle),
+    } = target
+    {
+        runtime_bundle::embed(bundle, build_dir)?;
+    }
+    let is_wasm = matches!(target, BinaryTarget::Wasm);
 
     // ── Build ────────────────────────────────────────────────────────────────
     let mut cargo_args = vec!["build", "--release", "--locked"];
@@ -1330,7 +1369,7 @@ fn compile_browser_bundle(
         shims,
         &build_dir,
         &temporary_wasm,
-        true,
+        BinaryTarget::Wasm,
         backend_grants,
     );
     if let Err(error) = build_result {
@@ -1515,6 +1554,26 @@ fn write_browser_bundle(
 
 fn write_runtime_sources(src_dir: &Path) -> Result<()> {
     fs::create_dir_all(src_dir)?;
+    fs::write(
+        src_dir.join("computation_core.rs"),
+        RUNTIME_COMPUTATION_CORE_RS,
+    )?;
+    let computation_dir = src_dir.join("computation");
+    fs::create_dir_all(&computation_dir)?;
+    fs::write(
+        computation_dir.join("realization_plan.rs"),
+        RUNTIME_REALIZATION_PLAN_RS,
+    )?;
+    fs::write(
+        computation_dir.join("graph_realization_plan.rs"),
+        RUNTIME_GRAPH_REALIZATION_PLAN_RS,
+    )?;
+    fs::write(
+        computation_dir.join("oir_physical_execution.rs"),
+        RUNTIME_OIR_PHYSICAL_EXECUTION_RS,
+    )?;
+    fs::write(computation_dir.join("mod.rs"),
+        "pub mod realization_plan;\npub mod graph_realization_plan;\npub mod oir_physical_execution;\npub use realization_plan::*;\npub use graph_realization_plan::*;\npub use oir_physical_execution::*;\n")?;
     fs::write(src_dir.join("value.rs"), RUNTIME_VALUE_RS)?;
     fs::write(src_dir.join("capability.rs"), RUNTIME_CAPABILITY_RS)?;
     fs::write(src_dir.join("environment.rs"), RUNTIME_ENVIRONMENT_RS)?;
@@ -1553,6 +1612,8 @@ fn write_runtime_sources(src_dir: &Path) -> Result<()> {
     }
     fs::write(src_dir.join("eval_core.rs"), RUNTIME_EVAL_CORE_RS)?;
     fs::write(src_dir.join("eval.rs"), RUNTIME_EVAL_RS)?;
+    fs::create_dir_all(src_dir.join("eval"))?;
+    fs::write(src_dir.join("eval/migration.rs"), RUNTIME_MIGRATION_RS)?;
     fs::write(src_dir.join("process.rs"), RUNTIME_PROCESS_RS)?;
     fs::write(src_dir.join("backend.rs"), RUNTIME_BACKEND_RS)?;
     fs::write(
@@ -1635,6 +1696,7 @@ fn write_runtime_sources(src_dir: &Path) -> Result<()> {
     fs::write(hgraph_dir.join("kinds.rs"), RUNTIME_HGRAPH_KINDS_RS)?;
     fs::write(hgraph_dir.join("from_oir.rs"), RUNTIME_HGRAPH_FROM_OIR_RS)?;
     fs::write(hgraph_dir.join("schedule.rs"), RUNTIME_HGRAPH_SCHEDULE_RS)?;
+    fs::write(hgraph_dir.join("semantics.rs"), RUNTIME_HGRAPH_SEMANTICS_RS)?;
     fs::write(hgraph_dir.join("solve.rs"), RUNTIME_HGRAPH_SOLVE_RS)?;
 
     // ── executor: state-complete graph coordinator ──────────────────────────
@@ -2399,6 +2461,11 @@ fn generate_lib_rs(include_project: bool) -> String {
 // calls them directly.
 
 pub mod value;
+pub(crate) mod shims {{
+    pub(crate) const BUNDLED_SHIM_SUPPORT_NAMES: &[&str] = &{RUNTIME_SHIM_SUPPORT_NAMES:?};
+}}
+pub mod computation_core;
+pub mod computation;
 mod capability;
 pub mod environment;
 pub mod backend;
@@ -3559,6 +3626,24 @@ mod tests {
         fs::write(src_dir.join("lib.rs"), generate_lib_rs(false)).unwrap();
 
         let lib_rs = fs::read_to_string(src_dir.join("lib.rs")).unwrap();
+        assert!(lib_rs.contains("pub mod computation_core;"));
+        assert!(lib_rs.contains("pub mod computation;"));
+        assert_eq!(
+            fs::read_to_string(src_dir.join("computation_core.rs")).unwrap(),
+            RUNTIME_COMPUTATION_CORE_RS
+        );
+        assert_eq!(
+            fs::read_to_string(src_dir.join("computation/realization_plan.rs")).unwrap(),
+            RUNTIME_REALIZATION_PLAN_RS
+        );
+        assert_eq!(
+            fs::read_to_string(src_dir.join("computation/graph_realization_plan.rs")).unwrap(),
+            RUNTIME_GRAPH_REALIZATION_PLAN_RS
+        );
+        assert_eq!(
+            fs::read_to_string(src_dir.join("computation/oir_physical_execution.rs")).unwrap(),
+            RUNTIME_OIR_PHYSICAL_EXECUTION_RS
+        );
         assert!(lib_rs.contains("pub mod effects;"));
         assert!(lib_rs.contains("pub mod execution_contract;"));
         assert!(lib_rs.contains("pub(crate) mod eval_core;"));

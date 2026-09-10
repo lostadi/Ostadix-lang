@@ -67,6 +67,7 @@ enum ParallelTaskBody {
         shim: PathBuf,
         sandbox: BackendSandboxPolicy,
         executable_leases: Arc<crate::runtime_exec::ExecutableLeaseSet>,
+        morphism_contract: Option<crate::backend_morphism::BackendCrossingContractV1>,
     },
 }
 
@@ -77,6 +78,7 @@ pub(crate) struct EphemeralShimRuntime {
     shim: PathBuf,
     sandbox: BackendSandboxPolicy,
     executable_leases: Arc<crate::runtime_exec::ExecutableLeaseSet>,
+    morphism_contract: Option<crate::backend_morphism::BackendCrossingContractV1>,
 }
 
 impl EphemeralShimRuntime {
@@ -84,11 +86,13 @@ impl EphemeralShimRuntime {
         shim: PathBuf,
         sandbox: BackendSandboxPolicy,
         executable_leases: Arc<crate::runtime_exec::ExecutableLeaseSet>,
+        morphism_contract: Option<crate::backend_morphism::BackendCrossingContractV1>,
     ) -> Self {
         Self {
             shim,
             sandbox,
             executable_leases,
+            morphism_contract,
         }
     }
 }
@@ -499,11 +503,17 @@ fn build_task(
                 shim,
                 sandbox,
                 executable_leases,
+                morphism_contract,
             } = shim_runtime.ok_or_else(|| {
                 anyhow::anyhow!("ephemeral shim adapter requires an authorized runtime binding")
             })?;
             let children = plan.child_schedule(id).map_err(anyhow::Error::msg)?;
             let bindings = frame.exec_scope(id, plan)?;
+            if let Some(contract) = morphism_contract {
+                contract
+                    .validate_bindings(&language, &bindings)
+                    .map_err(anyhow::Error::msg)?;
+            }
             let mut code = String::new();
             for child in children {
                 match &plan.nodes[child.0].kind {
@@ -515,7 +525,15 @@ fn build_task(
                             bail!("text plan node {} did not materialize a string", child.0);
                         }
                     }
-                    _ => code.push_str(&render_with(renderer, frame.value(child)?)),
+                    _ => {
+                        let value = frame.value(child)?;
+                        if let Some(contract) = morphism_contract {
+                            contract
+                                .validate_value(&language, value)
+                                .map_err(anyhow::Error::msg)?;
+                        }
+                        code.push_str(&render_with(renderer, value));
+                    }
                 }
             }
             ParallelTaskBody::EphemeralShim {
@@ -525,6 +543,7 @@ fn build_task(
                 shim,
                 sandbox,
                 executable_leases,
+                morphism_contract,
             }
         }
         TaskKind::Renderer {
@@ -666,15 +685,20 @@ fn execute_prepared(task: &ParallelTask, context: &TaskContext) -> Result<OValue
             shim,
             sandbox,
             executable_leases,
+            morphism_contract,
         } => {
             let lexical_bindings = bindings.clone();
             run_ephemeral_with_eval_callback(
                 language,
                 code,
                 bindings.clone(),
-                shim,
-                sandbox,
-                Some(executable_leases),
+                crate::process::BackendLaunchContext {
+                    shim_path: shim,
+                    sandbox,
+                    executable_leases: Some(executable_leases),
+                    launch_generation_sha256: None,
+                },
+                *morphism_contract,
                 |src, explicit_scope, remaining| {
                     let callback_scope = match explicit_scope {
                         None => lexical_bindings.clone(),
