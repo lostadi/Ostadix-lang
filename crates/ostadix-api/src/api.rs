@@ -18,8 +18,9 @@ pub mod aot_source;
 
 pub use crate::backend_morphism::{
     render_rust_scalar_stdout_program_v1, shadow_assess_backend_morphism_v1,
-    BackendMorphismAssessmentV1, BackendMorphismErrorV1, BackendMorphismKernelV1,
-    BackendMorphismV1, BackendNativeValueV1, BACKEND_MORPHISM_SCHEMA_V1,
+    BackendCrossingContractV1, BackendMorphismAssessmentV1, BackendMorphismErrorV1,
+    BackendMorphismKernelV1, BackendMorphismReceiptV1, BackendMorphismV1, BackendNativeValueV1,
+    BACKEND_MORPHISM_SCHEMA_V1,
 };
 pub use crate::eval::{
     Evaluator, PlacementFragmentBindingsV1, PlacementFragmentBindingsV2,

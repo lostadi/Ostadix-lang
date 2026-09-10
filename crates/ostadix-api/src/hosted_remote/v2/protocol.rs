@@ -90,6 +90,8 @@ pub enum SessionStatusV2 {
     Ready,
     Executing,
     RecoveryRequired,
+    Migrating,
+    Migrated,
     Quarantined,
     Closing,
     Closed,
@@ -101,6 +103,7 @@ pub enum PlacementPurposeV2 {
     OpenSession,
     Execute,
     Recover,
+    Migrate,
 }
 
 /// The exact hosted command whose digest is carried by canonical
@@ -182,7 +185,7 @@ impl HostedCommandBindingV2 {
                 // authorization enforces None exactly in that initial state
                 // and requires Some(current generation) thereafter.
             }
-            PlacementPurposeV2::Recover => {
+            PlacementPurposeV2::Recover | PlacementPurposeV2::Migrate => {
                 if self.client_sequence == 0
                     || self.operation_sha256.is_some()
                     || self.recovery_warrant_sha256.is_none()
@@ -664,6 +667,10 @@ pub struct SessionQueryV2 {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum HostedRequestV2 {
+    MigrateSession {
+        protocol: String,
+        request: Box<super::migration_protocol::MigrateSessionRequestV2>,
+    },
     OpenSession {
         protocol: String,
         request: OpenSessionRequestV2,
@@ -697,7 +704,8 @@ pub enum HostedRequestV2 {
 impl HostedRequestV2 {
     pub fn validate(&self) -> Result<()> {
         let protocol = match self {
-            Self::OpenSession { protocol, .. }
+            Self::MigrateSession { protocol, .. }
+            | Self::OpenSession { protocol, .. }
             | Self::SubmitOperation { protocol, .. }
             | Self::Status { protocol, .. }
             | Self::Actors { protocol, .. }
@@ -709,6 +717,7 @@ impl HostedRequestV2 {
             bail!("unsupported hosted protocol `{protocol}`");
         }
         match self {
+            Self::MigrateSession { request, .. } => request.validate()?,
             Self::OpenSession { request, .. } => {
                 request.validate()?;
             }
@@ -850,6 +859,9 @@ pub struct SessionViewV2 {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum JournalEventV2 {
+    MigrationTransition {
+        transition: Box<super::migration_protocol::MigrationTransitionV2>,
+    },
     SessionOpened {
         request_sha256: String,
         principal_sha256: String,
@@ -1044,6 +1056,7 @@ impl JournalEventV2 {
 
     pub fn placement_lease_sha256(&self) -> Option<&str> {
         match self {
+            Self::MigrationTransition { transition } => Some(&transition.placement_lease_sha256),
             Self::SessionOpened {
                 placement_lease_sha256,
                 ..
@@ -1074,6 +1087,7 @@ impl JournalEventV2 {
 
     pub fn placement_lease_nonce(&self) -> Option<&str> {
         match self {
+            Self::MigrationTransition { transition } => Some(&transition.placement_lease_nonce),
             Self::SessionOpened {
                 placement_lease_nonce,
                 ..
@@ -1104,6 +1118,11 @@ impl JournalEventV2 {
 
     pub fn client_commit(&self) -> Option<(u64, &str, &str)> {
         match self {
+            Self::MigrationTransition { transition } if transition.terminal => Some((
+                transition.client_sequence,
+                &transition.client_request_id,
+                &transition.request_sha256,
+            )),
             Self::OperationAccepted {
                 client_sequence,
                 client_request_id,
@@ -1167,6 +1186,10 @@ pub struct SignedJournalEntryV2 {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "response", rename_all = "snake_case")]
 pub enum HostedResponseV2 {
+    Migration {
+        receipt: SignedJournalEntryV2,
+        snapshot: Option<crate::backend_state::EvaluatorStateSnapshotV1>,
+    },
     SessionOpened {
         capability: SessionCapabilityV2,
         receipt: SignedJournalEntryV2,
@@ -1247,7 +1270,7 @@ fn validate_capability_v2(value: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_client_mutation_v2(sequence: u64, request_id: &str) -> Result<()> {
+pub(super) fn validate_client_mutation_v2(sequence: u64, request_id: &str) -> Result<()> {
     if sequence == 0 || sequence == u64::MAX {
         bail!("session mutation sequence must be between one and u64::MAX - 1");
     }

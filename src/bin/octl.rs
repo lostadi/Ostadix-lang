@@ -1206,7 +1206,7 @@ fn authority_issue(args: AuthorityIssueArgs) -> Result<()> {
                 command.state_reservation.clone(),
             )
         }
-        PlacementPurposeV2::Execute | PlacementPurposeV2::Recover => {
+        PlacementPurposeV2::Execute | PlacementPurposeV2::Recover | PlacementPurposeV2::Migrate => {
             if observation.is_some() {
                 bail!("only open-session leases may carry a state-capacity observation");
             }
