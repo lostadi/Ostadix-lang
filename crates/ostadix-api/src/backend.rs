@@ -112,8 +112,15 @@ pub fn run_backend(lang: &str) -> Result<()> {
             }
         }
         let response = match command {
+            BackendWireCommandV2::ExecMorphismV1 { .. } => BackendWireResponseV2::err(
+                "morphism.unsupported-backend: this native adapter has no executable morphism contract",
+            ),
             BackendWireCommandV2::Exec { code, bindings } => {
-                match backend.exec(lang, &code, bindings) {
+                let result = if lang == "javascript" && (code.contains("O.native_")
+                    || bindings.values().any(|value| matches!(value, OValue::Native { .. }))) {
+                    run_javascript_native_bridge(&backend.tools, &code, &bindings, &mut reader, &mut writer)
+                } else { backend.exec(lang, &code, bindings) };
+                match result {
                     Ok(value) => BackendWireResponseV2::ok(value),
                     Err(error) => BackendWireResponseV2::err(format!("{error:#}")),
                 }
@@ -126,6 +133,9 @@ pub fn run_backend(lang: &str) -> Result<()> {
             BackendWireCommandV2::Ping => BackendWireResponseV2::ok(OValue::Null),
             BackendWireCommandV2::EvalResult { .. } => BackendWireResponseV2::err(
                 "backend received eval_result without a pending eval request",
+            ),
+            BackendWireCommandV2::NativeOperationV1 { .. } => BackendWireResponseV2::err(
+                "native.unsupported-owner: this adapter does not retain Python objects",
             ),
             BackendWireCommandV2::StateCapabilitiesV1 => {
                 BackendWireResponseV2::StateCapabilitiesV1 {
@@ -819,6 +829,171 @@ fn run_script(
     )
 }
 
+// A dedicated inherited socket carries callbacks; ordinary stdout/stderr keep
+// their existing meanings and can contain arbitrary bytes without impersonating
+// protocol frames. The parent evaluator remains the operation coordinator.
+#[cfg(unix)]
+fn run_javascript_native_bridge(
+    tools: &BackendToolchain,
+    code: &str,
+    bindings: &HashMap<String, OValue>,
+    host_input: &mut impl io::Read,
+    host_output: &mut impl Write,
+) -> Result<OValue> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
+    use std::os::unix::process::CommandExt;
+    let temp = TempDir::new("o-native-javascript")?;
+    let source = temp.path().join("main.js");
+    fs::write(
+        &source,
+        format!(
+            "{JAVASCRIPT_NATIVE_BRIDGE}\n{}\n{code}",
+            javascript_preamble(bindings)
+        ),
+    )?;
+    let (socket, child_socket) = UnixStream::pair()?;
+    let child_fd = child_socket.as_raw_fd();
+    let mut command = tools.command("node")?;
+    command
+        .arg(source)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // SAFETY: dup2/fcntl are async-signal-safe; no allocation or locks in the
+    // child hook. FD3 is reserved only in this child's native bridge process.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::dup2(child_fd, 3) < 0 || libc::fcntl(3, libc::F_SETFD, 0) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = command.spawn()?;
+    drop(child_socket);
+    let output = thread::spawn(move || child.wait_with_output());
+    let mut socket_reader = BufReader::new(socket.try_clone()?);
+    let mut socket_writer = socket;
+    let bridge = (|| -> Result<()> {
+        loop {
+            use std::io::Read as _;
+            let mut line = Vec::new();
+            let read = (&mut socket_reader)
+                .take(16 * 1024 * 1024 + 1)
+                .read_until(b'\n', &mut line)?;
+            if read == 0 {
+                return Ok(());
+            }
+            if read > 16 * 1024 * 1024 || line.last() != Some(&b'\n') {
+                bail!("native.request-too-large: JavaScript bridge frame exceeds 16 MiB");
+            }
+            let request: BackendWireResponseV2 = serde_json::from_slice(&line)?;
+            if !matches!(request, BackendWireResponseV2::EvalRequest { .. }) {
+                bail!("native.invalid-request: bridge accepts only evaluator callbacks");
+            }
+            wire::write_frame(host_output, &request)?;
+            let response = wire::read_frame::<_, BackendWireCommandV2>(host_input)?
+                .context("native.coordinator-closed: callback did not receive a result")?;
+            let BackendWireCommandV2::EvalResult { value } = response else {
+                bail!("native.invalid-response: callback expected eval_result");
+            };
+            serde_json::to_writer(&mut socket_writer, &value)?;
+            socket_writer.write_all(b"\n")?;
+        }
+    })();
+    // EOF also wakes a consumer blocked on an operation when the coordinator
+    // rejects a frame. The outer owned process group/deadline handles programs
+    // that deliberately ignore that failure or retain a duplicate socket.
+    let _ = socket_writer.shutdown(std::net::Shutdown::Both);
+    let result = output
+        .join()
+        .map_err(|_| anyhow!("JavaScript output reader panicked"))??;
+    bridge?;
+    output_to_value("javascript", result)
+}
+
+#[cfg(not(unix))]
+fn run_javascript_native_bridge(
+    _tools: &BackendToolchain,
+    _code: &str,
+    _bindings: &HashMap<String, OValue>,
+    _host_input: &mut impl io::Read,
+    _host_output: &mut impl Write,
+) -> Result<OValue> {
+    bail!(
+        "native.unsupported-transport: JavaScript owner operations currently require Unix sockets"
+    )
+}
+
+const JAVASCRIPT_NATIVE_BRIDGE: &str = r#"
+(() => {
+  const fs = require('fs');
+  const wire = (value, seen = new Set(), depth = 0) => {
+    if (depth > 64) throw Error('native.argument-depth');
+    if (value === null) return {t:'null'};
+    if (typeof value === 'boolean') return {t:'bool',v:value};
+    if (typeof value === 'string') return {t:'text',v:{utf8:value,encoding:'utf-8'}};
+    if (typeof value === 'bigint') return {t:'number',v:{kind:'int',v:value.toString()}};
+    if (typeof value === 'number') {
+      if (!Number.isFinite(value)) throw Error('native.nonfinite-argument');
+      if (Number.isSafeInteger(value) && !Object.is(value,-0))
+        return {t:'number',v:{kind:'int',v:value.toString()}};
+      const bits=Buffer.alloc(8); bits.writeDoubleBE(value);
+      return {t:'number',v:{kind:'binary_float',format:'f64',bits:[...bits]}};
+    }
+    if (typeof value !== 'object') throw Error('native.unsupported-argument');
+    if (value.t === 'native') return value;
+    if (seen.has(value)) throw Error('native.aliased-argument: pass a native handle for identity');
+    seen.add(value);
+    if (Array.isArray(value)) return {t:'list',v:value.map(v=>wire(v,seen,depth+1))};
+    if (![Object.prototype,null].includes(Object.getPrototypeOf(value))) throw Error('native.unsupported-argument');
+    const result={};
+    for (const key of Reflect.ownKeys(value)) {
+      const entry=Object.getOwnPropertyDescriptor(value,key);
+      if (typeof key!=='string' || !('value' in entry)) throw Error('native.unsupported-argument');
+      Object.defineProperty(result,key,{value:wire(entry.value,seen,depth+1),enumerable:true});
+    }
+    return {t:'map',v:result};
+  };
+  const lift = value => {
+    if (value.t==='error') throw Error(value.msg);
+    if (value.t==='native') return value;
+    if (value.t==='null') return null;
+    if (value.t==='bool') return value.v;
+    if (value.t==='text') return value.v.utf8;
+    if (value.t==='number' && value.v.kind==='int') {
+      const n=BigInt(value.v.v); return n>=BigInt(Number.MIN_SAFE_INTEGER)&&n<=BigInt(Number.MAX_SAFE_INTEGER)?Number(n):n;
+    }
+    if (value.t==='number' && value.v.kind==='binary_float' && value.v.format==='f64')
+      return Buffer.from(value.v.bits).readDoubleBE();
+    throw Error('native.unsupported-result');
+  };
+  const invoke=(name,bindings) => {
+    const names=Object.keys(bindings), scope={};
+    for(const key of names) scope[key]=wire(bindings[key]);
+    const request={status:'eval_request',src:name+'('+names.map(n=>'$'+n).join(',')+')',scope:{t:'scope',bindings:scope}};
+    const encoded=Buffer.from(JSON.stringify(request)+'\n');
+    if(encoded.length>16*1024*1024) throw Error('native.request-too-large');
+    let offset=0; while(offset<encoded.length) offset+=fs.writeSync(3,encoded,offset);
+    const bytes=[], byte=Buffer.alloc(1);
+    while(true) {
+      if(fs.readSync(3,byte,0,1,null)===0) throw Error('native.coordinator-closed');
+      if(byte[0]===10) break;
+      if(bytes.length>=16*1024*1024) throw Error('native.response-too-large');
+      bytes.push(byte[0]);
+    }
+    return lift(JSON.parse(Buffer.from(bytes).toString('utf8')));
+  };
+  globalThis.O=Object.freeze({
+    native_call:(handle,...args)=>invoke('native_call',{handle,args}),
+    native_get:(handle,name)=>invoke('native_get',{handle,name}),
+    native_set:(handle,name,value)=>invoke('native_set',{handle,name,value}),
+    native_release:handle=>invoke('native_release',{handle})
+  });
+})();
+"#;
+
 fn run_file_command(
     tools: &BackendToolchain,
     label: &str,
@@ -1511,6 +1686,7 @@ fn javascript_preamble(bindings: &HashMap<String, OValue>) -> String {
             OValue::Null => preamble.push_str(&format!("const {name} = null;\n")),
             OValue::List { v } => push_json_const(&mut preamble, name, v),
             OValue::Map { v } => push_json_const(&mut preamble, name, v),
+            OValue::Native { .. } => push_json_const(&mut preamble, name, value),
             _ => {}
         }
     }

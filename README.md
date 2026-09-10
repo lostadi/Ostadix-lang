@@ -647,6 +647,9 @@ execution behavior at that rollover. V6 retains the V5 projection shape and
 adds ordered `wasm-tools+wasmtime` and `wasm-tools+wasmer` WebAssembly runtime
 alternatives after the two frozen WABT alternatives. Package 0.3 separately makes Graph
 V2/Evidence V6 current; morphism profiles remain shadow metadata on that path.
+An explicit [Python plain-data crossing contract](docs/BACKEND_MORPHISM_ENFORCEMENT_V1.md)
+now enforces supported conversions at actual dispatch boundaries. It does not
+change those catalog profiles into universal proofs.
 Rebuild the runtime and MCP server, then regenerate
 short-lived profiles and all derived placement evidence after this rollover. The
 exact boundary and regeneration sequence are in [Hosted Placement
@@ -2982,7 +2985,12 @@ Python.render_child(ONumber::Int(42))
 With N languages and this single protocol, interoperability costs O(N) code,
 one renderer per language, instead of O(N squared) bridges between every
 pair. The canonical exchange form is explicit and inspectable rather than
-hidden in a compiler pass.
+hidden in a compiler pass. Python's explicit [native object handles](docs/PYTHON_NATIVE_HANDLES.md)
+retain arbitrary objects in their owner process and carry checked opaque
+descriptors through O. They preserve owner identity without claiming portable
+reconstruction in other runtimes. O, Python, and the Unix JavaScript adapter can
+invoke, inspect, modify, and release those objects through the exact admitted
+owner using `native_call`, `native_get`, `native_set`, and `native_release`.
 
 ### 3. Explicit persistent environments
 
@@ -3777,6 +3785,13 @@ computations are equivalent exactly when they return the same OValue, take
 `Beh_O = OValue`. Each backend's OValue lifting map is then its unique arrow to
 the terminal carrier.
 
+This restricted return-value contract does not establish equivalence under
+callbacks, retained environments, live resources, or arbitrary future
+interactions. Each enlarged boundary needs a compatibility argument connecting
+its lifting to those interactions. The [execution observation contract](docs/EXECUTION_OBSERVATION_CONTRACT.md)
+states the transition/trace model and finite DAG commutation theorem, and
+documents the executable finite-model checker and its limits.
+
 The terminal-object statement applies to backend-to-OValue lifting, not to
 every `render_child` projection back into source. Rendering is deliberately
 consumer-specific and some consumers only have a presentation or marker for a
@@ -3954,7 +3969,15 @@ with `O`.
 
 Native hosted binaries contain the `.O` source, runtime modules, lockfile
 dependency versions, and bundled core shims. Python, Nix, and other language
-runtimes remain explicit host dependencies. `--shim-dir` overlays or adds
+runtimes remain explicit host dependencies by default. The optional
+[`--runtime-bundle`](docs/EMBEDDED_RUNTIME_BUNDLES.md) embeds a supplied runtime
+tree and uses its `bin/` exclusively for command lookup; host OS, dynamic
+libraries, and external services still require separate qualification.
+Its Linux rootfs profile uses the [runtime closure collector](docs/LINUX_RUNTIME_ROOTFS.md)
+and private filesystem/network namespaces to run embedded foreign runtimes
+inside an immutable image, with writable scratch space and ordinary subprocess
+support. Runtime data and services still need explicit closure qualification.
+`--shim-dir` overlays or adds
 shim files before packaging. `--keep-build-dir` retains the generated Cargo
 project for inspection. `--backend-grant` may be repeated for script mode and
 native hosted binaries as a compatibility hook. Compiled binaries mint fresh
