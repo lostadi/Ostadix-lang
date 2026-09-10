@@ -121,7 +121,7 @@ fn source_formatting_changes_the_exact_bundle_and_logical_identity() {
     manifest
         .bytes
         .extend_from_slice(b"\n# formatting-only bundle change\n");
-    manifest.content_hash = format!("{:x}", Sha256::digest(&manifest.bytes));
+    manifest.content_hash = hex::encode(Sha256::digest(&manifest.bytes));
 
     let reformatted = build_project_hgraph(&reformatted_bundle, Some("main"), None).unwrap();
     let reformatted_logical = reformatted.logical_v1().unwrap();

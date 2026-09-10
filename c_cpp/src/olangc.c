@@ -333,9 +333,10 @@ static int remove_tree(const char *path) {
     return rmdir(path);
 }
 
-/* Every external backend advertised by generated_main.c is required. */
+/* Every advertised backend and its imported support modules are required. */
 static const char *SHIM_NAMES[] = {
     "o_shim_common.py",
+    "o_native_objects.py",
     "python_shim.py",
     "nix_shim.py",
     "nix_store_shim.py",

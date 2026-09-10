@@ -505,7 +505,8 @@ def _state_error_response(backend, code, error):
 
 def command_loop(handle_exec, handle_cleanup=None, handle_ping=None,
                  handle_state_capabilities=None, handle_checkpoint=None,
-                 handle_restore=None, state_backend=None):
+                 handle_restore=None, state_backend=None,
+                 handle_exec_morphism=None, handle_native_operation=None):
     state_backend = state_backend or backend_name_from_argv()
     while True:
         try:
@@ -515,6 +516,16 @@ def command_loop(handle_exec, handle_cleanup=None, handle_ping=None,
             tag = cmd.get("cmd")
             if tag == "exec":
                 handle_exec(cmd)
+            elif tag == "native_operation_v1":
+                if handle_native_operation is None:
+                    send_err("native.unsupported-owner: adapter has no native operation protocol")
+                else:
+                    handle_native_operation(cmd)
+            elif tag == "exec_morphism_v1":
+                if handle_exec_morphism is None:
+                    send_err("morphism.unsupported-backend: adapter has no executable crossing contract")
+                else:
+                    handle_exec_morphism(cmd)
             elif tag == "cleanup":
                 if handle_cleanup is not None:
                     handle_cleanup()

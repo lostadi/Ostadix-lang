@@ -26,6 +26,7 @@ fn main() -> Result<()> {
     let mut json_output = false;
     let mut check_only = false;
     let mut crossing_evidence = false;
+    let mut morphism_contract = None;
     let mut eval_source: Option<String> = None;
     let mut local_workers = None;
     let mut required_source_sha256: Option<String> = None;
@@ -39,6 +40,7 @@ fn main() -> Result<()> {
                 | "--json"
                 | "--check"
                 | "--crossing-evidence"
+                | "--morphism-contract"
                 | "--eval"
                 | "-e"
                 | "--require-source-sha256"
@@ -55,6 +57,17 @@ fn main() -> Result<()> {
             "--crossing-evidence" => {
                 crossing_evidence = true;
                 json_output = true;
+            }
+            "--morphism-contract" => {
+                let name = args
+                    .pop_front()
+                    .context("--morphism-contract requires python-plain-data-lossless")?;
+                if name != "python-plain-data-lossless" {
+                    bail!("unsupported morphism contract {name:?}; supported: python-plain-data-lossless");
+                }
+                morphism_contract = Some(
+                    o_lang::backend_morphism::BackendCrossingContractV1::PythonPlainDataLossless,
+                );
             }
             "--eval" | "-e" => {
                 eval_source = Some(
@@ -153,7 +166,13 @@ fn main() -> Result<()> {
             && io::stderr().is_terminal() =>
         {
             let (shim_dir, _shim_guard) = resolve_shim_dir(None)?;
-            return run_repl(shim_dir, backends, &backend_grants, local_workers);
+            return run_repl(
+                shim_dir,
+                backends,
+                &backend_grants,
+                local_workers,
+                morphism_contract,
+            );
         }
         None if eval_source.is_none() => {
             print_usage(&mut io::stderr())?;
@@ -166,7 +185,13 @@ fn main() -> Result<()> {
                 print_usage(&mut io::stderr())?;
                 bail!("unexpected extra argument after --repl: {}", extra);
             }
-            return run_repl(shim_dir, backends, &backend_grants, local_workers);
+            return run_repl(
+                shim_dir,
+                backends,
+                &backend_grants,
+                local_workers,
+                morphism_contract,
+            );
         }
         _ => {}
     }
@@ -218,6 +243,9 @@ fn main() -> Result<()> {
     let mut evaluator = Evaluator::new(shim_dir).with_registered_backends(backends);
     if crossing_evidence {
         evaluator = evaluator.with_crossing_observations();
+    }
+    if let Some(contract) = morphism_contract {
+        evaluator = evaluator.with_morphism_contract(contract);
     }
     if let Some(workers) = local_workers {
         evaluator = evaluator.with_local_worker_parallelism(workers);
@@ -336,6 +364,7 @@ fn print_usage(out: &mut impl Write) -> io::Result<()> {
         out,
         "  O --crossing-evidence <input.O>      # JSON with observed graph adapter boundaries"
     )?;
+    writeln!(out, "  O --morphism-contract python-plain-data-lossless <input.O> # enforce native Python crossings")?;
     writeln!(
         out,
         "  O --check <input.O>                  # parse-only validation (combine with --json)"
@@ -414,9 +443,13 @@ fn run_repl(
     backends: HashSet<String>,
     backend_grants: &[String],
     local_workers: Option<usize>,
+    morphism_contract: Option<o_lang::backend_morphism::BackendCrossingContractV1>,
 ) -> Result<()> {
     let color = io::stderr().is_terminal();
     let mut evaluator = Evaluator::new(shim_dir).with_registered_backends(backends.clone());
+    if let Some(contract) = morphism_contract {
+        evaluator = evaluator.with_morphism_contract(contract);
+    }
     if let Some(workers) = local_workers {
         evaluator = evaluator.with_local_worker_parallelism(workers);
     }

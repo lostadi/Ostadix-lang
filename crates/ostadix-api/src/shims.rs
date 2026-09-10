@@ -46,6 +46,10 @@ pub const BUNDLED_SHIMS: &[(&str, &[u8])] = &[
         "o_shim_common.py",
         include_bytes!("../backends/o_shim_common.py"),
     ),
+    (
+        "o_native_objects.py",
+        include_bytes!("../backends/o_native_objects.py"),
+    ),
     ("ocaml_shim.py", include_bytes!("../backends/ocaml_shim.py")),
     (
         "python_shim.py",
@@ -68,6 +72,8 @@ pub const BUNDLED_SHIMS: &[(&str, &[u8])] = &[
         include_bytes!("../backends/webassembly_shim.py"),
     ),
 ];
+
+pub(crate) const BUNDLED_SHIM_SUPPORT_NAMES: &[&str] = &["o_shim_common.py", "o_native_objects.py"];
 
 /// Truthful restart boundary for every executable bundled compatibility shim.
 /// This catalog describes backend-owned process state only; it does not turn
@@ -104,7 +110,7 @@ pub fn bundled_shim_state_class(name: &str) -> Option<BundledShimStateClass> {
         | "webassembly_shim.py" => Some(BundledShimStateClass::Stateless),
         // The common module is shipped beside executable shims but is not a
         // backend actor and therefore has no independent state tier.
-        "o_shim_common.py" => None,
+        "o_shim_common.py" | "o_native_objects.py" => None,
         _ => None,
     }
 }
@@ -193,13 +199,14 @@ mod tests {
             .collect::<std::collections::BTreeSet<_>>();
         assert!(names.contains("python_shim.py"));
         assert!(names.contains("o_shim_common.py"));
+        assert!(names.contains("o_native_objects.py"));
     }
 
     #[test]
     fn every_executable_bundled_shim_has_one_state_class() {
         let classified = BUNDLED_SHIMS
             .iter()
-            .filter(|(name, _)| *name != "o_shim_common.py")
+            .filter(|(name, _)| !BUNDLED_SHIM_SUPPORT_NAMES.contains(name))
             .map(|(name, _)| (*name, bundled_shim_state_class(name)))
             .collect::<Vec<_>>();
         assert_eq!(classified.len(), 22);
