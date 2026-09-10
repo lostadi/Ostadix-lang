@@ -2940,7 +2940,7 @@ which      = "6"
 semver     = {{ version = "1", features = ["serde"] }}
 sha2       = "0.10"
 hex        = "0.4"
-ed25519-dalek = "2"
+ed25519-dalek = "3"
 num-bigint = {{ version = "0.4", features = ["serde"] }}
 num-traits = "0.2"
 bitflags   = "2"
@@ -3883,7 +3883,7 @@ mod tests {
             RUNTIME_WORLD_RECEIPT_CODEC_RS,
             "generated runtimes must receive the signed receipt codec verbatim"
         );
-        assert!(generate_cargo_toml("generated-runtime", false).contains("ed25519-dalek = \"2\""));
+        assert!(generate_cargo_toml("generated-runtime", false).contains("ed25519-dalek = \"3\""));
 
         fs::remove_dir_all(build_dir).unwrap();
     }
