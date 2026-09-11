@@ -1,0 +1,44 @@
+#!/usr/bin/env O
+# six_properties_demo.O -- a minimal, runnable demonstration of the six
+# properties this project claims are novel only in their conjunction (see
+# REVIEW.md at the repository root for the full claim and its caveats):
+#
+#   1. expression-granular evaluator selection -- each `\lang^( ... )_lang`
+#      block below picks its own evaluator; the choice is per-expression,
+#      not per-file or per-cell.
+#   2. recursive nestability -- blocks contain further blocks to arbitrary
+#      depth (python -> html -> python below).
+#   3. registry-open evaluator family -- `bash`, `html`, and `python` are
+#      three ordinary, independently registered entries in the same backend
+#      catalog; nothing about nesting is special-cased per language pair.
+#   4. independent real runtimes -- the `bash^` and `python^` blocks each
+#      spawn a real, separate OS process (see crates/ostadix-api/src/process.rs);
+#      `html^` is a trusted inline renderer, included here to show a nested
+#      non-subprocess evaluator alongside the two subprocess ones.
+#   5. one canonical cross-language value type -- bash's captured stdout,
+#      python's integer, and html's rendered markup all flow between blocks
+#      as the same OValue, with no hand-written serialization glue visible
+#      in this file.
+#   6. one execution graph -- this whole file lowers to a single graph
+#      before anything runs; there is no separate "cell 1 / cell 2" pipeline
+#      (verify with: olangc examples/six_properties_demo.O --target ir
+#      --shim-dir backends).
+#
+# Run it with: O examples/six_properties_demo.O backends
+
+let shell_note = bash^(
+echo -n "hello from an independent bash process"
+)_bash
+
+python^(
+page = html^(
+<article>
+  <p>Shell process said: $shell_note</p>
+  <p>Python then computed python^(
+__oval_result__ = 6 * 7
+)_python inside the same nested tree.</p>
+</article>
+)_html
+
+__oval_result__ = page
+)_python

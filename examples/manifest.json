@@ -572,6 +572,24 @@
       }
     },
     {
+      "path": "six_properties_demo.O",
+      "editions": ["rust"],
+      "classification": "integration",
+      "requirements": {
+        "backends": ["bash", "html", "python"],
+        "programs": ["bash", "python3"],
+        "authorities": ["process"]
+      },
+      "expected": {
+        "rust": {
+          "patterns": [
+            "Shell process said: hello from an independent bash process",
+            "Python then computed 42 inside the same nested tree."
+          ]
+        }
+      }
+    },
+    {
       "path": "sql_aggregation.O",
       "editions": ["rust"],
       "classification": "integration",
