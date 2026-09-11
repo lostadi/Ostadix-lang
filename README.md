@@ -65,6 +65,9 @@ G13 qualification gates is named **OSTADIX Alpha**.
 
 ### Read the technical artifact set
 
+- [One-page entry point for outside reviewers](REVIEW.md) — start here if you
+  have a few minutes and want the core claim, a single runnable example, and
+  an explicit list of what is verified versus asserted.
 - [Technical whitepaper PDF](Ostadix-lang_Technical_Whitepaper.pdf)
 - [Technical whitepaper TeX source](docs/Ostadix-lang_Technical_Whitepaper.tex)
 - [Compiler-emitted O-linked HGraph as DOT](docs/figures/o-linked-codebase-hgraph.dot)
@@ -3129,7 +3132,11 @@ The HGraph coordinator is the default executor. The serial OIR executor remains
 the differential oracle. Wherever a
 prior system satisfies part of this
 conjunction, the paragraphs above and below say so; corrections and closer
-prior art are welcome as issues.
+prior art are welcome as issues. [REVIEW.md](REVIEW.md) collects this
+conjunction claim, a single runnable example that exercises all six
+properties (`examples/six_properties_demo.O`), and an explicit list of what
+is verified versus merely asserted, for anyone deciding whether to look
+closer or file a correction.
 
 **Systems languages.** C, Rust, Zig, and freestanding subsets of other
 languages already compile kernels. O-core's distinct point is its placement
