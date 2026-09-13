@@ -913,6 +913,10 @@ build_mcp_server() {
       cp "$mcp_bin" "$HOME/.local/bin/ostadix-mcp"
       chmod +x "$HOME/.local/bin/ostadix-mcp"
       echo "  wrapper → $HOME/.local/bin/ostadix-mcp"
+      remove_managed_file "$HOME/.local/bin/ostadix-mcp-client"
+      cp "$PROJECT_ROOT/scripts/ostadix_mcp_client.py" "$HOME/.local/bin/ostadix-mcp-client"
+      chmod +x "$HOME/.local/bin/ostadix-mcp-client"
+      echo "  client → $HOME/.local/bin/ostadix-mcp-client"
     fi
   fi
   echo "MCP build done → $mcp_dir/target/release/ostadix-mcp"
@@ -1675,7 +1679,8 @@ echo "  cargo run --package o-lang -- examples/hello.O"
 echo "  ./c_cpp/O examples/hello.O ./backends"
 echo "  ./c_cpp/olangc examples/hello.O -o /tmp/h && /tmp/h"
 echo "  python3 -m o_lang examples/hello.O"
-echo "  ostadix-mcp                           # MCP stdio server (includes o_runtimes, o_analyze_intent, o_execute_intent, o_run, and diagnostics)"
+echo "  ostadix-mcp                           # MCP stdio server (capability discovery, full CLI access, jobs, and diagnostics)"
+echo "  ostadix-mcp-client --list-tools        # persistent local bridge for agent function callers"
 if $WRITE_ENV; then
   printf '  source %q                         # activate O_LANG_ROOT/tool paths now\n' "$ENV_FILE"
 fi

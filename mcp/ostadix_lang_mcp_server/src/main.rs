@@ -5,12 +5,21 @@
 //!
 //! Logging goes to **stderr** only (stdout is MCP JSON-RPC).
 
+mod capabilities;
+mod execution;
+
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{CallToolResult, Content, ServerCapabilities, ServerInfo},
-    schemars, tool, tool_handler, tool_router,
+    model::{
+        AnnotateAble, CallToolResult, Content, ListResourcesResult, PaginatedRequestParam,
+        RawResource, ReadResourceRequestParam, ReadResourceResult, ResourceContents,
+        ServerCapabilities, ServerInfo,
+    },
+    schemars,
+    service::RequestContext,
+    tool, tool_handler, tool_router,
     transport::stdio,
-    ErrorData as McpError, ServerHandler, ServiceExt,
+    ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
 };
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -47,6 +56,7 @@ struct OstadixMcp {
     tool_router: ToolRouter<Self>,
     runtime_search: RuntimeSearchPath,
     intents: Arc<Mutex<IntentStore>>,
+    jobs: execution::JobManager,
 }
 
 impl OstadixMcp {
@@ -55,6 +65,7 @@ impl OstadixMcp {
             tool_router: Self::tool_router(),
             runtime_search,
             intents: Arc::new(Mutex::new(IntentStore::default())),
+            jobs: execution::JobManager::new(),
         }
     }
 }
@@ -1182,79 +1193,55 @@ async fn run_cmd(
     env: &[(&str, String)],
     timeout_secs: u64,
 ) -> Result<(i32, String, String), String> {
-    let mut cmd = Command::new(program);
-    cmd.args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        // Keep abnormal future cancellation from orphaning the group leader;
-        // the explicit timeout path below kills and reaps the whole group.
-        .kill_on_drop(true);
-    #[cfg(unix)]
-    {
-        cmd.process_group(0);
-    }
-    if let Some(c) = cwd {
-        cmd.current_dir(c);
-    }
-    for (k, v) in env {
-        cmd.env(k, v);
-    }
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("spawn {}: {e}", program.display()))?;
-
-    let mut stdout_pipe = child
-        .stdout
-        .take()
-        .ok_or_else(|| "child stdout was not piped".to_string())?;
-    let mut stderr_pipe = child
-        .stderr
-        .take()
-        .ok_or_else(|| "child stderr was not piped".to_string())?;
-    #[cfg(unix)]
-    let process_group_id = child.id();
-    let mut stdout_bytes = Vec::new();
-    let mut stderr_bytes = Vec::new();
-    let completed = tokio::time::timeout(Duration::from_secs(timeout_secs), async {
-        let (status, stdout, stderr) = tokio::join!(
-            child.wait(),
-            stdout_pipe.read_to_end(&mut stdout_bytes),
-            stderr_pipe.read_to_end(&mut stderr_bytes),
-        );
-        let status = status.map_err(|e| format!("wait: {e}"))?;
-        stdout.map_err(|e| format!("read stdout: {e}"))?;
-        stderr.map_err(|e| format!("read stderr: {e}"))?;
-        Ok::<_, String>(status)
-    })
-    .await;
-
-    let status = match completed {
-        Ok(result) => result?,
-        Err(_) => {
-            #[cfg(unix)]
-            if let Some(pid) = process_group_id {
-                if let Ok(group_id) = i32::try_from(pid) {
-                    // SAFETY: the child was placed in a new process group whose
-                    // id is the leader pid. Keep that id before waiting so the
-                    // group can still be killed after the leader has exited and
-                    // descendants are retaining its stdout/stderr pipes.
-                    unsafe {
-                        libc::kill(-group_id, libc::SIGKILL);
-                    }
-                }
-            }
-            if !matches!(child.try_wait(), Ok(Some(_))) {
-                let _ = child.kill().await;
-            }
-            let _ = child.wait().await;
-            return Err(format!("timeout after {timeout_secs}s"));
-        }
+    // Legacy tools retain their text contract, but share the same concurrent,
+    // disk-backed execution and cancellation cleanup as the full CLI gateway.
+    let jobs = execution::JobManager::new();
+    let cwd = match cwd {
+        Some(cwd) => cwd.to_path_buf(),
+        None => std::env::current_dir().map_err(|error| error.to_string())?,
     };
-    let code = status.code().unwrap_or(-1);
-    let stdout = String::from_utf8_lossy(&stdout_bytes).into_owned();
-    let stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
-    Ok((code, stdout, stderr))
+    let started = jobs
+        .start(execution::ExecutionRequest {
+            program: program.to_path_buf(),
+            args: args.iter().map(|arg| (*arg).into()).collect(),
+            cwd,
+            env: env
+                .iter()
+                .map(|(key, value)| ((*key).into(), value.clone()))
+                .collect(),
+            stdin: None,
+            timeout_secs: Some(timeout_secs),
+            pty: false,
+        })
+        .await?;
+    let id = started["job_id"].as_str().ok_or("missing job_id")?;
+    let _ = jobs.write(id, "", true).await;
+    let status = jobs.wait(id).await?;
+    if status["state"] == "timed_out" {
+        return Err(format!("timeout after {timeout_secs}s"));
+    }
+    if let Some(error) = status["error"].as_str() {
+        if status["exit_code"].is_null() || status["exit_code"] == 0 {
+            return Err(error.into());
+        }
+    }
+    let mut output = Vec::new();
+    for stream in ["stdout", "stderr"] {
+        let page = jobs.read(id, stream, 0, 262144).await?;
+        let mut text = page["text"].as_str().unwrap_or_default().to_string();
+        if page["next_offset"].as_u64() < page["total_bytes"].as_u64() {
+            text.push_str(&format!(
+                "\n[MCP preview truncated; full {stream} log: {}]\n",
+                page["path"]
+            ));
+        }
+        output.push(text);
+    }
+    Ok((
+        status["exit_code"].as_i64().unwrap_or(-1) as i32,
+        output.remove(0),
+        output.remove(0),
+    ))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1553,7 +1540,9 @@ fn resolve_search_corpus(
         return Ok((work, corpus, false));
     }
     let conventional = home_dir().join("a18re");
-    if conventional.is_dir() {
+    // A leftover ~/a18re directory without a search corpus must not hide the
+    // bundled programs. Explicit work/A18_WORK selections still fail clearly.
+    if conventional.join("search").is_dir() {
         let work = conventional
             .canonicalize()
             .map_err(|error| format!("resolve work {}: {error}", conventional.display()))?;
@@ -1672,6 +1661,227 @@ impl schemars::JsonSchema for EmptyArgs {
             "description": "No parameters",
             "properties": {}
         })
+    }
+}
+
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+struct CapabilityArgs {
+    /// Optional case-insensitive capability, command, or family search.
+    query: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+struct GuideArgs {
+    /// Workflow topic: all, runtime, compiler, projects, mesh, core, live, capacity, device, agents.
+    topic: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct CliArgs {
+    /// Exact Ostadix command ID from o_capabilities, such as O, o, olangc, o-link, octl, or ocorec.
+    command: String,
+    /// Literal argument array. All CLI options/subcommands are available; no shell expansion is performed.
+    #[serde(default)]
+    args: Vec<String>,
+    /// Working directory; relative paths resolve against O_LANG_ROOT.
+    cwd: Option<String>,
+    /// Per-child environment overrides; never changes another job or the MCP process environment.
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+    /// Initial stdin text. Foreground pipe jobs receive EOF after this text; background jobs keep input open.
+    stdin: Option<String>,
+    /// Foreground default 120 seconds, background default no deadline. Zero explicitly disables the deadline.
+    timeout_secs: Option<u64>,
+    /// Return a job_id immediately. Use status/read/write/cancel across calls in this MCP session.
+    #[serde(default)]
+    background: bool,
+    /// Allocate a Unix terminal for REPLs and terminal programs. Terminal output is merged in stdout.
+    #[serde(default)]
+    pty: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct EvalArgs {
+    /// Complete inline O source, including nested hosted languages. Passed literally to O --eval.
+    source: String,
+    /// Interpreter options, such as --json, --executor graph, --workers, or backend grants.
+    #[serde(default)]
+    args: Vec<String>,
+    cwd: Option<String>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+    stdin: Option<String>,
+    timeout_secs: Option<u64>,
+    #[serde(default)]
+    background: bool,
+    #[serde(default)]
+    pty: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct JobArgs {
+    /// Job ID returned by this MCP session. Jobs do not survive server shutdown.
+    job_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct JobReadArgs {
+    job_id: String,
+    /// stdout (default) or stderr; PTY output is merged in stdout.
+    stream: Option<String>,
+    /// Byte cursor from a previous read; default zero.
+    offset: Option<u64>,
+    /// Maximum bytes in this page, default 65536, maximum 262144. Full logs remain on disk.
+    limit: Option<usize>,
+    /// utf8_lossy (default) for text previews, or base64 for lossless binary/UTF-8 byte retrieval.
+    encoding: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct JobWriteArgs {
+    job_id: String,
+    /// Literal stdin text, including newlines or terminal control characters when needed.
+    #[serde(default)]
+    input: String,
+    /// Close pipe stdin after writing; on a canonical PTY send terminal EOF.
+    #[serde(default)]
+    close: bool,
+    /// Maximum seconds to wait for input acceptance, including any earlier write; default 30. Zero disables the deadline.
+    timeout_secs: Option<u64>,
+}
+
+fn structured_result(value: serde_json::Value) -> Result<CallToolResult, McpError> {
+    Ok(CallToolResult::structured(value))
+}
+
+fn structured_failure(error: impl Into<String>) -> Result<CallToolResult, McpError> {
+    Ok(CallToolResult::structured_error(
+        serde_json::json!({"error": error.into()}),
+    ))
+}
+
+fn validate_child_input(args: &[String], env: &BTreeMap<String, String>) -> Result<(), String> {
+    if args.iter().any(|arg| arg.contains('\0')) {
+        return Err("command arguments must not contain NUL bytes".into());
+    }
+    for (key, value) in env {
+        if key.is_empty() || key.contains(['=', '\0']) || value.contains('\0') {
+            return Err("environment names must be nonempty and contain neither '=' nor NUL; values must not contain NUL".into());
+        }
+    }
+    Ok(())
+}
+
+struct ForegroundJobGuard {
+    jobs: execution::JobManager,
+    id: String,
+    active: bool,
+}
+
+impl Drop for ForegroundJobGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self.jobs.request_cancel(&self.id);
+        }
+    }
+}
+
+impl OstadixMcp {
+    async fn execute_cli(&self, args: CliArgs) -> Result<CallToolResult, McpError> {
+        if let Err(error) = validate_child_input(&args.args, &args.env) {
+            return structured_failure(error);
+        }
+        let root = resolve_lang_root();
+        let backends = resolve_backends(&root);
+        let cwd = match resolve_directory(&root, args.cwd.as_deref(), "working directory") {
+            Ok(cwd) => cwd,
+            Err(error) => return structured_failure(error),
+        };
+        let (program, mut argv) = match capabilities::resolve_command(&root, &args.command) {
+            Ok(command) => command,
+            Err(error) => return structured_failure(error),
+        };
+        argv.extend(args.args);
+        let mut env = BTreeMap::from([
+            ("O_LANG_ROOT".into(), root.display().to_string()),
+            ("O_BACKENDS_DIR".into(), backends.display().to_string()),
+            ("A18_WORK".into(), cwd.display().to_string()),
+        ]);
+        // The dispatcher also works when binaries are installed through PATH
+        // or built in target/debug. Preserve explicitly selected launchers.
+        for (key, command) in [
+            ("O_LANG_OCLI_BIN", "o-cli"),
+            ("O_LANG_OLANGC_BIN", "olangc"),
+            ("O_LANG_EVALUATOR_BIN", "O"),
+            ("O_LANG_LIVE_BIN", "o-live-host"),
+            ("O_LANG_OGIT_BIN", "ogit"),
+            ("O_LANG_NODE_BIN", "o-node"),
+            ("O_LANG_OCTL_BIN", "octl"),
+            ("O_LANG_REGISTRY_BIN", "o-registry"),
+            ("O_LANG_INFO_BIN", "o-info"),
+            ("O_LANG_DEVICE_BIN", "ostadix-device"),
+        ] {
+            if std::env::var_os(key).is_none() {
+                if let Ok((binary, prefix)) = capabilities::resolve_command(&root, command) {
+                    if prefix.is_empty() {
+                        env.insert(key.into(), binary.display().to_string());
+                    }
+                }
+            }
+        }
+        env.extend(args.env);
+        let timeout_secs = args
+            .timeout_secs
+            .or(if args.background { None } else { Some(120) })
+            .filter(|value| *value != 0);
+        let started = match self
+            .jobs
+            .start(execution::ExecutionRequest {
+                program,
+                args: argv,
+                cwd,
+                env,
+                stdin: args.stdin,
+                timeout_secs,
+                pty: args.pty,
+            })
+            .await
+        {
+            Ok(started) => started,
+            Err(error) => return structured_failure(error),
+        };
+        if args.background {
+            return structured_result(started);
+        }
+        let Some(id) = started["job_id"].as_str() else {
+            return structured_failure("job manager returned no job_id");
+        };
+        let mut guard = ForegroundJobGuard {
+            jobs: self.jobs.clone(),
+            id: id.into(),
+            active: true,
+        };
+        // Noninteractive foreground commands must observe EOF even when no
+        // input was supplied. A PTY remains interactive until exit/deadline.
+        if !args.pty {
+            let _ = self.jobs.write(id, "", true).await;
+        }
+        let mut result = match self.jobs.wait(id).await {
+            Ok(result) => result,
+            Err(error) => return structured_failure(error),
+        };
+        guard.active = false;
+        for stream in ["stdout", "stderr"] {
+            match self.jobs.read(id, stream, 0, 65536).await {
+                Ok(page) => result[stream] = page,
+                Err(error) => return structured_failure(error),
+            }
+        }
+        if result["state"] == "completed" && result["exit_code"] == 0 {
+            structured_result(result)
+        } else {
+            Ok(CallToolResult::structured_error(result))
+        }
     }
 }
 
@@ -1876,6 +2086,176 @@ fn sanitize_information_head_output(stdout: &str, expected_head: &str) -> Result
 
 #[tool_router]
 impl OstadixMcp {
+    #[tool(
+        description = "Discover every Ostadix command family, resolved executables, help invocations, and task guides. Filter with query to keep context compact.",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn o_capabilities(
+        &self,
+        Parameters(args): Parameters<CapabilityArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        structured_result(capabilities::catalog(
+            &resolve_lang_root(),
+            args.query.as_deref(),
+        ))
+    }
+
+    #[tool(
+        description = "Read concise Ostadix workflows for runtime, compiler, projects, mesh, core, live, capacity, device, or agents. Defaults to topic all.",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn o_guide(
+        &self,
+        Parameters(args): Parameters<GuideArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let topic = args.topic.as_deref().unwrap_or("all");
+        match capabilities::guide(topic) {
+            Some(guide) => structured_result(serde_json::json!({"topic": topic, "guide": guide})),
+            None => structured_failure("unknown guide topic; use all, runtime, compiler, projects, mesh, core, live, capacity, device, or agents"),
+        }
+    }
+
+    #[tool(
+        description = "Run any cataloged Ostadix CLI with full literal argv, cwd, per-child env, stdin, optional PTY, and background jobs. Includes compiler/linker, projects, node/session/registry, O-core, live, capacity, and device operations. The selected CLI retains its own admission rules; this is direct execution and may mutate local or remote state.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn o_cli(
+        &self,
+        Parameters(args): Parameters<CliArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.execute_cli(args).await
+    }
+
+    #[tool(
+        description = "Execute inline polyglot O source via O --eval without a temporary source file. Supports interpreter options, cwd, per-call env, stdin, PTY, and background jobs; hosted code has the same capabilities as normal O execution.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn o_eval(
+        &self,
+        Parameters(args): Parameters<EvalArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut argv = args.args;
+        argv.extend(["--eval".to_string(), args.source]);
+        self.execute_cli(CliArgs {
+            command: "O".into(),
+            args: argv,
+            cwd: args.cwd,
+            env: args.env,
+            stdin: args.stdin,
+            timeout_secs: args.timeout_secs,
+            background: args.background,
+            pty: args.pty,
+        })
+        .await
+    }
+
+    #[tool(
+        description = "List managed jobs in this MCP server session, including completion and exit status. Does not wait for running work.",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn o_job_list(
+        &self,
+        Parameters(_args): Parameters<EmptyArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        match self.jobs.list().await {
+            Ok(value) => structured_result(value),
+            Err(error) => structured_failure(error),
+        }
+    }
+
+    #[tool(
+        description = "Inspect a managed job's state, exit code, log paths, and cleanup evidence. A started job is not a successful result.",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn o_job_status(
+        &self,
+        Parameters(args): Parameters<JobArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        match self.jobs.status(&args.job_id).await {
+            Ok(value) => structured_result(value),
+            Err(error) => structured_failure(error),
+        }
+    }
+
+    #[tool(
+        description = "Read a bounded stdout or stderr page using byte cursors. Complete output remains in disk logs; reading does not block or stop execution.",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn o_job_read(
+        &self,
+        Parameters(args): Parameters<JobReadArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        match self
+            .jobs
+            .read_encoded(
+                &args.job_id,
+                args.stream.as_deref().unwrap_or("stdout"),
+                args.offset.unwrap_or(0),
+                args.limit.unwrap_or(65536),
+                args.encoding.as_deref().unwrap_or("utf8_lossy"),
+            )
+            .await
+        {
+            Ok(value) => structured_result(value),
+            Err(error) => structured_failure(error),
+        }
+    }
+
+    #[tool(
+        description = "Send literal input or EOF to a running managed job, including REPLs and PTY terminal programs. Input can cause the selected program to perform actions.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn o_job_write(
+        &self,
+        Parameters(args): Parameters<JobWriteArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        match self
+            .jobs
+            .write_with_timeout(
+                &args.job_id,
+                &args.input,
+                args.close,
+                args.timeout_secs
+                    .or(Some(30))
+                    .filter(|seconds| *seconds != 0),
+            )
+            .await
+        {
+            Ok(value) => structured_result(value),
+            Err(error) => structured_failure(error),
+        }
+    }
+
+    #[tool(
+        description = "Cancel one managed job and wait for its owned process cleanup. Other jobs continue independently.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn o_job_cancel(
+        &self,
+        Parameters(args): Parameters<JobArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        match self.jobs.cancel(&args.job_id).await {
+            Ok(value) => structured_result(value),
+            Err(error) => structured_failure(error),
+        }
+    }
+
     #[tool(
         description = "Report O-lang / Ostadix-lang environment: roots, tools, shim presence, and all-runtime summary"
     )]
@@ -2421,17 +2801,75 @@ impl OstadixMcp {
 impl ServerHandler for OstadixMcp {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
+            server_info: rmcp::model::Implementation {
+                name: "ostadix-mcp".into(),
+                title: Some("Ostadix runtime and toolchain".into()),
+                version: concat!(env!("CARGO_PKG_VERSION"), "+agent-surface.1").into(),
+                website_url: Some("https://github.com/lostadi/Ostadix-lang".into()),
+                icons: None,
+            },
             instructions: Some(
-                "Ostadix-lang / O-lang MCP (Rust). Use o_env/o_runtimes/o_doctor first. \
+                "Ostadix-lang / O-lang MCP. Start with o_capabilities(query) and o_guide(topic) to discover the full command surface without loading every guide. \
+Use o_cli for all canonical CLI arguments, per-call env/cwd/stdin, compiler/linker/project/mesh/node/session/core/live/capacity/device operations. \
+Use o_eval for inline polyglot O. background=true returns a session job; use o_job_list/status/read/write/cancel. pty=true supports Unix terminals. \
+Jobs run concurrently, full logs stay on disk, and a job start is not success. Jobs end on MCP server shutdown; no restart persistence is claimed. \
+Use o_env/o_runtimes/o_doctor to check the environment. Source capability discovery is not installed-version or runtime-health proof; inspect the catalog's safe help invocation when needed. \
 Use o_analyze_intent then o_execute_intent for a one-use same-intent gate; o_run remains direct ungated compatibility execution. \
 Use o_information_inspect only for bounded descriptive reads of an existing local Information V1 head; it grants no authority. \
 Always run .O programs through an MCP O tool so backends is absolute. \
 Never pass the literal string O_BACKENDS_DIR; never put $VAR inside .O sources (O splices $IDENT)."
                     .into(),
             ),
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
+            capabilities: ServerCapabilities::builder().enable_tools().enable_resources().build(),
             ..Default::default()
         }
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParam>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, McpError> {
+        let mut resources = vec![RawResource::new(
+            "ostadix://capabilities",
+            "Ostadix command capability catalog",
+        )
+        .no_annotation()];
+        for topic in [
+            "all", "runtime", "compiler", "projects", "mesh", "core", "live", "capacity", "device",
+            "agents",
+        ] {
+            resources.push(
+                RawResource::new(
+                    format!("ostadix://guide/{topic}"),
+                    format!("Ostadix {topic} guide"),
+                )
+                .no_annotation(),
+            );
+        }
+        Ok(ListResourcesResult {
+            resources,
+            next_cursor: None,
+        })
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParam,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResult, McpError> {
+        let text = if request.uri == "ostadix://capabilities" {
+            capabilities::catalog(&resolve_lang_root(), None).to_string()
+        } else if let Some(topic) = request.uri.strip_prefix("ostadix://guide/") {
+            capabilities::guide(topic)
+                .ok_or_else(|| McpError::invalid_params("unknown Ostadix guide", None))?
+                .to_string()
+        } else {
+            return Err(McpError::invalid_params("unknown Ostadix resource", None));
+        };
+        Ok(ReadResourceResult {
+            contents: vec![ResourceContents::text(text, request.uri)],
+        })
     }
 }
 
@@ -2454,8 +2892,11 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let server = OstadixMcp::new(runtime_search);
+    let jobs = server.jobs.clone();
     let service = server.serve(stdio()).await?;
-    service.waiting().await?;
+    let outcome = service.waiting().await;
+    jobs.shutdown().await.map_err(anyhow::Error::msg)?;
+    outcome?;
     Ok(())
 }
 

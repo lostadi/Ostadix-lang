@@ -304,7 +304,7 @@ jobs:
         run: |
           cargo +1.97.1 build --release --locked --package o-lang --bin O --bin o-cli --bin olangc --bin o-info
           cargo +1.97.1 test --locked --manifest-path mcp/ostadix_lang_mcp_server/Cargo.toml
-          python3 -m unittest -v tests.test_mcp_smoke
+          python3 -m unittest -v tests.test_mcp_smoke tests.test_mcp_client
           cargo +1.97.1 clippy --locked --manifest-path mcp/ostadix_lang_mcp_server/Cargo.toml -- -D warnings
           cargo +1.97.1 build --release --locked --manifest-path mcp/ostadix_lang_mcp_server/Cargo.toml
           python3 scripts/smoke_ostadix_mcp.py

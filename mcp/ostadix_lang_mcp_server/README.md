@@ -1,13 +1,24 @@
 # ostadix-mcp (Rust-only)
 
-Stdio MCP server for **Ostadix-lang / O-lang**. Agents call tools that always
-resolve an **absolute** `O_BACKENDS_DIR`, so relative `backends` and bare
-`$O_BACKENDS_DIR` splice mistakes do not break runs.
+Stdio MCP server for **Ostadix-lang / O-lang**. Agents can discover the
+installed toolchain, read task guides, invoke its command families with literal
+arguments, evaluate inline `.O`, and manage concurrent or interactive jobs.
+The server supplies an **absolute** `O_BACKENDS_DIR`, so relative `backends`
+and bare `$O_BACKENDS_DIR` splice mistakes do not break runs.
 
 ## Tools
 
 | Tool | Purpose |
 |------|---------|
+| `o_capabilities` | Search the command catalog, resolved executable availability, documentation paths, and related guide topics; optional `query` filters the inventory |
+| `o_guide` | Read a task guide; `topic` defaults to the overview, with runtime/compiler/projects/mesh/core/live/capacity/device/agents guidance |
+| `o_cli` | Invoke a catalog command with its complete literal `args` array, optional cwd/env/stdin, timeout, background execution, and PTY |
+| `o_eval` | Evaluate inline `.O` through the installed interpreter, with per-call cwd/env/interpreter arguments and optional background execution or PTY |
+| `o_job_list` | List the jobs owned by this MCP session without waiting for running work |
+| `o_job_status` | Inspect one session job's state, exit status, log sizes, input state, and process cleanup evidence |
+| `o_job_read` | Read stdout or stderr by byte offset with a bounded page and continuation cursor |
+| `o_job_write` | Send input to a running job and optionally close its input |
+| `o_job_cancel` | Cancel one job and clean up its Unix process session, including nested process groups |
 | `o_env` | Print roots, `O` / `olangc` paths, shim presence, and the 30-backend runtime summary |
 | `o_runtimes` | Report executable discovery and catalog value capabilities for every canonical backend and supported alternative runtime set |
 | `o_doctor` | Existence checks + shim inventory + complete runtime report + resolved external or bundled search corpus |
@@ -18,6 +29,147 @@ resolve an **absolute** `O_BACKENDS_DIR`, so relative `backends` and bare
 | `o_olangc` | `olangc` with `--shim-dir`; relative input/output resolves against the repository root. `materialize_only` admits ordinary binary/WASM inputs, requires a new contained destination below the server cwd, rejects traversal/existing targets, and invokes neither Cargo nor output publication. |
 | `o_search_run` | Run one strict leaf name from `<work>/search`, or bundled `examples/` when no external work tree exists; reject traversal and symlink escape |
 | `o_information_inspect` | Fixed, bounded `o-info head` inspection of one existing local Information V1 root; returns sanitized IDs/count, no state path or authority, and makes no logical/content/inode/mode/mtime change (atime untested) |
+
+## Agent workflow
+
+Start with `o_capabilities` and `o_guide`, then use `o_env`, `o_runtimes`, and
+`o_doctor` for the selected installation. The catalog covers the shipped Cargo
+binaries and supported dispatch/script entry points, including interpreter,
+compiler, project linking, O-core, mesh/node operations, Live-World, O-Git,
+kernel/capacity tooling, notebook, language server, and build/release helpers.
+Filter it by task or command name to keep discovery output focused.
+MCP resource clients can read the same catalog at `ostadix://capabilities`
+and guides at `ostadix://guide/{topic}`; `resources/list` enumerates them.
+
+Catalog `available` means the executable or script interpreter was located.
+It does not establish that every dependency, backend, target, node, device, or
+requested operation works. `runtime_readiness_verified` and
+`installed_help_verified` make that boundary explicit. Use the reported
+`help_args` where present to inspect the selected executable's own interface;
+some service entry points do not support a conventional help invocation.
+The catalog is compiled from the source version shipped with this MCP; it can
+differ from separately installed CLI binaries until they are rebuilt together.
+
+The direct command gateway preserves all CLI options. For example:
+
+```json
+{"command":"olangc","args":["/project/main.O","--target","dot","--shim-dir","/absolute/backends"],"cwd":"/project"}
+```
+
+Pass a catalog command identifier such as `O`, `o`, `olangc`, `o-link`, `octl`,
+or `ocorec` as `command`. The gateway resolves its executable and supplies the
+argument vector without shell interpolation. `args` contains individual
+arguments; shell operators, quoting, glob expansion, and variable substitution
+are not a command language. Use `env` for per-process environment values and
+`cwd` for the working directory. Environment changes do not modify the MCP
+server's environment or other jobs. All CLI flags remain subject to the
+selected tool's actual parsing and runtime admission rules.
+
+Inline programs avoid temporary-source bookkeeping:
+
+```json
+{"source":"python^(\n__oval_result__ = 1 + 1\n)_python","cwd":"/project"}
+```
+
+`o_eval` still executes ordinary O syntax and its selected backend. `$IDENT`
+inside an O source is a splice, including when the source is a JSON string;
+pass environment values through `env`, and let the hosted language read them.
+Use the original `o_analyze_intent` / `o_execute_intent` pair when execution
+must be bound to the analyzed source and graph intent.
+
+## Long-running and interactive jobs
+
+Set `background: true` on `o_cli` or `o_eval` for a managed job that returns
+immediately. Jobs are independent: waiting for one does not serialize another
+job's execution. They survive individual tool calls within the same MCP
+session; they do not become detached persistent services after MCP shutdown.
+Use the native service-management mechanism when persistence across agent
+sessions is required.
+
+For example, an O REPL can be started with:
+
+```json
+{"command":"O","args":["--repl","/absolute/backends"],"background":true,"pty":true}
+```
+
+Use its returned `job_id` with `o_job_write` to send a line, `o_job_read` to
+inspect output, and `o_job_status` to inspect progress. `close: true` closes
+pipe input. PTY input closure sends terminal EOF characters; programs using
+raw terminal input may interpret those characters themselves. PTYs combine
+stdout and stderr into the stdout log. Input writes have a 30-second default
+timeout covering both input-lock waiting and transmission; `timeout_secs: 0`
+explicitly permits an unbounded write. A write timeout reports the accepted
+byte count and whether EOF delivery is uncertain.
+
+Managed Unix jobs start in a fresh operating-system process session.
+`o_job_cancel` stops that session's processes, including backend-owned nested
+process groups; a subprocess that explicitly creates another session is
+outside this boundary. Cleanup evidence reports the scan, signaling, child
+reaping, and completed log drainage. Normal successful completion preserves
+the native command's daemon-start behavior.
+
+Foreground calls return a job result with bounded stdout/stderr previews and
+retained log locations. Nonzero exit, timeout, and cancellation are MCP tool
+errors with job/exit evidence. New tools provide the same JSON object as both
+`structuredContent` and text so clients supporting either representation can
+read it. The original ten tools retain their text contracts.
+
+`o_job_read` accepts `stream: "stdout" | "stderr"`, `offset`, and `limit`.
+Advance using `next_offset`; offsets and `bytes_read` count bytes, while `text`
+uses UTF-8 replacement decoding by default. Select `encoding: "base64"` for
+lossless bytes in the `data` field, including split multibyte characters.
+The full log artifact is also available. `eof` means the current end of
+the log; check job state or `complete` to distinguish a running job from a
+finished one. Logs are written to disk to avoid retaining unlimited process
+output in the server heap.
+
+## Agents with short-lived function wrappers
+
+Agents that start a new function process for every tool call can use
+[`scripts/ostadix_mcp_client.py`](../../scripts/ostadix_mcp_client.py). It keeps
+one stdio MCP session behind a private local Unix socket so a background job
+created by one invocation remains available to later invocations:
+
+```bash
+python3 scripts/ostadix_mcp_client.py --list-tools
+python3 scripts/ostadix_mcp_client.py o_eval '{"source":"python^( __oval_result__ = 2 )_python","background":true}'
+python3 scripts/ostadix_mcp_client.py o_job_list '{}'
+python3 scripts/ostadix_mcp_client.py --status
+python3 scripts/ostadix_mcp_client.py --stop
+```
+
+The bridge uses `OSTADIX_MCP` for the server executable, `O_LANG_ROOT` and
+`O_BACKENDS_DIR` for the installation, and optional `OSTADIX_MCP_CLIENT_DIR`
+for its private directory. The default directory is
+`/tmp/ostadix-mcp-client-<uid>`, mode 0700, with mode 0600 lock and log files.
+Binary path, root, and backends determine session identity. Startup is locked;
+concurrent calls share one MCP child and route replies by JSON-RPC request ID.
+Child stderr goes directly to a log, and a nonblocking writer keeps stalled
+MCP stdin from blocking unrelated bridge requests or shutdown.
+
+`--list-tools` exports the MCP's actual tool schemas for function-registration
+generation. `--status` inspects an existing bridge without starting one.
+`--stop` closes the MCP transport and waits for that bridge's processes to
+exit, including the MCP's managed-job cleanup. Restart the bridge explicitly
+after replacing the MCP binary or changing inherited runtime configuration;
+the bridge does not discard active jobs automatically.
+
+A disconnected or timed-out foreground caller sends MCP cancellation for an
+already-transmitted request. A request still queued for transmission is
+discarded. If transmission started, the error marks execution as uncertain;
+the bridge never retries such a request. Explicit background calls survive
+their caller's exit and remain discoverable through `o_job_list`.
+Structured tool output and `isError` are preserved, while successful legacy
+text tools retain their existing text output. The default transport wait is
+600 seconds (`OSTADIX_MCP_CLIENT_TIMEOUT` can change it), extended to at least
+30 seconds beyond a positive tool `timeout_secs`. An explicit client
+`--timeout` overrides this calculation. Tool `timeout_secs: 0` and client
+`--timeout 0` both preserve an unbounded foreground wait; client disconnection
+still cancels a pending foreground request. Background jobs allow such
+operations to continue without keeping a function invocation attached.
+The bridge has a 16 MiB JSON
+frame bound; use job-log pagination for large output. Its socket is local to
+the user account, with no network listener or cross-machine protocol.
 
 ## Build / install
 
@@ -48,6 +200,13 @@ the root release `O`, `olangc`, and `o-info` binaries. Under a deliberately syst
 both supported relative-path forms of `o_run`, relative-path `o_olangc`, and
 bundled `o_search_run`, rejects search-path escape, and performs fixed local
 Information V1 head inspection with a no-mutation tree comparison.
+It also checks the new structured and text response contracts, command
+discovery and guide resources, literal per-job environment/cwd handling,
+inline evaluation, CLI failures, independent background jobs, byte-paged
+logs, REPL stdin/EOF, and cancellation of a delayed descendant. All execution
+fixtures use disposable local state; this smoke does not exercise every
+cataloged command, start a real node, install software, or contact a remote
+service. PTY behavior has separate execution-layer tests.
 The client drains stdout/stderr concurrently and retains out-of-order JSON-RPC
 replies by id.
 
@@ -63,8 +222,9 @@ stdout and stderr concurrently through hard byte limits, kills and reaps the
 process group on Unix (the direct child elsewhere) on overflow or timeout,
 rejects non-UTF-8/control/unexpected or duplicate output, and never returns raw
 stderr or the state path. It invokes
-only `o-info head --state ... --head ...`; no generic arguments, shell, cloud,
-or network surface is exposed.
+only `o-info head --state ... --head ...`. This fixed inspector has no generic
+arguments. The separate `o_cli` tool exposes the full `o-info` CLI and its
+possible effects; it does not inherit this inspector's read-only guarantee.
 
 The installed-layout transport smoke is:
 
@@ -93,7 +253,8 @@ the admitted module and `examples/webassembly_hello.O` under Wasmtime;
 outside the normal boot path.
 
 The root runtime remains an independent child: the MCP crate does not link
-`o-lang` or write Information logical state. `o-info head` uses
+`o-lang`. The fixed inspector does not write Information logical state;
+`o-info head` uses
 `InformationStoreReaderV1`, which creates no directory/lock, repairs no mode,
 and updates no head. The sanitized result is descriptive metadata only.
 Information presence, a verified pack, World `signature_validated`, and Hosted
@@ -123,11 +284,12 @@ authority.
 This protocol is a local **same-intent gate**, not authorization, a capability,
 a retained admission object, proof of runtime health, or a capacity lease.
 `o_run` remains available as an explicitly ungated compatibility path. The MCP
-crate does not link the root runtime and does not add a worker, scheduler lane,
-or persistent `O` process.
+crate does not link the root runtime or change its worker and scheduler
+configuration. Managed background jobs may keep an `O` process alive for the
+duration of the MCP session.
 
-Package 0.3 MCP execution remains deliberately local and uses fresh Graph V2
-with `oexec.evidence/v6` and `oexec.admission/v6`; current CLI/API inspection
+The existing local execution tools retain fresh Graph V2 with
+`oexec.evidence/v6` and `oexec.admission/v6`; current CLI/API inspection
 exposes Schedule Explanation/Why V2. Graph V1, Evidence/Admission V5, Schedule
 Explanation/Why V1, and `PreparedPlacementFragmentV1` remain explicit archival
 inspection surfaces only. The MCP never uplifts, relabels, authorizes, or
@@ -135,19 +297,16 @@ dispatches them as current V2/V6 authority. Execution Intent V1 stays bound to
 the frozen Graph V1 identity, but a matching handle carries no authority and
 forces fresh Graph V2/V6 admission before dispatch.
 
-Hosted Placement V6 is a separate milestone. Its current preparation boundary
-is `PreparedPlacementFragmentV2`; the authenticated direct-node surface is the
-`octl node ...` client and `o-node` service documented in
-[`docs/HOSTED_PLACEMENT_V6.md`](../../docs/HOSTED_PLACEMENT_V6.md). This MCP
-does not discover a federated registry, enroll a node, request a placement
-lease, or turn a stable intent handle into placement authority. No MCP tool
-wraps frozen one-operation V1, durable session V2, placement-authority issuance
-or the co-located development mint, explicit closed-session GC, or the separate
-local `o-registry` snapshot store. In particular, no MCP tool holds a session
-bearer, submits `PlacementLeaseV2`, consumes a V2 signed journal receipt, or
-opens or upgrades a durable state root; `o-node` rejects durable state without
-the exact package-0.3 execution-authority marker, while a fresh empty root may
-be initialized with that marker.
+Hosted Placement V6 uses `PreparedPlacementFragmentV2`; its authenticated
+direct-node surface is the `octl node ...` client and `o-node` service documented
+in [`docs/HOSTED_PLACEMENT_V6.md`](../../docs/HOSTED_PLACEMENT_V6.md).
+`o_cli` exposes their complete arguments along with registry and related
+command families. It supplies process execution, input, logs, and lifecycle
+control; the native CLI retains responsibility for credentials, admission,
+placement leases, durable sessions, receipt verification, and state-version
+checks. Neither a catalog entry nor a same-intent handle supplies missing
+authority or upgrades an old execution identity. Inspect the mesh guide and
+the selected CLI's help for the current operation before invoking it.
 
 The checked-in `.mcp.json` contains no shell expressions. When explicit
 environment paths are absent, the server recognizes the repository from its
@@ -243,11 +402,15 @@ Reload MCP / restart the session so tools appear as `olang__o_runtimes`,
 
 ## Agent rules (encoded in tool instructions)
 
-1. Prefer `o_analyze_intent` + `o_execute_intent` when the action must remain
+1. Discover the current command families with `o_capabilities`, read the
+   relevant `o_guide`, and check the selected runtime with the environment tools.
+2. Use `o_cli` for complete CLI options, `o_eval` for inline programs, and job
+   tools for concurrent, long-running, or interactive work.
+3. Prefer `o_analyze_intent` + `o_execute_intent` when the action must remain
    bound to inspected source and graph intent; `o_run` is direct execution.
-2. Never pass the literal string `O_BACKENDS_DIR` as the backends argv.
-3. Never put `$VAR` / `$O_BACKENDS_DIR` **inside** `.O` sources (O splices `$IDENT`).
-4. Always use an absolute backends directory.
+4. Never pass the literal string `O_BACKENDS_DIR` as the backends argv.
+5. Never put `$VAR` / `$O_BACKENDS_DIR` **inside** `.O` sources (O splices `$IDENT`).
+6. Always use an absolute backends directory.
 
 ## Stack
 

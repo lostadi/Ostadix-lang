@@ -76,6 +76,7 @@ class LowercaseCliDispatchTests(unittest.TestCase):
             ("plan", "--parallel", "auto", "project", "--live"),
             ("explain", "last-run"),
             ("inspect", "last-run", "--trace"),
+            ("computation", "inspect", "artifact with spaces.cbor", "--json"),
             ("operation", "inspect", "set", "set.cbor", "--json"),
             ("operation", "normalize", "--json"),
             ("realizations", "normalize", "--json"),

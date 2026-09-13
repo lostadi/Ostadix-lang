@@ -21,10 +21,19 @@ from typing import Any, BinaryIO
 PROTOCOL_VERSION = "2025-03-26"
 EXPECTED_TOOLS = {
     "o_analyze_intent",
+    "o_capabilities",
+    "o_cli",
     "o_doctor",
     "o_env",
+    "o_eval",
     "o_execute_intent",
     "o_information_inspect",
+    "o_guide",
+    "o_job_cancel",
+    "o_job_list",
+    "o_job_read",
+    "o_job_status",
+    "o_job_write",
     "o_olangc",
     "o_run",
     "o_runtimes",
@@ -178,6 +187,214 @@ def _record_field(text: str, key: str) -> str:
             if value:
                 return value
     raise SmokeError(f"MCP result omitted nonempty {key}= record:\n{text}")
+
+
+def _content_object(result: dict[str, Any]) -> dict[str, Any]:
+    """Read the structured contract, checking its text-only client equivalent."""
+    try:
+        text_value = json.loads(_content_text(result))
+    except json.JSONDecodeError as error:
+        raise SmokeError("MCP structured tool returned invalid JSON text") from error
+    if not isinstance(text_value, dict):
+        raise SmokeError("MCP structured tool returned a non-object JSON value")
+    structured = result.get("structuredContent", text_value)
+    if not isinstance(structured, dict) or structured != text_value:
+        raise SmokeError("MCP structuredContent and JSON text disagree")
+    return structured
+
+
+def _run_agent_surface_smoke(
+    process: subprocess.Popen[bytes],
+    responses: ResponseReader,
+    root: Path,
+    timeout: float,
+    fixture: Path,
+) -> None:
+    """Exercise agent discovery and job transport using local disposable effects."""
+    next_request = 100
+
+    def request(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        nonlocal next_request
+        request_id = next_request
+        next_request += 1
+        _send(
+            process,
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": method,
+                "params": params,
+            },
+        )
+        return responses.response(request_id, timeout)
+
+    def call(
+        name: str, arguments: dict[str, Any], *, error: bool = False
+    ) -> dict[str, Any]:
+        result = request("tools/call", {"name": name, "arguments": arguments})
+        if (result.get("isError") is True) != error:
+            raise SmokeError(f"{name} returned unexpected error status: {_content_text(result)}")
+        return _content_object(result)
+
+    def wait_job(job_id: str, expected: str = "completed") -> dict[str, Any]:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            status = call("o_job_status", {"job_id": job_id})
+            if status.get("state") != "running":
+                if status.get("state") != expected:
+                    raise SmokeError(f"job {job_id} expected {expected}: {status}")
+                return status
+            time.sleep(0.05)
+        raise SmokeError(f"job {job_id} did not finish within {timeout}s")
+
+    def read_all(job_id: str, stream: str, limit: int = 512) -> str:
+        offset = 0
+        chunks: list[str] = []
+        while True:
+            page = call(
+                "o_job_read",
+                {"job_id": job_id, "stream": stream, "offset": offset, "limit": limit},
+            )
+            if page.get("offset") != offset or not isinstance(page.get("text"), str):
+                raise SmokeError(f"job read returned an invalid cursor/text: {page}")
+            advance = page.get("next_offset")
+            count = page.get("bytes_read")
+            if not isinstance(advance, int) or not isinstance(count, int):
+                raise SmokeError(f"job read omitted byte cursor metadata: {page}")
+            if not (0 <= count <= limit) or advance != offset + count:
+                raise SmokeError(f"job read violated byte pagination: {page}")
+            chunks.append(page["text"])
+            if page.get("eof") is True:
+                return "".join(chunks)
+            if advance <= offset:
+                raise SmokeError(f"job read stalled before EOF: {page}")
+            offset = advance
+
+    capabilities = call("o_capabilities", {})
+    commands = capabilities.get("commands", [])
+    command_names = {command.get("id") for command in commands if isinstance(command, dict)}
+    required = {"O", "olangc", "o-link", "o-unlink", "ocorec", "octl", "o-node", "ogit"}
+    if not required.issubset(command_names):
+        raise SmokeError(f"o_capabilities omitted commands: {sorted(required - command_names)}")
+    if capabilities.get("schema") != "ostadix.mcp-capabilities/v1" or capabilities.get("runtime_readiness_verified") is not False:
+        raise SmokeError("capability discovery omitted its schema or presence-only boundary")
+    located_o = next(command for command in commands if command.get("id") == "O")
+    if located_o.get("available") is not True or not Path(located_o.get("resolved_path", "")).is_file():
+        raise SmokeError(f"capability discovery did not locate the installed interpreter: {located_o}")
+    guide = call("o_guide", {})
+    if not isinstance(guide.get("guide"), str) or not guide["guide"].strip():
+        raise SmokeError(f"o_guide omitted its agent instructions: {guide}")
+    resource_list = request("resources/list", {})
+    resources = resource_list.get("resources", [])
+    uris = {resource.get("uri") for resource in resources if isinstance(resource, dict)}
+    if not {"ostadix://capabilities", "ostadix://guide/all", "ostadix://guide/mesh"}.issubset(uris):
+        raise SmokeError("MCP resources omitted the capability catalog or task guides")
+    for uri, expected in (
+        ("ostadix://capabilities", capabilities),
+        ("ostadix://guide/all", guide["guide"]),
+    ):
+        resource = request("resources/read", {"uri": uri})
+        contents = resource.get("contents", [])
+        if len(contents) != 1 or contents[0].get("uri") != uri:
+            raise SmokeError(f"MCP resource returned unexpected contents: {resource}")
+        text = contents[0].get("text", "")
+        actual = json.loads(text) if isinstance(expected, dict) else text
+        if actual != expected:
+            raise SmokeError(f"MCP resource {uri} disagrees with its tool equivalent")
+
+    help_result = call("o_cli", {"command": "O", "args": ["--help"]})
+    if help_result.get("exit_code") != 0 or "Usage:" not in help_result.get("stdout", {}).get("text", ""):
+        raise SmokeError(f"o_cli O --help failed: {help_result}")
+    if not isinstance(help_result.get("job_id"), str):
+        raise SmokeError("foreground CLI call omitted retained job identity")
+
+    # An environment value containing shell syntax must stay literal. Each job
+    # gets its own environment, and cwd must apply to the evaluated backend.
+    shell_marker = fixture / "must-not-be-created"
+    literal = f"$(touch {shell_marker}) `touch {shell_marker}`"
+    source = (
+        "python^(\nimport json, os\n"
+        "__oval_result__ = json.dumps({'value': os.environ.get('OSTADIX_MCP_SMOKE_LITERAL'), "
+        "'cwd': os.getcwd()}, sort_keys=True)\n)_python\n"
+    )
+    evaluated = call(
+        "o_eval",
+        {"source": source, "cwd": os.fspath(fixture), "env": {"OSTADIX_MCP_SMOKE_LITERAL": literal}},
+    )
+    evaluation_text = evaluated.get("stdout", {}).get("text", "")
+    if literal not in evaluation_text or os.fspath(fixture) not in evaluation_text or shell_marker.exists():
+        raise SmokeError(f"inline eval changed literal env/cwd: {evaluated}")
+    isolated = call("o_eval", {"source": source, "cwd": os.fspath(fixture)})
+    if '"value": null' not in isolated.get("stdout", {}).get("text", ""):
+        raise SmokeError(f"per-job environment escaped into later evaluation: {isolated}")
+
+    failed = call("o_cli", {"command": "O", "args": ["--mcp-smoke-invalid-option"]}, error=True)
+    if failed.get("exit_code") in (None, 0) or failed.get("state") != "failed":
+        raise SmokeError(f"failed CLI command lost exit evidence: {failed}")
+
+    # File barriers verify independent jobs make progress without timing-based
+    # assumptions about worker startup or backend imports.
+    barrier = fixture / "release-first-job"
+    waiting_source = (
+        "python^(\nfrom pathlib import Path\nimport time\n"
+        f"barrier = Path({os.fspath(barrier)!r})\n"
+        "while not barrier.exists():\n    time.sleep(0.02)\n"
+        "__oval_result__ = 'first-job-released'\n)_python\n"
+    )
+    waiting = call("o_eval", {"source": waiting_source, "background": True, "timeout_secs": 30})
+    listed_jobs = call("o_job_list", {})
+    if waiting["job_id"] not in {job.get("job_id") for job in listed_jobs.get("jobs", [])}:
+        raise SmokeError(f"job list omitted a running job: {listed_jobs}")
+    releasing = call(
+        "o_eval",
+        {"source": "python^(\nfrom pathlib import Path\n" + f"Path({os.fspath(barrier)!r}).write_text('released')\n" + "__oval_result__ = 'second-job-completed'\n)_python\n"},
+    )
+    if "second-job-completed" not in releasing.get("stdout", {}).get("text", ""):
+        raise SmokeError(f"second job failed while first was waiting: {releasing}")
+    wait_job(waiting["job_id"])
+    if "first-job-released" not in read_all(waiting["job_id"], "stdout", limit=7):
+        raise SmokeError("paged background log omitted the completed result")
+
+    repl = call(
+        "o_cli",
+        {"command": "O", "args": ["--repl", os.fspath(root / "backends")], "background": True, "timeout_secs": 30},
+    )
+    call("o_job_write", {"job_id": repl["job_id"], "input": "python^( __oval_result__ = 1 + 1 )_python\n", "close": True})
+    wait_job(repl["job_id"])
+    if "[number] 2" not in read_all(repl["job_id"], "stdout"):
+        raise SmokeError("background REPL did not receive input and EOF")
+
+    # The descendant writes only after cancellation should have killed its
+    # process group. The ready marker proves it was actually launched first.
+    ready = fixture / "descendant-ready"
+    escaped = fixture / "descendant-survived"
+    child_code = f"import time; from pathlib import Path; time.sleep(2); Path({os.fspath(escaped)!r}).write_text('survived')"
+    spawn_descendant = (
+        f"subprocess.Popen([sys.executable, '-c', {child_code!r}])\n"
+        if os.name == "posix"
+        else ""
+    )
+    cancellable_source = (
+        "python^(\nfrom pathlib import Path\nimport subprocess, sys, time\n"
+        + spawn_descendant
+        +
+        f"Path({os.fspath(ready)!r}).write_text('ready')\n"
+        "time.sleep(30)\n)_python\n"
+    )
+    cancellable = call("o_eval", {"source": cancellable_source, "background": True, "timeout_secs": 30})
+    deadline = time.monotonic() + timeout
+    while not ready.exists():
+        if time.monotonic() >= deadline:
+            raise SmokeError("cancellation fixture did not launch its descendant")
+        time.sleep(0.02)
+    call("o_job_cancel", {"job_id": cancellable["job_id"]})
+    cancelled = wait_job(cancellable["job_id"], "cancelled")
+    if cancelled.get("cleanup", {}).get("child_reaped") is not True:
+        raise SmokeError(f"cancelled job omitted child reap evidence: {cancelled}")
+    if os.name == "posix":
+        time.sleep(2.2)
+        if escaped.exists():
+            raise SmokeError("cancelled job left a descendant able to commit an effect")
 
 
 def run_smoke(
@@ -373,8 +590,8 @@ def run_smoke(
         initialized = responses.response(1, timeout)
         if initialized.get("protocolVersion") != PROTOCOL_VERSION:
             raise SmokeError("MCP initialize negotiated an unexpected protocol version")
-        if "tools" not in initialized.get("capabilities", {}):
-            raise SmokeError("MCP initialize did not advertise tools")
+        if not {"tools", "resources"}.issubset(initialized.get("capabilities", {})):
+            raise SmokeError("MCP initialize did not advertise tools and resources")
 
         _send(
             process,
@@ -886,6 +1103,11 @@ def run_smoke(
                     "o_search_run accepted a path outside its leaf-token contract:\n"
                     f"{rejected_text}"
                 )
+
+        with tempfile.TemporaryDirectory(prefix=".mcp-agent-smoke-") as agent_fixture:
+            _run_agent_surface_smoke(
+                process, responses, root, timeout, Path(agent_fixture).resolve()
+            )
 
         if require_wasm:
             assert wasm_output is not None

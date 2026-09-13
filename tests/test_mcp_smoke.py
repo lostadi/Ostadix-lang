@@ -129,5 +129,33 @@ class ResponseReaderTests(unittest.TestCase):
         reader.join(0.5)
 
 
+class StructuredToolResultTests(unittest.TestCase):
+    @staticmethod
+    def result(value: object, **extra: object) -> dict[str, object]:
+        return {
+            "content": [{"type": "text", "text": json.dumps(value)}],
+            **extra,
+        }
+
+    def test_text_only_clients_receive_the_same_job_object(self) -> None:
+        value = {"job_id": "job-1", "state": "completed", "exit_code": 0}
+        self.assertEqual(smoke._content_object(self.result(value)), value)
+        self.assertEqual(
+            smoke._content_object(self.result(value, structuredContent=value)), value
+        )
+
+    def test_disagreeing_structured_and_text_results_are_rejected(self) -> None:
+        with self.assertRaisesRegex(smoke.SmokeError, "disagree"):
+            smoke._content_object(
+                self.result({"exit_code": 1}, structuredContent={"exit_code": 0})
+            )
+
+    def test_non_object_and_invalid_json_are_rejected(self) -> None:
+        with self.assertRaisesRegex(smoke.SmokeError, "non-object"):
+            smoke._content_object(self.result(["job-1"]))
+        with self.assertRaisesRegex(smoke.SmokeError, "invalid JSON"):
+            smoke._content_object({"content": [{"type": "text", "text": "not-json"}]})
+
+
 if __name__ == "__main__":
     unittest.main()
